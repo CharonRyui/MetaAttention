@@ -1,9 +1,28 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from numbers import Integral
+import warnings
 
 import torch
+
+from .stateful_operator import (
+    AlgorithmIR,
+    CompileOptions,
+    ElementwiseScale,
+    Exp,
+    HeadMapping,
+    Input,
+    MatrixReadout,
+    OuterProduct,
+    PropagationComposition,
+    RankOneDelta,
+    StateSpec,
+    StateTransition,
+    StatefulOperator,
+    StateTuple,
+    TensorInput,
+)
 
 
 CHUNK_SIZE = 64
@@ -84,7 +103,6 @@ def validate_gdn_inputs(
             raise RuntimeError("GDN Engine requires an NVIDIA CUDA H20/sm89 device")
         capability = torch.cuda.get_device_capability(query.device)
         name = torch.cuda.get_device_name(query.device)
-        # CUDA reports H20 as 9.0 despite its Ada-compatible execution limits.
         if "H20" not in name.upper():
             raise RuntimeError(
                 f"GDN Engine requires NVIDIA H20/sm89; found {name} with capability {capability}"
@@ -93,11 +111,38 @@ def validate_gdn_inputs(
     return batch, query_heads, value_heads, length, resolved_scale
 
 
+def gated_delta_rule_operator(*, scale: float | None = None) -> StatefulOperator:
+    resolved_scale = DEFAULT_SCALE if scale is None else scale
+    if not isinstance(resolved_scale, float):
+        raise TypeError("scale must be a Python float")
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), torch.bfloat16),
+            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), torch.bfloat16),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), torch.bfloat16),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+            TensorInput("beta", ("batch", "state_heads", "sequence"), torch.float32),
+        ),
+        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        transition=StateTransition(
+            "memory",
+            PropagationComposition(
+                (ElementwiseScale(Exp(Input("gate"))), RankOneDelta(Input("key"), Input("beta")))
+            ),
+            OuterProduct(Input("key"), Input("value") * Input("beta")),
+        ),
+        readout=MatrixReadout("memory", Input("query") * resolved_scale),
+        head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),
+    )
+    return StatefulOperator(algorithm, compile_options=CompileOptions())
+
+
 @dataclass(frozen=True)
 class GDNEngine:
-    """Dedicated fixed-length H20 Gated Delta Rule engine."""
+    """Deprecated positional adapter for the IR-first Gated Delta Rule operator."""
 
     device: torch.device | str | int | None = None
+    _operators: dict[float, StatefulOperator] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.device is None:
@@ -107,6 +152,11 @@ class GDNEngine:
         else:
             device = torch.device(self.device)
         object.__setattr__(self, "device", device)
+        warnings.warn(
+            "GDNEngine is deprecated; construct gated_delta_rule_operator and bind named inputs instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         if device.type != "cuda" or torch.version.hip is not None or not torch.cuda.is_available():
             raise RuntimeError("GDN Engine requires an NVIDIA CUDA H20/sm89 device")
         name = torch.cuda.get_device_name(device)
@@ -128,28 +178,24 @@ class GDNEngine:
         initial_state: torch.Tensor | None = None,
         output_final_state: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        from .gdn_flash_qla import gated_delta_rule
-
-        validate_gdn_inputs(
-            query,
-            key,
-            value,
-            gate,
-            beta,
-            scale=scale,
-            initial_state=initial_state,
+        _, _, _, _, resolved_scale = validate_gdn_inputs(
+            query, key, value, gate, beta, scale=scale, initial_state=initial_state
         )
-        resolved_scale = DEFAULT_SCALE if scale is None else scale
-        output, final_state = gated_delta_rule(
-            query,
-            key,
-            value,
-            gate,
-            beta,
-            scale=resolved_scale,
-            initial_state=initial_state,
-            output_final_state=output_final_state,
+        operator = self._operators.get(resolved_scale)
+        if operator is None:
+            operator = gated_delta_rule_operator(scale=resolved_scale)
+            self._operators[resolved_scale] = operator
+        state = None if initial_state is None else StateTuple(("memory",), (initial_state,))
+        result = operator(
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            initial_state=state,
+            return_final_state=output_final_state,
         )
         if output_final_state:
-            return output, final_state
-        return output
+            output, final_state = result
+            return output, final_state["memory"]
+        return result

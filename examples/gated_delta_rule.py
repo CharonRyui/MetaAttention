@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from attn_engine import GDNEngine
+from attn_engine import gated_delta_rule_operator
 
 
 def gated_delta_rule(device: str | torch.device = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
@@ -18,16 +18,16 @@ def gated_delta_rule(device: str | torch.device = "cuda") -> tuple[torch.Tensor,
         batch, value_heads, dim, dim, device=device, dtype=torch.float32, requires_grad=True
     )
 
-    output, final_state = GDNEngine(device)(
-        query,
-        key,
-        value,
-        gate,
-        beta,
-        initial_state=initial_state,
-        output_final_state=True,
+    output, final_state = gated_delta_rule_operator()(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        beta=beta,
+        initial_state={"memory": initial_state},
+        return_final_state=True,
     )
-    (output.float().square().mean() + final_state.square().mean()).backward()
+    (output.float().square().mean() + final_state["memory"].square().mean()).backward()
     return output, final_state
 
 
