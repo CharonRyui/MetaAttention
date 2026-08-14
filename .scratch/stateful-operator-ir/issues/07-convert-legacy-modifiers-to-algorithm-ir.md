@@ -11,5 +11,5 @@
 - [ ] Stateful-path `CustomIO` declarations convert to typed Tensor Inputs while ordinary AttentionEngine `CustomIO` behavior remains unchanged.
 - [ ] Deprecated and IR-first entrypoints for Gated Linear Attention, RetNet recurrent, and Mamba2 match for forward and all differentiable gradients within established tolerances.
 - [ ] An unsupported modifier expression fails during conversion, identifies the modifier and unsupported expression, and never reaches kernel compilation.
-- [ ] There is one Algorithm IR lowering path: no legacy kernel path, eager fallback, or model-specific escape hatch remains.
+- [ ] There is one StatefulOperator compilation path: no legacy kernel path, eager fallback, frontend-type dispatch, or model-name escape hatch remains.
 - [ ] New production code and new tests do not depend on modifier construction except explicit compatibility coverage.

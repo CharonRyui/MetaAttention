@@ -13,7 +13,7 @@ The upstream FlashQLA implementation of Gated Delta Rule chunked prefill. In thi
 The initial GDN contract: H20/sm89 BF16 fixed-length training with forward and backward execution, GVA, and initial/final recurrent state. Variable-length and automatic intra-card context parallelism are excluded.
 
 **GDN Engine**:
-The dedicated module that owns GDN lowering and kernel execution. It is separate from the scalar-decay LinearAttentionEngine.
+The temporary legacy frontend for Gated Delta Rule. It preserves the existing GDN call contract by adapting it to an equivalent Algorithm IR and the shared Stateful Operator; new code constructs the rank-one delta transition directly.
 
 **Head-first Layout**:
 The GDN Engine public tensor layout: query and key are `[B,Hk,T,K]`, value is `[B,Hv,T,V]`, and gate and beta are `[B,Hv,T]`. This is the native MetaAttention layout.
@@ -39,11 +39,13 @@ Query, key, value, and output use bfloat16. Log-space gate, beta, initial state,
 
 **Algorithm IR** — A backend-independent description of a stateful sequence operator: input transforms, a structured state transition, and a state readout. It defines model mathematics, not a GPU schedule.
 
-**State transition** — The per-token transformation from a prior state to a next state. In the first refactor phase it is a structured affine transition, `s_next = L(inputs) * s + b(inputs)`.
+**Stateful Operator** — The sole IR-first public compiler interface for state-transition algorithms such as GDN and Mamba2. It accepts validated Algorithm IR and typed input specifications, derives Backward IR, selects a compatible lowering strategy, and returns a stateless callable operator.
 
-**Structured affine transition** — A state transition whose propagation is one of the compiler-recognized forms: identity, elementwise scale, or diagonal scale, plus an input-derived injection. Its composition and backward rules are compiler-derived.
+**State transition** — The per-token transformation from a prior state to a next state. It combines an ordered structured propagation with an input-derived injection.
 
-**State readout** — The per-token computation performed after the state transition. It produces output from the updated state and transformed inputs, so the current token's state injection is visible to its output.
+**Structured affine transition** — A state transition whose propagation is a compiler-recognized node or an ordered composition of such nodes, plus an input-derived injection. Its composition and backward rules are compiler-derived.
+
+**Rank-one delta propagation** — A structured matrix-state propagation `S -> S - beta * k * (k^T * S)` for an arbitrary unnormalized key and raw differentiable beta. GDN composes scalar `exp(log_gate)` decay before this propagation, then adds a beta-weighted key-value outer-product injection.
 
 **State injection** — The input-derived additive term in a structured affine transition. The first phase recognizes outer product, elementwise product, direct input, and zero injection.
 
@@ -54,6 +56,10 @@ Query, key, value, and output use bfloat16. Log-space gate, beta, initial state,
 **Final state** — The state tuple after the final token. Callers may request it for streaming or continuation; compatibility frontends return only token outputs by default.
 
 **Frontend sugar** — Model-facing conveniences such as `q_mod`, `k_mod`, `v_mod`, and `decay_mod`. These are lowered into Algorithm IR and are not core compiler semantics.
+
+**Backward IR** — The compiler-derived vector-Jacobian-product program for an Algorithm IR. Frontends cannot construct or override it; lowering strategies may implement an equivalent specialized backward.
+
+**Stateful program** — The validated forward Algorithm IR paired with its compiler-derived Backward IR for lowering. It is an internal compiler artifact, not a model-authoring interface.
 
 **IR-derived backward** — The backward graph is derived from Algorithm IR node VJPs. Frontends do not provide independent backward functions; lowering strategies implement the derived graph.
 

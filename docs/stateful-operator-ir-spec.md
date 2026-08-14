@@ -20,11 +20,11 @@ The first phase supports structured affine transitions of the form:
 
 `next_state = propagation(inputs, prior_state) + injection(inputs)`
 
-Propagation is restricted to compiler-recognized identity, elementwise-scale, and diagonal-scale forms. State injection is restricted to outer product, elementwise product, direct input, and zero. The compiler derives composition and backward behavior from these IR nodes; users cannot supply arbitrary transition functions or independent backward definitions.
+Propagation is restricted to compiler-recognized identity, scalar or elementwise scale, diagonal scale, and rank-one delta forms. Propagations may form an ordered composition whose order is part of Algorithm IR semantics and structural identity. State injection is restricted to outer product, elementwise product, direct input, and zero. The compiler derives composition and backward behavior from these IR nodes; users cannot supply arbitrary transition functions or independent backward definitions.
 
-Provide a typed, explicit IR construction interface for new stateful operators. Model-specific frontends wrap this interface so ordinary users do not need to construct every node manually. Migrate Gated Linear Attention, RetNet recurrent, and Mamba2 to this shared Algorithm IR while retaining the existing optimized lowering strategy.
+Provide typed, explicit IR constructors and one public `StatefulOperator` interface for new stateful code. Runtime tensors bind by Tensor Input name; symbolic input declarations remain in Algorithm IR while concrete shapes, layouts, devices, backend identity, and compile options form the specialization signature. Migrate Gated Linear Attention, RetNet recurrent, Mamba2, and GDN to this shared interface while retaining their optimized lowering strategies.
 
-Keep the existing `LinearAttentionEngine` modifier constructor during this phase as a deprecated compatibility adapter. The adapter captures and validates supported modifier expressions, converts them into the same Algorithm IR, and then uses the same lowering path as IR-first operators. It must reject expressions that cannot be represented by the supported IR. It must not retain a second legacy lowering, silently execute an eager recurrence, or create model-specific fallback behavior.
+Keep the modifier-based `LinearAttentionEngine` and the existing `GDNEngine` during this phase as deprecated compatibility adapters. Each adapter validates and converts its supported legacy contract into Algorithm IR, then uses the same Stateful Operator compilation path. Neither adapter may retain a second legacy lowering, silently execute an eager recurrence, or dispatch by model name.
 
 The core operator accepts an optional named initial state tuple, defaulting to zero, and may return the named final state tuple for streaming continuation. Compatibility calls continue to return token outputs only unless the new state interface is used.
 
@@ -83,61 +83,62 @@ Normalization is explicitly unsupported in this phase. The design reserves named
 
 ## Implementation Decisions
 
-- Build one deep stateful-operator module whose external interface accepts a validated Algorithm IR plus compile options and returns a callable operator. The same interface is the primary behavioral test seam.
-- Algorithm IR is backend-independent. It describes input transforms, a named state tuple, structured affine transitions, post-transition state readout, typed tensor inputs, and Head Mapping. It does not contain chunk sizes, tile shapes, scan implementation, warp configuration, memory placement, or backend source code.
-- The first-phase state transition is affine: propagation of prior state plus input-derived injection.
-- Supported propagation nodes are identity, elementwise scale, and diagonal scale. The compiler determines their composition behavior; callers cannot assert associativity manually.
-- Supported state-injection nodes are outer product, elementwise product, direct input, and zero.
+- Build one deep stateful-operator module whose sole IR-first public interface accepts a validated Algorithm IR plus compile options and returns a stateless callable operator. Runtime Tensor Inputs bind only by keyword name; `return_final_state` requests a named final StateTuple. The same interface is the primary behavioral test seam.
+- Algorithm IR is backend-independent. It describes symbolic typed Tensor Inputs, input transforms, a named state tuple, structured affine transitions, post-transition state readout, and Head Mapping. It does not contain concrete batch or sequence sizes, devices, chunk sizes, tile shapes, scan implementation, warp configuration, memory placement, or backend source code.
+- The first-phase state transition is affine: ordered structured propagation of prior state plus input-derived injection.
+- Supported propagation nodes are identity, scalar or elementwise scale, diagonal scale, and rank-one delta. Ordered propagation composition is explicit; order participates in validation, VJP derivation, lowering selection, and structural cache identity. Rank-one delta maps a prior matrix state as `S -> S - beta * k * (k^T * S)` for arbitrary unnormalized `k` and raw differentiable `beta`; it performs no normalization or clamping.
+- Supported state-injection nodes are outer product, elementwise product, direct input, and zero. Typed input expressions may scale an operand before injection without materializing a frontend temporary. GDN retains log-space gate as a Tensor Input and expresses its exponential explicitly.
 - Readout occurs after transition. The updated state is visible to the output at the same sequence position.
-- The initial readout set must cover the existing stateful examples, including matrix-style readout for Linear Attention/retention and elementwise or contraction-based Mamba2 readout. Readout forms remain typed and enumerated rather than arbitrary Python callbacks.
+- The initial readout set must cover the migration targets, including matrix-style readout for Linear Attention, retention, and GDN, plus elementwise or contraction-based Mamba2 readout. Readout forms remain typed and enumerated rather than arbitrary Python callbacks.
 - State is represented as an ordered tuple of named tensor states. Each state declares logical shape roles, storage dtype, and accumulation dtype. References are by state name.
-- The initial lowering strategy may accept only the state tuple configurations required by the three migration targets. Other valid Algorithm IR configurations receive an explicit unsupported-lowering diagnostic.
-- Initial state is optional and defaults to zeros. Final state is returned only when requested. State is caller-owned; the engine does not mutate persistent internal state between calls.
-- Tensor inputs replace `CustomIO` only within stateful operators. Each input declares a name, logical shape roles, dtype, and whether gradients are required.
+- A lowering strategy may accept only the state tuple and node combinations it declares through structural and backend capabilities. Other valid Algorithm IR configurations receive an explicit unsupported-lowering diagnostic.
+- Initial state is optional and defaults to zeros. Final state is returned only when requested, as a named StateTuple paired with output. State is caller-owned; the engine does not mutate persistent internal state between calls.
+- Each Algorithm IR Tensor Input declares a name, logical shape roles, dtype, and whether gradients are required. Concrete shape, layout, and device metadata is supplied to specialization explicitly or inferred from the first runtime call.
 - Head Mapping explicitly relates query heads, state heads, key/input groups, and value heads. Valid divisibility, broadcasting, and gradient-reduction relationships are checked before lowering.
 - Input transforms may reuse the existing symbolic expression machinery for supported elementwise leaf transformations, but symbolic expression DAGs are not themselves state-transition IR.
-- The IR-first authoring interface uses typed explicit constructors and factory functions. It does not trace arbitrary Python transition/readout functions and does not parse Python source or AST.
-- Every differentiable IR node owns a vector-Jacobian-product rule. The compiler derives backward semantics from the forward Algorithm IR. Frontends cannot provide an independent custom backward.
-- Existing chunked forward, state propagation, output, and backward kernel skeletons remain the first lowering strategy. Refactoring them into a separate Schedule IR is deferred.
-- Existing tuning controls and generated-kernel compilation remain available through the stateful operator module. Schedule configuration is not embedded into Algorithm IR.
-- Generated-code caching uses a canonical structural representation of Algorithm IR plus relevant tensor metadata, backend identity, and compile/tuning options. Python object identity and wrapper function identity are not cache keys.
-- Validation runs before backend code generation. It checks state references, shape-role compatibility, dtypes, propagation/injection/readout node support, Head Mapping, differentiability requirements, initial-state compatibility, and lowering support.
-- Unsupported behavior is a compile-time error. There is no eager recurrence fallback, no separate legacy kernel path, and no model-name special case.
-- The existing modifier-based `LinearAttentionEngine` constructor remains temporarily as a compatibility adapter. It emits a deprecation warning, converts supported modifier DAGs and `CustomIO` declarations into Algorithm IR, and invokes the same stateful operator module.
-- Compatibility conversion accepts only modifier expressions that map to supported input transforms, propagation, injection, or readout behavior. Failed conversion identifies the modifier and unsupported expression.
-- New production code, examples added after this refactor, and new tests use the IR-first interface. The compatibility adapter is tested only for migration parity and warning behavior.
-- Gated Linear Attention, RetNet recurrent, and Mamba2 frontends migrate to Algorithm IR in this phase. They must not select a model-specific lowering branch.
-- Mamba2 is the abstraction pressure test: its selective state transition and readout must lower without a `Mamba2SpecialCase` or equivalent model-name dispatch.
+- The IR-first authoring interface uses typed explicit constructors. It does not trace arbitrary Python transition/readout functions, parse Python source or AST, or provide model-specific IR factories.
+- Every differentiable forward IR node owns a vector-Jacobian-product rule. The compiler alone derives Backward IR and pairs it with the validated forward IR as an internal Stateful Program. Frontends cannot construct or override Backward IR; a lowering strategy may implement an equivalent specialized backward.
+- Existing chunked forward, state propagation, output, and backward kernel skeletons remain available as lowering strategies. Refactoring them into a separate Schedule IR is deferred.
+- Existing tuning controls and generated-kernel compilation remain available through StatefulOperator. Algorithm IR construction and concrete specialization are separate; eager specialization from metadata and lazy first-call specialization use the same seam.
+- Generated-code caching uses canonical Algorithm IR, concrete input metadata, backend identity, and relevant compile/tuning options. Python object identity and wrapper identity are not cache keys. Mathematical constants such as GDN query scale reside at their semantic expression site in Algorithm IR and participate in its identity.
+- Validation runs before backend code generation. Generic validation checks state references, shape-role compatibility, dtypes, propagation composition, injection/readout support, Head Mapping, differentiability, and initial-state compatibility; selected lowering validation checks backend, concrete shape, layout, alignment, and implementation limits.
+- Unsupported behavior is a pre-codegen error. Lowering selection uniquely matches IR structure and backend capability; no eager recurrence fallback, model-name dispatch, or ambiguous first-success selection is allowed.
+- The modifier-based `LinearAttentionEngine` remains temporarily as a deprecated adapter that converts supported modifier DAGs and `CustomIO` declarations into Algorithm IR.
+- `GDNEngine(device)` remains temporarily as a deprecated adapter that preserves its positional tensor, `output_final_state`, and naked state-tensor contracts; maps them to named inputs, `return_final_state`, and the `memory` state; and caches equivalent StatefulOperator instances by resolved scale.
+- Compatibility conversion failures identify the unsupported expression or contract relationship and never reach kernel compilation.
+- New production code, examples, and tests use explicit Algorithm IR and StatefulOperator. Compatibility adapters are tested only for migration parity and warning behavior.
+- Gated Linear Attention, RetNet recurrent, Mamba2, and GDN migrate to StatefulOperator. Specialized lowering is permitted when selected from IR structure and backend capability; frontend type and model name never select it.
+- Mamba2 remains an abstraction pressure test: its selective state transition and readout must lower without a `Mamba2SpecialCase` or equivalent model-name dispatch.
 - Normalization is unsupported in this phase. No denominator state convention, epsilon, clamp, detach, or normalized readout contract is introduced.
-- The compatibility modifier interface is scheduled for removal in the next explicit migration phase after repository callsites and published examples have moved to IR-first construction.
+- Both compatibility adapters are scheduled for removal in the next explicit migration phase after repository callsites and published examples have moved to IR-first construction.
 - Documentation uses the domain terms Algorithm IR, state transition, structured affine transition, state injection, state readout, state tuple, Tensor Input, Head Mapping, frontend sugar, IR-derived backward, and lowering strategy consistently.
 
 ## Testing Decisions
 
-- Test primarily through the highest seam: construct or obtain a callable stateful operator, invoke it with real tensors, and observe outputs, optional final state, gradients, warnings, and validation errors. Tests should not assert generated source text, internal dataclass layout, helper call counts, or template string fragments.
-- Reuse the existing functional GPU-test style and independent PyTorch references. Existing tests already compare official example factories and direct engine calls with dtype- and operator-specific tolerances, including backward gradients where supported.
-- Add IR-first functional coverage for Gated Linear Attention, RetNet recurrent, and Mamba2. Each test compares output with the independent PyTorch reference.
-- Add differential migration coverage that runs equivalent IR-first and deprecated modifier-based operators on identical seeded inputs and compares outputs within existing dtype-specific tolerances.
-- Compare gradients for every differentiable primary input and every differentiable Tensor Input. Mamba2 coverage includes selective parameters used in propagation and injection.
-- Do not require bitwise equality. Use established project tolerances for float16 and bfloat16, tightening only where current reference behavior supports it.
+- Test primarily through the highest seam: construct a StatefulOperator from explicit Algorithm IR, invoke it with real keyword-bound tensors, and observe outputs, optional named final state, gradients, warnings, specialization behavior, and validation errors. Tests should not assert generated source text, internal dataclass layout, helper call counts, or template string fragments.
+- Reuse the existing functional GPU-test style and independent PyTorch references. Existing tests already compare official examples and direct engine calls with dtype- and operator-specific tolerances, including backward gradients where supported.
+- Add IR-first functional coverage for Gated Linear Attention, RetNet recurrent, Mamba2, and GDN. Each test compares output with an independent PyTorch reference.
+- Add differential migration coverage that runs equivalent IR-first and deprecated adapter operators on identical seeded inputs. GDN coverage compares both the legacy adapter and FP64 reference, including final state.
+- Compare gradients for every differentiable Tensor Input and provided initial state. Mamba2 coverage includes selective parameters; GDN coverage includes query, key, value, gate, beta, GVA reductions, and losses entering through output and final state.
+- Do not require bitwise equality. Use established project tolerances; GDN retains its 2% relative-L2 contract.
 - Test post-transition readout with a short deterministic sequence where the current token’s injection produces an observable current-position output. This prevents accidental pre-transition readout.
-- Test omitted initial state against an explicit zero state.
-- Test sequence continuation: running a prefix while requesting final state, then running the suffix with that state, must match a single full-sequence invocation within dtype-specific tolerances.
+- Test omitted initial state against an explicit zero StateTuple.
+- Test sequence continuation: running an aligned prefix while requesting final state, then running an aligned suffix with that state, must match one invocation within dtype-specific tolerances. The current H20 GDN lowering requires every segment length to be a positive multiple of 64.
 - Test requested final-state shape, dtype, names, and numerical value against a simple reference recurrence.
 - Test that callers which do not request final state receive the existing output-only contract.
 - Test that engine instances do not retain state across independent calls.
 - Test valid and invalid Head Mapping relationships, including equal heads, supported grouped heads, non-divisible groups, and required gradient reductions.
-- Test validation failures for missing state references, duplicate state names, incompatible initial-state shapes/dtypes, unsupported propagation/injection/readout nodes, and unsupported state-tuple lowering combinations.
+- Test validation failures for missing or unknown keyword inputs, duplicate state names, incompatible concrete metadata, invalid initial state, unsupported propagation composition, injection/readout nodes, ambiguous lowering matches, and unsupported lowering capabilities.
 - Test that normalization constructs are rejected explicitly rather than miscompiled or ignored.
-- Test compatibility-adapter deprecation warnings and successful conversion for every modifier pattern used by the three migration targets.
-- Test that an unsupported modifier DAG fails during compatibility conversion and never reaches kernel compilation.
-- Add focused CPU-safe tests for Algorithm IR validation, canonicalization, structural cache identity, shape-role inference, Head Mapping validation, and VJP graph construction where these behaviors do not require executing a GPU kernel.
-- VJP unit tests verify mathematical behavior of supported nodes at observable tensor boundaries, preferably against PyTorch autograd on small tensors. They do not inspect the internal graph representation.
-- Cache tests verify that structurally equivalent IR definitions share identity and semantically different transitions do not. They do not assert a particular hash algorithm or filename.
-- Retain the existing official example import test so all migrated factories remain importable without compiling kernels.
+- Test deprecation warnings and successful conversion for both legacy adapters. `GDNEngine` retains its existing positional call, `output_final_state` flag, and naked state return while constructing equivalent IR internally.
+- Test that unsupported legacy modifier DAGs fail during conversion and never reach kernel compilation.
+- Add focused CPU-safe tests for Algorithm IR validation, canonicalization, structural cache identity, shape-role inference, Head Mapping, Backward IR derivation, keyword binding, and lowering capability selection where these behaviors do not require a GPU.
+- VJP unit tests verify mathematical behavior of supported nodes and ordered compositions at observable tensor boundaries, preferably against PyTorch autograd on small tensors. They do not inspect internal graph representation.
+- Cache tests verify that structurally equivalent IR definitions share identity and semantically different transitions, scales, concrete metadata, backends, or compile options do not. They do not assert a particular hash algorithm or filename.
+- Retain official example import tests so IR construction never compiles a kernel.
 - Run the existing CPU-safe unit suite after implementation.
-- Run the specific GPU functional cases for Gated Linear Attention, RetNet recurrent, and Mamba2 on supported hardware. Then run the full functional GPU suite to detect accidental changes to shared compilation infrastructure.
-- Performance benchmarking is not an acceptance gate for the semantic refactor, but the generated operators must continue using the existing optimized lowering rather than an eager fallback. Any observed material regression is a blocker for release and must be diagnosed separately from numerical correctness.
+- Run the specific supported-GPU functional cases for Gated Linear Attention, RetNet recurrent, Mamba2, and GDN. Then run the full functional GPU suite to detect accidental changes to shared compilation infrastructure.
+- Performance benchmarking is not an acceptance gate for the semantic refactor, but generated operators must continue using optimized lowerings rather than eager fallback. Any material regression is a release blocker and must be diagnosed separately from numerical correctness.
 
 ## Out of Scope
 
@@ -162,9 +163,11 @@ Normalization is explicitly unsupported in this phase. The design reserves named
 - The project glossary defines the canonical vocabulary for this work. Implementation and documentation should avoid using `q_mod`, `k_mod`, `v_mod`, or `decay_mod` as names for core IR concepts.
 - Recommended implementation sequence:
   1. Define and validate typed Algorithm IR nodes, state tuples, Tensor Inputs, Head Mapping, canonicalization, and VJPs.
-  2. Add the stateful-operator compilation seam and adapt the existing lowering strategy to consume validated IR.
-  3. Implement initial/final-state behavior and IR-derived backward through the existing kernel skeletons.
+  2. Add the StatefulOperator compilation seam and adapt the existing lowering strategy to consume validated IR.
+  3. Implement initial/final-state behavior and compiler-derived Backward IR through existing kernel skeletons.
   4. Migrate Gated Linear Attention and RetNet recurrent.
-  5. Migrate Mamba2 without model-specific lowering.
-  6. Add the deprecated modifier compatibility adapter and differential parity coverage.
-  7. Update public stateful-operator documentation and migration guidance.
+  5. Migrate Mamba2 without model-name dispatch.
+  6. Enforce complete IR validation, structural cache identity, and capability-based lowering selection.
+  7. Convert the modifier-based LinearAttentionEngine into a deprecated adapter while independently adding rank-one delta IR and migrating GDN through StatefulOperator.
+  8. Convert GDNEngine into a deprecated adapter with differential parity coverage.
+  9. Update public stateful-operator documentation, examples, migration guidance, and release verification.
