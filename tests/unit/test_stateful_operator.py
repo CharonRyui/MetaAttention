@@ -46,7 +46,6 @@ def _gla_ir() -> AlgorithmIR:
 def test_structurally_equivalent_ir_has_stable_identity():
     first = _gla_ir()
     second = _gla_ir()
-
     assert first.structural_identity == second.structural_identity
     assert first == second
 
@@ -64,20 +63,13 @@ def test_semantic_change_changes_structural_identity():
         readout=first.readout,
         head_mapping=first.head_mapping,
     )
-
     assert first.structural_identity != second.structural_identity
 
 
 def test_duplicate_state_names_are_rejected():
     ir = _gla_ir()
     with pytest.raises(ValueError, match="duplicate state name 'memory'"):
-        AlgorithmIR(
-            inputs=ir.inputs,
-            states=ir.states + ir.states,
-            transition=ir.transition,
-            readout=ir.readout,
-            head_mapping=ir.head_mapping,
-        )
+        AlgorithmIR(inputs=ir.inputs, states=ir.states + ir.states, transition=ir.transition, readout=ir.readout, head_mapping=ir.head_mapping)
 
 
 def test_unknown_state_reference_is_rejected():
@@ -86,11 +78,7 @@ def test_unknown_state_reference_is_rejected():
         AlgorithmIR(
             inputs=ir.inputs,
             states=ir.states,
-            transition=StateTransition(
-                state="other",
-                propagation=ir.transition.propagation,
-                injection=ir.transition.injection,
-            ),
+            transition=StateTransition("other", ir.transition.propagation, ir.transition.injection),
             readout=ir.readout,
             head_mapping=ir.head_mapping,
         )
@@ -104,28 +92,16 @@ def test_head_mapping_rejects_non_divisible_runtime_heads_before_lowering():
         "value": torch.empty(1, 3, 64, 128, dtype=torch.bfloat16),
         "gate": torch.empty(1, 3, 64, dtype=torch.float32),
     }
-
     with pytest.raises(ValueError, match="state heads .* divisible by query heads"):
         operator(**tensors)
 
 
 def test_runtime_inputs_bind_by_keyword_name():
     operator = StatefulOperator(_gla_ir())
-
     with pytest.raises(TypeError, match="missing required input: gate"):
-        operator(
-            query=torch.empty(0),
-            key=torch.empty(0),
-            value=torch.empty(0),
-        )
+        operator(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0))
     with pytest.raises(TypeError, match="unknown input: typo"):
-        operator(
-            query=torch.empty(0),
-            key=torch.empty(0),
-            value=torch.empty(0),
-            gate=torch.empty(0),
-            typo=torch.empty(0),
-        )
+        operator(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0), gate=torch.empty(0), typo=torch.empty(0))
 
 
 def test_normalization_is_rejected_explicitly():
@@ -143,31 +119,24 @@ def test_gdn_ordered_propagation_is_valid_and_order_sensitive():
     )
     state = (StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),)
     mapping = HeadMapping(query="query_heads", key="key_heads", value="value_heads", state="state_heads")
-    propagation = PropagationComposition(
-        (ElementwiseScale(Exp(Input("gate"))), RankOneDelta(Input("key"), Input("beta")))
-    )
-    transition = StateTransition(
-        "memory",
-        propagation,
-        OuterProduct(Input("key"), Input("value") * Input("beta")),
-    )
-    forward = AlgorithmIR(
-        inputs,
-        state,
-        transition,
-        MatrixReadout("memory", Input("query") * (128**-0.5)),
-        mapping,
-    )
-    reversed_ir = AlgorithmIR(
-        inputs,
-        state,
-        StateTransition(
-            "memory",
-            PropagationComposition(tuple(reversed(propagation.nodes))),
-            transition.injection,
-        ),
-        forward.readout,
-        mapping,
-    )
-
+    propagation = PropagationComposition((ElementwiseScale(Exp(Input("gate"))), RankOneDelta(Input("key"), Input("beta"))))
+    transition = StateTransition("memory", propagation, OuterProduct(Input("key"), Input("value") * Input("beta")))
+    forward = AlgorithmIR(inputs, state, transition, MatrixReadout("memory", Input("query") * (128**-0.5)), mapping)
+    reversed_ir = AlgorithmIR(inputs, state, StateTransition("memory", PropagationComposition(tuple(reversed(propagation.nodes))), transition.injection), forward.readout, mapping)
     assert forward.structural_identity != reversed_ir.structural_identity
+
+
+def test_invalid_initial_state_is_rejected_before_lowering():
+    operator = StatefulOperator(_gla_ir())
+    inputs = {
+        "query": torch.empty(1, 1, 64, 128, dtype=torch.bfloat16),
+        "key": torch.empty(1, 1, 64, 128, dtype=torch.bfloat16),
+        "value": torch.empty(1, 1, 64, 128, dtype=torch.bfloat16),
+        "gate": torch.empty(1, 1, 64, dtype=torch.float32),
+    }
+    with pytest.raises(ValueError, match="invalid initial state names"):
+        operator(**inputs, initial_state={"wrong": torch.empty(1)})
+    with pytest.raises(ValueError, match="must have shape"):
+        operator(**inputs, initial_state={"memory": torch.empty(1, 1, 1, 1)})
+    with pytest.raises(ValueError, match="must have dtype"):
+        operator(**inputs, initial_state={"memory": torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)})

@@ -78,69 +78,82 @@ def mask_mod(b, h, q_idx, kv_idx) -> Bool:
 ```
 
 
-### Customized Linear Attention API
+## Stateful Operator API
 
-AttentionEngine also support customized linear attention mechanism. Users can define their own linear attention mechanism by defining the following components:
-- `qkv_meta`: meta information for Q, K, V, such as shape, dtype
-- `q_mod`: elementwise modification on Q
-- `k_mod`: elementwise modification on K
-- `v_mod`: elementwise modification on V
-- `decay_mod`: elementwise modification on decay
-- `custom_io`: custom inputs for attention mechanism
+Stateful sequence operators are authored with explicit Algorithm IR and compiled
+through `StatefulOperator`. Runtime tensors bind by keyword to declared Tensor
+Input names. The operator is stateless; an omitted initial state means zero, and
+`return_final_state=True` returns a named `StateTuple`.
+
 ```py
-mod = LinearAttentionEngine(
-    qkv_meta: Tuple[MetaTensor, MetaTensor, MetaTensor],
-    q_mod: Callable[[Tensor, CustomIO], Tensor],
-    k_mod: Callable[[Tensor, CustomIO], Tensor],
-    v_mod: Callable[[Tensor, CustomIO], Tensor],
-    decay_mod: Callable[[Tensor, CustomIO], Tensor],
-    custom_io: CustomIO
+from attn_engine import StatefulOperator, gated_delta_rule_operator
+
+operator = gated_delta_rule_operator(scale=0.125)
+output, final_state = operator(
+    query=query,
+    key=key,
+    value=value,
+    gate=gate,
+    beta=beta,
+    initial_state={"memory": state},
+    return_final_state=True,
 )
-output = mod(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    decay: torch.Tensor,
-    custom_io: Optional[List[torch.Tensor]]
+next_output = operator(
+    query=next_query,
+    key=next_key,
+    value=next_value,
+    gate=next_gate,
+    beta=next_beta,
+    initial_state=final_state,
 )
-output.backward(do)
 ```
 
+The first-phase Algorithm IR supports identity, elementwise or diagonal scale,
+ordered propagation composition, rank-one delta propagation, outer-product and
+elementwise state injection, direct input, zero injection, and typed state
+readouts. Head Mapping declares grouped-head relationships and validates
+divisibility before lowering. Normalized numerator/denominator state is not
+supported in this phase.
 
+`LinearAttentionEngine` and `GDNEngine` remain deprecated compatibility adapters
+for migration. New production code should construct Algorithm IR directly;
+arbitrary Python transition and readout callbacks are not accepted.
+
+## Deprecated Customized Linear Attention API
+
+The modifier-based constructor remains available only for migration and emits a
+`DeprecationWarning`. Its existing positional call contract is unchanged.
+
+```py
+mod = LinearAttentionEngine(qkv_meta, q_mod=..., k_mod=..., v_mod=..., decay_mod=..., custom_io=...)
+output = mod(q, k, v, decay, custom_input)
+```
 
 ## Gated Delta Rule API
 
-`GDNEngine` is the dedicated H20 training API for Gated Delta Rule. It is not
-an algorithm mode of `LinearAttentionEngine`.
+`gated_delta_rule_operator` is the IR-first H20 training interface. `GDNEngine`
+preserves the deprecated positional adapter contract and unwraps the named
+`memory` state for compatibility.
 
 ```py
-from attn_engine import GDNEngine
+from attn_engine import gated_delta_rule_operator
 
-engine = GDNEngine("cuda")
-output, final_state = engine(
-    query,               # [B, Hk, T, 128], bfloat16
-    key,                 # [B, Hk, T, 128], bfloat16
-    value,               # [B, Hv, T, 128], bfloat16
-    gate,                # [B, Hv, T], float32, log-space decay
-    beta,                # [B, Hv, T], float32
-    scale=0.125,         # optional Python float; default 128**-0.5
-    initial_state=state, # optional [B, Hv, 128, 128], float32
-    output_final_state=True,
+operator = gated_delta_rule_operator(scale=0.125)
+output, final_state = operator(
+    query=query, key=key, value=value, gate=gate, beta=beta,
+    initial_state={"memory": state}, return_final_state=True,
 )
 ```
 
 `Hv` must be a positive multiple of `Hk`; each query/key head serves
 `Hv/Hk` value and state heads. `T` must be positive and divisible by the fixed
 chunk size 64. Inputs are contiguous and head-first. Output is BF16; requested
-final state and a provided initial-state gradient are FP32. Losses may consume
-output, final state, or both, and backward covers query, key, value, gate,
-beta, and a provided initial state through the fused GDN backend while
-preserving the same public H20 contract.
+final state and a provided initial-state gradient are FP32.
 
 The first release supports only the repository's validated NVIDIA H20 target, fixed key/value dimensions 128, BF16 query/key/value, and FP32 gate/beta/state. It rejects other devices, dtypes, layouts, dimensions, and unaligned lengths before kernel execution.
 Q/K normalization, variable lengths, padding, and decode caches are outside this API.
 
-# Upcoming Features
+# Upcoming Features 
 
 ## Attention Library Level API
 This level API is designed for users to use the existing attention mechanism in the library.
