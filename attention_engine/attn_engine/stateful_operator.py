@@ -14,6 +14,7 @@ from core import CustomIO, meta_tensor
 
 
 _ROLE_ALIASES = {
+    "one": "1",
     "batch": "batch",
     "query_heads": "heads",
     "key_heads": "heads",
@@ -475,7 +476,6 @@ def _compile_gdn_lowering(algorithm: AlgorithmIR) -> Callable[..., Any]:
 
     return lowering
 
-
 def _compile_linear_lowering(
     algorithm: AlgorithmIR,
     inputs: dict[str, torch.Tensor],
@@ -497,9 +497,11 @@ def _compile_linear_lowering(
     propagation = algorithm.transition.propagation
     if isinstance(propagation, Identity):
         decay_name = None
+        decay_mod = None
     elif isinstance(propagation, ElementwiseScale):
         decay_name = _first_input_name(propagation.scale)
         primary.add(decay_name)
+        decay_mod = _expression_callback(propagation.scale, decay_name)
     else:
         raise ValueError("unsupported linear propagation")
 
@@ -510,11 +512,6 @@ def _compile_linear_lowering(
     q_mod = _expression_callback(algorithm.readout.query, query_name)
     k_mod = _expression_callback(algorithm.transition.injection.left, key_name)
     v_mod = _expression_callback(algorithm.transition.injection.right, value_name)
-    decay_mod = None
-    if isinstance(propagation, ElementwiseScale):
-        log_scale = _logarithm_for_linear_backend(propagation.scale)
-        decay_mod = _expression_callback(log_scale, decay_name)
-
     query = inputs[query_name]
     key = inputs[key_name]
     value = inputs[value_name]
@@ -524,7 +521,12 @@ def _compile_linear_lowering(
     from core.lower.lower_linear import lower_tl
 
     source = lower_tl(
-        qkv_meta, q_mod, k_mod, v_mod, decay_mod, custom_io,
+        qkv_meta,
+        q_mod,
+        k_mod,
+        v_mod,
+        decay_mod,
+        custom_io,
         tune=options.tune,
         tune_filename=options.tune_filename,
         tune_bwd=options.tune_backward,

@@ -1,8 +1,17 @@
-from attn_engine import LinearAttentionEngine
-from core import CustomIO
-from core.utils import meta_tensor
+from attn_engine import (
+    AlgorithmIR,
+    CompileOptions,
+    ElementwiseScale,
+    HeadMapping,
+    Input,
+    MatrixReadout,
+    OuterProduct,
+    StateSpec,
+    StateTransition,
+    StatefulOperator,
+    TensorInput,
+)
 from autotuner.arch import get_attn_device
-
 import torch
 
 """
@@ -22,26 +31,26 @@ O: [B, H, T, DV]
 
 
 def gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
-
     scale = 1 / D**0.5
-
-    def q_mod(q, custom_io):
-        return q * scale
-
-    qkv_meta = (
-        meta_tensor(B, H, S, D, dtype=dtype),
-        meta_tensor(B, H, S, D, dtype=dtype),
-        meta_tensor(B, H, S, DV, dtype=dtype),
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
+            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), dtype),
+        ),
+        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        transition=StateTransition(
+            "memory", ElementwiseScale(Input("gate")), OuterProduct(Input("key"), Input("value"))
+        ),
+        readout=MatrixReadout("memory", Input("query") * scale),
+        head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),
     )
-    custom_io = CustomIO({})
-    attn_device = get_attn_device()
-    mod = LinearAttentionEngine(
-        qkv_meta,
-        q_mod=q_mod,
-        custom_io=custom_io,
-        tune=tune,
-        tune_filename=f"tuned_config/{attn_device.name}/simple_gla",
-        tune_bwd=tune,
+    return StatefulOperator(
+        algorithm,
+        compile_options=CompileOptions(
+            tune=tune,
+            tune_filename=f"tuned_config/{get_attn_device().name}/simple_gla",
+            tune_backward=tune,
+        ),
     )
-
-    return mod

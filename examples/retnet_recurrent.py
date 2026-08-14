@@ -1,9 +1,20 @@
-from attn_engine import LinearAttentionEngine
-from core import CustomIO
-from core import meta_tensor
+from attn_engine import (
+    AlgorithmIR,
+    CompileOptions,
+    ElementwiseScale,
+    Exp,
+    HeadMapping,
+    Input,
+    MatrixReadout,
+    OuterProduct,
+    StateSpec,
+    StateTransition,
+    StatefulOperator,
+    TensorInput,
+)
 from autotuner.arch import get_attn_device
-
 import torch
+
 
 """
 Example of retention
@@ -22,30 +33,26 @@ O: [B, H, T, DV]
 
 
 def retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
-
-    def decay_mod(decay, custom_io):  # (B,H,seqlen)
-        return decay.log()
-
     scale = 1 / D**0.5
-
-    def q_mod(q, custom_io):
-        return q * scale
-
-    qkv_meta = (
-        meta_tensor(B, H, S, D, dtype=dtype),
-        meta_tensor(B, H, S, D, dtype=dtype),
-        meta_tensor(B, H, S, DV, dtype=dtype),
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
+            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+        ),
+        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        transition=StateTransition(
+            "memory", ElementwiseScale(Exp(Input("gate"))), OuterProduct(Input("key"), Input("value"))
+        ),
+        readout=MatrixReadout("memory", Input("query") * scale),
+        head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),
     )
-    custom_io = CustomIO({})
-    attn_device = get_attn_device()
-    mod = LinearAttentionEngine(
-        qkv_meta,
-        q_mod=q_mod,
-        decay_mod=decay_mod,
-        custom_io=custom_io,
-        tune=tune,
-        tune_filename=f"tuned_config/{attn_device.name}/retention_linear",
-        tune_bwd=tune,
+    return StatefulOperator(
+        algorithm,
+        compile_options=CompileOptions(
+            tune=tune,
+            tune_filename=f"tuned_config/{get_attn_device().name}/retention_linear",
+            tune_backward=tune,
+        ),
     )
-
-    return mod
