@@ -136,12 +136,12 @@ def test_legacy_mamba2(gpu_device, seed):
     a_ref = a_param.detach().requires_grad_()
     delta_ref = delta_t.detach().requires_grad_()
     actual = module(
-        query_actual,
-        key_actual,
-        value_actual,
-        delta_actual,
-        a_actual,
-        delta_actual.to(dtype),
+        query=query_actual,
+        key=key_actual,
+        value=value_actual,
+        delta=delta_actual,
+        A=a_actual,
+        dt=delta_actual.to(dtype),
     )
     expected = mamba2_reference(value_ref, delta_ref, a_ref, key_ref, query_ref).to(
         dtype
@@ -188,7 +188,7 @@ def test_legacy_gated_retention(gpu_device, seed):
     key_ref = key.detach().clone().requires_grad_()
     gate_ref = gate.detach().clone().to(dtype).requires_grad_()
     value_ref = value.detach().clone().requires_grad_()
-    actual = module(query, key, value, gate)
+    actual = module(query=query, key=key, value=value, gate=gate)
     expected = gated_retention_reference(query_ref, key_ref, value_ref, gate_ref).to(
         dtype
     )
@@ -301,7 +301,7 @@ def test_legacy_retnet_recurrent(gpu_device, seed):
     query_ref = query.detach().clone().requires_grad_()
     key_ref = key.detach().clone().requires_grad_()
     value_ref = value.detach().clone().requires_grad_()
-    actual = module(query, key, value, gate)
+    actual = module(query=query, key=key, value=value, gate=gate)
     expected = retnet_reference(query_ref, key_ref, value_ref)
     torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
     upstream = 0.1 * torch.randn_like(actual)

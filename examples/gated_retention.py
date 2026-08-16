@@ -2,6 +2,7 @@ from attn_engine import (
     AlgorithmIR,
     CompileOptions,
     ElementwiseScale,
+    Exp,
     HeadMapping,
     Input,
     MatrixReadout,
@@ -37,11 +38,11 @@ def gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
             TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
             TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
             TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
-            TensorInput("gate", ("batch", "state_heads", "sequence"), dtype),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
         ),
         states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
         transition=StateTransition(
-            "memory", ElementwiseScale(Input("gate")), OuterProduct(Input("key"), Input("value"))
+            "memory", ElementwiseScale(Exp(Input("gate"))), OuterProduct(Input("key"), Input("value"))
         ),
         readout=MatrixReadout("memory", Input("query") * scale),
         head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),

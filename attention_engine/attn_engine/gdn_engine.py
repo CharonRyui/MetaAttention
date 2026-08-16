@@ -111,7 +111,7 @@ def validate_gdn_inputs(
     return batch, query_heads, value_heads, length, resolved_scale
 
 
-def gated_delta_rule_operator(*, scale: float | None = None) -> StatefulOperator:
+def _build_gdn_operator(*, scale: float | None = None) -> StatefulOperator:
     resolved_scale = DEFAULT_SCALE if scale is None else scale
     if not isinstance(resolved_scale, float):
         raise TypeError("scale must be a Python float")
@@ -153,7 +153,7 @@ class GDNEngine:
             device = torch.device(self.device)
         object.__setattr__(self, "device", device)
         warnings.warn(
-            "GDNEngine is deprecated; construct gated_delta_rule_operator and bind named inputs instead",
+            "GDNEngine is deprecated; construct Algorithm IR and StatefulOperator with named inputs instead",
             DeprecationWarning,
             stacklevel=2,
         )
@@ -183,7 +183,7 @@ class GDNEngine:
         )
         operator = self._operators.get(resolved_scale)
         if operator is None:
-            operator = gated_delta_rule_operator(scale=resolved_scale)
+            operator = _build_gdn_operator(scale=resolved_scale)
             self._operators[resolved_scale] = operator
         state = None if initial_state is None else StateTuple(("memory",), (initial_state,))
         result = operator(

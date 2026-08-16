@@ -2,7 +2,6 @@ from attn_engine import (
     AlgorithmIR,
     CompileOptions,
     ElementwiseScale,
-    Exp,
     HeadMapping,
     Input,
     MatrixReadout,
@@ -43,7 +42,7 @@ def retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
         ),
         states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
         transition=StateTransition(
-            "memory", ElementwiseScale(Exp(Input("gate"))), OuterProduct(Input("key"), Input("value"))
+            "memory", ElementwiseScale(Input("gate")), OuterProduct(Input("key"), Input("value"))
         ),
         readout=MatrixReadout("memory", Input("query") * scale),
         head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),

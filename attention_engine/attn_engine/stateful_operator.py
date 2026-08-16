@@ -328,6 +328,10 @@ class StatefulOperator:
         role_sizes = self._validate_inputs(inputs)
         self.algorithm.head_mapping.validate(role_sizes)
         state = self._validate_state(initial_state, role_sizes, inputs)
+        if not _contains_rank_one_delta(self.algorithm.transition.propagation) and (
+            state is not None or return_final_state
+        ):
+            raise ValueError("selected linear lowering does not support initial or final state")
         key = self._specialization_key(inputs)
         lowering = self._compiled.get(key)
         if lowering is None:
@@ -492,7 +496,7 @@ def _compile_linear_lowering(
 
     query_name = _single_input_name(algorithm.readout.query, "readout query")
     key_name = _single_input_name(algorithm.transition.injection.left, "injection key")
-    value_name = _single_input_name(algorithm.transition.injection.right, "injection value")
+    value_name = _first_input_name(algorithm.transition.injection.right)
     primary = {query_name, key_name, value_name}
     propagation = algorithm.transition.propagation
     if isinstance(propagation, Identity):
@@ -501,7 +505,7 @@ def _compile_linear_lowering(
     elif isinstance(propagation, ElementwiseScale):
         decay_name = _first_input_name(propagation.scale)
         primary.add(decay_name)
-        decay_mod = _expression_callback(propagation.scale, decay_name)
+        decay_mod = _expression_callback(_logarithm_for_linear_backend(propagation.scale), decay_name)
     else:
         raise ValueError("unsupported linear propagation")
 
@@ -538,8 +542,6 @@ def _compile_linear_lowering(
     ordered_names.extend(spec.name for spec in custom_specs)
 
     def lowering(bound, initial_state, return_final_state):
-        if initial_state is not None or return_final_state:
-            raise ValueError("selected linear lowering does not support initial or final state")
         return callable_(*(bound[name] for name in ordered_names))
 
     return lowering

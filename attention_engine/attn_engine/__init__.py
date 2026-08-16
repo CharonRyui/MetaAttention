@@ -1,6 +1,6 @@
 from .attn_engine import AttentionEngine as AttentionEngine, OnlineFunc as OnlineFunc
 from .linear_attn_engine import LinearAttentionEngine as LinearAttentionEngine
-from .gdn_engine import GDNEngine as GDNEngine, gated_delta_rule_operator as gated_delta_rule_operator
+from .gdn_engine import GDNEngine as GDNEngine
 from .stateful_operator import (
     AlgorithmIR as AlgorithmIR,
     CompileOptions as CompileOptions,

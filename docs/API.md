@@ -86,9 +86,9 @@ Input names. The operator is stateless; an omitted initial state means zero, and
 `return_final_state=True` returns a named `StateTuple`.
 
 ```py
-from attn_engine import StatefulOperator, gated_delta_rule_operator
+from attn_engine import StatefulOperator
 
-operator = gated_delta_rule_operator(scale=0.125)
+operator = StatefulOperator(algorithm)
 output, final_state = operator(
     query=query,
     key=key,
@@ -97,14 +97,6 @@ output, final_state = operator(
     beta=beta,
     initial_state={"memory": state},
     return_final_state=True,
-)
-next_output = operator(
-    query=next_query,
-    key=next_key,
-    value=next_value,
-    gate=next_gate,
-    beta=next_beta,
-    initial_state=final_state,
 )
 ```
 
@@ -131,19 +123,13 @@ output = mod(q, k, v, decay, custom_input)
 
 ## Gated Delta Rule API
 
-`gated_delta_rule_operator` is the IR-first H20 training interface. `GDNEngine`
-preserves the deprecated positional adapter contract and unwraps the named
-`memory` state for compatibility.
+Gated Delta Rule is authored by constructing explicit rank-one-delta
+Algorithm IR and invoking `StatefulOperator`. `GDNEngine` remains the
+deprecated positional compatibility adapter and unwraps the named `memory`
+state for compatibility.
 
-```py
-from attn_engine import gated_delta_rule_operator
-
-operator = gated_delta_rule_operator(scale=0.125)
-output, final_state = operator(
-    query=query, key=key, value=value, gate=gate, beta=beta,
-    initial_state={"memory": state}, return_final_state=True,
-)
-```
+The IR retains log-space `gate` as a Tensor Input and expresses `Exp(gate)`
+explicitly. `beta` is raw and differentiable; keys are not normalized.
 
 `Hv` must be a positive multiple of `Hk`; each query/key head serves
 `Hv/Hk` value and state heads. `T` must be positive and divisible by the fixed
