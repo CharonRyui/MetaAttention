@@ -328,14 +328,15 @@ class StatefulOperator:
         role_sizes = self._validate_inputs(inputs)
         self.algorithm.head_mapping.validate(role_sizes)
         state = self._validate_state(initial_state, role_sizes, inputs)
-        if not _contains_rank_one_delta(self.algorithm.transition.propagation) and (
-            state is not None or return_final_state
-        ):
-            raise ValueError("selected linear lowering does not support initial or final state")
-        key = self._specialization_key(inputs)
+        key = self._specialization_key(inputs) + (":stateful" if (state is not None or return_final_state) else ":stateless")
         lowering = self._compiled.get(key)
         if lowering is None:
-            lowering = self._compile(inputs)
+            if (state is not None or return_final_state) and not _contains_rank_one_delta(
+                self.algorithm.transition.propagation
+            ):
+                lowering = _compile_linear_stateful_lowering(self.algorithm)
+            else:
+                lowering = self._compile(inputs)
             self._compiled[key] = lowering
         result = lowering(inputs, state, return_final_state)
         if return_final_state:
@@ -545,6 +546,79 @@ def _compile_linear_lowering(
         return callable_(*(bound[name] for name in ordered_names))
 
     return lowering
+
+
+def _compile_linear_stateful_lowering(algorithm: AlgorithmIR) -> Callable[..., Any]:
+    if len(algorithm.states) != 1:
+        raise ValueError("linear stateful lowering supports exactly one state")
+    if not isinstance(algorithm.transition.injection, OuterProduct):
+        raise ValueError("linear stateful lowering supports only outer-product injection")
+    if not isinstance(algorithm.readout, MatrixReadout):
+        raise ValueError("linear stateful lowering supports only matrix readout")
+    state_name = algorithm.transition.state
+    query = _single_input_name(algorithm.readout.query, "readout query")
+
+    def lowering(bound, initial_state, return_final_state):
+        state = initial_state[0] if initial_state is not None else None
+        output, final = _run_linear_stateful(
+            algorithm, bound, state, query, state_name
+        )
+        return (output, (final,)) if return_final_state else output
+
+    return lowering
+
+def _run_linear_stateful(algorithm, bound, state, query_name, state_name):
+    state_spec = next(spec for spec in algorithm.states if spec.name == state_name)
+    query_value = _evaluate_runtime_expression(algorithm.readout.query, bound)
+    injection = algorithm.transition.injection
+    left = _evaluate_runtime_expression(injection.left, bound)
+    right = _evaluate_runtime_expression(injection.right, bound)
+    propagation = algorithm.transition.propagation
+    if isinstance(propagation, Identity):
+        scale = None
+    elif isinstance(propagation, ElementwiseScale):
+        scale = _evaluate_runtime_expression(propagation.scale, bound)
+    else:
+        raise ValueError("unsupported linear stateful propagation")
+
+    batch, _, length, _ = query_value.shape
+    state_heads = left.shape[1]
+    if state is None:
+        state = torch.zeros(
+            batch,
+            state_heads,
+            left.shape[-1],
+            right.shape[-1],
+            device=query_value.device,
+            dtype=state_spec.accumulation_dtype,
+        )
+    outputs = []
+    for token in range(length):
+        token_scale = 1 if scale is None else scale[..., token]
+        current = state * token_scale[..., None, None]
+        current = current + torch.einsum(
+            "bhk,bhv->bhkv", left[..., token, :].float(), right[..., token, :].float()
+        )
+        query_token = query_value[..., token, :].float()
+        outputs.append(torch.einsum("bhk,bhkv->bhv", query_token, current).to(query_value.dtype))
+        state = current
+    return torch.stack(outputs, dim=2), state
+
+
+
+
+def _evaluate_runtime_expression(expression, bound):
+    if isinstance(expression, Input):
+        return bound[expression.name]
+    if isinstance(expression, Constant):
+        return expression.value
+    if isinstance(expression, Multiply):
+        return _evaluate_runtime_expression(expression.left, bound) * _evaluate_runtime_expression(expression.right, bound)
+    if isinstance(expression, Exp):
+        return _evaluate_runtime_expression(expression.operand, bound).exp()
+    if isinstance(expression, Log):
+        return _evaluate_runtime_expression(expression.operand, bound).log()
+    raise ValueError(f"unsupported runtime input expression {type(expression).__name__}")
 
 
 def _expression_callback(expression: InputExpression, root_name: str) -> Callable[..., Any] | None:

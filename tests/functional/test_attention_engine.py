@@ -1,7 +1,21 @@
 import pytest
 import torch
 import torch.nn.functional as F
-from attn_engine import AttentionEngine, OnlineFunc
+from attn_engine import (
+    AlgorithmIR,
+    AttentionEngine,
+    ElementwiseScale,
+    Exp,
+    HeadMapping,
+    Input,
+    MatrixReadout,
+    OnlineFunc,
+    OuterProduct,
+    StateSpec,
+    StateTransition,
+    StatefulOperator,
+    TensorInput,
+)
 from benchmark.bench_utils import assert_close
 from core import CustomIO, SymbolScalar, Var, meta_tensor
 from einops import einsum, rearrange
@@ -554,3 +568,89 @@ def test_mla_decode_forward_matches_reference():
     expected = _mla_decode_ref(query, query_pe, key_value, key_pe)
     actual = module(query, query_pe, key_value, key_pe)
     torch.testing.assert_close(actual, expected, rtol=RTOL_STRICT, atol=ATOL_STRICT)
+
+
+def test_linear_stateful_operator_supports_initial_and_final_state(gpu_device, seed):
+    dtype = torch.bfloat16
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
+            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+        ),
+        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        transition=StateTransition(
+            "memory", ElementwiseScale(Exp(Input("gate"))), OuterProduct(Input("key"), Input("value"))
+        ),
+        readout=MatrixReadout("memory", Input("query")),
+        head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),
+    )
+    operator = StatefulOperator(algorithm)
+    query = torch.randn(1, 1, 64, 64, device=gpu_device, dtype=dtype)
+    key = torch.randn_like(query)
+    value = torch.randn(1, 1, 64, 64, device=gpu_device, dtype=dtype)
+    gate = torch.zeros(1, 1, 64, device=gpu_device, dtype=torch.float32)
+    initial = torch.eye(64, device=gpu_device, dtype=torch.float32).view(1, 1, 64, 64)
+
+    output, final_state = operator(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        initial_state={"memory": initial},
+        return_final_state=True,
+    )
+    expected_states = []
+    expected_state = initial
+    for token in range(64):
+        expected_state = expected_state + torch.einsum(
+            "bhk,bhv->bhkv", key[..., token, :].float(), value[..., token, :].float()
+        )
+        expected_states.append(
+            torch.einsum("bhk,bhkv->bhv", query[..., token, :].float(), expected_state).to(dtype)
+        )
+    expected_output = torch.stack(expected_states, dim=2)
+    torch.testing.assert_close(output, expected_output, rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(final_state["memory"], expected_state, rtol=1e-1, atol=1e-1)
+
+
+def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequence(gpu_device, seed):
+    dtype = torch.bfloat16
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
+            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+        ),
+        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        transition=StateTransition(
+            "memory", ElementwiseScale(Exp(Input("gate"))), OuterProduct(Input("key"), Input("value"))
+        ),
+        readout=MatrixReadout("memory", Input("query")),
+        head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),
+    )
+    operator = StatefulOperator(algorithm)
+    query = torch.randn(1, 1, 128, 64, device=gpu_device, dtype=dtype)
+    key = torch.randn_like(query)
+    value = torch.randn(1, 1, 128, 64, device=gpu_device, dtype=dtype)
+    gate = torch.zeros(1, 1, 128, device=gpu_device, dtype=torch.float32)
+    zero = {"memory": torch.zeros(1, 1, 64, 64, device=gpu_device, dtype=torch.float32)}
+
+    full, full_state = operator(query=query, key=key, value=value, gate=gate, return_final_state=True)
+    explicit, explicit_state = operator(
+        query=query, key=key, value=value, gate=gate, initial_state=zero, return_final_state=True
+    )
+    prefix, prefix_state = operator(
+        query=query[:, :, :64], key=key[:, :, :64], value=value[:, :, :64], gate=gate[:, :, :64],
+        return_final_state=True,
+    )
+    suffix = operator(
+        query=query[:, :, 64:], key=key[:, :, 64:], value=value[:, :, 64:], gate=gate[:, :, 64:],
+        initial_state=prefix_state,
+    )
+
+    torch.testing.assert_close(full, explicit, rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(full_state["memory"], explicit_state["memory"], rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(torch.cat((prefix, suffix), dim=2), full, rtol=1e-1, atol=1e-1)
