@@ -1,62 +1,40 @@
+import torch
+
 from attn_engine import (
     AlgorithmIR,
+    AxisScale,
     CompileOptions,
-    ElementwiseScale,
     Exp,
     HeadMapping,
     Input,
-    MatrixReadout,
-    OuterProduct,
+    ProductFactor,
+    ProductInjection,
+    StateContraction,
     StateSpec,
     StateTransition,
     StatefulOperator,
     TensorInput,
 )
 from autotuner.arch import get_attn_device
-import torch
-
-"""Illustrative selective-state profile authored from generic Stateful Operator IR.
-
-The explicit equation and compiler contract are defined by
-``docs/stateful-operator-ir-spec.md``; this name is an acceptance profile, not
-a lowering dispatch key.
-"""
 
 
 def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, tune=False):
-    if HK is None:
-        HK = HQ
-    if HV is None:
-        HV = HQ
+    """Selective-state acceptance profile expressed only with generic IR nodes."""
     algorithm = AlgorithmIR(
         inputs=(
-            TensorInput(
-                "query", ("batch", "query_heads", "sequence", "key_dim"), dtype
-            ),
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
             TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
-            TensorInput(
-                "value", ("batch", "value_heads", "sequence", "value_dim"), dtype
-            ),
-            TensorInput("delta", ("batch", "state_heads", "sequence"), torch.float32),
-            TensorInput("A", ("one", "state_heads"), dtype),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput("A", ("one", "state_heads", "key_dim"), dtype),
             TensorInput("dt", ("batch", "state_heads", "sequence"), dtype),
         ),
         states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
         transition=StateTransition(
             "memory",
-            ElementwiseScale(Exp(Input("delta") * Input("A"))),
-            OuterProduct(Input("key"), Input("value") * Input("dt")),
+            propagations=(AxisScale(Exp(Input("dt") * Input("A")), ("key_dim",)),),
+            injections=(ProductInjection((ProductFactor(Input("dt") * Input("key"), ("key_dim",)), ProductFactor(Input("value"), ("value_dim",)))),),
         ),
-        readout=MatrixReadout("memory", Input("query")),
-        head_mapping=HeadMapping(
-            "query_heads", "key_heads", "value_heads", "state_heads"
-        ),
+        readouts=(StateContraction("output", "memory", Input("query"), "key_dim", dtype),),
+        head_mapping=HeadMapping({"query_heads": "state_heads", "key_heads": "state_heads", "value_heads": "state_heads"}),
     )
-    return StatefulOperator(
-        algorithm,
-        compile_options=CompileOptions(
-            tune=tune,
-            tune_filename=f"tuned_config/{get_attn_device().name}/mamba2",
-            tune_backward=tune,
-        ),
-    )
+    return StatefulOperator(algorithm, compile_options=CompileOptions(tune=tune, tune_filename=f"tuned_config/{get_attn_device().name}/mamba2", tune_backward=tune))

@@ -1,142 +1,171 @@
 from __future__ import annotations
 
+import dataclasses
+import json
+
 import pytest
 import torch
 
 from attn_engine import (
+    Add,
     AlgorithmIR,
-    ElementwiseScale,
+    AxisScale,
+    Constant,
+    ExecutionResult,
     Exp,
     HeadMapping,
     Input,
-    MatrixReadout,
-    OuterProduct,
-    PropagationComposition,
-    RankOneDelta,
+    Multiply,
+    ProductFactor,
+    ProductInjection,
+    StateContraction,
     StateSpec,
     StateTransition,
+    StatefulCompilationError,
     StatefulOperator,
+    StateTuple,
     TensorInput,
 )
-
 
 pytestmark = pytest.mark.unit
 
 
-def _gla_ir() -> AlgorithmIR:
-    inputs = (
-        TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), torch.bfloat16),
-        TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), torch.bfloat16),
-        TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), torch.bfloat16),
-        TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
-    )
+def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
     return AlgorithmIR(
-        inputs=inputs,
+        inputs=(
+            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
+            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
+            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+        ),
         states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
         transition=StateTransition(
-            state="memory",
-            propagation=ElementwiseScale(Input("gate")),
-            injection=OuterProduct(Input("key"), Input("value")),
+            "memory",
+            propagations=(AxisScale(Exp(Input("gate"))),),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("key"), ("key_dim",)),
+                        ProductFactor(Input("value"), ("value_dim",)),
+                    )
+                ),
+            ),
         ),
-        readout=MatrixReadout("memory", Input("query")),
-        head_mapping=HeadMapping(query="query_heads", key="key_heads", value="value_heads", state="state_heads"),
+        readouts=(StateContraction("output", "memory", Input("query"), "key_dim", dtype),),
+        head_mapping=HeadMapping(
+            mappings={
+                "query_heads": "state_heads",
+                "key_heads": "state_heads",
+                "value_heads": "state_heads",
+            }
+        ),
     )
 
 
-def test_structurally_equivalent_ir_has_stable_identity():
-    first = _gla_ir()
-    second = _gla_ir()
-    assert first.structural_identity == second.structural_identity
-    assert first == second
+def _inputs(length: int = 3, *, requires_grad: bool = False):
+    generator = torch.Generator().manual_seed(7)
+    tensors = {
+        "query": torch.randn(1, 1, length, 2, generator=generator, requires_grad=requires_grad),
+        "key": torch.randn(1, 1, length, 2, generator=generator, requires_grad=requires_grad),
+        "value": torch.randn(1, 1, length, 3, generator=generator, requires_grad=requires_grad),
+        "gate": torch.randn(1, 1, length, generator=generator, requires_grad=requires_grad),
+    }
+    return tensors
 
 
-def test_semantic_change_changes_structural_identity():
-    first = _gla_ir()
-    second = AlgorithmIR(
-        inputs=first.inputs,
-        states=first.states,
-        transition=StateTransition(
-            state="memory",
-            propagation=ElementwiseScale(Exp(Input("gate"))),
-            injection=first.transition.injection,
-        ),
-        readout=first.readout,
-        head_mapping=first.head_mapping,
+def _reference(inputs, initial=None):
+    state = torch.zeros(1, 1, 2, 3) if initial is None else initial
+    outputs = []
+    for token in range(inputs["query"].shape[2]):
+        state = state * inputs["gate"][..., token].exp().unsqueeze(-1).unsqueeze(-1)
+        state = state + torch.einsum(
+            "bhf,bhg->bhfg", inputs["key"][..., token, :], inputs["value"][..., token, :]
+        )
+        outputs.append(torch.einsum("bhf,bhfg->bhg", inputs["query"][..., token, :], state))
+    return torch.stack(outputs, dim=2), state
+
+
+def test_constant_bits_and_commutative_identity_are_canonical():
+    assert Constant(0.0).bits != Constant(-0.0).bits
+    with pytest.raises(ValueError, match="NaN and infinity"):
+        Constant(float("nan"))
+    assert Add(Input("x"), Input("y")) == Add(Input("y"), Input("x"))
+    assert Multiply(Input("x"), Input("y")) == Multiply(Input("y"), Input("x"))
+    assert Add(Add(Input("x"), Input("y")), Input("z")) != Add(Input("x"), Add(Input("y"), Input("z")))
+
+
+def test_dense_invocation_returns_immutable_named_result_and_gradients():
+    inputs = _inputs(requires_grad=True)
+    expected_output, expected_state = _reference(inputs)
+    result = StatefulOperator(_accumulator_ir())(**inputs, return_final_state=True)
+
+    assert isinstance(result, ExecutionResult)
+    torch.testing.assert_close(result.outputs["output"], expected_output)
+    torch.testing.assert_close(result.outputs[0], expected_output)
+    assert result.final_state is not None
+    torch.testing.assert_close(result.final_state["memory"], expected_state)
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        result.final_state = None
+    loss = result.outputs[0].square().sum() + result.final_state[0].square().sum()
+    gradients = torch.autograd.grad(loss, tuple(inputs.values()))
+    assert all(gradient is not None for gradient in gradients)
+
+
+def test_omitted_state_and_continuation_match_full_invocation():
+    inputs = _inputs(length=4)
+    operator = StatefulOperator(_accumulator_ir())
+    full = operator(**inputs, return_final_state=True)
+    prefix = operator(**{name: value[:, :, :2] for name, value in inputs.items()}, return_final_state=True)
+    assert prefix.final_state is not None
+    suffix = operator(
+        **{name: value[:, :, 2:] for name, value in inputs.items()},
+        initial_state=prefix.final_state,
     )
-    assert first.structural_identity != second.structural_identity
+    torch.testing.assert_close(
+        torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2),
+        full.outputs[0],
+    )
 
 
-def test_duplicate_state_names_are_rejected():
-    ir = _gla_ir()
-    with pytest.raises(ValueError, match="duplicate state name 'memory'"):
-        AlgorithmIR(inputs=ir.inputs, states=ir.states + ir.states, transition=ir.transition, readout=ir.readout, head_mapping=ir.head_mapping)
+def test_packed_empty_sequences_preserve_state_and_offsets_are_runtime_data():
+    operator = StatefulOperator(_accumulator_ir())
+    dense = _inputs(length=3)
+    packed = {name: value.squeeze(0).transpose(0, 1).contiguous() for name, value in dense.items()}
+    # canonical packed tensors are [tokens, heads, features...]
+    packed = {name: value.transpose(0, 1).contiguous() if value.shape[0] == 1 else value for name, value in packed.items()}
+    offsets = torch.tensor([0, 0, 3, 3], dtype=torch.int32)
+    initial = torch.randn(3, 1, 2, 3)
+    result = operator(
+        **packed,
+        sequence_offsets=offsets,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    assert result.final_state is not None
+    torch.testing.assert_close(result.final_state[0][0], initial[0])
+    torch.testing.assert_close(result.final_state[0][2], initial[2])
+    assert result.outputs[0].shape[0] == 3
 
 
-def test_unknown_state_reference_is_rejected():
-    ir = _gla_ir()
-    with pytest.raises(ValueError, match="unknown state 'other'"):
+def test_structured_errors_are_json_safe_and_have_canonical_paths():
+    operator = StatefulOperator(_accumulator_ir())
+    with pytest.raises(StatefulCompilationError) as captured:
+        operator(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0))
+    error = captured.value
+    assert error.category == "RUNTIME_BINDING"
+    assert error.path == "inputs"
+    json.dumps(error.as_dict())
+
+
+def test_ir_requires_exactly_one_matrix_state():
+    ir = _accumulator_ir()
+    with pytest.raises(StatefulCompilationError) as captured:
         AlgorithmIR(
             inputs=ir.inputs,
-            states=ir.states,
-            transition=StateTransition("other", ir.transition.propagation, ir.transition.injection),
-            readout=ir.readout,
+            states=(),
+            transition=ir.transition,
+            readouts=ir.readouts,
             head_mapping=ir.head_mapping,
         )
-
-
-def test_head_mapping_rejects_non_divisible_runtime_heads_before_lowering():
-    operator = StatefulOperator(_gla_ir())
-    tensors = {
-        "query": torch.empty(1, 2, 64, 128, dtype=torch.bfloat16),
-        "key": torch.empty(1, 2, 64, 128, dtype=torch.bfloat16),
-        "value": torch.empty(1, 3, 64, 128, dtype=torch.bfloat16),
-        "gate": torch.empty(1, 3, 64, dtype=torch.float32),
-    }
-    with pytest.raises(ValueError, match="state heads .* divisible by query heads"):
-        operator(**tensors)
-
-
-def test_runtime_inputs_bind_by_keyword_name():
-    operator = StatefulOperator(_gla_ir())
-    with pytest.raises(TypeError, match="missing required input: gate"):
-        operator(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0))
-    with pytest.raises(TypeError, match="unknown input: typo"):
-        operator(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0), gate=torch.empty(0), typo=torch.empty(0))
-
-
-def test_normalization_is_rejected_explicitly():
-    with pytest.raises(ValueError, match="normalization is not supported"):
-        StatefulOperator(_gla_ir(), normalization="sum")
-
-
-def test_gdn_ordered_propagation_is_valid_and_order_sensitive():
-    inputs = (
-        TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), torch.bfloat16),
-        TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), torch.bfloat16),
-        TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), torch.bfloat16),
-        TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
-        TensorInput("beta", ("batch", "state_heads", "sequence"), torch.float32),
-    )
-    state = (StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),)
-    mapping = HeadMapping(query="query_heads", key="key_heads", value="value_heads", state="state_heads")
-    propagation = PropagationComposition((ElementwiseScale(Exp(Input("gate"))), RankOneDelta(Input("key"), Input("beta"))))
-    transition = StateTransition("memory", propagation, OuterProduct(Input("key"), Input("value") * Input("beta")))
-    forward = AlgorithmIR(inputs, state, transition, MatrixReadout("memory", Input("query") * (128**-0.5)), mapping)
-    reversed_ir = AlgorithmIR(inputs, state, StateTransition("memory", PropagationComposition(tuple(reversed(propagation.nodes))), transition.injection), forward.readout, mapping)
-    assert forward.structural_identity != reversed_ir.structural_identity
-
-
-def test_invalid_initial_state_is_rejected_before_lowering():
-    operator = StatefulOperator(_gla_ir())
-    inputs = {
-        "query": torch.empty(1, 1, 64, 128, dtype=torch.bfloat16),
-        "key": torch.empty(1, 1, 64, 128, dtype=torch.bfloat16),
-        "value": torch.empty(1, 1, 64, 128, dtype=torch.bfloat16),
-        "gate": torch.empty(1, 1, 64, dtype=torch.float32),
-    }
-    with pytest.raises(ValueError, match="invalid initial state names"):
-        operator(**inputs, initial_state={"wrong": torch.empty(1)})
-    with pytest.raises(ValueError, match="must have shape"):
-        operator(**inputs, initial_state={"memory": torch.empty(1, 1, 1, 1)})
-    with pytest.raises(ValueError, match="must have dtype"):
-        operator(**inputs, initial_state={"memory": torch.empty(1, 1, 128, 128, dtype=torch.bfloat16)})
+    assert captured.value.category == "IR_SCHEMA"
+    assert captured.value.path == "states"
