@@ -15,19 +15,11 @@ from attn_engine import (
 from autotuner.arch import get_attn_device
 import torch
 
-"""
-Example of mamba2 SSD
+"""Illustrative selective-state profile authored from generic Stateful Operator IR.
 
-fwd:
-input:
-Q: [B, H, T, D]
-K: [B, H, T, D]
-V: [B, H, T, DV]
-decay: [B, H, T] or [B, H, T, D] (TODO) float32
-...custom_inputs
-
-output:
-O: [B, H, T, DV]
+The explicit equation and compiler contract are defined by
+``docs/stateful-operator-ir-spec.md``; this name is an acceptance profile, not
+a lowering dispatch key.
 """
 
 
@@ -38,9 +30,13 @@ def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, tune=False):
         HV = HQ
     algorithm = AlgorithmIR(
         inputs=(
-            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
+            TensorInput(
+                "query", ("batch", "query_heads", "sequence", "key_dim"), dtype
+            ),
             TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
-            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
+            TensorInput(
+                "value", ("batch", "value_heads", "sequence", "value_dim"), dtype
+            ),
             TensorInput("delta", ("batch", "state_heads", "sequence"), torch.float32),
             TensorInput("A", ("one", "state_heads"), dtype),
             TensorInput("dt", ("batch", "state_heads", "sequence"), dtype),
@@ -52,7 +48,9 @@ def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, tune=False):
             OuterProduct(Input("key"), Input("value") * Input("dt")),
         ),
         readout=MatrixReadout("memory", Input("query")),
-        head_mapping=HeadMapping("query_heads", "key_heads", "value_heads", "state_heads"),
+        head_mapping=HeadMapping(
+            "query_heads", "key_heads", "value_heads", "state_heads"
+        ),
     )
     return StatefulOperator(
         algorithm,

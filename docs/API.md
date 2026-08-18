@@ -97,13 +97,13 @@ multi-state programs, and other State ranks are not supported.
 ```py
 from attn_engine import StatefulOperator
 
-operator = StatefulOperator(algorithm)  # Target may be supplied explicitly
+operator = StatefulOperator(algorithm)  # Target is optional
 result = operator(
     query=query,
     key=key,
     value=value,
     initial_state=state_tuple,       # optional StateTuple
-    sequence_offsets=offsets,        # packed mode only; int32 CUDA tensor
+    sequence_offsets=offsets,        # packed mode only
     return_final_state=True,
 )
 
@@ -111,46 +111,42 @@ output = result.outputs["output"]
 state = result.final_state["memory"]
 ```
 
-Every invocation returns immutable `ExecutionResult`, containing a named output
-tuple and optional named final State. Single outputs and States are never
-unwrapped. Missing initial State means one FP32 zero State per logical sequence.
-Final State is materialized only when requested. Packed values use contiguous
-token-major `[total_tokens, heads, features...]`; dense values use canonical
-role-order contiguous layout. Empty sequences and unaligned tail chunks have
-identity-transition semantics and do not read padding.
+Every invocation returns immutable `ExecutionResult`, containing immutable named
+outputs and optional named final State. Single outputs and State are never
+unwrapped. The first schema has one matrix State with two ordered Feature roles;
+GLA, RetNet, selective state evolution, Mamba2-style compositions, GDN, and
+custom pressure programs use the same generic IR. Missing initial State means
+one FP32 zero State per logical sequence. Final State is materialized only when
+requested. Packed values are contiguous token-major tensors with shared int32
+sequence offsets. Empty sequences and inactive tail lanes have identity semantics
+and do not read padding.
 
 The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
-outputs, FP32 State, canonical contiguous layouts, and Feature dimension pairs
-`(64,64)`, `(64,128)`, `(128,64)`, and `(128,128)`. H100, CPU, ROCm, unknown
-same-capability products, and unidentifiable MIG devices are rejected. No
-implicit copies, transposes, padding, eager recurrence, or dedicated GDN
-backend are used.
+outputs, FP32 State, canonical contiguous layouts, and Feature pairs in
+`{64,128} × {64,128}`. H100, ROCm, CPU, unknown products, and unidentifiable
+MIG devices are rejected. No implicit copies, transposes, eager recurrence,
+token-serial fallback, model-name dispatch, or dedicated GDN backend exists.
 
 Compiler analysis is internal. Invalid IR, unsupported composition, target
-mismatch, invalid packed offsets, unsupported concrete specialization, and
-code-generation failures surface as structured `StatefulCompilationError`
-values with stable category codes, public-IR paths, and JSON-safe details.
+mismatch, invalid packed offsets, unsupported specialization, and codegen
+failures surface as structured `StatefulCompilationError` values. The complete
+contract is in `docs/stateful-operator-ir-spec.md`.
 
 ## Legacy Customized Linear Attention API
 
 The modifier-based `LinearAttentionEngine` remains available with its existing
 interface and behavior. It is outside the Stateful Operator compiler guarantee
-and is not changed by this specification.
+and is not routed through this compiler.
 
 ```py
 mod = LinearAttentionEngine(qkv_meta, q_mod=..., k_mod=..., v_mod=..., decay_mod=..., custom_io=...)
 output = mod(q, k, v, decay, custom_input)
 ```
-
-## Gated Delta Rule
-
-GDN is an explicit Algorithm IR composition of generic Axis Scale, Rank-One
-propagation, Product Injection, and State Contraction nodes. `GDNEngine` is not
-part of the public interface and is removed; FlashQLA is only a mathematical
+GDN is an explicit generic Algorithm IR composition. A dedicated GDN engine is
+not part of the public interface; FlashQLA is only an independent mathematical
 or performance reference, never a Stateful Operator execution backend.
 
-See `docs/stateful-operator-ir-spec.md` for the complete language, numeric,
-packed-sequence, cache, Target, error, and verification contracts.
+See `docs/stateful-operator-ir-spec.md` for the complete contract.
 
 # Upcoming Features
 

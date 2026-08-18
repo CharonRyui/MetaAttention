@@ -4,7 +4,10 @@ Status: `proposed`
 
 ## Problem Statement
 
-MetaAttention can generate families of ordinary and scalar-decay linear attention operators, but its current stateful authoring path does not let a model author compose a new recurrent attention rule and receive a generated parallel implementation. The current `StatefulOperator` presents Algorithm IR while selecting legacy whole algorithms underneath it. Stateful linear continuation uses an eager token loop, Gated Delta Rule bypasses generic lowering through a dedicated implementation, and backward semantics come from whichever implementation was selected. The interface therefore describes a catalog, not a compiler.
+The current branch is not yet an implementation of this contract: its prior
+authoring path selected legacy whole algorithms underneath Algorithm IR.
+This specification explicitly forbids eager token loops, dedicated GDN
+execution, and backend-specific backward as the implementation target.
 
 Model authors need one small mathematical interface for state evolution. A supported state transition must compile because its typed algebra is Scanable, not because the repository recognizes a model name or exact graph. The same mathematical program must drive forward, backward, dense execution, packed variable-length execution, initial/final state, capability diagnostics, and cache identity. Kernel schedules may optimize common algebraic structures, but they must not replace their semantics.
 
@@ -141,10 +144,23 @@ The primary and only public behavioral test seam is constructing a `StatefulOper
 - Algorithm IR carries one or more ordered, uniquely named State Contractions. Every contraction reads post-transition State, contracts exactly one Feature role with an operand expression, introduces no additional Feature role, retains the other State Feature role, and declares output dtype. Readouts cannot depend on other outputs.
 - Head Mapping is a set of explicit source-Head-role mappings to the State Head role. The first schema supports identity and contiguous group broadcast only. Each mapping defines its inverse gradient reduction. No node assumes query, key, or value names.
 - A Scanable Program has an associative affine summary whose storage depends only on State Feature sizes, never sequence length. The canonical semantic summary may contain a dense State transform and additive State term. Dense closure makes general Rank-One composition Scanable.
+For the selective diagonal/Mamba2-style acceptance profile, the intended
+composition is explicit: `a_t = exp(dt_t * A)`, `u_t = dt_t * key_t`,
+`S_t = AxisScale(a_t, S_{t-1}) + ProductInjection(u_t, value_t)`, and
+`y_t = StateContraction(S_t, query_t)`. `A` is a typed constant or broadcast
+Input with one State Head role; `dt` and all products obey the declared
+BF16/FP32 promotion and FP32 State rules. This equation is a profile example,
+not a compiler primitive or dispatch key.
+
+- A summary is represented semantically as an affine map `(M, b)` over the
+  matrix State. Summary composition is `(M2, b2) ∘ (M1, b1) = (M2 M1,
+  M2 b1 + b2)`, and applying a token summary to State `S` yields `M S + b`.
+  Factorized, WY/KKT, low-rank, or tiled forms are permitted only as equivalent
+  storage and schedule optimizations.
 - A Recurrent Program is mathematically valid but lacks a compiler-proven compact associative summary. It receives a stable rejection before backend lowering. Target or resource limitations never change execution class.
 - Every forward expression, propagation, Product Injection, State Contraction, State operation, and Head Mapping operation owns a compiler VJP. The compiler composes an internal canonical Backward IR. Frontends cannot construct or override it.
 - Backward IR explicitly represents named output cotangents, optional final-State cotangent, reverse State propagation, initial-State gradient, Head Mapping reductions, and aliased-input accumulation. Generated backward has no hand-written profile path.
-- The public interface does not expose `analyze_program`, `ProgramAnalysis`, or `SpecializationAnalysis`. Compiler analysis remains an internal code-generation-free phase.
+- Compiler analysis has no public entry point or stable report type. It remains an internal code-generation-free phase.
 - Public failures use `StatefulCompilationError` with a stable category code, canonical public-IR path, and JSON-safe details. Human message text and internal reports are not compatibility contracts.
 - Deterministic validation order is IR structure, role/dtype typing, scanability and VJP completeness, runtime binding/sequence/State validity, Target matching, concrete resource capability, then code generation.
 - Runtime Tensor Inputs bind by keyword name only. All required and no unknown names must be present.
@@ -220,7 +236,7 @@ The primary and only public behavioral test seam is constructing a `StatefulOper
 - FlashQLA/GDN kernels as a Stateful Operator execution backend.
 - Arbitrary Python transition, injection, readout, composition, or backward callbacks.
 - Public construction or override of Backward IR.
-- Public `analyze_program`, Program Analysis, Specialization Analysis, or stable diagnostic-report JSON.
+- A public compiler-analysis entry point or stable diagnostic-report JSON.
 - More than one State or State with a Feature rank other than two.
 - Coupled multi-State transitions or normalized numerator/denominator State.
 - General einsum, arbitrary tensor contraction, multi-axis State Contraction, or readout dependency graphs.
