@@ -7,32 +7,11 @@ The QLA operator targeted by this repository. It is distinct from scalar-decay g
 _Avoid_: Gated Attention, GLA
 
 **QLA**:
-The upstream FlashQLA implementation of Gated Delta Rule chunked prefill. In this repository, “QLA adaptation” means adding a dedicated GDN path, not changing the existing scalar-decay linear-attention path.
-
-**First Release**:
-The initial GDN contract: H20/sm89 BF16 fixed-length training with forward and backward execution, GVA, and initial/final recurrent state. Variable-length and automatic intra-card context parallelism are excluded.
-
-**GDN Engine**:
-The temporary legacy frontend for Gated Delta Rule. It preserves the existing GDN call contract by adapting it to an equivalent Algorithm IR and the shared Stateful Operator; new code constructs the rank-one delta transition directly.
-
-**Head-first Layout**:
-The GDN Engine public tensor layout: query and key are `[B,Hk,T,K]`, value is `[B,Hv,T,V]`, and gate and beta are `[B,Hv,T]`. This is the native MetaAttention layout.
-_Avoid_: Token-first Layout
-
-**GDN State**:
-The optional fp32 recurrent state with layout `[B,Hv,128,128]`. A missing initial state means zero state; final state is returned only when explicitly requested.
+The upstream FlashQLA implementation used as a mathematical and performance reference for Gated Delta Rule. It is not a Stateful Operator execution path.
 
 **GDN Grouped Value Attention (GVA)**:
-The first-release head mapping where `Hv % Hk == 0`. Each query/key head serves `Hv/Hk` value and recurrent-state heads.
+A head mapping where `Hv % Hk == 0`; each query/key head serves `Hv/Hk` value and recurrent-state heads.
 
-**GDN Chunk Alignment**:
-The first release requires `T % 64 == 0`. Unaligned input is rejected explicitly; the engine never truncates or pads sequences implicitly.
-
-**H20 GDN Adapter**:
-The sm89 TileLang implementation of GDN. It follows FlashQLA's mathematical reference and test behavior but does not reuse Hopper-only warp-specialized kernels.
-
-**GDN Precision Contract**:
-Query, key, value, and output use bfloat16. Log-space gate, beta, initial state, final state, and state accumulation use float32.
 # Stateful Operator Domain
 
 ## Glossary
@@ -49,22 +28,38 @@ Query, key, value, and output use bfloat16. Log-space gate, beta, initial state,
 
 **State injection** — The input-derived additive term in a structured affine transition. The first phase recognizes outer product, elementwise product, direct input, and zero injection.
 
-**State tuple** — An ordered collection of named tensor states. Each state has its own shape and dtype, and transitions and readouts reference states by name. A lowering strategy may reject state combinations it does not support.
+**State tuple** — An ordered collection of named tensor states. Each state declares storage and accumulation dtypes; transitions read the prior tuple, commit next states simultaneously, and never mutate caller-owned storage.
 
 **Initial state** — An optional caller-provided state tuple used before the first token. Missing initial state means a zero-initialized state tuple.
 
-**Final state** — The state tuple after the final token. Callers may request it for streaming or continuation; compatibility frontends return only token outputs by default.
+**Final state** — The state tuple after the final token. Callers may request it for streaming or continuation through the stable Execution Result interface.
 
-**Frontend sugar** — Model-facing conveniences such as `q_mod`, `k_mod`, `v_mod`, and `decay_mod`. These are lowered into Algorithm IR and are not core compiler semantics.
+**Frontend sugar** — Model-facing conveniences outside Algorithm IR. Stateful Operator examples construct IR explicitly; legacy `LinearAttentionEngine` modifier inputs remain outside the new compiler guarantee.
 
-**Backward IR** — The compiler-derived vector-Jacobian-product program for an Algorithm IR. Frontends cannot construct or override it; lowering strategies may implement an equivalent specialized backward.
+**Backward IR** — The internal compiler-derived vector-Jacobian-product program for an Algorithm IR. Frontends cannot construct or override it, and generated backward execution implements it compositionally.
 
-**Stateful program** — The validated forward Algorithm IR paired with its compiler-derived Backward IR for lowering. It is an internal compiler artifact, not a model-authoring interface.
+**Stateful program** — Validated Algorithm IR paired with compiler-derived Backward IR, execution class, and Target capability analysis for lowering. It is an internal compiler artifact, not a model-authoring interface.
 
-**IR-derived backward** — The backward graph is derived from Algorithm IR node VJPs. Frontends do not provide independent backward functions; lowering strategies implement the derived graph.
+**IR-derived backward** — Backward semantics derived from Algorithm IR node VJPs, including named output and final-state cotangents, initial-state gradients, and Head Mapping reductions.
 
 **Head mapping** — The explicit relationship between input heads and state heads, including valid group broadcasting and reduction rules. It is Algorithm IR semantics, not a kernel layout inference.
 
 **Tensor input** — A named, typed external tensor available to input transforms, transitions, or readouts. Its shape roles, dtype, and gradient requirement are declared by an input specification; it replaces `CustomIO` only for stateful operators.
 
-**Lowering strategy** — A backend-specific execution method, including chunking, scans, tiling, fusion, state materialization, and backward kernels. It is separate from Algorithm IR.
+**Lowering strategy** — The backend-specific schedule, tiling, layout, fusion, state materialization, and kernel generation used to execute a Scanable Program. It does not replace node semantics or select model-specific implementations.
+
+**Backend capability** — The concrete dtype, shape, layout, and architecture combinations a Target can lower for forward, continuation, and backward. Public IR constructors define mathematical language; capability determines whether a Scanable Program can execute on that Target.
+
+**Execution class** — A compiler-derived classification of validated Algorithm IR by its state-summary algebra. A scanable program has a compact associative summary and may enter Stateful Operator lowering; a recurrent program does not and is rejected before backend lowering in this phase.
+
+**Scanable program** — A stateful program whose typed propagation composition has a compiler-proven compact associative summary suitable for parallel chunked execution.
+
+**Recurrent program** — A mathematically valid stateful program without a compiler-proven compact associative summary. It has no Stateful Operator execution path in the current phase.
+
+**Target** — An immutable description of the intended stateful backend and hardware architecture used for capability analysis and specialization. It is explicit rather than inferred from process-global device state.
+
+**Program analysis** — The compiler-owned, code-generation-free derivation of execution class, Backward IR, target capability, specialization constraints, and actionable diagnostics from Algorithm IR and a Target.
+
+**Named output tuple** — An ordered collection of uniquely named token-output tensors produced by post-transition readouts. Output order and names are Algorithm IR semantics.
+
+**Execution result** — The immutable result of a Stateful Operator invocation, containing a Named Output Tuple and an optional final State Tuple with stable return shape.
