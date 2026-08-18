@@ -80,66 +80,79 @@ def mask_mod(b, h, q_idx, kv_idx) -> Bool:
 
 ## Stateful Operator API
 
-Stateful sequence operators are authored with explicit Algorithm IR and compiled
-through `StatefulOperator`. Runtime tensors bind by keyword to declared Tensor
-Input names. The operator is stateless; an omitted initial state means zero, and
-`return_final_state=True` returns a named `StateTuple`.
+Stateful sequence operators are authored by constructing explicit Algorithm IR
+and compiling it through `StatefulOperator`. The IR is model-independent: GLA,
+RetNet recurrent state evolution, selective state evolution, GDN, and custom
+compositions use the same typed nodes. Runtime tensors bind by keyword to named
+Tensor Inputs. `LinearAttentionEngine` remains a separate legacy generator and
+is not routed through this compiler.
+
+The first compiler schema has one named matrix State with two ordered Feature
+roles. It supports typed Input Expressions (`Input`, BF16/FP32 `Constant`,
+`Add`, `Multiply`, `Negate`, `Exp`), role-directed Axis Scale, general
+Rank-One propagation, Product Injection tuples, explicit Head Mapping, and
+single-role State Contractions. Arbitrary Python callbacks, generic einsum,
+multi-state programs, and other State ranks are not supported.
 
 ```py
 from attn_engine import StatefulOperator
 
-operator = StatefulOperator(algorithm)
-output, final_state = operator(
+operator = StatefulOperator(algorithm)  # Target may be supplied explicitly
+result = operator(
     query=query,
     key=key,
     value=value,
-    gate=gate,
-    beta=beta,
-    initial_state={"memory": state},
+    initial_state=state_tuple,       # optional StateTuple
+    sequence_offsets=offsets,        # packed mode only; int32 CUDA tensor
     return_final_state=True,
 )
+
+output = result.outputs["output"]
+state = result.final_state["memory"]
 ```
 
-The first-phase Algorithm IR supports identity, elementwise or diagonal scale,
-ordered propagation composition, rank-one delta propagation, outer-product and
-elementwise state injection, direct input, zero injection, and typed state
-readouts. Head Mapping declares grouped-head relationships and validates
-divisibility before lowering. Normalized numerator/denominator state is not
-supported in this phase.
+Every invocation returns immutable `ExecutionResult`, containing a named output
+tuple and optional named final State. Single outputs and States are never
+unwrapped. Missing initial State means one FP32 zero State per logical sequence.
+Final State is materialized only when requested. Packed values use contiguous
+token-major `[total_tokens, heads, features...]`; dense values use canonical
+role-order contiguous layout. Empty sequences and unaligned tail chunks have
+identity-transition semantics and do not read padding.
 
-`LinearAttentionEngine` and `GDNEngine` remain deprecated compatibility adapters
-for migration. New production code should construct Algorithm IR directly;
-arbitrary Python transition and readout callbacks are not accepted.
+The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
+outputs, FP32 State, canonical contiguous layouts, and Feature dimension pairs
+`(64,64)`, `(64,128)`, `(128,64)`, and `(128,128)`. H100, CPU, ROCm, unknown
+same-capability products, and unidentifiable MIG devices are rejected. No
+implicit copies, transposes, padding, eager recurrence, or dedicated GDN
+backend are used.
 
-## Deprecated Customized Linear Attention API
+Compiler analysis is internal. Invalid IR, unsupported composition, target
+mismatch, invalid packed offsets, unsupported concrete specialization, and
+code-generation failures surface as structured `StatefulCompilationError`
+values with stable category codes, public-IR paths, and JSON-safe details.
 
-The modifier-based constructor remains available only for migration and emits a
-`DeprecationWarning`. Its existing positional call contract is unchanged.
+## Legacy Customized Linear Attention API
+
+The modifier-based `LinearAttentionEngine` remains available with its existing
+interface and behavior. It is outside the Stateful Operator compiler guarantee
+and is not changed by this specification.
 
 ```py
 mod = LinearAttentionEngine(qkv_meta, q_mod=..., k_mod=..., v_mod=..., decay_mod=..., custom_io=...)
 output = mod(q, k, v, decay, custom_input)
 ```
 
-## Gated Delta Rule API
+## Gated Delta Rule
 
-Gated Delta Rule is authored by constructing explicit rank-one-delta
-Algorithm IR and invoking `StatefulOperator`. `GDNEngine` remains the
-deprecated positional compatibility adapter and unwraps the named `memory`
-state for compatibility.
+GDN is an explicit Algorithm IR composition of generic Axis Scale, Rank-One
+propagation, Product Injection, and State Contraction nodes. `GDNEngine` is not
+part of the public interface and is removed; FlashQLA is only a mathematical
+or performance reference, never a Stateful Operator execution backend.
 
-The IR retains log-space `gate` as a Tensor Input and expresses `Exp(gate)`
-explicitly. `beta` is raw and differentiable; keys are not normalized.
+See `docs/stateful-operator-ir-spec.md` for the complete language, numeric,
+packed-sequence, cache, Target, error, and verification contracts.
 
-`Hv` must be a positive multiple of `Hk`; each query/key head serves
-`Hv/Hk` value and state heads. `T` must be positive and divisible by the fixed
-chunk size 64. Inputs are contiguous and head-first. Output is BF16; requested
-final state and a provided initial-state gradient are FP32.
-
-The first release supports only the repository's validated NVIDIA H20 target, fixed key/value dimensions 128, BF16 query/key/value, and FP32 gate/beta/state. It rejects other devices, dtypes, layouts, dimensions, and unaligned lengths before kernel execution.
-Q/K normalization, variable lengths, padding, and decode caches are outside this API.
-
-# Upcoming Features 
+# Upcoming Features
 
 ## Attention Library Level API
 This level API is designed for users to use the existing attention mechanism in the library.
