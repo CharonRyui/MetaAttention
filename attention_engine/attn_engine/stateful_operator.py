@@ -65,7 +65,9 @@ def as_expression(value: InputExpression | float | int) -> InputExpression:
         return value
     if isinstance(value, (int, float)):
         return Constant(float(value))
-    raise TypeError(f"expected an input expression or numeric constant, got {type(value).__name__}")
+    raise TypeError(
+        f"expected an input expression or numeric constant, got {type(value).__name__}"
+    )
 
 
 @dataclass(frozen=True)
@@ -82,7 +84,9 @@ class TensorInput:
             raise ValueError(f"tensor input '{self.name}' must declare shape roles")
         unknown = set(self.roles) - set(_ROLE_ALIASES)
         if unknown:
-            raise ValueError(f"tensor input '{self.name}' has unknown shape role {sorted(unknown)[0]!r}")
+            raise ValueError(
+                f"tensor input '{self.name}' has unknown shape role {sorted(unknown)[0]!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -114,8 +118,6 @@ class RankOneDelta:
     beta: InputExpression
 
 
-
-
 @dataclass(frozen=True)
 class PropagationComposition:
     nodes: tuple[Identity | ElementwiseScale | DiagonalScale | RankOneDelta, ...]
@@ -123,7 +125,11 @@ class PropagationComposition:
     def __post_init__(self) -> None:
         if not self.nodes:
             raise ValueError("propagation composition must contain at least one node")
-Propagation = Identity | ElementwiseScale | DiagonalScale | RankOneDelta | PropagationComposition
+
+
+Propagation = (
+    Identity | ElementwiseScale | DiagonalScale | RankOneDelta | PropagationComposition
+)
 
 
 @dataclass(frozen=True)
@@ -215,13 +221,17 @@ class AlgorithmIR:
             raise ValueError("Algorithm IR requires at least one state")
         state_names = {state.name for state in self.states}
         if self.transition.state not in state_names:
-            raise ValueError(f"transition references unknown state '{self.transition.state}'")
+            raise ValueError(
+                f"transition references unknown state '{self.transition.state}'"
+            )
         if self.readout.state not in state_names:
             raise ValueError(f"readout references unknown state '{self.readout.state}'")
         input_names = {tensor.name for tensor in self.inputs}
         for expression in _expressions(self):
             if isinstance(expression, Input) and expression.name not in input_names:
-                raise ValueError(f"expression references unknown input '{expression.name}'")
+                raise ValueError(
+                    f"expression references unknown input '{expression.name}'"
+                )
 
     @property
     def structural_identity(self) -> str:
@@ -254,7 +264,10 @@ def _canonical(value: Any) -> Any:
     if is_dataclass(value):
         return {
             "node": type(value).__name__,
-            **{field.name: _canonical(getattr(value, field.name)) for field in fields(value)},
+            **{
+                field.name: _canonical(getattr(value, field.name))
+                for field in fields(value)
+            },
         }
     if isinstance(value, tuple):
         return [_canonical(item) for item in value]
@@ -303,7 +316,9 @@ class StatefulOperator:
         self.algorithm = algorithm
         self.compile_options = compile_options or CompileOptions()
         if self.compile_options.backend != "tilelang":
-            raise ValueError(f"unsupported stateful backend '{self.compile_options.backend}'")
+            raise ValueError(
+                f"unsupported stateful backend '{self.compile_options.backend}'"
+            )
         self._compiled: dict[str, Callable[..., Any]] = {}
 
     @property
@@ -328,12 +343,14 @@ class StatefulOperator:
         role_sizes = self._validate_inputs(inputs)
         self.algorithm.head_mapping.validate(role_sizes)
         state = self._validate_state(initial_state, role_sizes, inputs)
-        key = self._specialization_key(inputs) + (":stateful" if (state is not None or return_final_state) else ":stateless")
+        key = self._specialization_key(inputs) + (
+            ":stateful" if (state is not None or return_final_state) else ":stateless"
+        )
         lowering = self._compiled.get(key)
         if lowering is None:
-            if (state is not None or return_final_state) and not _contains_rank_one_delta(
-                self.algorithm.transition.propagation
-            ):
+            if (
+                state is not None or return_final_state
+            ) and not _contains_rank_one_delta(self.algorithm.transition.propagation):
                 lowering = _compile_linear_stateful_lowering(self.algorithm)
             else:
                 lowering = self._compile(inputs)
@@ -341,7 +358,9 @@ class StatefulOperator:
         result = lowering(inputs, state, return_final_state)
         if return_final_state:
             output, state_values = result
-            return output, StateTuple(tuple(item.name for item in self.algorithm.states), state_values)
+            return output, StateTuple(
+                tuple(item.name for item in self.algorithm.states), state_values
+            )
         return result
 
     def _validate_inputs(self, inputs: dict[str, torch.Tensor]) -> dict[str, int]:
@@ -352,9 +371,13 @@ class StatefulOperator:
             if not isinstance(tensor, torch.Tensor):
                 raise TypeError(f"input '{spec.name}' must be a torch.Tensor")
             if tensor.ndim != len(spec.roles):
-                raise ValueError(f"input '{spec.name}' must have {len(spec.roles)} dimensions")
+                raise ValueError(
+                    f"input '{spec.name}' must have {len(spec.roles)} dimensions"
+                )
             if tensor.dtype != spec.dtype:
-                raise ValueError(f"input '{spec.name}' must have dtype {spec.dtype}, got {tensor.dtype}")
+                raise ValueError(
+                    f"input '{spec.name}' must have dtype {spec.dtype}, got {tensor.dtype}"
+                )
             if not tensor.is_contiguous():
                 raise ValueError(f"input '{spec.name}' must be contiguous")
             if device is None:
@@ -364,7 +387,9 @@ class StatefulOperator:
             for role, size in zip(spec.roles, tensor.shape):
                 prior = role_sizes.setdefault(role, size)
                 if prior != size:
-                    raise ValueError(f"shape role '{role}' has conflicting sizes {prior} and {size}")
+                    raise ValueError(
+                        f"shape role '{role}' has conflicting sizes {prior} and {size}"
+                    )
         return role_sizes
 
     def _validate_state(
@@ -380,7 +405,11 @@ class StatefulOperator:
         if set(values) != expected_names:
             missing = expected_names - values.keys()
             unknown = values.keys() - expected_names
-            detail = f"missing {sorted(missing)}" if missing else f"unknown {sorted(unknown)}"
+            detail = (
+                f"missing {sorted(missing)}"
+                if missing
+                else f"unknown {sorted(unknown)}"
+            )
             raise ValueError(f"invalid initial state names: {detail}")
         device = next(iter(inputs.values())).device
         result: list[torch.Tensor] = []
@@ -392,9 +421,13 @@ class StatefulOperator:
                     f"initial state '{spec.name}' must have shape {expected_shape}, got {tuple(tensor.shape)}"
                 )
             if tensor.dtype != spec.storage_dtype:
-                raise ValueError(f"initial state '{spec.name}' must have dtype {spec.storage_dtype}")
+                raise ValueError(
+                    f"initial state '{spec.name}' must have dtype {spec.storage_dtype}"
+                )
             if tensor.device != device:
-                raise ValueError(f"initial state '{spec.name}' must be on device {device}")
+                raise ValueError(
+                    f"initial state '{spec.name}' must be on device {device}"
+                )
             if not tensor.is_contiguous():
                 raise ValueError(f"initial state '{spec.name}' must be contiguous")
             result.append(tensor)
@@ -446,11 +479,20 @@ def _contains_rank_one_delta(propagation: Propagation) -> bool:
 
 def _compile_gdn_lowering(algorithm: AlgorithmIR) -> Callable[..., Any]:
     propagation = algorithm.transition.propagation
-    if not isinstance(propagation, PropagationComposition) or len(propagation.nodes) != 2:
-        raise ValueError("rank-one delta lowering requires scale then rank-one propagation")
+    if (
+        not isinstance(propagation, PropagationComposition)
+        or len(propagation.nodes) != 2
+    ):
+        raise ValueError(
+            "rank-one delta lowering requires scale then rank-one propagation"
+        )
     scale_node, delta_node = propagation.nodes
-    if not isinstance(scale_node, ElementwiseScale) or not isinstance(delta_node, RankOneDelta):
-        raise ValueError("rank-one delta lowering requires ordered scale then rank-one propagation")
+    if not isinstance(scale_node, ElementwiseScale) or not isinstance(
+        delta_node, RankOneDelta
+    ):
+        raise ValueError(
+            "rank-one delta lowering requires ordered scale then rank-one propagation"
+        )
     if not isinstance(algorithm.transition.injection, OuterProduct):
         raise ValueError("rank-one delta lowering requires outer-product injection")
     if not isinstance(algorithm.readout, MatrixReadout):
@@ -462,24 +504,38 @@ def _compile_gdn_lowering(algorithm: AlgorithmIR) -> Callable[..., Any]:
     value, injection_beta = _match_product_inputs(algorithm.transition.injection.right)
     query, scale = _match_scaled_input(algorithm.readout.query)
     if key != injection_key or beta != injection_beta:
-        raise ValueError("rank-one delta key and beta must match the injection operands")
+        raise ValueError(
+            "rank-one delta key and beta must match the injection operands"
+        )
 
     def lowering(bound, initial_state, return_final_state):
         from .gdn_engine import validate_gdn_inputs
-        from .gdn_tilelang import gated_delta_rule
+        from .gdn_flash_qla import gated_delta_rule
 
         state = initial_state[0] if initial_state is not None else None
         validate_gdn_inputs(
-            bound[query], bound[key], bound[value], bound[gate], bound[beta],
-            scale=scale, initial_state=state,
+            bound[query],
+            bound[key],
+            bound[value],
+            bound[gate],
+            bound[beta],
+            scale=scale,
+            initial_state=state,
         )
         output, final = gated_delta_rule(
-            bound[query], bound[key], bound[value], bound[gate], bound[beta],
-            scale=scale, initial_state=state, output_final_state=return_final_state,
+            bound[query],
+            bound[key],
+            bound[value],
+            bound[gate],
+            bound[beta],
+            scale=scale,
+            initial_state=state,
+            output_final_state=return_final_state,
         )
         return (output, (final,)) if return_final_state else output
 
     return lowering
+
 
 def _compile_linear_lowering(
     algorithm: AlgorithmIR,
@@ -492,7 +548,10 @@ def _compile_linear_lowering(
         raise ValueError("linear lowering supports only outer-product injection")
     if not isinstance(algorithm.readout, MatrixReadout):
         raise ValueError("linear lowering supports only matrix readout")
-    if isinstance(algorithm.transition.propagation, (PropagationComposition, RankOneDelta, DiagonalScale)):
+    if isinstance(
+        algorithm.transition.propagation,
+        (PropagationComposition, RankOneDelta, DiagonalScale),
+    ):
         raise ValueError("linear lowering does not support this propagation structure")
 
     query_name = _single_input_name(algorithm.readout.query, "readout query")
@@ -506,13 +565,18 @@ def _compile_linear_lowering(
     elif isinstance(propagation, ElementwiseScale):
         decay_name = _first_input_name(propagation.scale)
         primary.add(decay_name)
-        decay_mod = _expression_callback(_logarithm_for_linear_backend(propagation.scale), decay_name)
+        decay_mod = _expression_callback(
+            _logarithm_for_linear_backend(propagation.scale), decay_name
+        )
     else:
         raise ValueError("unsupported linear propagation")
 
     custom_specs = [spec for spec in algorithm.inputs if spec.name not in primary]
     custom_io = CustomIO(
-        {spec.name: tuple(_ROLE_ALIASES[role] for role in spec.roles) for spec in custom_specs}
+        {
+            spec.name: tuple(_ROLE_ALIASES[role] for role in spec.roles)
+            for spec in custom_specs
+        }
     )
     q_mod = _expression_callback(algorithm.readout.query, query_name)
     k_mod = _expression_callback(algorithm.transition.injection.left, key_name)
@@ -552,7 +616,9 @@ def _compile_linear_stateful_lowering(algorithm: AlgorithmIR) -> Callable[..., A
     if len(algorithm.states) != 1:
         raise ValueError("linear stateful lowering supports exactly one state")
     if not isinstance(algorithm.transition.injection, OuterProduct):
-        raise ValueError("linear stateful lowering supports only outer-product injection")
+        raise ValueError(
+            "linear stateful lowering supports only outer-product injection"
+        )
     if not isinstance(algorithm.readout, MatrixReadout):
         raise ValueError("linear stateful lowering supports only matrix readout")
     state_name = algorithm.transition.state
@@ -560,12 +626,11 @@ def _compile_linear_stateful_lowering(algorithm: AlgorithmIR) -> Callable[..., A
 
     def lowering(bound, initial_state, return_final_state):
         state = initial_state[0] if initial_state is not None else None
-        output, final = _run_linear_stateful(
-            algorithm, bound, state, query, state_name
-        )
+        output, final = _run_linear_stateful(algorithm, bound, state, query, state_name)
         return (output, (final,)) if return_final_state else output
 
     return lowering
+
 
 def _run_linear_stateful(algorithm, bound, state, query_name, state_name):
     state_spec = next(spec for spec in algorithm.states if spec.name == state_name)
@@ -600,11 +665,11 @@ def _run_linear_stateful(algorithm, bound, state, query_name, state_name):
             "bhk,bhv->bhkv", left[..., token, :].float(), right[..., token, :].float()
         )
         query_token = query_value[..., token, :].float()
-        outputs.append(torch.einsum("bhk,bhkv->bhv", query_token, current).to(query_value.dtype))
+        outputs.append(
+            torch.einsum("bhk,bhkv->bhv", query_token, current).to(query_value.dtype)
+        )
         state = current
     return torch.stack(outputs, dim=2), state
-
-
 
 
 def _evaluate_runtime_expression(expression, bound):
@@ -613,15 +678,21 @@ def _evaluate_runtime_expression(expression, bound):
     if isinstance(expression, Constant):
         return expression.value
     if isinstance(expression, Multiply):
-        return _evaluate_runtime_expression(expression.left, bound) * _evaluate_runtime_expression(expression.right, bound)
+        return _evaluate_runtime_expression(
+            expression.left, bound
+        ) * _evaluate_runtime_expression(expression.right, bound)
     if isinstance(expression, Exp):
         return _evaluate_runtime_expression(expression.operand, bound).exp()
     if isinstance(expression, Log):
         return _evaluate_runtime_expression(expression.operand, bound).log()
-    raise ValueError(f"unsupported runtime input expression {type(expression).__name__}")
+    raise ValueError(
+        f"unsupported runtime input expression {type(expression).__name__}"
+    )
 
 
-def _expression_callback(expression: InputExpression, root_name: str) -> Callable[..., Any] | None:
+def _expression_callback(
+    expression: InputExpression, root_name: str
+) -> Callable[..., Any] | None:
     if expression == Input(root_name):
         return None
 
@@ -639,9 +710,9 @@ def _evaluate_symbolic(expression, root_name, root, custom_io):
     if isinstance(expression, Constant):
         return expression.value
     if isinstance(expression, Multiply):
-        return _evaluate_symbolic(expression.left, root_name, root, custom_io) * _evaluate_symbolic(
-            expression.right, root_name, root, custom_io
-        )
+        return _evaluate_symbolic(
+            expression.left, root_name, root, custom_io
+        ) * _evaluate_symbolic(expression.right, root_name, root, custom_io)
     if isinstance(expression, Exp):
         return _evaluate_symbolic(expression.operand, root_name, root, custom_io).exp()
     if isinstance(expression, Log):
