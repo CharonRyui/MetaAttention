@@ -35,3 +35,7 @@ The immutable public result of every Stateful Operator invocation. It contains n
 
 ## Target capability
 The concrete hardware, dtype, layout, and resource envelope accepted by a compiler specialization. A capability failure does not change a program's Scanable classification.
+
+## Structural optimization
+A compiler-selected equivalent representation or lowering justified by typed Algorithm IR structure and specialization metadata. It is shared by every matching program and never depends on a model name or complete known profile identity.
+_Avoid_: Algorithm-specific optimization, profile-specific kernel, model dispatch

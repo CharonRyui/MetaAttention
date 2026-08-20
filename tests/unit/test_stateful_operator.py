@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -247,6 +248,34 @@ def test_analysis_maps_expression_head_roles_to_state_heads():
     ]
     assert STATE_HEADS in injection_type.roles
     assert KEY_HEADS not in injection_type.roles
+
+
+def test_analysis_derives_raw_dense_recipe_from_structure():
+    scalar = _accumulator_ir()._analysis.scalar_factorized
+    assert scalar is not None
+    dense = scalar.dense
+    assert dense is not None
+    assert dense.propagation[0].name == "gate"
+    assert dense.propagation[1].is_log_scale
+    assert dense.left_factor[0].name == "key"
+    assert dense.right_factor[0].name == "value"
+    assert dense.readout[0].name == "query"
+
+
+def test_cached_dense_call_revalidates_runtime_metadata(monkeypatch):
+    monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "0")
+    operator = StatefulOperator(_accumulator_ir())
+    operator._dense_cached_call = operator._build_dense_cached_call(
+        _inputs(),
+        SimpleNamespace(uniform_length=3, sequence_count=1),
+        torch.zeros(1, 1, 2, 3),
+        object(),
+    )
+    invalid = _inputs()
+    invalid["query"] = invalid["query"].transpose(-1, -2)
+    with pytest.raises(StatefulCompilationError) as captured:
+        operator(**invalid)
+    assert captured.value.category == "RUNTIME_SHAPE"
 
 
 def test_analysis_rejects_unmapped_incompatible_head_roles():

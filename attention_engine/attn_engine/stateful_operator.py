@@ -534,6 +534,7 @@ class StatefulOperator:
         self._specializations: set[str] = set()
         self._plans: dict[str, Any] = {}
         self._zero_states: dict[tuple[Any, ...], torch.Tensor] = {}
+        self._dense_cached_call: Callable[..., ExecutionResult] | None = None
 
     @property
     def _structural_identity(self) -> str:
@@ -553,6 +554,15 @@ class StatefulOperator:
         return_final_state: bool = False,
         **inputs: torch.Tensor,
     ) -> ExecutionResult:
+        if (
+            initial_state is None
+            and sequence_offsets is None
+            and not return_final_state
+            and not any(tensor.requires_grad for tensor in inputs.values())
+        ):
+            cached = self._dense_cached_call
+            if cached is not None:
+                return cached(inputs)
         expected = {item.name for item in self.algorithm.inputs}
         missing = expected - inputs.keys()
         unknown = inputs.keys() - expected
@@ -597,16 +607,114 @@ class StatefulOperator:
                 scalar_factorized=self.algorithm._analysis.scalar_factorized,
             )
             self._plans[specialization] = plan
-        values = self._normalize_inputs(inputs, runtime, role_sizes)
-        outputs, final_state = self._lower_parallel_scan(
-            values, state, runtime, return_final_state, plan
+        scalar_profile = getattr(plan, "scalar_factorized", None)
+        raw_dense = (
+            runtime.device.type == "cuda"
+            and not runtime.packed
+            and scalar_profile is not None
+            and scalar_profile.dense is not None
+            and not any(tensor.requires_grad for tensor in inputs.values())
+            and not state.requires_grad
         )
+        if raw_dense:
+            assert runtime.uniform_length is not None
+            output, fused_final = plan.scalar_factorized_dense_raw(
+                inputs,
+                state,
+                sequence_count=runtime.sequence_count,
+                sequence_length=runtime.uniform_length,
+                output_dtype=self.algorithm.readouts[0].output_dtype,
+                return_final_state=return_final_state,
+            )
+            outputs = (output,)
+            final_state = (
+                StateTuple((self.algorithm.states[0].name,), (fused_final,))
+                if return_final_state
+                else None
+            )
+            if initial_state is None and sequence_offsets is None and not return_final_state:
+                self._dense_cached_call = self._build_dense_cached_call(
+                    inputs, runtime, state, plan
+                )
+        else:
+            values = self._normalize_inputs(inputs, runtime, role_sizes)
+            outputs, final_state = self._lower_parallel_scan(
+                values, state, runtime, return_final_state, plan
+            )
         return ExecutionResult(
             NamedOutputTuple(
                 tuple(readout.name for readout in self.algorithm.readouts), outputs
             ),
             final_state,
         )
+
+    def _build_dense_cached_call(
+        self,
+        inputs: Mapping[str, torch.Tensor],
+        runtime: _Runtime,
+        state: torch.Tensor,
+        plan: Any,
+    ) -> Callable[[Mapping[str, torch.Tensor]], ExecutionResult]:
+        specs = self.algorithm.inputs
+        expected_names = frozenset(spec.name for spec in specs)
+        expected_metadata = tuple(
+            (spec.name, tuple(inputs[spec.name].shape), spec.dtype, inputs[spec.name].device)
+            for spec in specs
+        )
+        output_names = tuple(readout.name for readout in self.algorithm.readouts)
+        output_dtype = self.algorithm.readouts[0].output_dtype
+        assert runtime.uniform_length is not None
+        sequence_count = runtime.sequence_count
+        sequence_length = runtime.uniform_length
+
+        def cached_call(current: Mapping[str, torch.Tensor]) -> ExecutionResult:
+            if current.keys() != expected_names:
+                missing = expected_names - current.keys()
+                unknown = current.keys() - expected_names
+                details = {"missing": sorted(missing)} if missing else {"unknown": sorted(unknown)}
+                raise StatefulCompilationError("RUNTIME_BINDING", "inputs", details)
+            for spec, (name, shape, dtype, device) in zip(specs, expected_metadata, strict=True):
+                tensor = current[name]
+                path = f"inputs.{name}"
+                if not isinstance(tensor, torch.Tensor):
+                    raise StatefulCompilationError(
+                        "RUNTIME_BINDING", path, {"expected": "torch.Tensor"}
+                    )
+                if tensor.dtype != dtype:
+                    raise StatefulCompilationError(
+                        "RUNTIME_DTYPE", path, {"expected": str(dtype), "actual": str(tensor.dtype)}
+                    )
+                if tensor.device != device:
+                    raise StatefulCompilationError("RUNTIME_DEVICE", "inputs", {})
+                if tuple(tensor.shape) != shape:
+                    raise StatefulCompilationError(
+                        "RUNTIME_SHAPE", path, {"expected": shape}
+                    )
+                if not tensor.is_contiguous():
+                    raise StatefulCompilationError(
+                        "RUNTIME_LAYOUT", path, {"expected": "contiguous"}
+                    )
+                if not spec.differentiable and tensor.requires_grad:
+                    raise StatefulCompilationError(
+                        "RUNTIME_GRAD", path, {"differentiable": False}
+                    )
+                if tensor.requires_grad:
+                    self._dense_cached_call = None
+                    return self(**current)
+            self._validate_aliases(current)
+            output, _ = plan.scalar_factorized_dense_raw(
+                current,
+                state,
+                sequence_count=sequence_count,
+                sequence_length=sequence_length,
+                output_dtype=output_dtype,
+                return_final_state=False,
+            )
+            return ExecutionResult(
+                NamedOutputTuple._unchecked(output_names, (output,)), None
+            )
+
+        return cached_call
 
     def _validate_runtime(
         self,
@@ -1055,6 +1163,7 @@ class StatefulOperator:
         scalar_profile = getattr(executable, "scalar_factorized", None)
         can_fuse_scalar = (
             scalar_profile is not None
+            and runtime.device.type == "cuda"
             and scalar_profile.injection_count == 1
             and scalar_profile.readout_count == 1
             and not any(tensor.requires_grad for tensor in values.values())

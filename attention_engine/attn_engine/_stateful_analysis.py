@@ -16,12 +16,44 @@ class ExecutionClass(Enum):
 
 
 @dataclass(frozen=True)
+class ScalarExpressionIR:
+    """One-input expression recipe accepted by the raw dense lowering."""
+
+    input_name: str
+    operation: str
+    scale: float = 1.0
+    is_log_scale: bool = False
+
+
+@dataclass(frozen=True)
+class DenseInputIR:
+    """Physical axes needed to load one dense Tensor Input directly."""
+
+    name: str
+    batch_axis: int
+    head_axis: int
+    sequence_axis: int
+    feature_axis: int | None
+
+
+@dataclass(frozen=True)
+class DenseScalarFactorizedIR:
+    """Target-independent recipe for one-launch dense scalar lowering."""
+
+    propagation: tuple[DenseInputIR, ScalarExpressionIR]
+    left_factor: tuple[DenseInputIR, ScalarExpressionIR]
+    right_factor: tuple[DenseInputIR, ScalarExpressionIR]
+    readout: tuple[DenseInputIR, ScalarExpressionIR]
+
+
+@dataclass(frozen=True)
 class ScalarFactorizedIR:
     """Structural proof for scalar propagation with rank-one injections."""
 
     injection_count: int
     readout_count: int
     propagation_count: int
+    dense: DenseScalarFactorizedIR | None
 
 
 @dataclass(frozen=True)
@@ -226,10 +258,43 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         readout.role == feature_roles[0] for readout in algorithm.readouts
     )
     if scalar_propagations and factorized_injections and same_orientation:
+        dense_scalar = None
+        if (
+            len(algorithm.transition.propagations) == 1
+            and len(algorithm.transition.injections) == 1
+            and len(algorithm.readouts) == 1
+        ):
+            propagation_node = algorithm.transition.propagations[0]
+            injection = algorithm.transition.injections[0]
+            left_factor = next(
+                factor for factor in injection.factors if factor.roles == (feature_roles[0],)
+            )
+            right_factor = next(
+                factor for factor in injection.factors if factor.roles == (feature_roles[1],)
+            )
+            propagation = _dense_scalar_binding(
+                propagation_node.factor, algorithm, feature_role=None
+            )
+            left = _dense_scalar_binding(
+                left_factor.expression, algorithm, feature_role=feature_roles[0]
+            )
+            right = _dense_scalar_binding(
+                right_factor.expression, algorithm, feature_role=feature_roles[1]
+            )
+            readout = _dense_scalar_binding(
+                algorithm.readouts[0].operand,
+                algorithm,
+                feature_role=feature_roles[0],
+            )
+            if all(recipe is not None for recipe in (propagation, left, right, readout)):
+                dense_scalar = DenseScalarFactorizedIR(
+                    propagation, left, right, readout
+                )
         scalar_factorized = ScalarFactorizedIR(
             len(algorithm.transition.injections),
             len(algorithm.readouts),
             len(algorithm.transition.propagations),
+            dense_scalar,
         )
     return Analysis(
         ExecutionClass.SCANABLE,
@@ -304,3 +369,66 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
         elif isinstance(expression, (Negate, Exp)):
             result.extend(_input_names(expression.operand))
     return tuple(result)
+
+
+def _dense_scalar_binding(
+    expression: InputExpression,
+    algorithm: AlgorithmIR,
+    *,
+    feature_role: Any | None,
+    require_exp: bool = False,
+) -> tuple[DenseInputIR, ScalarExpressionIR] | None:
+    from .stateful_operator import Batch, Constant, Exp, HeadRole, Input, Multiply, Negate, Sequence
+
+    operation = "identity"
+    scale = 1.0
+    is_log_scale = False
+    if isinstance(expression, Exp):
+        expression = expression.operand
+        is_log_scale = True
+    elif require_exp:
+        return None
+    if isinstance(expression, Negate):
+        expression = expression.operand
+        scale = -scale
+    if isinstance(expression, Multiply):
+        if isinstance(expression.left, Constant):
+            scale *= expression.left.value
+            expression = expression.right
+        elif isinstance(expression.right, Constant):
+            scale *= expression.right.value
+            expression = expression.left
+        else:
+            return None
+    if not isinstance(expression, Input):
+        return None
+    spec = next(item for item in algorithm.inputs if item.name == expression.name)
+    if Batch not in spec.roles or Sequence not in spec.roles:
+        return None
+    head_axis = next(
+        (index for index, role in enumerate(spec.roles) if isinstance(role, HeadRole)),
+        None,
+    )
+    if head_axis is None:
+        return None
+    expected_roles = (
+        (Batch, spec.roles[head_axis], Sequence)
+        if feature_role is None
+        else (Batch, spec.roles[head_axis], Sequence, feature_role)
+    )
+    if spec.roles != expected_roles:
+        return None
+    present_features = tuple(
+        role for role in algorithm.states[0].feature_roles if role in spec.roles
+    )
+    if present_features != (() if feature_role is None else (feature_role,)):
+        return None
+    feature_axis = None if feature_role is None else spec.roles.index(feature_role)
+    binding = DenseInputIR(
+        spec.name,
+        spec.roles.index(Batch),
+        head_axis,
+        spec.roles.index(Sequence),
+        feature_axis,
+    )
+    return binding, ScalarExpressionIR(spec.name, operation, scale, is_log_scale)
