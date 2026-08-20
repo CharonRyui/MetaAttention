@@ -2,12 +2,38 @@ from __future__ import annotations
 
 import json
 import statistics
+import time
 from collections.abc import Callable
 
 import torch
 
+from attn_engine import LinearAttentionEngine
+from core import CustomIO
+from core.utils import meta_tensor
 from examples.gated_retention import gated_retention
-from tests.functional.reference import gated_retention as reference_gated_retention
+
+
+BATCHES = 10
+REPETITIONS = 20
+WARMUP = 10
+
+
+def _legacy_gated_retention(B, H, S, D, DV, dtype=torch.bfloat16):
+    scale = 1 / D**0.5
+
+    def q_mod(query, custom_io):
+        return query * scale
+
+    return LinearAttentionEngine(
+        (
+            meta_tensor(B, H, S, D, dtype=dtype),
+            meta_tensor(B, H, S, D, dtype=dtype),
+            meta_tensor(B, H, S, DV, dtype=dtype),
+        ),
+        q_mod=q_mod,
+        custom_io=CustomIO({}),
+        tune=False,
+    )
 
 
 BATCHES = 10
@@ -31,13 +57,17 @@ def _median_runtime(call: Callable[[], object]) -> tuple[float, float]:
     return statistics.median(samples), max(samples)
 
 
-def _bootstrap(values: list[float], *, seed: int = 17) -> tuple[float, float]:
+def _paired_median_bootstrap(
+    new_values: list[float], old_values: list[float], *, seed: int = 17
+) -> tuple[float, float]:
+    if len(new_values) != len(old_values) or not new_values:
+        raise ValueError("paired samples must have equal nonzero length")
     generator = torch.Generator().manual_seed(seed)
-    tensor = torch.tensor(values, dtype=torch.float64)
-    draws = torch.randint(0, len(values), (20_000, len(values)), generator=generator)
-    ratios = tensor[draws].mean(dim=1)
-    quantiles = torch.tensor((0.025, 0.975), dtype=tensor.dtype)
-    interval = torch.quantile(ratios, quantiles)
+    new = torch.tensor(new_values, dtype=torch.float64)
+    old = torch.tensor(old_values, dtype=torch.float64)
+    draws = torch.randint(0, len(new_values), (20_000, len(new_values)), generator=generator)
+    ratios = new[draws].median(dim=1).values / old[draws].median(dim=1).values
+    interval = torch.quantile(ratios, torch.tensor((0.025, 0.975), dtype=new.dtype))
     return interval[0].item(), interval[1].item()
 
 
@@ -55,16 +85,19 @@ def main() -> None:
         raise SystemExit("CUDA is required")
     device = torch.device("cuda")
     query, key, value, gate = _profile(device)
+    compile_start = time.perf_counter()
     new = gated_retention(1, 2, 128, 64, 64)
-    old = reference_gated_retention
+
     def new_call():
         return new(query=query, key=key, value=value, gate=gate).outputs["output"]
 
-    def old_call():
-        return old(query, key, value, gate)
     new_call()
     torch.cuda.synchronize()
-    first_compile_ms = _median_runtime(new_call)[0]
+    first_compile_ms = (time.perf_counter() - compile_start) * 1_000
+    old = _legacy_gated_retention(1, 2, 128, 64, 64)
+
+    def old_call():
+        return old(query, key, value, gate)
     new_samples, old_samples = [], []
     peak_new, peak_old = [], []
     for batch in range(BATCHES):
@@ -80,18 +113,31 @@ def main() -> None:
             else:
                 old_samples.append(median)
                 peak_old.append(peak)
-    latency_ratios = [new / old for new, old in zip(new_samples, old_samples, strict=True)]
-    memory_ratios = [new / old for new, old in zip(peak_new, peak_old, strict=True)]
-    print(json.dumps({
-        "batches": BATCHES,
-        "repetitions": REPETITIONS,
-        "warmup": WARMUP,
-        "first_compile_ms": first_compile_ms,
-        "latency_ratio_ci95": _bootstrap(latency_ratios),
-        "memory_ratio_ci95": _bootstrap(memory_ratios),
-        "latency_ratios": latency_ratios,
-        "memory_ratios": memory_ratios,
-    }, indent=2))
+    latency_ratios = [
+        new_value / old_value
+        for new_value, old_value in zip(new_samples, old_samples, strict=True)
+    ]
+    memory_ratios = [
+        new_value / old_value
+        for new_value, old_value in zip(peak_new, peak_old, strict=True)
+    ]
+    print(
+        json.dumps(
+            {
+                "batches": BATCHES,
+                "repetitions": REPETITIONS,
+                "warmup": WARMUP,
+                "first_compile_ms": first_compile_ms,
+                "latency_ratio_ci95": _paired_median_bootstrap(
+                    new_samples, old_samples
+                ),
+                "memory_ratio_ci95": _paired_median_bootstrap(peak_new, peak_old),
+                "latency_ratios": latency_ratios,
+                "memory_ratios": memory_ratios,
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

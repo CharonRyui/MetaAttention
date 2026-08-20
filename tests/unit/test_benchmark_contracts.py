@@ -13,6 +13,8 @@ from benchmark import dump_bench_result, h100_cases, load_csv_data, mi250_cases
 from benchmark import figure11, figure14
 from benchmark import plot_fig_h100
 from benchmark.plot_fig_mi250 import plot_figure14
+from testing.benchmark_stateful_h20 import _paired_median_bootstrap
+
 
 
 pytestmark = [pytest.mark.unit, pytest.mark.io]
@@ -53,6 +55,13 @@ def _assert_metaattention_rows(paths: tuple[Path, ...]) -> None:
         rows = list(csv.reader(path.open(newline="", encoding="utf-8")))
         assert rows
         assert any(row and row[0] == "MetaAttention" for row in rows[1:])
+
+def test_paired_median_bootstrap_uses_batch_medians():
+    lower, upper = _paired_median_bootstrap(
+        [2.0, 4.0, 6.0, 8.0], [1.0, 2.0, 3.0, 4.0], seed=5
+    )
+    assert lower == pytest.approx(2.0)
+    assert upper == pytest.approx(2.0)
 
 
 def test_benchmark_case_matrices_are_exact():
