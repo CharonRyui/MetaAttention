@@ -1064,6 +1064,7 @@ class StatefulOperator:
                 sequence_count=runtime.sequence_count,
                 sequence_length=runtime.uniform_length,
                 output_dtype=self.algorithm.readouts[0].output_dtype,
+                return_final_state=return_final_state,
             )
             output_values = [output]
             final_state = (

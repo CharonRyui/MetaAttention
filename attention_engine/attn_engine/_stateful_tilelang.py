@@ -65,7 +65,8 @@ class TileLangExecutable:
         sequence_count: int,
         sequence_length: int,
         output_dtype: torch.dtype,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return_final_state: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.scalar_factorized is None:
             raise ValueError("plan is not scalar-factorized")
         return tilelang_scalar_factorized_dense(
@@ -77,6 +78,7 @@ class TileLangExecutable:
             sequence_count=sequence_count,
             sequence_length=sequence_length,
             output_dtype=output_dtype,
+            return_final_state=return_final_state,
         )
 
 
@@ -211,6 +213,7 @@ def _compile_scalar_factorized_dense_forward(
     input_dtype: torch.dtype,
     output_dtype: torch.dtype,
     device_index: int,
+    return_final_state: bool,
 ):
     import tilelang
     import tilelang.language as T
@@ -409,12 +412,12 @@ def _compile_scalar_factorized_dense_forward(
                             + update_fragment[row, column]
                         )
                     T.sync_threads()
-
-                for row, column in T.Parallel(rows, block_columns):
-                    if column_start + column < columns:
-                        final[
-                            sequence, head, row, column_start + column
-                        ] = state[row, column]
+                if return_final_state:
+                    for row, column in T.Parallel(rows, block_columns):
+                        if column_start + column < columns:
+                            final[
+                                sequence, head, row, column_start + column
+                            ] = state[row, column]
 
         return kernel
 
@@ -431,7 +434,8 @@ def tilelang_scalar_factorized_dense(
     sequence_count: int,
     sequence_length: int,
     output_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    return_final_state: bool,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
     heads, rows, columns = initial_state.shape[1:]
     output = torch.empty(
         sequence_count,
@@ -441,7 +445,7 @@ def tilelang_scalar_factorized_dense(
         device=left.device,
         dtype=output_dtype,
     )
-    final = torch.empty_like(initial_state)
+    final = torch.empty_like(initial_state) if return_final_state else initial_state
     device_index = left.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -454,6 +458,7 @@ def tilelang_scalar_factorized_dense(
         left.dtype,
         output_dtype,
         device_index,
+        return_final_state,
     )
     kernel(
         scale.reshape(sequence_count * sequence_length, heads)
@@ -472,7 +477,7 @@ def tilelang_scalar_factorized_dense(
         output,
         final,
     )
-    return output, final
+    return output, final if return_final_state else None
 
 
 def is_parallel_plan(plan: Any) -> bool:
