@@ -533,6 +533,7 @@ class StatefulOperator:
         self.compile_options = compile_options or CompileOptions()
         self._specializations: set[str] = set()
         self._plans: dict[str, Any] = {}
+        self._zero_states: dict[tuple[Any, ...], torch.Tensor] = {}
 
     @property
     def _structural_identity(self) -> str:
@@ -566,7 +567,13 @@ class StatefulOperator:
         runtime, role_sizes = self._validate_runtime(inputs, sequence_offsets)
         self._validate_target(runtime.device)
         self._validate_aliases(inputs)
-        state = self._validate_state(initial_state, runtime)
+        state = self._validate_state(
+            initial_state,
+            runtime,
+            cache_default=not (
+                runtime.token_count == 0 and return_final_state
+            ),
+        )
         specialization = self._specialization_key(
             inputs, state, runtime, return_final_state
         )
@@ -803,7 +810,11 @@ class StatefulOperator:
                     )
 
     def _validate_state(
-        self, state: StateTuple | None, runtime: _Runtime
+        self,
+        state: StateTuple | None,
+        runtime: _Runtime,
+        *,
+        cache_default: bool,
     ) -> torch.Tensor:
         spec = self.algorithm.states[0]
         shape = (
@@ -813,7 +824,14 @@ class StatefulOperator:
             runtime.feature_sizes[1],
         )
         if state is None:
-            return torch.zeros(shape, device=runtime.device, dtype=torch.float32)
+            if not cache_default:
+                return torch.zeros(shape, device=runtime.device, dtype=torch.float32)
+            key = (runtime.device, *shape)
+            cached = self._zero_states.get(key)
+            if cached is None:
+                cached = torch.zeros(shape, device=runtime.device, dtype=torch.float32)
+                self._zero_states[key] = cached
+            return cached
         if not isinstance(state, StateTuple) or state.names != (spec.name,):
             raise StatefulCompilationError(
                 "RUNTIME_STATE", "initial_state", {"expected": [spec.name]}

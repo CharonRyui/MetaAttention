@@ -489,6 +489,21 @@ def tilelang_scalar_factorized_forward(
         final,
     )
     return output, final if return_final_state else None
+
+
+@lru_cache(maxsize=None)
+def _dense_offsets(
+    sequence_count: int, sequence_length: int, device_index: int
+) -> torch.Tensor:
+    return torch.arange(
+        0,
+        (sequence_count + 1) * sequence_length,
+        sequence_length,
+        device=torch.device("cuda", device_index),
+        dtype=torch.int32,
+    )
+
+
 def tilelang_scalar_factorized_dense(
     scale: torch.Tensor,
     left: torch.Tensor,
@@ -501,13 +516,10 @@ def tilelang_scalar_factorized_dense(
     output_dtype: torch.dtype,
     return_final_state: bool,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    offsets = torch.arange(
-        0,
-        (sequence_count + 1) * sequence_length,
-        sequence_length,
-        device=scale.device,
-        dtype=torch.int32,
-    )
+    device_index = scale.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    offsets = _dense_offsets(sequence_count, sequence_length, device_index)
     output, final = tilelang_scalar_factorized_forward(
         scale,
         left,
