@@ -507,7 +507,7 @@ def tilelang_scalar_factorized_dense(
         device=scale.device,
         dtype=torch.int32,
     )
-    return tilelang_scalar_factorized_forward(
+    output, final = tilelang_scalar_factorized_forward(
         scale,
         left,
         right,
@@ -519,6 +519,10 @@ def tilelang_scalar_factorized_dense(
         output_dtype=output_dtype,
         return_final_state=return_final_state,
     )
+    output = output.reshape(
+        sequence_count, sequence_length, output.shape[1], output.shape[2]
+    ).permute(0, 2, 1, 3)
+    return output, final
 
 
 
