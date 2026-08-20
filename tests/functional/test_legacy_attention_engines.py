@@ -235,6 +235,45 @@ def test_legacy_gated_retention_unaligned_scalar_carry(gpu_device, seed):
             "bhd,bhdf->bhf", scale * query_f[:, :, token], state
         )
     torch.testing.assert_close(actual, expected.to(dtype), rtol=1e-1, atol=1e-1)
+def test_gated_retention_packed_scalar_inference(gpu_device, seed):
+    lengths = (0, 65, 64, 0)
+    token_count = sum(lengths)
+    heads, dim = 2, 64
+    dtype = torch.bfloat16
+    module = gated_retention(4, heads, 65, dim, dim, dtype=dtype)
+    query = torch.randn(token_count, heads, dim, device=gpu_device, dtype=dtype)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    gate = torch.full((token_count, heads), -0.01, device=gpu_device)
+    offsets = torch.tensor((0, 0, 65, 129, 129), device=gpu_device, dtype=torch.int32)
+    initial = torch.randn(4, heads, dim, dim, device=gpu_device, dtype=torch.float32)
+    result = module(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        sequence_offsets=offsets,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    expected = torch.empty_like(query)
+    expected_final = initial.clone()
+    scale = dim**-0.5
+    start = 0
+    for sequence, length in enumerate(lengths):
+        state = initial[sequence]
+        for token in range(start, start + length):
+            state = gate[token, :, None, None].exp() * state
+            state = state + key[token, :, :, None].float() * value[token, :, None, :].float()
+            expected[token] = torch.einsum(
+                "hd,hdf->hf", scale * query[token].float(), state
+            ).to(dtype)
+        expected_final[sequence] = state
+        start += length
+    assert result.final_state is not None
+    torch.testing.assert_close(result.outputs["output"], expected, rtol=0.1, atol=0.1)
+    torch.testing.assert_close(result.final_state["memory"], expected_final, rtol=0.1, atol=0.1)
+
 
 
 

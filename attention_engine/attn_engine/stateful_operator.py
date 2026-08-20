@@ -1037,7 +1037,6 @@ class StatefulOperator:
         scalar_profile = getattr(executable, "scalar_factorized", None)
         can_fuse_scalar = (
             scalar_profile is not None
-            and not runtime.packed
             and scalar_profile.injection_count == 1
             and scalar_profile.readout_count == 1
             and not any(tensor.requires_grad for tensor in values.values())
@@ -1055,17 +1054,35 @@ class StatefulOperator:
                 state_spec,
             ).float()
             assert elementwise is not None
-            output, fused_final = executable.scalar_factorized_dense(
-                elementwise,
-                factors[state_spec.feature_roles[0]],
-                factors[state_spec.feature_roles[1]],
-                readout,
-                initial_state,
-                sequence_count=runtime.sequence_count,
-                sequence_length=runtime.uniform_length,
-                output_dtype=self.algorithm.readouts[0].output_dtype,
-                return_final_state=return_final_state,
-            )
+            if runtime.packed:
+                assert runtime.offsets is not None
+                max_sequence_length = max(
+                    runtime.token_count, 1
+                )
+                output, fused_final = executable.scalar_factorized_packed(
+                    elementwise,
+                    factors[state_spec.feature_roles[0]],
+                    factors[state_spec.feature_roles[1]],
+                    readout,
+                    initial_state,
+                    runtime.offsets,
+                    sequence_count=runtime.sequence_count,
+                    max_sequence_length=max_sequence_length,
+                    output_dtype=self.algorithm.readouts[0].output_dtype,
+                    return_final_state=return_final_state,
+                )
+            else:
+                output, fused_final = executable.scalar_factorized_dense(
+                    elementwise,
+                    factors[state_spec.feature_roles[0]],
+                    factors[state_spec.feature_roles[1]],
+                    readout,
+                    initial_state,
+                    sequence_count=runtime.sequence_count,
+                    sequence_length=runtime.uniform_length,
+                    output_dtype=self.algorithm.readouts[0].output_dtype,
+                    return_final_state=return_final_state,
+                )
             output_values = [output]
             final_state = (
                 StateTuple((state_spec.name,), (fused_final,))
