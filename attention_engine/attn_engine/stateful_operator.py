@@ -1045,14 +1045,14 @@ class StatefulOperator:
         if can_fuse_scalar:
             injection_term = self.algorithm.transition.injections[0]
             factors = {
-                factor.roles[0]: _evaluate(factor.expression, values).float()
+                factor.roles[0]: _evaluate(factor.expression, values)
                 for factor in injection_term.factors
             }
             readout = _feature_vector(
                 _evaluate(self.algorithm.readouts[0].operand, values),
                 self.algorithm.readouts[0].role,
                 state_spec,
-            ).float()
+            )
             assert elementwise is not None
             if runtime.packed:
                 assert runtime.offsets is not None
