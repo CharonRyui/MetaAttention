@@ -38,3 +38,19 @@ EXAMPLE_FACTORIES = (
 def test_official_example_factory_imports(module_name: str, factory_name: str):
     module = importlib.import_module(module_name)
     assert callable(getattr(module, factory_name))
+
+
+def test_stateful_profile_factories_return_stateful_operators():
+    from attn_engine import StatefulOperator
+    from examples.gated_delta_rule import gated_delta_rule
+    from examples.gated_retention import gated_retention
+    from examples.mamba2 import mamba2
+    from examples.retnet_recurrent import retnet_recurrent
+
+    factories = (
+        gated_retention(1, 2, 4, 64, 64),
+        retnet_recurrent(1, 2, 4, 64, 64),
+        mamba2(1, 2, 4, 64, 64),
+        gated_delta_rule(1, 2, 4, 64, 64),
+    )
+    assert all(isinstance(operator, StatefulOperator) for operator in factories)

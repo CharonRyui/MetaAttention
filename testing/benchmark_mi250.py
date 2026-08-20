@@ -354,9 +354,11 @@ def bench_retnet_recurrent(
 
     # ours
     attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype, tune=True)
-    fwd_lat = do_bench(lambda: attention_module(q, k, v, g))
+    fwd_lat = do_bench(
+        lambda: attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
+    )
     if require_grad:
-        o = attention_module(q, k, v, g)
+        o = attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
         bwd_lat = do_bench(lambda: o.backward(do, retain_graph=True))
 
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
@@ -421,11 +423,13 @@ def bench_mamba2_ssm(
     attention_module = mamba2(B, HQ, S, D, DV, HK, HV, dtype=dtype, tune=True)
     fwd_lat = do_bench(
         lambda: attention_module(
-            q_ours, k_ours, v_ours, dt_ours, A_ours, dt_ours.to(dtype)
-        )
+            query=q_ours, key=k_ours, value=v_ours, A=A_ours, dt=dt_ours
+        ).outputs["output"]
     )
     if require_grad:
-        o = attention_module(q_ours, k_ours, v_ours, dt_ours, A_ours, dt_ours.to(dtype))
+        o = attention_module(
+            query=q_ours, key=k_ours, value=v_ours, A=A_ours, dt=dt_ours
+        ).outputs["output"]
         bwd_lat = do_bench(lambda: o.backward(do_ours, retain_graph=True))
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
 

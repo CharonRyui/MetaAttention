@@ -6,3 +6,5 @@ autotuner.log
 .eggs/
 build/
 dist/
+attention_engine/core/template/third_party/
+testing/tuned_config/

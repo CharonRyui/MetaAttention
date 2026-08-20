@@ -2,6 +2,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 from attn_engine import (
+    Batch,
+    FeatureRole,
+    HeadRole,
+    Sequence,
     AlgorithmIR,
     AttentionEngine,
     AxisScale,
@@ -21,6 +25,14 @@ from attn_engine import (
 from benchmark.bench_utils import assert_close
 from core import CustomIO, SymbolScalar, Var, meta_tensor
 from einops import einsum, rearrange
+
+KEY = FeatureRole("key_dim")
+VALUE = FeatureRole("value_dim")
+QUERY_HEADS = HeadRole("query_heads")
+KEY_HEADS = HeadRole("key_heads")
+VALUE_HEADS = HeadRole("value_heads")
+STATE_HEADS = HeadRole("state_heads")
+
 
 pytestmark = [
     pytest.mark.functional,
@@ -576,19 +588,19 @@ def test_linear_stateful_operator_supports_initial_and_final_state(gpu_device, s
     dtype = torch.bfloat16
     algorithm = AlgorithmIR(
         inputs=(
-            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
-            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
-            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
-            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+            TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
+            TensorInput("key", (Batch, KEY_HEADS, Sequence, KEY), dtype),
+            TensorInput("value", (Batch, VALUE_HEADS, Sequence, VALUE), dtype),
+            TensorInput("gate", (Batch, STATE_HEADS, Sequence), torch.float32),
         ),
-        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("gate"))),),
-            injections=(ProductInjection((ProductFactor(Input("key"), ("key_dim",)), ProductFactor(Input("value"), ("value_dim",)))),),
+            injections=(ProductInjection((ProductFactor(Input("key"), (KEY,)), ProductFactor(Input("value"), (VALUE,)))),),
         ),
-        readouts=(StateContraction("output", "memory", Input("query"), "key_dim", dtype),),
-        head_mapping=HeadMapping({"query_heads": "state_heads", "key_heads": "state_heads", "value_heads": "state_heads"}),
+        readouts=(StateContraction("output", "memory", Input("query"), KEY, dtype),),
+        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}),
     )
     operator = StatefulOperator(algorithm)
     query = torch.randn(1, 1, 64, 64, device=gpu_device, dtype=dtype)
@@ -626,19 +638,19 @@ def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequenc
     dtype = torch.bfloat16
     algorithm = AlgorithmIR(
         inputs=(
-            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
-            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
-            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
-            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+            TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
+            TensorInput("key", (Batch, KEY_HEADS, Sequence, KEY), dtype),
+            TensorInput("value", (Batch, VALUE_HEADS, Sequence, VALUE), dtype),
+            TensorInput("gate", (Batch, STATE_HEADS, Sequence), torch.float32),
         ),
-        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("gate"))),),
-            injections=(ProductInjection((ProductFactor(Input("key"), ("key_dim",)), ProductFactor(Input("value"), ("value_dim",)))),),
+            injections=(ProductInjection((ProductFactor(Input("key"), (KEY,)), ProductFactor(Input("value"), (VALUE,)))),),
         ),
-        readouts=(StateContraction("output", "memory", Input("query"), "key_dim", dtype),),
-        head_mapping=HeadMapping({"query_heads": "state_heads", "key_heads": "state_heads", "value_heads": "state_heads"}),
+        readouts=(StateContraction("output", "memory", Input("query"), KEY, dtype),),
+        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}),
     )
     operator = StatefulOperator(algorithm)
     query = torch.randn(1, 1, 128, 64, device=gpu_device, dtype=dtype)

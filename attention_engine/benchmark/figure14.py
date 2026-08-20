@@ -318,9 +318,11 @@ def bench_retnet_recurrent(
     v1.requires_grad_(require_grad)
 
     attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype, tune=True)
-    fwd_lat = timer(lambda: attention_module(q, k, v, g))
+    fwd_lat = timer(
+        lambda: attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
+    )
     if require_grad:
-        output = attention_module(q, k, v, g)
+        output = attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
         bwd_lat = timer(lambda: output.backward(do, retain_graph=True))
     else:
         bwd_lat = None
@@ -393,13 +395,13 @@ def bench_mamba2_ssm(
     attention_module = mamba2(B, HQ, S, D, DV, HK, HV, dtype=dtype, tune=True)
     fwd_lat = timer(
         lambda: attention_module(
-            q_ours, k_ours, v_ours, dt_ours, A_ours, dt_ours.to(dtype)
-        )
+            query=q_ours, key=k_ours, value=v_ours, A=A_ours, dt=dt_ours
+        ).outputs["output"]
     )
     if require_grad:
         output = attention_module(
-            q_ours, k_ours, v_ours, dt_ours, A_ours, dt_ours.to(dtype)
-        )
+            query=q_ours, key=k_ours, value=v_ours, A=A_ours, dt=dt_ours
+        ).outputs["output"]
         bwd_lat = timer(lambda: output.backward(do_ours, retain_graph=True))
     else:
         bwd_lat = None

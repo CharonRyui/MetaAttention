@@ -10,14 +10,18 @@ from attn_engine import (
     Add,
     AlgorithmIR,
     AxisScale,
+    Batch,
     Constant,
     ExecutionResult,
     Exp,
+    FeatureRole,
     HeadMapping,
+    HeadRole,
     Input,
     Multiply,
     ProductFactor,
     ProductInjection,
+    Sequence,
     StateContraction,
     StateSpec,
     StateTransition,
@@ -27,36 +31,48 @@ from attn_engine import (
     TensorInput,
 )
 
+
 pytestmark = pytest.mark.unit
+@pytest.fixture(autouse=True)
+def _allow_cpu_stateful_operator(monkeypatch):
+    monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "1")
+
+
+KEY = FeatureRole("key_dim")
+VALUE = FeatureRole("value_dim")
+QUERY_HEADS = HeadRole("query_heads")
+KEY_HEADS = HeadRole("key_heads")
+VALUE_HEADS = HeadRole("value_heads")
+STATE_HEADS = HeadRole("state_heads")
 
 
 def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
     return AlgorithmIR(
         inputs=(
-            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), dtype),
-            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), dtype),
-            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), dtype),
-            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
+            TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
+            TensorInput("key", (Batch, KEY_HEADS, Sequence, KEY), dtype),
+            TensorInput("value", (Batch, VALUE_HEADS, Sequence, VALUE), dtype),
+            TensorInput("gate", (Batch, STATE_HEADS, Sequence), torch.float32),
         ),
-        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("gate"))),),
             injections=(
                 ProductInjection(
                     (
-                        ProductFactor(Input("key"), ("key_dim",)),
-                        ProductFactor(Input("value"), ("value_dim",)),
+                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("value"), (VALUE,)),
                     )
                 ),
             ),
         ),
-        readouts=(StateContraction("output", "memory", Input("query"), "key_dim", dtype),),
+        readouts=(StateContraction("output", "memory", Input("query"), KEY, dtype),),
         head_mapping=HeadMapping(
             mappings={
-                "query_heads": "state_heads",
-                "key_heads": "state_heads",
-                "value_heads": "state_heads",
+                QUERY_HEADS: STATE_HEADS,
+                KEY_HEADS: STATE_HEADS,
+                VALUE_HEADS: STATE_HEADS,
             }
         ),
     )
@@ -64,13 +80,12 @@ def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
 
 def _inputs(length: int = 3, *, requires_grad: bool = False):
     generator = torch.Generator().manual_seed(7)
-    tensors = {
+    return {
         "query": torch.randn(1, 1, length, 2, generator=generator, requires_grad=requires_grad),
         "key": torch.randn(1, 1, length, 2, generator=generator, requires_grad=requires_grad),
         "value": torch.randn(1, 1, length, 3, generator=generator, requires_grad=requires_grad),
         "gate": torch.randn(1, 1, length, generator=generator, requires_grad=requires_grad),
     }
-    return tensors
 
 
 def _reference(inputs, initial=None):
@@ -83,6 +98,40 @@ def _reference(inputs, initial=None):
         )
         outputs.append(torch.einsum("bhf,bhfg->bhg", inputs["query"][..., token, :], state))
     return torch.stack(outputs, dim=2), state
+
+
+def test_batch_static_inputs_preserve_per_sequence_values():
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", (Batch, STATE_HEADS, Sequence, KEY), torch.float32),
+            TensorInput("key", (Batch, STATE_HEADS, Sequence, KEY), torch.float32),
+            TensorInput("weight", (Batch, STATE_HEADS, VALUE), torch.float32),
+        ),
+        states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
+        transition=StateTransition(
+            "memory",
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("weight"), (VALUE,)),
+                    )
+                ),
+            ),
+        ),
+        readouts=(
+            StateContraction("output", "memory", Input("query"), KEY, torch.float32),
+        ),
+        head_mapping=HeadMapping(),
+    )
+    query = torch.ones(2, 1, 2, 2)
+    key = torch.ones(2, 1, 2, 2)
+    weight = torch.tensor([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 6.0]]])
+    output = StatefulOperator(algorithm)(query=query, key=key, weight=weight).outputs[0]
+    expected = torch.tensor(
+        [[[[2.0, 4.0, 6.0], [4.0, 8.0, 12.0]]], [[[8.0, 10.0, 12.0], [16.0, 20.0, 24.0]]]]
+    )
+    torch.testing.assert_close(output, expected)
 
 
 def test_constant_bits_and_commutative_identity_are_canonical():
@@ -121,17 +170,13 @@ def test_omitted_state_and_continuation_match_full_invocation():
         **{name: value[:, :, 2:] for name, value in inputs.items()},
         initial_state=prefix.final_state,
     )
-    torch.testing.assert_close(
-        torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2),
-        full.outputs[0],
-    )
+    torch.testing.assert_close(torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2), full.outputs[0])
 
 
 def test_packed_empty_sequences_preserve_state_and_offsets_are_runtime_data():
     operator = StatefulOperator(_accumulator_ir())
     dense = _inputs(length=3)
     packed = {name: value.squeeze(0).transpose(0, 1).contiguous() for name, value in dense.items()}
-    # canonical packed tensors are [tokens, heads, features...]
     packed = {name: value.transpose(0, 1).contiguous() if value.shape[0] == 1 else value for name, value in packed.items()}
     offsets = torch.tensor([0, 0, 3, 3], dtype=torch.int32)
     initial = torch.randn(3, 1, 2, 3)
@@ -144,7 +189,133 @@ def test_packed_empty_sequences_preserve_state_and_offsets_are_runtime_data():
     assert result.final_state is not None
     torch.testing.assert_close(result.final_state[0][0], initial[0])
     torch.testing.assert_close(result.final_state[0][2], initial[2])
-    assert result.outputs[0].shape[0] == 3
+    assert result.outputs[0].shape == (3, 1, 3)
+
+def test_specialization_identity_reuses_offset_metadata_and_tracks_training_modes():
+    operator = StatefulOperator(_accumulator_ir())
+    dense = _inputs(length=3)
+    packed = {
+        name: value.squeeze(0).transpose(0, 1).contiguous()
+        for name, value in dense.items()
+    }
+    packed = {
+        name: value.transpose(0, 1).contiguous() if value.shape[0] == 1 else value
+        for name, value in packed.items()
+    }
+    operator(**packed, sequence_offsets=torch.tensor([0, 1, 3], dtype=torch.int32))
+    operator(**packed, sequence_offsets=torch.tensor([0, 2, 3], dtype=torch.int32))
+    assert len(operator._specializations) == 1
+
+    initial = torch.zeros(2, 1, 2, 3, requires_grad=True)
+    operator(
+        **packed,
+        sequence_offsets=torch.tensor([0, 2, 3], dtype=torch.int32),
+        initial_state=StateTuple(("memory",), (initial,)),
+    )
+    assert len(operator._specializations) == 2
+
+
+def test_analysis_derives_scanable_affine_summary_and_backward_ir():
+    analysis = _accumulator_ir()._analysis
+    assert analysis.execution_class.value == "scanable"
+    assert analysis.affine_summary.transform == "dense"
+    assert analysis.backward.output_cotangents == ("output",)
+    assert analysis.backward.initial_state_gradient == "d_memory_initial"
+    assert {step.operation for step in analysis.backward.reverse_steps} >= {
+        "axis_scale",
+        "product_injection",
+        "state_contraction",
+        "head_reduce",
+    }
+
+def test_compiled_plan_owns_parallel_forward_and_derived_backward():
+    operator = StatefulOperator(_accumulator_ir())
+    operator(**_inputs())
+    executable = next(iter(operator._plans.values()))
+
+    assert executable.plan.uses_parallel_summary
+    assert executable.backward_ir is operator.algorithm._analysis.backward
+    assert any(
+        step.operation == "state_recurrence"
+        for step in executable.backward_ir.reverse_steps
+    )
+
+def test_analysis_maps_expression_head_roles_to_state_heads():
+    analysis = _accumulator_ir()._analysis
+    injection_type = dict(analysis.expression_types)[
+        "transition.injections[0].factors[0].expression"
+    ]
+    assert STATE_HEADS in injection_type.roles
+    assert KEY_HEADS not in injection_type.roles
+
+
+def test_analysis_rejects_unmapped_incompatible_head_roles():
+    other_heads = HeadRole("other_heads")
+    with pytest.raises(StatefulCompilationError) as captured:
+        AlgorithmIR(
+            inputs=(
+                TensorInput("left", (Batch, KEY_HEADS, Sequence, KEY), torch.float32),
+                TensorInput("right", (Batch, other_heads, Sequence, KEY), torch.float32),
+            ),
+            states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
+            transition=StateTransition(
+                "memory",
+                injections=(
+                    ProductInjection(
+                        (
+                            ProductFactor(Input("left") * Input("right"), (KEY,)),
+                            ProductFactor(Constant(1.0), (VALUE,)),
+                        )
+                    ),
+                ),
+            ),
+            readouts=(StateContraction("output", "memory", Input("left"), KEY),),
+            head_mapping=HeadMapping({KEY_HEADS: STATE_HEADS}),
+        )
+    assert captured.value.category == "IR_TYPE"
+    assert captured.value.path == "transition.injections[0].factors[0].expression"
+
+
+@pytest.mark.parametrize("loss_mode", ("output", "state", "joint"))
+def test_output_and_final_state_cotangent_modes_match_reference(loss_mode):
+    actual_inputs = _inputs(length=4, requires_grad=True)
+    reference_inputs = {
+        name: value.detach().clone().requires_grad_()
+        for name, value in actual_inputs.items()
+    }
+    actual_initial = torch.randn(1, 1, 2, 3, requires_grad=True)
+    reference_initial = actual_initial.detach().clone().requires_grad_()
+    result = StatefulOperator(_accumulator_ir())(
+        **actual_inputs,
+        initial_state=StateTuple(("memory",), (actual_initial,)),
+        return_final_state=True,
+    )
+    expected_output, expected_state = _reference(reference_inputs, reference_initial)
+    assert result.final_state is not None
+    actual_loss = torch.zeros((), dtype=torch.float32)
+    expected_loss = torch.zeros((), dtype=torch.float32)
+    if loss_mode in ("output", "joint"):
+        actual_loss = actual_loss + result.outputs[0].square().sum()
+        expected_loss = expected_loss + expected_output.square().sum()
+    if loss_mode in ("state", "joint"):
+        actual_loss = actual_loss + result.final_state[0].square().sum()
+        expected_loss = expected_loss + expected_state.square().sum()
+    actual_gradients = torch.autograd.grad(
+        actual_loss, (*actual_inputs.values(), actual_initial), allow_unused=True
+    )
+    expected_gradients = torch.autograd.grad(
+        expected_loss, (*reference_inputs.values(), reference_initial), allow_unused=True
+    )
+    for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=5e-5, atol=1e-3)
+
+
+def test_untyped_roles_are_rejected_without_compatibility_shim():
+    with pytest.raises(TypeError, match="typed logical roles"):
+        TensorInput("query", ("batch", "heads", "sequence", "feature"), torch.float32)
 
 
 def test_structured_errors_are_json_safe_and_have_canonical_paths():
@@ -155,6 +326,20 @@ def test_structured_errors_are_json_safe_and_have_canonical_paths():
     assert error.category == "RUNTIME_BINDING"
     assert error.path == "inputs"
     json.dumps(error.as_dict())
+
+def test_structured_errors_with_typed_roles_are_json_safe():
+    error = StatefulCompilationError(
+        "IR_TYPE", "roles", {"role": KEY, "mapping": {QUERY_HEADS: STATE_HEADS}}
+    )
+    assert json.loads(json.dumps(error.as_dict())) == {
+        "category": "IR_TYPE",
+        "path": "roles",
+        "details": {
+            "mapping": {"query_heads": {"name": "state_heads", "node": "HeadRole"}},
+            "role": {"name": "key_dim", "node": "FeatureRole"},
+        },
+    }
+
 
 
 def test_ir_requires_exactly_one_matrix_state():

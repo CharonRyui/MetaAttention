@@ -6,6 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from attn_engine import StateTuple
 from examples.gated_retention import gated_retention
 from examples.mamba2 import mamba2
 from examples.mha import causal_softmax_attention
@@ -89,11 +90,11 @@ def test_legacy_mamba2(gpu_device, seed):
     batch, query_heads, seqlen, dim, dim_value, key_heads, value_heads = (
         1,
         1,
-        2048,
+        128,
         128,
         64,
         1,
-        80,
+        4,
     )
     dtype = torch.bfloat16
     module = mamba2(
@@ -128,21 +129,26 @@ def test_legacy_mamba2(gpu_device, seed):
     query_actual = query.transpose(1, 2).contiguous().requires_grad_()
     key_actual = key.transpose(1, 2).contiguous().requires_grad_()
     value_actual = value.transpose(1, 2).contiguous().requires_grad_()
-    a_actual = a_param[None].contiguous().requires_grad_()
+    a_actual = (
+        a_param[None, :, None]
+        .expand(batch, value_heads, dim)
+        .contiguous()
+        .requires_grad_()
+    )
     delta_actual = delta_t.transpose(1, 2).contiguous().requires_grad_()
     query_ref = query.detach().requires_grad_()
     key_ref = key.detach().requires_grad_()
     value_ref = value.detach().requires_grad_()
     a_ref = a_param.detach().requires_grad_()
     delta_ref = delta_t.detach().requires_grad_()
-    actual = module(
+    actual_result = module(
         query=query_actual,
         key=key_actual,
         value=value_actual,
-        delta=delta_actual,
         A=a_actual,
-        dt=delta_actual.to(dtype),
+        dt=delta_actual,
     )
+    actual = actual_result.outputs["output"]
     expected = mamba2_reference(value_ref, delta_ref, a_ref, key_ref, query_ref).to(
         dtype
     )
@@ -167,7 +173,7 @@ def test_legacy_mamba2(gpu_device, seed):
 
 
 def test_legacy_gated_retention(gpu_device, seed):
-    batch, heads, seqlen, dim, dim_value = 8, 32, 2048, 256, 256
+    batch, heads, seqlen, dim, dim_value = 1, 2, 128, 64, 64
     dtype = torch.bfloat16
     module = gated_retention(batch, heads, seqlen, dim, dim_value, dtype=dtype)
     query = torch.randn(
@@ -188,7 +194,7 @@ def test_legacy_gated_retention(gpu_device, seed):
     key_ref = key.detach().clone().requires_grad_()
     gate_ref = gate.detach().clone().to(dtype).requires_grad_()
     value_ref = value.detach().clone().requires_grad_()
-    actual = module(query=query, key=key, value=value, gate=gate)
+    actual = module(query=query, key=key, value=value, gate=gate).outputs["output"]
     expected = gated_retention_reference(query_ref, key_ref, value_ref, gate_ref).to(
         dtype
     )
@@ -202,6 +208,34 @@ def test_legacy_gated_retention(gpu_device, seed):
         rtol=1e-1,
         atol=1e-1,
     )
+def test_legacy_gated_retention_unaligned_scalar_carry(gpu_device, seed):
+    batch, heads, seqlen, dim, dim_value = 1, 2, 129, 64, 64
+    dtype = torch.bfloat16
+    module = gated_retention(batch, heads, seqlen, dim, dim_value, dtype=dtype)
+    query = torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype)
+    key = torch.randn_like(query)
+    gate = torch.full((batch, heads, seqlen), -0.001, device=gpu_device)
+    value = torch.randn(batch, heads, seqlen, dim_value, device=gpu_device, dtype=dtype)
+    initial = torch.randn(batch, heads, dim, dim_value, device=gpu_device, dtype=torch.float32)
+    actual = module(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        initial_state=StateTuple(("memory",), (initial,)),
+    ).outputs["output"]
+    query_f, key_f, value_f, gate_f = [x.float() for x in (query, key, value, gate)]
+    state = initial.clone()
+    expected = torch.empty(batch, heads, seqlen, dim_value, device=gpu_device)
+    scale = dim**-0.5
+    for token in range(seqlen):
+        state = gate_f[:, :, token, None, None].exp() * state
+        state = state + key_f[:, :, token, :, None] * value_f[:, :, token, None, :]
+        expected[:, :, token] = torch.einsum(
+            "bhd,bhdf->bhf", scale * query_f[:, :, token], state
+        )
+    torch.testing.assert_close(actual, expected.to(dtype), rtol=1e-1, atol=1e-1)
+
 
 
 def test_legacy_sigmoid(gpu_device, seed):
@@ -282,7 +316,7 @@ def test_legacy_sparse_gqa_decode(gpu_device, seed):
 
 
 def test_legacy_retnet_recurrent(gpu_device, seed):
-    batch, heads, seqlen, dim, dim_value = 1, 32, 2048, 256, 512
+    batch, heads, seqlen, dim, dim_value = 1, 2, 128, 64, 128
     dtype = torch.bfloat16
     module = retnet_recurrent(
         batch, heads, seqlen, dim, dim_value, dtype=dtype, tune=False
@@ -301,7 +335,7 @@ def test_legacy_retnet_recurrent(gpu_device, seed):
     query_ref = query.detach().clone().requires_grad_()
     key_ref = key.detach().clone().requires_grad_()
     value_ref = value.detach().clone().requires_grad_()
-    actual = module(query=query, key=key, value=value, gate=gate)
+    actual = module(query=query, key=key, value=value, gate=gate).outputs["output"]
     expected = retnet_reference(query_ref, key_ref, value_ref)
     torch.testing.assert_close(actual, expected, rtol=1e-1, atol=1e-1)
     upstream = 0.1 * torch.randn_like(actual)

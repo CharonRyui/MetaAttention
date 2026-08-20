@@ -3,6 +3,10 @@ from __future__ import annotations
 import torch
 
 from attn_engine import (
+    Batch,
+    FeatureRole,
+    HeadRole,
+    Sequence,
     AlgorithmIR,
     AxisScale,
     Exp,
@@ -15,72 +19,150 @@ from attn_engine import (
     StateSpec,
     StateTransition,
     StatefulOperator,
-    StateTuple,
     TensorInput,
 )
 
+KEY = FeatureRole("key_dim")
+VALUE = FeatureRole("value_dim")
+QUERY_HEADS = HeadRole("query_heads")
+KEY_HEADS = HeadRole("key_heads")
+VALUE_HEADS = HeadRole("value_heads")
+STATE_HEADS = HeadRole("state_heads")
 
-def gated_delta_rule(device: str | torch.device = "cuda") -> tuple[torch.Tensor, torch.Tensor]:
-    """Gated Delta Rule expressed only with generic Stateful Operator nodes."""
-    device = torch.device(device)
-    batch, query_heads, state_heads, length, dim = 1, 1, 2, 64, 128
-    query = torch.randn(batch, query_heads, length, dim, device=device, dtype=torch.bfloat16, requires_grad=True)
-    key = torch.randn_like(query, requires_grad=True)
-    value = torch.randn(batch, state_heads, length, dim, device=device, dtype=torch.bfloat16, requires_grad=True)
-    gate = (-torch.rand(batch, state_heads, length, device=device)).requires_grad_()
-    beta = torch.rand(batch, state_heads, length, device=device, requires_grad=True)
-    initial = torch.zeros(batch, state_heads, dim, dim, device=device, dtype=torch.float32, requires_grad=True)
 
+def gated_delta_rule(
+    B: int,
+    H: int,
+    S: int,
+    D: int,
+    DV: int,
+    *,
+    HQ: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> StatefulOperator:
+    """Build the GDN acceptance profile from generic Stateful Operator nodes."""
     algorithm = AlgorithmIR(
         inputs=(
-            TensorInput("query", ("batch", "query_heads", "sequence", "key_dim"), torch.bfloat16),
-            TensorInput("key", ("batch", "key_heads", "sequence", "key_dim"), torch.bfloat16),
-            TensorInput("value", ("batch", "value_heads", "sequence", "value_dim"), torch.bfloat16),
-            TensorInput("gate", ("batch", "state_heads", "sequence"), torch.float32),
-            TensorInput("beta", ("batch", "state_heads", "sequence"), torch.float32),
+            TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
+            TensorInput("key", (Batch, KEY_HEADS, Sequence, KEY), dtype),
+            TensorInput("value", (Batch, VALUE_HEADS, Sequence, VALUE), dtype),
+            TensorInput("gate", (Batch, STATE_HEADS, Sequence), torch.float32),
+            TensorInput("beta", (Batch, STATE_HEADS, Sequence), torch.float32),
         ),
-        states=(StateSpec("memory", ("batch", "state_heads", "key_dim", "value_dim")),),
+        states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
         transition=StateTransition(
             "memory",
             propagations=(
                 AxisScale(Exp(Input("gate"))),
-                RankOnePropagation("key_dim", Input("key"), Input("key"), -Input("beta")),
+                RankOnePropagation(KEY, Input("key"), Input("key"), -Input("beta")),
             ),
             injections=(
                 ProductInjection(
                     (
-                        ProductFactor(Input("key"), ("key_dim",)),
-                        ProductFactor(Input("value") * Input("beta"), ("value_dim",)),
+                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("value") * Input("beta"), (VALUE,)),
                     )
                 ),
             ),
         ),
         readouts=(
-            StateContraction("output", "memory", Input("query") * (dim**-0.5), "key_dim", torch.bfloat16),
+            StateContraction(
+                "output", "memory", Input("query") * (D**-0.5), KEY, dtype
+            ),
         ),
         head_mapping=HeadMapping(
-            mappings={
-                "query_heads": "state_heads",
-                "key_heads": "state_heads",
-                "value_heads": "state_heads",
+            {
+                QUERY_HEADS: STATE_HEADS,
+                KEY_HEADS: STATE_HEADS,
+                VALUE_HEADS: STATE_HEADS,
             }
         ),
     )
-    result = StatefulOperator(algorithm)(
-        query=query,
-        key=key,
-        value=value,
-        gate=gate,
-        beta=beta,
-        initial_state=StateTuple(("memory",), (initial,)),
-        return_final_state=True,
+    return StatefulOperator(algorithm)
+
+def compositional_pressure_profile(
+    B: int = 2,
+    H: int = 4,
+    S: int = 129,
+    D: int = 64,
+    DV: int = 128,
+    *,
+    HQ: int = 2,
+    dtype: torch.dtype = torch.bfloat16,
+) -> StatefulOperator:
+    """Model-independent composition stress profile for generic affine lowering."""
+    source_heads = HeadRole("source_heads")
+    algorithm = AlgorithmIR(
+        inputs=(
+            TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
+            TensorInput(
+                "auxiliary_query", (Batch, QUERY_HEADS, Sequence, KEY), dtype
+            ),
+            TensorInput("left", (Batch, source_heads, Sequence, KEY), dtype),
+            TensorInput("right", (Batch, source_heads, Sequence, KEY), dtype),
+            TensorInput(
+                "left_gate", (Batch, STATE_HEADS, Sequence, KEY), torch.float32
+            ),
+            TensorInput(
+                "right_gate", (Batch, STATE_HEADS, Sequence, VALUE), torch.float32
+            ),
+            TensorInput(
+                "coefficient", (Batch, STATE_HEADS, Sequence), torch.float32
+            ),
+            TensorInput("value", (Batch, source_heads, Sequence, VALUE), dtype),
+        ),
+        states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
+        transition=StateTransition(
+            "memory",
+            propagations=(
+                AxisScale(Exp(Input("left_gate")), (KEY,)),
+                RankOnePropagation(
+                    KEY, Input("left"), Input("right"), Input("coefficient")
+                ),
+                AxisScale(Exp(Input("right_gate")), (VALUE,)),
+            ),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("left"), (KEY,)),
+                        ProductFactor(Input("value"), (VALUE,)),
+                    )
+                ),
+                ProductInjection(
+                    (
+                        ProductFactor(Input("right"), (KEY,)),
+                        ProductFactor(
+                            Input("value") * Input("coefficient"), (VALUE,)
+                        ),
+                    )
+                ),
+            ),
+        ),
+        readouts=(
+            StateContraction("output", "memory", Input("query"), KEY, dtype),
+            StateContraction(
+                "auxiliary", "memory", Input("auxiliary_query"), KEY, dtype
+            ),
+        ),
+        head_mapping=HeadMapping(
+            {QUERY_HEADS: STATE_HEADS, source_heads: STATE_HEADS}
+        ),
     )
-    assert result.final_state is not None
-    output, final = result.outputs["output"], result.final_state["memory"]
-    (output.float().square().mean() + final.square().mean()).backward()
-    return output, final
+    return StatefulOperator(algorithm)
 
 
 if __name__ == "__main__":
-    result, state = gated_delta_rule()
-    print(f"output={tuple(result.shape)} final_state={tuple(state.shape)}")
+    device = torch.device("cuda")
+    batch, query_heads, state_heads, length, dim = 1, 1, 2, 64, 128
+    operator = gated_delta_rule(batch, state_heads, length, dim, dim, HQ=query_heads)
+    query = torch.randn(
+        batch, query_heads, length, dim, device=device, dtype=torch.bfloat16
+    )
+    key = torch.randn_like(query)
+    value = torch.randn(
+        batch, state_heads, length, dim, device=device, dtype=torch.bfloat16
+    )
+    gate = -torch.rand(batch, state_heads, length, device=device)
+    beta = torch.rand(batch, state_heads, length, device=device)
+    result = operator(query=query, key=key, value=value, gate=gate, beta=beta)
+    print(f"output={tuple(result.outputs['output'].shape)}")

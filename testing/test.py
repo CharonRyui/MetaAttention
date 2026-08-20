@@ -201,7 +201,9 @@ def check_mamba2(
     A_ours = A_ours.detach().requires_grad_(require_grad)
     dt_ours = dt_ours.detach().requires_grad_(require_grad)
 
-    o = attention_module(q_ours, k_ours, v_ours, dt_ours, A_ours, dt_ours.to(dtype))
+    o = attention_module(
+        query=q_ours, key=k_ours, value=v_ours, A=A_ours, dt=dt_ours
+    ).outputs["output"]
     if require_grad:
         o.backward(do_ours, retain_graph=True)
 
@@ -463,7 +465,7 @@ def check_gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, require_grad=Tru
 
     # ours
     attention_module = gated_retention(B, H, S, D, DV, dtype=dtype)
-    o = attention_module(q, k, v, g)
+    o = attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
     if require_grad:
         o.backward(do, retain_graph=True)
 
@@ -849,7 +851,7 @@ def check_retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16, require_grad=Tr
     v1.detach_().requires_grad_(require_grad)
 
     # ours
-    o = attention_module(query, key, value, g)
+    o = attention_module(query=query, key=key, value=value, gate=g).outputs["output"]
     if require_grad:
         o.backward(do, retain_graph=True)
 
