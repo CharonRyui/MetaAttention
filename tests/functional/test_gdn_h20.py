@@ -30,9 +30,11 @@ def _bindings(device: torch.device, *, length: int = 64):
         dtype=torch.bfloat16,
         requires_grad=True,
     )
-    key = torch.nn.functional.normalize(
-        torch.randn_like(query), p=2, dim=-1
-    ).detach().requires_grad_()
+    key = (
+        torch.nn.functional.normalize(torch.randn_like(query), p=2, dim=-1)
+        .detach()
+        .requires_grad_()
+    )
     value = torch.randn(
         batch,
         state_heads,
@@ -43,9 +45,7 @@ def _bindings(device: torch.device, *, length: int = 64):
         requires_grad=True,
     )
     gate = (-torch.rand(batch, state_heads, length, device=device)).requires_grad_()
-    beta = torch.rand(
-        batch, state_heads, length, device=device, requires_grad=True
-    )
+    beta = torch.rand(batch, state_heads, length, device=device, requires_grad=True)
     return query, key, value, gate, beta
 
 
@@ -147,15 +147,15 @@ def _pressure_bindings(device: torch.device, lengths: tuple[int, ...]):
         "auxiliary_query": sample(2, 64),
         "left": sample(2, 64),
         "right": sample(2, 64),
-        "left_gate": (-0.01 * torch.rand(
-            token_count, 4, 64, device=device, generator=generator
-        )).requires_grad_(),
-        "right_gate": (-0.01 * torch.rand(
-            token_count, 4, 128, device=device, generator=generator
-        )).requires_grad_(),
-        "coefficient": (0.001 * torch.randn(
-            token_count, 4, device=device, generator=generator
-        )).requires_grad_(),
+        "left_gate": (
+            -0.01 * torch.rand(token_count, 4, 64, device=device, generator=generator)
+        ).requires_grad_(),
+        "right_gate": (
+            -0.01 * torch.rand(token_count, 4, 128, device=device, generator=generator)
+        ).requires_grad_(),
+        "coefficient": (
+            0.001 * torch.randn(token_count, 4, device=device, generator=generator)
+        ).requires_grad_(),
         "value": sample(2, 128),
     }
 
@@ -180,14 +180,22 @@ def _pressure_reference(bindings, lengths, initial):
             coefficient = repeated["coefficient"][token].float()
             state = left_gate[:, :, None] * state
             contraction = torch.einsum("hd,hdf->hf", right, state)
-            state = state + coefficient[:, None, None] * left[:, :, None] * contraction[:, None, :]
+            state = (
+                state
+                + coefficient[:, None, None]
+                * left[:, :, None]
+                * contraction[:, None, :]
+            )
             state = state * right_gate[:, None, :]
             state = state + left[:, :, None] * value[:, None, :]
-            state = state + right[:, :, None] * value[:, None, :] * coefficient[:, None, None]
+            state = (
+                state
+                + right[:, :, None] * value[:, None, :] * coefficient[:, None, None]
+            )
             outputs.append(
-                torch.einsum(
-                    "hd,hdf->hf", repeated["query"][token].float(), state
-                ).to(torch.bfloat16)
+                torch.einsum("hd,hdf->hf", repeated["query"][token].float(), state).to(
+                    torch.bfloat16
+                )
             )
             auxiliaries.append(
                 torch.einsum(
@@ -200,8 +208,12 @@ def _pressure_reference(bindings, lengths, initial):
         offset += length
     output_shape = (0, 4, 128)
     return (
-        torch.stack(outputs) if outputs else initial.new_empty(output_shape).to(torch.bfloat16),
-        torch.stack(auxiliaries) if auxiliaries else initial.new_empty(output_shape).to(torch.bfloat16),
+        torch.stack(outputs)
+        if outputs
+        else initial.new_empty(output_shape).to(torch.bfloat16),
+        torch.stack(auxiliaries)
+        if auxiliaries
+        else initial.new_empty(output_shape).to(torch.bfloat16),
         torch.stack(finals),
     )
 
@@ -215,8 +227,7 @@ def test_compositional_pressure_profile_packed_forward_backward(gpu_device):
         for name, value in actual_bindings.items()
     }
     actual_initial = (
-        0.05
-        * torch.randn(4, 4, 64, 128, device=gpu_device, dtype=torch.float32)
+        0.05 * torch.randn(4, 4, 64, 128, device=gpu_device, dtype=torch.float32)
     ).requires_grad_()
     reference_initial = actual_initial.detach().clone().requires_grad_()
     operator = compositional_pressure_profile()
@@ -230,11 +241,15 @@ def test_compositional_pressure_profile_packed_forward_backward(gpu_device):
         reference_bindings, lengths, reference_initial
     )
     assert result.final_state is not None
-    torch.testing.assert_close(result.outputs["output"], expected_output, rtol=0.04, atol=0.1)
+    torch.testing.assert_close(
+        result.outputs["output"], expected_output, rtol=0.04, atol=0.1
+    )
     torch.testing.assert_close(
         result.outputs["auxiliary"], expected_auxiliary, rtol=0.04, atol=0.1
     )
-    torch.testing.assert_close(result.final_state[0], expected_state, rtol=0.04, atol=0.1)
+    torch.testing.assert_close(
+        result.final_state[0], expected_state, rtol=0.04, atol=0.1
+    )
     assert torch.equal(result.final_state[0][0], actual_initial[0])
     assert torch.equal(result.final_state[0][2], actual_initial[2])
 
@@ -285,8 +300,6 @@ def test_compositional_pressure_profile_dense_unaligned_tail(gpu_device):
     torch.testing.assert_close(
         result.final_state[0], expected_state, rtol=0.04, atol=0.1
     )
-
-
 
 
 def test_compositional_pressure_profile_all_empty(gpu_device):

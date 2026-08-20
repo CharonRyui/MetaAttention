@@ -105,9 +105,7 @@ def tilelang_kkt_solve(
         # A = K @ K^T
         if right <= seq_end_idx:
             T.ptx_wait_group(0)
-        T.gemm(
-            k_shared, k_shared, a64_fragment, transpose_B=True, clear_accum=True
-        )
+        T.gemm(k_shared, k_shared, a64_fragment, transpose_B=True, clear_accum=True)
 
         # A = b * A
         for j_s, j_t in T.Parallel(block_S, block_S):
@@ -185,9 +183,7 @@ def tilelang_kkt_solve(
 
         # Combine inversion output
         for j_s, k_s, k_t in T.Parallel(2, 32, 32):
-            a64_shared[j_s * 32 + k_s, j_s * 32 + k_t] = a32i_fragment[
-                j_s, k_s, k_t
-            ]
+            a64_shared[j_s * 32 + k_s, j_s * 32 + k_t] = a32i_fragment[j_s, k_s, k_t]
         for k_s, k_t in T.Parallel(32, 32):
             a64_shared[32 + k_s, k_t] = a32o_fragment[k_s, k_t]
         for k_s, k_t in T.Parallel(32, 32):

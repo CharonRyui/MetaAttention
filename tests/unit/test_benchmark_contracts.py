@@ -16,7 +16,6 @@ from benchmark.plot_fig_mi250 import plot_figure14
 from testing.benchmark_stateful_h20 import _paired_median_bootstrap
 
 
-
 pytestmark = [pytest.mark.unit, pytest.mark.io]
 
 
@@ -55,6 +54,7 @@ def _assert_metaattention_rows(paths: tuple[Path, ...]) -> None:
         rows = list(csv.reader(path.open(newline="", encoding="utf-8")))
         assert rows
         assert any(row and row[0] == "MetaAttention" for row in rows[1:])
+
 
 def test_paired_median_bootstrap_uses_batch_medians():
     lower, upper = _paired_median_bootstrap(

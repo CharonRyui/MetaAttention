@@ -44,9 +44,25 @@ def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, tune=False):
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("dt") * Input("A")), (KEY,)),),
-            injections=(ProductInjection((ProductFactor(Input("dt") * Input("key"), (KEY,)), ProductFactor(Input("value"), (VALUE,)))),),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("dt") * Input("key"), (KEY,)),
+                        ProductFactor(Input("value"), (VALUE,)),
+                    )
+                ),
+            ),
         ),
         readouts=(StateContraction("output", "memory", Input("query"), KEY, dtype),),
-        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}),
+        head_mapping=HeadMapping(
+            {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
+        ),
     )
-    return StatefulOperator(algorithm, compile_options=CompileOptions(tune=tune, tune_filename=f"tuned_config/{get_attn_device().name}/mamba2", tune_backward=tune))
+    return StatefulOperator(
+        algorithm,
+        compile_options=CompileOptions(
+            tune=tune,
+            tune_filename=f"tuned_config/{get_attn_device().name}/mamba2",
+            tune_backward=tune,
+        ),
+    )

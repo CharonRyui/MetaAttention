@@ -48,9 +48,7 @@ def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]
                         dynamic_cache_size -= 1
                     elif not is_static:
                         cache_entries = (
-                            cache_entries[:i]
-                            + cache_entries[i + 1 :]
-                            + [entry]
+                            cache_entries[:i] + cache_entries[i + 1 :] + [entry]
                         )
                     return last_result
 

@@ -47,9 +47,7 @@ def tilelang_prepare_h(
         g_shape = (1, num_tokens, H)
         b_shape = (1, num_tokens, H)
         h_shape = (
-            (1, num_chunks, H, DV, DK)
-            if state_v_first
-            else (1, num_chunks, H, DK, DV)
+            (1, num_chunks, H, DV, DK) if state_v_first else (1, num_chunks, H, DK, DV)
         )
     else:
         k_shape = (batch_size, num_tokens, Hg, DK)
@@ -62,16 +60,8 @@ def tilelang_prepare_h(
             if state_v_first
             else (batch_size, num_chunks, H, DK, DV)
         )
-    h0_shape = (
-        (batch_size, H, DV, DK)
-        if state_v_first
-        else (batch_size, H, DK, DV)
-    )
-    ht_shape = (
-        (batch_size, H, DV, DK)
-        if state_v_first
-        else (batch_size, H, DK, DV)
-    )
+    h0_shape = (batch_size, H, DV, DK) if state_v_first else (batch_size, H, DK, DV)
+    ht_shape = (batch_size, H, DV, DK) if state_v_first else (batch_size, H, DK, DV)
     m_shape = (batch_size, H, DK, DK)
 
     @T.prim_func
@@ -446,7 +436,9 @@ def tilelang_prepare_h(
                         else:
                             for j_s, j_k in T.Parallel(block_S, DK):
                                 if left + j_s < seq_end_idx:
-                                    k_shared[i_s % num_stages, j_s, j_k] = k[batch_idx, left + j_s, bhg, j_k]
+                                    k_shared[i_s % num_stages, j_s, j_k] = k[
+                                        batch_idx, left + j_s, bhg, j_k
+                                    ]
                                 else:
                                     k_shared[i_s % num_stages, j_s, j_k] = 0
                             T.fence_proxy_async()
@@ -471,7 +463,9 @@ def tilelang_prepare_h(
                         else:
                             for j_s, j_v in T.Parallel(block_S, DV):
                                 if left + j_s < seq_end_idx:
-                                    v_shared[i_s % num_stages, j_s, j_v] = v[batch_idx, left + j_s, bh, j_v]
+                                    v_shared[i_s % num_stages, j_s, j_v] = v[
+                                        batch_idx, left + j_s, bh, j_v
+                                    ]
                                 else:
                                     v_shared[i_s % num_stages, j_s, j_v] = 0
                         # Load A
@@ -484,7 +478,9 @@ def tilelang_prepare_h(
                         else:
                             for j_s, j_t in T.Parallel(block_S, block_S):
                                 if left + j_s < seq_end_idx:
-                                    a_shared[i_s % num_stages, j_s, j_t] = a[batch_idx, left + j_s, bh, j_t]
+                                    a_shared[i_s % num_stages, j_s, j_t] = a[
+                                        batch_idx, left + j_s, bh, j_t
+                                    ]
                                 else:
                                     a_shared[i_s % num_stages, j_s, j_t] = 0
                             T.fence_proxy_async()
@@ -614,9 +610,7 @@ def fused_gdr_h(
     use_initial_state = initial_state is not None
     if initial_state is None:
         initial_state = torch.empty(
-            (real_batch_size, H, V, K)
-            if state_v_first
-            else (real_batch_size, H, K, V),
+            (real_batch_size, H, V, K) if state_v_first else (real_batch_size, H, K, V),
             dtype=torch.float32,
             device=k.device,
         )
@@ -629,9 +623,7 @@ def fused_gdr_h(
     )
     ht_dtype = k.dtype if is_cp else torch.float32
     final_state = torch.empty(
-        (real_batch_size, H, V, K)
-        if state_v_first
-        else (real_batch_size, H, K, V),
+        (real_batch_size, H, V, K) if state_v_first else (real_batch_size, H, K, V),
         dtype=ht_dtype,
         device=k.device,
     )

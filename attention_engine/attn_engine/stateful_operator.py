@@ -7,12 +7,21 @@ import json
 import math
 import os
 import sys
-from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence as TypingSequence
+from typing import (
+    Any,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence as TypingSequence,
+)
 
 import torch
 
 SCHEMA_VERSION = "stateful-operator-ir/1"
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
+
+
 @dataclass(frozen=True)
 class _SingletonRole:
     name: str
@@ -53,7 +62,6 @@ class FeatureRole:
 LogicalRole = _SingletonRole | HeadRole | FeatureRole
 
 
-
 class StatefulCompilationError(Exception):
     """Stable public failure from Stateful Operator validation or specialization."""
 
@@ -81,7 +89,9 @@ class StatefulCompilationError(Exception):
 class _NamedTensorTuple:
     __slots__ = ("_names", "_values")
 
-    def __init__(self, names: TypingSequence[str], values: TypingSequence[torch.Tensor]) -> None:
+    def __init__(
+        self, names: TypingSequence[str], values: TypingSequence[torch.Tensor]
+    ) -> None:
         if len(names) != len(values):
             raise ValueError("names and values must have equal length")
         if len(set(names)) != len(names):
@@ -241,8 +251,13 @@ class TensorInput:
         if not self.name.isidentifier():
             raise ValueError(f"invalid tensor input name {self.name!r}")
         if not self.roles or len(set(self.roles)) != len(self.roles):
-            raise ValueError(f"tensor input '{self.name}' requires unique logical roles")
-        if not all(isinstance(role, (_SingletonRole, HeadRole, FeatureRole)) for role in self.roles):
+            raise ValueError(
+                f"tensor input '{self.name}' requires unique logical roles"
+            )
+        if not all(
+            isinstance(role, (_SingletonRole, HeadRole, FeatureRole))
+            for role in self.roles
+        ):
             raise TypeError("Tensor Input roles must be typed logical roles")
         if self.dtype not in _SUPPORTED_DTYPES:
             raise ValueError("Tensor Inputs support only BF16 and FP32")
@@ -288,10 +303,14 @@ class AxisScale:
     roles: tuple[FeatureRole, ...]
 
     def __init__(
-        self, factor: InputExpression | float | int, roles: TypingSequence[FeatureRole] = ()
+        self,
+        factor: InputExpression | float | int,
+        roles: TypingSequence[FeatureRole] = (),
     ) -> None:
         roles = tuple(roles)
-        if len(set(roles)) != len(roles) or not all(isinstance(role, FeatureRole) for role in roles):
+        if len(set(roles)) != len(roles) or not all(
+            isinstance(role, FeatureRole) for role in roles
+        ):
             raise TypeError("Axis Scale roles must be unique Feature roles")
         object.__setattr__(self, "factor", as_expression(factor))
         object.__setattr__(self, "roles", roles)
@@ -328,7 +347,9 @@ class ProductFactor:
         self, expression: InputExpression, roles: TypingSequence[FeatureRole] = ()
     ) -> None:
         roles = tuple(roles)
-        if len(set(roles)) != len(roles) or not all(isinstance(role, FeatureRole) for role in roles):
+        if len(set(roles)) != len(roles) or not all(
+            isinstance(role, FeatureRole) for role in roles
+        ):
             raise TypeError("Product factor roles must be unique Feature roles")
         object.__setattr__(self, "expression", as_expression(expression))
         object.__setattr__(self, "roles", roles)
@@ -377,15 +398,21 @@ class HeadMapping:
 
     def __init__(
         self,
-        mappings: Mapping[HeadRole, HeadRole] | TypingSequence[tuple[HeadRole, HeadRole]] = (),
+        mappings: Mapping[HeadRole, HeadRole]
+        | TypingSequence[tuple[HeadRole, HeadRole]] = (),
     ) -> None:
         values = mappings.items() if isinstance(mappings, Mapping) else mappings
         pairs = tuple(values)
-        if not all(isinstance(source, HeadRole) and isinstance(target, HeadRole) for source, target in pairs):
+        if not all(
+            isinstance(source, HeadRole) and isinstance(target, HeadRole)
+            for source, target in pairs
+        ):
             raise TypeError("Head Mapping requires typed Head roles")
         if len({source for source, _ in pairs}) != len(pairs):
             raise ValueError("Head Mapping source roles must be unique")
-        object.__setattr__(self, "mappings", tuple(sorted(pairs, key=lambda pair: pair[0].name)))
+        object.__setattr__(
+            self, "mappings", tuple(sorted(pairs, key=lambda pair: pair[0].name))
+        )
 
     def target_for(self, source: HeadRole) -> HeadRole | None:
         return dict(self.mappings).get(source)
@@ -396,6 +423,7 @@ class StateTransition:
     state: str
     propagations: tuple[Identity | AxisScale | RankOnePropagation, ...]
     injections: tuple[ProductInjection, ...]
+
     def __init__(
         self,
         state: str,
@@ -405,7 +433,9 @@ class StateTransition:
     ) -> None:
         object.__setattr__(self, "state", state)
         object.__setattr__(
-            self, "propagations", tuple(node for node in propagations if not isinstance(node, Identity))
+            self,
+            "propagations",
+            tuple(node for node in propagations if not isinstance(node, Identity)),
         )
         object.__setattr__(self, "injections", tuple(injections))
 
@@ -580,9 +610,7 @@ class StatefulOperator:
         state = self._validate_state(
             initial_state,
             runtime,
-            cache_default=not (
-                runtime.token_count == 0 and return_final_state
-            ),
+            cache_default=not (runtime.token_count == 0 and return_final_state),
         )
         specialization = self._specialization_key(
             inputs, state, runtime, return_final_state
@@ -594,7 +622,8 @@ class StatefulOperator:
 
             needs_dense = any(
                 isinstance(node, RankOnePropagation)
-                or isinstance(node, AxisScale) and len(node.roles) == 1
+                or isinstance(node, AxisScale)
+                and len(node.roles) == 1
                 for node in self.algorithm.transition.propagations
             )
             plan = compile_plan(
@@ -632,7 +661,11 @@ class StatefulOperator:
                 if return_final_state
                 else None
             )
-            if initial_state is None and sequence_offsets is None and not return_final_state:
+            if (
+                initial_state is None
+                and sequence_offsets is None
+                and not return_final_state
+            ):
                 self._dense_cached_call = self._build_dense_cached_call(
                     inputs, runtime, state, plan
                 )
@@ -658,7 +691,12 @@ class StatefulOperator:
         specs = self.algorithm.inputs
         expected_names = frozenset(spec.name for spec in specs)
         expected_metadata = tuple(
-            (spec.name, tuple(inputs[spec.name].shape), spec.dtype, inputs[spec.name].device)
+            (
+                spec.name,
+                tuple(inputs[spec.name].shape),
+                spec.dtype,
+                inputs[spec.name].device,
+            )
             for spec in specs
         )
         output_names = tuple(readout.name for readout in self.algorithm.readouts)
@@ -671,9 +709,15 @@ class StatefulOperator:
             if current.keys() != expected_names:
                 missing = expected_names - current.keys()
                 unknown = current.keys() - expected_names
-                details = {"missing": sorted(missing)} if missing else {"unknown": sorted(unknown)}
+                details = (
+                    {"missing": sorted(missing)}
+                    if missing
+                    else {"unknown": sorted(unknown)}
+                )
                 raise StatefulCompilationError("RUNTIME_BINDING", "inputs", details)
-            for spec, (name, shape, dtype, device) in zip(specs, expected_metadata, strict=True):
+            for spec, (name, shape, dtype, device) in zip(
+                specs, expected_metadata, strict=True
+            ):
                 tensor = current[name]
                 path = f"inputs.{name}"
                 if not isinstance(tensor, torch.Tensor):
@@ -682,7 +726,9 @@ class StatefulOperator:
                     )
                 if tensor.dtype != dtype:
                     raise StatefulCompilationError(
-                        "RUNTIME_DTYPE", path, {"expected": str(dtype), "actual": str(tensor.dtype)}
+                        "RUNTIME_DTYPE",
+                        path,
+                        {"expected": str(dtype), "actual": str(tensor.dtype)},
                     )
                 if tensor.device != device:
                     raise StatefulCompilationError("RUNTIME_DEVICE", "inputs", {})
@@ -779,7 +825,9 @@ class StatefulOperator:
                 dimensions = zip(spec.roles, tensor.shape)
                 if Sequence in spec.roles:
                     length = tensor.shape[spec.roles.index(Sequence)]
-                    uniform_length = length if uniform_length is None else uniform_length
+                    uniform_length = (
+                        length if uniform_length is None else uniform_length
+                    )
                     if length != uniform_length or length <= 0:
                         raise StatefulCompilationError(
                             "RUNTIME_SHAPE", path, {"role": "sequence"}
@@ -884,11 +932,19 @@ class StatefulOperator:
             index = torch.cuda.current_device()
         product = torch.cuda.get_device_name(index)
         capability = torch.cuda.get_device_capability(index)
-        if "MIG" in product.upper() or "H20" not in product.upper() or capability != (9, 0):
+        if (
+            "MIG" in product.upper()
+            or "H20" not in product.upper()
+            or capability != (9, 0)
+        ):
             raise StatefulCompilationError(
                 "TARGET",
                 "target",
-                {"expected_product": "H20", "actual_product": product, "capability": capability},
+                {
+                    "expected_product": "H20",
+                    "actual_product": product,
+                    "capability": capability,
+                },
             )
         if self.target is not None and (
             self.target.device_type != "cuda"
@@ -904,7 +960,11 @@ class StatefulOperator:
         tensors = list(inputs.items())
         for index, (left_name, left) in enumerate(tensors):
             for right_name, right in tensors[index + 1 :]:
-                if left is right or left.untyped_storage().data_ptr() != right.untyped_storage().data_ptr():
+                if (
+                    left is right
+                    or left.untyped_storage().data_ptr()
+                    != right.untyped_storage().data_ptr()
+                ):
                     continue
                 left_start = left.storage_offset() * left.element_size()
                 right_start = right.storage_offset() * right.element_size()
@@ -954,7 +1014,11 @@ class StatefulOperator:
             raise StatefulCompilationError(
                 "RUNTIME_STATE",
                 f"initial_state.{spec.name}",
-                {"shape": shape, "dtype": "torch.float32", "device": str(runtime.device)},
+                {
+                    "shape": shape,
+                    "dtype": "torch.float32",
+                    "device": str(runtime.device),
+                },
             )
         return tensor
 
@@ -980,7 +1044,9 @@ class StatefulOperator:
                 order = [spec.roles.index(Batch), spec.roles.index(Sequence)]
                 if head_role is not None:
                     order.append(spec.roles.index(head_role))
-                order.extend(spec.roles.index(role) for role in features if role in spec.roles)
+                order.extend(
+                    spec.roles.index(role) for role in features if role in spec.roles
+                )
                 value = tensor.permute(order).reshape(
                     runtime.token_count, *[tensor.shape[index] for index in order[2:]]
                 )
@@ -995,7 +1061,9 @@ class StatefulOperator:
                 order = [singleton_axis]
                 if head_role is not None:
                     order.append(spec.roles.index(head_role))
-                order.extend(spec.roles.index(role) for role in features if role in spec.roles)
+                order.extend(
+                    spec.roles.index(role) for role in features if role in spec.roles
+                )
                 value = tensor.permute(order)
                 if batch_axis is None:
                     value = value.reshape(1, *value.shape[1:]).expand(
@@ -1028,17 +1096,25 @@ class StatefulOperator:
                     raise StatefulCompilationError(
                         "RUNTIME_SHAPE", f"inputs.{spec.name}", {"role": head_role}
                     )
-                value = value.repeat_interleave(runtime.state_heads // source_heads, dim=1)
+                value = value.repeat_interleave(
+                    runtime.state_heads // source_heads, dim=1
+                )
             present_features = tuple(role for role in features if role in spec.roles)
             if present_features == ():
                 value = value.reshape(runtime.token_count, runtime.state_heads, 1, 1)
             elif present_features == (features[0],):
                 value = value.reshape(
-                    runtime.token_count, runtime.state_heads, runtime.feature_sizes[0], 1
+                    runtime.token_count,
+                    runtime.state_heads,
+                    runtime.feature_sizes[0],
+                    1,
                 )
             elif present_features == (features[1],):
                 value = value.reshape(
-                    runtime.token_count, runtime.state_heads, 1, runtime.feature_sizes[1]
+                    runtime.token_count,
+                    runtime.state_heads,
+                    1,
+                    runtime.feature_sizes[1],
                 )
             else:
                 value = value.reshape(
@@ -1049,7 +1125,6 @@ class StatefulOperator:
                 )
             result[spec.name] = value
         return result
-
 
     def _lower_parallel_scan(
         self,
@@ -1072,19 +1147,29 @@ class StatefulOperator:
             )
         else:
             assert runtime.uniform_length is not None
-            segment = torch.arange(runtime.sequence_count, device=device).repeat_interleave(
-                runtime.uniform_length
-            )
+            segment = torch.arange(
+                runtime.sequence_count, device=device
+            ).repeat_interleave(runtime.uniform_length)
         if token_count == 0:
             outputs = tuple(
                 torch.empty(
-                    (0, heads, right_size if readout.role == state_spec.feature_roles[0] else left_size),
+                    (
+                        0,
+                        heads,
+                        right_size
+                        if readout.role == state_spec.feature_roles[0]
+                        else left_size,
+                    ),
                     device=device,
                     dtype=readout.output_dtype,
                 )
                 for readout in self.algorithm.readouts
             )
-            final = StateTuple((state_spec.name,), (initial_state,)) if return_final_state else None
+            final = (
+                StateTuple((state_spec.name,), (initial_state,))
+                if return_final_state
+                else None
+            )
             return outputs, final
         identity_only = not self.algorithm.transition.propagations
         has_rank = any(
@@ -1126,13 +1211,17 @@ class StatefulOperator:
                         assert left is not None
                         left = factor * left
                     else:
-                        elementwise = factor if elementwise is None else elementwise * factor
+                        elementwise = (
+                            factor if elementwise is None else elementwise * factor
+                        )
                 elif not node.roles:
                     if needs_dense_transform:
                         assert left is not None
                         left = factor * left
                     else:
-                        elementwise = factor if elementwise is None else elementwise * factor
+                        elementwise = (
+                            factor if elementwise is None else elementwise * factor
+                        )
                 elif node.roles[0] == state_spec.feature_roles[0]:
                     assert left is not None
                     left = torch.diag_embed(factor[..., :, 0]) @ left
@@ -1183,9 +1272,7 @@ class StatefulOperator:
             assert elementwise is not None
             if runtime.packed:
                 assert runtime.offsets is not None
-                max_sequence_length = max(
-                    runtime.token_count, 1
-                )
+                max_sequence_length = max(runtime.token_count, 1)
                 output, fused_final = executable.scalar_factorized_packed(
                     elementwise,
                     factors[state_spec.feature_roles[0]],
@@ -1235,9 +1322,7 @@ class StatefulOperator:
         if elementwise is not None:
             scale = elementwise.contiguous()
             if runtime.device.type == "cuda":
-                states = executable.prefix(
-                    scale, injection, segment_i32, initial_state
-                )
+                states = executable.prefix(scale, injection, segment_i32, initial_state)
             else:
                 scale, injection = _segmented_elementwise_scan(
                     scale, injection, segment
@@ -1358,9 +1443,15 @@ def _segmented_affine_scan(
             + old_bias[offset:]
         )
         mask = valid.view(-1, 1, 1, 1)
-        left = torch.cat((old_left[:offset], torch.where(mask, combined_left, old_left[offset:])))
-        right = torch.cat((old_right[:offset], torch.where(mask, combined_right, old_right[offset:])))
-        bias = torch.cat((old_bias[:offset], torch.where(mask, combined_bias, old_bias[offset:])))
+        left = torch.cat(
+            (old_left[:offset], torch.where(mask, combined_left, old_left[offset:]))
+        )
+        right = torch.cat(
+            (old_right[:offset], torch.where(mask, combined_right, old_right[offset:]))
+        )
+        bias = torch.cat(
+            (old_bias[:offset], torch.where(mask, combined_bias, old_bias[offset:]))
+        )
         offset *= 2
     return left, right, bias
 
@@ -1377,8 +1468,12 @@ def _segmented_elementwise_scan(
         valid = (segment[offset:] == segment[:-offset]).view(-1, 1, 1, 1)
         combined_scale = old_scale[offset:] * old_scale[:-offset]
         combined_bias = old_scale[offset:] * old_bias[:-offset] + old_bias[offset:]
-        scale = torch.cat((old_scale[:offset], torch.where(valid, combined_scale, old_scale[offset:])))
-        bias = torch.cat((old_bias[:offset], torch.where(valid, combined_bias, old_bias[offset:])))
+        scale = torch.cat(
+            (old_scale[:offset], torch.where(valid, combined_scale, old_scale[offset:]))
+        )
+        bias = torch.cat(
+            (old_bias[:offset], torch.where(valid, combined_bias, old_bias[offset:]))
+        )
         offset *= 2
     return scale, bias
 
@@ -1390,7 +1485,9 @@ def _evaluate(
         return values[expression.name]
     if isinstance(expression, Constant):
         sample = next(iter(values.values()))
-        return torch.tensor(expression.value, device=sample.device, dtype=expression.dtype)
+        return torch.tensor(
+            expression.value, device=sample.device, dtype=expression.dtype
+        )
     if isinstance(expression, Add):
         return _evaluate(expression.left, values) + _evaluate(expression.right, values)
     if isinstance(expression, Multiply):
@@ -1416,11 +1513,7 @@ def _head_role(
     roles: TypingSequence[LogicalRole], features: TypingSequence[FeatureRole]
 ) -> HeadRole | None:
     return next(
-        (
-            role
-            for role in roles
-            if isinstance(role, HeadRole)
-        ),
+        (role for role in roles if isinstance(role, HeadRole)),
         None,
     )
 
@@ -1429,9 +1522,7 @@ def _reject_duplicate_names(items: Iterable[Any], path: str) -> None:
     seen: set[str] = set()
     for item in items:
         if item.name in seen:
-            raise StatefulCompilationError(
-                "IR_SCHEMA", path, {"duplicate": item.name}
-            )
+            raise StatefulCompilationError("IR_SCHEMA", path, {"duplicate": item.name})
         seen.add(item.name)
 
 

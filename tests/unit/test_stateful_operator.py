@@ -34,6 +34,8 @@ from attn_engine import (
 
 
 pytestmark = pytest.mark.unit
+
+
 @pytest.fixture(autouse=True)
 def _allow_cpu_stateful_operator(monkeypatch):
     monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "1")
@@ -82,10 +84,18 @@ def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
 def _inputs(length: int = 3, *, requires_grad: bool = False):
     generator = torch.Generator().manual_seed(7)
     return {
-        "query": torch.randn(1, 1, length, 2, generator=generator, requires_grad=requires_grad),
-        "key": torch.randn(1, 1, length, 2, generator=generator, requires_grad=requires_grad),
-        "value": torch.randn(1, 1, length, 3, generator=generator, requires_grad=requires_grad),
-        "gate": torch.randn(1, 1, length, generator=generator, requires_grad=requires_grad),
+        "query": torch.randn(
+            1, 1, length, 2, generator=generator, requires_grad=requires_grad
+        ),
+        "key": torch.randn(
+            1, 1, length, 2, generator=generator, requires_grad=requires_grad
+        ),
+        "value": torch.randn(
+            1, 1, length, 3, generator=generator, requires_grad=requires_grad
+        ),
+        "gate": torch.randn(
+            1, 1, length, generator=generator, requires_grad=requires_grad
+        ),
     }
 
 
@@ -95,9 +105,13 @@ def _reference(inputs, initial=None):
     for token in range(inputs["query"].shape[2]):
         state = state * inputs["gate"][..., token].exp().unsqueeze(-1).unsqueeze(-1)
         state = state + torch.einsum(
-            "bhf,bhg->bhfg", inputs["key"][..., token, :], inputs["value"][..., token, :]
+            "bhf,bhg->bhfg",
+            inputs["key"][..., token, :],
+            inputs["value"][..., token, :],
         )
-        outputs.append(torch.einsum("bhf,bhfg->bhg", inputs["query"][..., token, :], state))
+        outputs.append(
+            torch.einsum("bhf,bhfg->bhg", inputs["query"][..., token, :], state)
+        )
     return torch.stack(outputs, dim=2), state
 
 
@@ -130,7 +144,10 @@ def test_batch_static_inputs_preserve_per_sequence_values():
     weight = torch.tensor([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 6.0]]])
     output = StatefulOperator(algorithm)(query=query, key=key, weight=weight).outputs[0]
     expected = torch.tensor(
-        [[[[2.0, 4.0, 6.0], [4.0, 8.0, 12.0]]], [[[8.0, 10.0, 12.0], [16.0, 20.0, 24.0]]]]
+        [
+            [[[2.0, 4.0, 6.0], [4.0, 8.0, 12.0]]],
+            [[[8.0, 10.0, 12.0], [16.0, 20.0, 24.0]]],
+        ]
     )
     torch.testing.assert_close(output, expected)
 
@@ -141,7 +158,9 @@ def test_constant_bits_and_commutative_identity_are_canonical():
         Constant(float("nan"))
     assert Add(Input("x"), Input("y")) == Add(Input("y"), Input("x"))
     assert Multiply(Input("x"), Input("y")) == Multiply(Input("y"), Input("x"))
-    assert Add(Add(Input("x"), Input("y")), Input("z")) != Add(Input("x"), Add(Input("y"), Input("z")))
+    assert Add(Add(Input("x"), Input("y")), Input("z")) != Add(
+        Input("x"), Add(Input("y"), Input("z"))
+    )
 
 
 def test_dense_invocation_returns_immutable_named_result_and_gradients():
@@ -165,20 +184,31 @@ def test_omitted_state_and_continuation_match_full_invocation():
     inputs = _inputs(length=4)
     operator = StatefulOperator(_accumulator_ir())
     full = operator(**inputs, return_final_state=True)
-    prefix = operator(**{name: value[:, :, :2] for name, value in inputs.items()}, return_final_state=True)
+    prefix = operator(
+        **{name: value[:, :, :2] for name, value in inputs.items()},
+        return_final_state=True,
+    )
     assert prefix.final_state is not None
     suffix = operator(
         **{name: value[:, :, 2:] for name, value in inputs.items()},
         initial_state=prefix.final_state,
     )
-    torch.testing.assert_close(torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2), full.outputs[0])
+    torch.testing.assert_close(
+        torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2), full.outputs[0]
+    )
 
 
 def test_packed_empty_sequences_preserve_state_and_offsets_are_runtime_data():
     operator = StatefulOperator(_accumulator_ir())
     dense = _inputs(length=3)
-    packed = {name: value.squeeze(0).transpose(0, 1).contiguous() for name, value in dense.items()}
-    packed = {name: value.transpose(0, 1).contiguous() if value.shape[0] == 1 else value for name, value in packed.items()}
+    packed = {
+        name: value.squeeze(0).transpose(0, 1).contiguous()
+        for name, value in dense.items()
+    }
+    packed = {
+        name: value.transpose(0, 1).contiguous() if value.shape[0] == 1 else value
+        for name, value in packed.items()
+    }
     offsets = torch.tensor([0, 0, 3, 3], dtype=torch.int32)
     initial = torch.randn(3, 1, 2, 3)
     result = operator(
@@ -191,6 +221,7 @@ def test_packed_empty_sequences_preserve_state_and_offsets_are_runtime_data():
     torch.testing.assert_close(result.final_state[0][0], initial[0])
     torch.testing.assert_close(result.final_state[0][2], initial[2])
     assert result.outputs[0].shape == (3, 1, 3)
+
 
 def test_specialization_identity_reuses_offset_metadata_and_tracks_training_modes():
     operator = StatefulOperator(_accumulator_ir())
@@ -229,6 +260,7 @@ def test_analysis_derives_scanable_affine_summary_and_backward_ir():
         "head_reduce",
     }
 
+
 def test_compiled_plan_owns_parallel_forward_and_derived_backward():
     operator = StatefulOperator(_accumulator_ir())
     operator(**_inputs())
@@ -240,6 +272,7 @@ def test_compiled_plan_owns_parallel_forward_and_derived_backward():
         step.operation == "state_recurrence"
         for step in executable.backward_ir.reverse_steps
     )
+
 
 def test_analysis_maps_expression_head_roles_to_state_heads():
     analysis = _accumulator_ir()._analysis
@@ -284,7 +317,9 @@ def test_analysis_rejects_unmapped_incompatible_head_roles():
         AlgorithmIR(
             inputs=(
                 TensorInput("left", (Batch, KEY_HEADS, Sequence, KEY), torch.float32),
-                TensorInput("right", (Batch, other_heads, Sequence, KEY), torch.float32),
+                TensorInput(
+                    "right", (Batch, other_heads, Sequence, KEY), torch.float32
+                ),
             ),
             states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
             transition=StateTransition(
@@ -333,7 +368,9 @@ def test_output_and_final_state_cotangent_modes_match_reference(loss_mode):
         actual_loss, (*actual_inputs.values(), actual_initial), allow_unused=True
     )
     expected_gradients = torch.autograd.grad(
-        expected_loss, (*reference_inputs.values(), reference_initial), allow_unused=True
+        expected_loss,
+        (*reference_inputs.values(), reference_initial),
+        allow_unused=True,
     )
     for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
         if expected is None:
@@ -356,6 +393,7 @@ def test_structured_errors_are_json_safe_and_have_canonical_paths():
     assert error.path == "inputs"
     json.dumps(error.as_dict())
 
+
 def test_structured_errors_with_typed_roles_are_json_safe():
     error = StatefulCompilationError(
         "IR_TYPE", "roles", {"role": KEY, "mapping": {QUERY_HEADS: STATE_HEADS}}
@@ -368,7 +406,6 @@ def test_structured_errors_with_typed_roles_are_json_safe():
             "role": {"name": "key_dim", "node": "FeatureRole"},
         },
     }
-
 
 
 def test_ir_requires_exactly_one_matrix_state():

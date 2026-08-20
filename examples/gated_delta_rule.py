@@ -80,6 +80,7 @@ def gated_delta_rule(
     )
     return StatefulOperator(algorithm)
 
+
 def compositional_pressure_profile(
     B: int = 2,
     H: int = 4,
@@ -95,9 +96,7 @@ def compositional_pressure_profile(
     algorithm = AlgorithmIR(
         inputs=(
             TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
-            TensorInput(
-                "auxiliary_query", (Batch, QUERY_HEADS, Sequence, KEY), dtype
-            ),
+            TensorInput("auxiliary_query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
             TensorInput("left", (Batch, source_heads, Sequence, KEY), dtype),
             TensorInput("right", (Batch, source_heads, Sequence, KEY), dtype),
             TensorInput(
@@ -106,9 +105,7 @@ def compositional_pressure_profile(
             TensorInput(
                 "right_gate", (Batch, STATE_HEADS, Sequence, VALUE), torch.float32
             ),
-            TensorInput(
-                "coefficient", (Batch, STATE_HEADS, Sequence), torch.float32
-            ),
+            TensorInput("coefficient", (Batch, STATE_HEADS, Sequence), torch.float32),
             TensorInput("value", (Batch, source_heads, Sequence, VALUE), dtype),
         ),
         states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
@@ -131,9 +128,7 @@ def compositional_pressure_profile(
                 ProductInjection(
                     (
                         ProductFactor(Input("right"), (KEY,)),
-                        ProductFactor(
-                            Input("value") * Input("coefficient"), (VALUE,)
-                        ),
+                        ProductFactor(Input("value") * Input("coefficient"), (VALUE,)),
                     )
                 ),
             ),
@@ -144,9 +139,7 @@ def compositional_pressure_profile(
                 "auxiliary", "memory", Input("auxiliary_query"), KEY, dtype
             ),
         ),
-        head_mapping=HeadMapping(
-            {QUERY_HEADS: STATE_HEADS, source_heads: STATE_HEADS}
-        ),
+        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, source_heads: STATE_HEADS}),
     )
     return StatefulOperator(algorithm)
 

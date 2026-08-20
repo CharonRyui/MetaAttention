@@ -62,6 +62,7 @@ class TypedExpression:
     dtype: torch.dtype
     roles: tuple[Any, ...]
 
+
 @dataclass(frozen=True)
 class AffineSummaryIR:
     """Canonical semantic summary for vec(State): M @ state + additive."""
@@ -140,7 +141,10 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 raise StatefulCompilationError(
                     "IR_TYPE",
                     path,
-                    {"left_roles": _role_names(left.roles), "right_roles": _role_names(right.roles)},
+                    {
+                        "left_roles": _role_names(left.roles),
+                        "right_roles": _role_names(right.roles),
+                    },
                 )
             typed = TypedExpression(
                 expression,
@@ -172,7 +176,10 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 raise StatefulCompilationError(
                     "IR_TYPE",
                     f"{path}.roles",
-                    {"factor_features": _role_names(expected), "declared": _role_names(node.roles)},
+                    {
+                        "factor_features": _role_names(expected),
+                        "declared": _role_names(node.roles),
+                    },
                 )
             reverse.append(VJPStep(path, "axis_scale", _input_names(node.factor)))
         elif isinstance(node, RankOnePropagation):
@@ -180,16 +187,24 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             right = type_expression(node.right, f"{path}.right")
             coefficient = type_expression(node.coefficient, f"{path}.coefficient")
             for name, typed in (("left", left), ("right", right)):
-                if tuple(role for role in typed.roles if role in feature_roles) != (node.role,):
+                if tuple(role for role in typed.roles if role in feature_roles) != (
+                    node.role,
+                ):
                     raise StatefulCompilationError(
-                        "IR_TYPE", f"{path}.{name}", {"expected_feature": str(node.role)}
+                        "IR_TYPE",
+                        f"{path}.{name}",
+                        {"expected_feature": str(node.role)},
                     )
             if any(role in feature_roles for role in coefficient.roles):
                 raise StatefulCompilationError(
                     "IR_TYPE", f"{path}.coefficient", {"expected": "feature scalar"}
                 )
             reverse.append(
-                VJPStep(path, "rank_one", _input_names(node.left, node.right, node.coefficient))
+                VJPStep(
+                    path,
+                    "rank_one",
+                    _input_names(node.left, node.right, node.coefficient),
+                )
             )
         else:
             raise StatefulCompilationError(
@@ -207,10 +222,21 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 raise StatefulCompilationError(
                     "IR_TYPE",
                     f"{path}.factors[{factor_index}].roles",
-                    {"expression_features": _role_names(actual), "declared": _role_names(factor.roles)},
+                    {
+                        "expression_features": _role_names(actual),
+                        "declared": _role_names(factor.roles),
+                    },
                 )
         reverse.append(
-            VJPStep(path, "product_injection", tuple(name for factor in injection.factors for name in _input_names(factor.expression)))
+            VJPStep(
+                path,
+                "product_injection",
+                tuple(
+                    name
+                    for factor in injection.factors
+                    for name in _input_names(factor.expression)
+                ),
+            )
         )
 
     for index, readout in enumerate(algorithm.readouts):
@@ -221,7 +247,9 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             raise StatefulCompilationError(
                 "IR_TYPE", f"{path}.operand", {"expected_feature": str(readout.role)}
             )
-        reverse.append(VJPStep(path, "state_contraction", _input_names(readout.operand)))
+        reverse.append(
+            VJPStep(path, "state_contraction", _input_names(readout.operand))
+        )
 
     reverse.extend(
         VJPStep(f"head_mapping[{index}]", "head_reduce", (str(source),))
@@ -243,8 +271,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     )
     scalar_factorized = None
     scalar_propagations = all(
-        isinstance(node, Identity)
-        or isinstance(node, AxisScale) and not node.roles
+        isinstance(node, Identity) or isinstance(node, AxisScale) and not node.roles
         for node in algorithm.transition.propagations
     )
     factorized_injections = bool(algorithm.transition.injections) and all(
@@ -267,10 +294,14 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             propagation_node = algorithm.transition.propagations[0]
             injection = algorithm.transition.injections[0]
             left_factor = next(
-                factor for factor in injection.factors if factor.roles == (feature_roles[0],)
+                factor
+                for factor in injection.factors
+                if factor.roles == (feature_roles[0],)
             )
             right_factor = next(
-                factor for factor in injection.factors if factor.roles == (feature_roles[1],)
+                factor
+                for factor in injection.factors
+                if factor.roles == (feature_roles[1],)
             )
             propagation = _dense_scalar_binding(
                 propagation_node.factor, algorithm, feature_role=None
@@ -286,7 +317,9 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 algorithm,
                 feature_role=feature_roles[0],
             )
-            if all(recipe is not None for recipe in (propagation, left, right, readout)):
+            if all(
+                recipe is not None for recipe in (propagation, left, right, readout)
+            ):
                 dense_scalar = DenseScalarFactorizedIR(
                     propagation, left, right, readout
                 )
@@ -378,7 +411,16 @@ def _dense_scalar_binding(
     feature_role: Any | None,
     require_exp: bool = False,
 ) -> tuple[DenseInputIR, ScalarExpressionIR] | None:
-    from .stateful_operator import Batch, Constant, Exp, HeadRole, Input, Multiply, Negate, Sequence
+    from .stateful_operator import (
+        Batch,
+        Constant,
+        Exp,
+        HeadRole,
+        Input,
+        Multiply,
+        Negate,
+        Sequence,
+    )
 
     operation = "identity"
     scale = 1.0

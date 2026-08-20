@@ -1,4 +1,3 @@
-
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 import fcntl
@@ -54,6 +53,7 @@ class TileLangExecutable:
             )
         assert isinstance(transform, torch.Tensor)
         return tilelang_elementwise_prefix(transform, bias, segment, initial_state)
+
     def scalar_factorized_dense_raw(
         self,
         raw_inputs: dict[str, torch.Tensor],
@@ -102,6 +102,7 @@ class TileLangExecutable:
             output_dtype=output_dtype,
             return_final_state=return_final_state,
         )
+
     def scalar_factorized_packed(
         self,
         scale: torch.Tensor,
@@ -145,8 +146,12 @@ def compile_plan(
     """Compile an executable and atomically publish its portable descriptor."""
     toolchain = _toolchain_fingerprint()
     environment = _environment_fingerprint(device)
-    binary_identity = _digest((source_identity, mode, feature_sizes, toolchain, environment))
-    tuning_identity = _digest((binary_identity, environment, _clock_fingerprint(device)))
+    binary_identity = _digest(
+        (source_identity, mode, feature_sizes, toolchain, environment)
+    )
+    tuning_identity = _digest(
+        (binary_identity, environment, _clock_fingerprint(device))
+    )
     plan = TileLangPlan(
         source_identity,
         binary_identity,
@@ -158,9 +163,12 @@ def compile_plan(
         try:
             import tilelang  # noqa: F401
         except ImportError as error:
-            raise RuntimeError("TileLang is required for CUDA Stateful Operator plans") from error
+            raise RuntimeError(
+                "TileLang is required for CUDA Stateful Operator plans"
+            ) from error
         _publish_manifest(plan)
     return TileLangExecutable(plan, backward_ir, dense_summary, scalar_factorized)
+
 
 def _toolchain_fingerprint() -> tuple[str, ...]:
     try:
@@ -215,7 +223,9 @@ def _nvidia_smi_fingerprint(index: int, fields: str) -> str:
             text=True,
         ).stdout.strip()
     except (OSError, subprocess.CalledProcessError) as error:
-        raise RuntimeError("unable to fingerprint the CUDA driver and clock policy") from error
+        raise RuntimeError(
+            "unable to fingerprint the CUDA driver and clock policy"
+        ) from error
 
 
 def _digest(value: Any) -> str:
@@ -298,15 +308,11 @@ def _compile_scalar_factorized_dense_raw(
             readout: T.Tensor(
                 (sequence_count, heads, sequence_length, rows), dtype=readout_dtype
             ),
-            initial: T.Tensor(
-                (sequence_count, heads, rows, columns), dtype="float32"
-            ),
+            initial: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
             output: T.Tensor(
                 (sequence_count, heads, sequence_length, columns), dtype=output_dtype
             ),
-            final: T.Tensor(
-                (sequence_count, heads, rows, columns), dtype="float32"
-            ),
+            final: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
         ):
             with T.Kernel(
                 sequence_count * heads,
@@ -317,25 +323,17 @@ def _compile_scalar_factorized_dense_raw(
                 head = sequence_head % heads
                 column_start = column_block * block_columns
                 state = T.alloc_shared((rows, block_columns), dtype="float32")
-                readout_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype="float32"
-                )
-                left_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype="float32"
-                )
+                readout_shared = T.alloc_shared((chunk_tokens, rows), dtype="float32")
+                left_shared = T.alloc_shared((chunk_tokens, rows), dtype="float32")
                 right_shared = T.alloc_shared(
                     (chunk_tokens, block_columns), dtype="float32"
                 )
-                weighted_left = T.alloc_shared(
-                    (chunk_tokens, rows), dtype="float32"
-                )
+                weighted_left = T.alloc_shared((chunk_tokens, rows), dtype="float32")
                 scores_shared = T.alloc_shared(
                     (chunk_tokens, chunk_tokens), dtype="float32"
                 )
                 log_prefix = T.alloc_shared((chunk_tokens,), dtype="float32")
-                scores = T.alloc_fragment(
-                    (chunk_tokens, chunk_tokens), dtype="float32"
-                )
+                scores = T.alloc_fragment((chunk_tokens, chunk_tokens), dtype="float32")
                 output_fragment = T.alloc_fragment(
                     (chunk_tokens, block_columns), dtype="float32"
                 )
@@ -357,12 +355,8 @@ def _compile_scalar_factorized_dense_raw(
                     for token, row in T.Parallel(chunk_tokens, rows):
                         logical_token = chunk_start + token
                         if logical_token < sequence_length:
-                            readout_value = readout[
-                                sequence, head, logical_token, row
-                            ]
-                            left_value = left[
-                                sequence, head, logical_token, row
-                            ]
+                            readout_value = readout[sequence, head, logical_token, row]
+                            left_value = left[sequence, head, logical_token, row]
                             if readout_operation == "exp":
                                 readout_value = T.exp(readout_value)
                             if left_operation == "exp":
@@ -372,9 +366,7 @@ def _compile_scalar_factorized_dense_raw(
                         else:
                             readout_shared[token, row] = 0.0
                             left_shared[token, row] = 0.0
-                    for token, column in T.Parallel(
-                        chunk_tokens, block_columns
-                    ):
+                    for token, column in T.Parallel(chunk_tokens, block_columns):
                         logical_token = chunk_start + token
                         if (
                             logical_token < sequence_length
@@ -417,12 +409,8 @@ def _compile_scalar_factorized_dense_raw(
                         output_fragment,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, column in T.Parallel(
-                        chunk_tokens, block_columns
-                    ):
-                        output_fragment[token, column] *= T.exp(
-                            log_prefix[token]
-                        )
+                    for token, column in T.Parallel(chunk_tokens, block_columns):
+                        output_fragment[token, column] *= T.exp(log_prefix[token])
 
                     T.clear(scores)
                     T.gemm(
@@ -432,9 +420,7 @@ def _compile_scalar_factorized_dense_raw(
                         transpose_B=True,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, source in T.Parallel(
-                        chunk_tokens, chunk_tokens
-                    ):
+                    for token, source in T.Parallel(chunk_tokens, chunk_tokens):
                         scores[token, source] = T.if_then_else(
                             source <= token,
                             scores[token, source]
@@ -449,9 +435,7 @@ def _compile_scalar_factorized_dense_raw(
                         clear_accum=False,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, column in T.Parallel(
-                        chunk_tokens, block_columns
-                    ):
+                    for token, column in T.Parallel(chunk_tokens, block_columns):
                         logical_token = chunk_start + token
                         if (
                             logical_token < sequence_length
@@ -468,9 +452,8 @@ def _compile_scalar_factorized_dense_raw(
                         T.min(chunk_tokens - 1, sequence_length - chunk_start - 1)
                     ]
                     for token, row in T.Parallel(chunk_tokens, rows):
-                        weighted_left[token, row] = (
-                            left_shared[token, row]
-                            * T.exp(end_log - log_prefix[token])
+                        weighted_left[token, row] = left_shared[token, row] * T.exp(
+                            end_log - log_prefix[token]
                         )
                     T.clear(update_fragment)
                     T.gemm(
@@ -489,9 +472,9 @@ def _compile_scalar_factorized_dense_raw(
                 if return_final_state:
                     for row, column in T.Parallel(rows, block_columns):
                         if column_start + column < columns:
-                            final[
-                                sequence, head, row, column_start + column
-                            ] = state[row, column]
+                            final[sequence, head, row, column_start + column] = state[
+                                row, column
+                            ]
 
         return kernel
 
@@ -589,13 +572,9 @@ def _compile_scalar_factorized_forward(
             right: T.Tensor((heads, token_count, columns), dtype=input_dtype),
             readout: T.Tensor((heads, token_count, rows), dtype=input_dtype),
             offsets: T.Tensor((sequence_count + 1,), dtype="int32"),
-            initial: T.Tensor(
-                (sequence_count, heads, rows, columns), dtype="float32"
-            ),
+            initial: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
             output: T.Tensor((token_count, heads, columns), dtype=output_dtype),
-            final: T.Tensor(
-                (sequence_count, heads, rows, columns), dtype="float32"
-            ),
+            final: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
         ):
             with T.Kernel(
                 sequence_count * heads,
@@ -608,15 +587,9 @@ def _compile_scalar_factorized_forward(
                 sequence_start = offsets[sequence]
                 sequence_length = offsets[sequence + 1] - sequence_start
                 state = T.alloc_shared((rows, block_columns), dtype="float32")
-                query_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype="float32"
-                )
-                readout_float = T.alloc_shared(
-                    (chunk_tokens, rows), dtype="float32"
-                )
-                key_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype="float32"
-                )
+                query_shared = T.alloc_shared((chunk_tokens, rows), dtype="float32")
+                readout_float = T.alloc_shared((chunk_tokens, rows), dtype="float32")
+                key_shared = T.alloc_shared((chunk_tokens, rows), dtype="float32")
                 value_shared = T.alloc_shared(
                     (chunk_tokens, block_columns), dtype="float32"
                 )
@@ -627,9 +600,7 @@ def _compile_scalar_factorized_forward(
                     (chunk_tokens, chunk_tokens), dtype="float32"
                 )
                 log_prefix = T.alloc_shared((chunk_tokens,), dtype="float32")
-                scores = T.alloc_fragment(
-                    (chunk_tokens, chunk_tokens), dtype="float32"
-                )
+                scores = T.alloc_fragment((chunk_tokens, chunk_tokens), dtype="float32")
                 output_fragment = T.alloc_fragment(
                     (chunk_tokens, block_columns), dtype="float32"
                 )
@@ -655,16 +626,12 @@ def _compile_scalar_factorized_forward(
                             readout_float[token, row] = readout[
                                 head, physical_token, row
                             ]
-                            key_shared[token, row] = left[
-                                head, physical_token, row
-                            ]
+                            key_shared[token, row] = left[head, physical_token, row]
                         else:
                             query_shared[token, row] = 0.0
                             key_shared[token, row] = 0.0
                             readout_float[token, row] = 0.0
-                    for token, column in T.Parallel(
-                        chunk_tokens, block_columns
-                    ):
+                    for token, column in T.Parallel(chunk_tokens, block_columns):
                         logical_token = chunk_start + token
                         physical_token = sequence_start + logical_token
                         if (
@@ -683,9 +650,7 @@ def _compile_scalar_factorized_forward(
                             logical_token = chunk_start + token
                             if logical_token < sequence_length:
                                 physical_token = sequence_start + logical_token
-                                running_log[0] += T.log(
-                                    scale[head, physical_token]
-                                )
+                                running_log[0] += T.log(scale[head, physical_token])
                             log_prefix[token] = running_log[0]
                     T.sync_threads()
 
@@ -696,12 +661,8 @@ def _compile_scalar_factorized_forward(
                         output_fragment,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, column in T.Parallel(
-                        chunk_tokens, block_columns
-                    ):
-                        output_fragment[token, column] *= T.exp(
-                            log_prefix[token]
-                        )
+                    for token, column in T.Parallel(chunk_tokens, block_columns):
+                        output_fragment[token, column] *= T.exp(log_prefix[token])
 
                     T.clear(scores)
                     T.gemm(
@@ -711,9 +672,7 @@ def _compile_scalar_factorized_forward(
                         transpose_B=True,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, source in T.Parallel(
-                        chunk_tokens, chunk_tokens
-                    ):
+                    for token, source in T.Parallel(chunk_tokens, chunk_tokens):
                         scores[token, source] = T.if_then_else(
                             source <= token,
                             scores[token, source]
@@ -728,9 +687,7 @@ def _compile_scalar_factorized_forward(
                         clear_accum=False,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, column in T.Parallel(
-                        chunk_tokens, block_columns
-                    ):
+                    for token, column in T.Parallel(chunk_tokens, block_columns):
                         logical_token = chunk_start + token
                         if (
                             logical_token < sequence_length
@@ -746,10 +703,9 @@ def _compile_scalar_factorized_forward(
                         T.min(chunk_tokens - 1, sequence_length - chunk_start - 1)
                     ]
                     for token, row in T.Parallel(chunk_tokens, rows):
-                        weighted_key_shared[token, row] = (
-                            key_shared[token, row]
-                            * T.exp(end_log - log_prefix[token])
-                        )
+                        weighted_key_shared[token, row] = key_shared[
+                            token, row
+                        ] * T.exp(end_log - log_prefix[token])
                     T.clear(update_fragment)
                     T.gemm(
                         weighted_key_shared,
@@ -767,9 +723,9 @@ def _compile_scalar_factorized_forward(
                 if return_final_state:
                     for row, column in T.Parallel(rows, block_columns):
                         if column_start + column < columns:
-                            final[
-                                sequence, head, row, column_start + column
-                            ] = state[row, column]
+                            final[sequence, head, row, column_start + column] = state[
+                                row, column
+                            ]
 
         return kernel
 
@@ -870,12 +826,9 @@ def tilelang_scalar_factorized_dense(
     return output, final
 
 
-
-
-
-
 def is_parallel_plan(plan: Any) -> bool:
     return isinstance(plan, TileLangExecutable) and plan.plan.uses_parallel_summary
+
 
 def tilelang_elementwise_prefix(
     scale: torch.Tensor,
@@ -891,8 +844,6 @@ def tilelang_elementwise_prefix(
     if bias.numel() == 0:
         return bias
     return _TileLangElementwisePrefix.apply(scale, bias, segment, initial_state)
-
-
 
 
 @lru_cache(maxsize=None)
@@ -929,9 +880,7 @@ def _compile_elementwise_prefix(
             output_scale: T.Tensor(
                 (token_count, heads, scale_rows, scale_columns), dtype=dtype
             ),
-            output_bias: T.Tensor(
-                (token_count, heads, rows, columns), dtype=dtype
-            ),
+            output_bias: T.Tensor((token_count, heads, rows, columns), dtype=dtype),
         ):
             with T.Kernel(heads, matrix_blocks, threads=block_tokens) as (
                 head,
@@ -995,9 +944,7 @@ def _compile_elementwise_prefix(
                                 previous_scale[lane] = shared_scale[
                                     thread - offset, lane
                                 ]
-                                previous_bias[lane] = shared_bias[
-                                    thread - offset, lane
-                                ]
+                                previous_bias[lane] = shared_bias[thread - offset, lane]
                                 local_bias[lane] = (
                                     local_scale[lane] * previous_bias[lane]
                                     + local_bias[lane]
@@ -1027,15 +974,15 @@ def _compile_elementwise_prefix(
                                     local_scale[lane] = (
                                         local_scale[lane] * carry_scale[lane]
                                     )
-                                if scale_rows != 1 or scale_columns != 1 or (
-                                    matrix_block == 0 and lane == 0
+                                if (
+                                    scale_rows != 1
+                                    or scale_columns != 1
+                                    or (matrix_block == 0 and lane == 0)
                                 ):
                                     output_scale[
                                         token, head, scale_row, scale_column
                                     ] = local_scale[lane]
-                                output_bias[token, head, row, column] = local_bias[
-                                    lane
-                                ]
+                                output_bias[token, head, row, column] = local_bias[lane]
                     T.sync_threads()
 
                     if thread == 0:
@@ -1066,7 +1013,6 @@ def _compile_elementwise_prefix(
     return build_kernel()
 
 
-
 def _tilelang_segmented_elementwise_scan(
     scale: torch.Tensor,
     bias: torch.Tensor,
@@ -1095,6 +1041,7 @@ def _tilelang_segmented_elementwise_scan(
 
 class _TileLangElementwisePrefix(torch.autograd.Function):
     """Native TileLang scalar-affine composition with compiler-derived VJP."""
+
     @staticmethod
     def forward(
         ctx,
@@ -1117,9 +1064,7 @@ class _TileLangElementwisePrefix(torch.autograd.Function):
             states = output_bias.addcmul_(output_scale, initial)
         else:
             states = output_scale * initial + output_bias
-        ctx.save_for_backward(
-            scale, segment, output_scale, output_bias, initial_state
-        )
+        ctx.save_for_backward(scale, segment, output_scale, output_bias, initial_state)
         return states
 
     @staticmethod
@@ -1160,9 +1105,7 @@ class _TileLangElementwisePrefix(torch.autograd.Function):
             scale.shape,
         )
         state_gradient = torch.zeros_like(initial_state)
-        state_gradient.index_add_(
-            0, segment.long(), grad_states * output_scale
-        )
+        state_gradient.index_add_(0, segment.long(), grad_states * output_scale)
         return scale_gradient, adjoint_bias, None, state_gradient
 
 
@@ -1171,8 +1114,6 @@ def _sum_to_shape(value: torch.Tensor, shape: torch.Size) -> torch.Tensor:
         if expected == 1 and actual != 1:
             value = value.sum(dim=axis, keepdim=True)
     return value
-
-
 
 
 @lru_cache(maxsize=None)
@@ -1203,16 +1144,10 @@ def _compile_dense_matmul_step(
         @T.prim_func
         def kernel(
             left: T.Tensor((token_count, heads, rows, inner), dtype="float32"),
-            right: T.Tensor(
-                (token_count, heads, inner, columns), dtype="float32"
-            ),
+            right: T.Tensor((token_count, heads, inner, columns), dtype="float32"),
             segment: T.Tensor((token_count,), dtype="int32"),
-            extra: T.Tensor(
-                (token_count, heads, rows, columns), dtype="float32"
-            ),
-            output: T.Tensor(
-                (token_count, heads, rows, columns), dtype="float32"
-            ),
+            extra: T.Tensor((token_count, heads, rows, columns), dtype="float32"),
+            output: T.Tensor((token_count, heads, rows, columns), dtype="float32"),
         ):
             with T.Kernel(
                 token_count * heads,
@@ -1230,17 +1165,13 @@ def _compile_dense_matmul_step(
                 accumulator = T.alloc_fragment(
                     (block_rows, block_columns), dtype="float32"
                 )
-                left_shared = T.alloc_shared(
-                    (block_rows, block_inner), dtype="float32"
-                )
+                left_shared = T.alloc_shared((block_rows, block_inner), dtype="float32")
                 right_shared = T.alloc_shared(
                     (block_inner, block_columns), dtype="float32"
                 )
                 T.clear(accumulator)
                 if valid:
-                    left_token = (
-                        token - operand_offset if left_from_previous else token
-                    )
+                    left_token = token - operand_offset if left_from_previous else token
                     right_token = (
                         token if left_from_previous else token - operand_offset
                     )
@@ -1268,9 +1199,7 @@ def _compile_dense_matmul_step(
                         )
                         T.gemm(left_shared, right_shared, accumulator)
                     if addend:
-                        for row, column in T.Parallel(
-                            block_rows, block_columns
-                        ):
+                        for row, column in T.Parallel(block_rows, block_columns):
                             accumulator[row, column] += extra[
                                 token,
                                 head,
@@ -1359,16 +1288,56 @@ def _tilelang_dense_affine_scan(
         empty_left = torch.empty_like(left)
         empty_right = torch.empty_like(right)
         _compile_dense_matmul_step(
-            token_count, heads, rows, rows, rows, offset, offset, False, 1, False, device_index
+            token_count,
+            heads,
+            rows,
+            rows,
+            rows,
+            offset,
+            offset,
+            False,
+            1,
+            False,
+            device_index,
         )(left, left, segment, empty_left, next_left)
         _compile_dense_matmul_step(
-            token_count, heads, columns, columns, columns, offset, offset, True, 2, False, device_index
+            token_count,
+            heads,
+            columns,
+            columns,
+            columns,
+            offset,
+            offset,
+            True,
+            2,
+            False,
+            device_index,
         )(right, right, segment, empty_right, next_right)
         _compile_dense_matmul_step(
-            token_count, heads, rows, rows, columns, offset, offset, False, 0, False, device_index
+            token_count,
+            heads,
+            rows,
+            rows,
+            columns,
+            offset,
+            offset,
+            False,
+            0,
+            False,
+            device_index,
         )(left, bias, segment, empty_bias, temporary)
         _compile_dense_matmul_step(
-            token_count, heads, rows, columns, columns, offset, 0, False, 0, True, device_index
+            token_count,
+            heads,
+            rows,
+            columns,
+            columns,
+            offset,
+            0,
+            False,
+            0,
+            True,
+            device_index,
         )(temporary, right, segment, bias, next_bias)
         left, right, bias = next_left, next_right, next_bias
         offset *= 2
@@ -1392,9 +1361,7 @@ def tilelang_dense_affine_prefix(
         or segment.shape != (bias.shape[0],)
     ):
         raise ValueError("invalid dense affine prefix shapes")
-    return _TileLangDenseAffinePrefix.apply(
-        left, right, bias, segment, initial_state
-    )
+    return _TileLangDenseAffinePrefix.apply(left, right, bias, segment, initial_state)
 
 
 class _TileLangDenseAffinePrefix(torch.autograd.Function):
@@ -1413,10 +1380,7 @@ class _TileLangDenseAffinePrefix(torch.autograd.Function):
             left, right, bias, segment
         )
         states = (
-            prefix_left
-            @ initial_state[segment.long()]
-            @ prefix_right
-            + prefix_bias
+            prefix_left @ initial_state[segment.long()] @ prefix_right + prefix_bias
         )
         ctx.save_for_backward(left, right, segment, initial_state, states)
         return states
@@ -1424,9 +1388,7 @@ class _TileLangDenseAffinePrefix(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_states: torch.Tensor | None):
         left, right, segment, initial_state, states = ctx.saved_tensors
-        grad_states = (
-            torch.zeros_like(states) if grad_states is None else grad_states
-        )
+        grad_states = torch.zeros_like(states) if grad_states is None else grad_states
         same_next = (segment[:-1] == segment[1:]).view(-1, 1, 1, 1)
         continuation_left = torch.zeros_like(left)
         continuation_right = torch.zeros_like(right)
@@ -1455,16 +1417,8 @@ class _TileLangDenseAffinePrefix(torch.autograd.Function):
             states[:-1],
             previous_state[1:],
         )
-        grad_left = (
-            adjoint
-            @ right.transpose(-1, -2)
-            @ previous_state.transpose(-1, -2)
-        )
-        grad_right = (
-            previous_state.transpose(-1, -2)
-            @ left.transpose(-1, -2)
-            @ adjoint
-        )
+        grad_left = adjoint @ right.transpose(-1, -2) @ previous_state.transpose(-1, -2)
+        grad_right = previous_state.transpose(-1, -2) @ left.transpose(-1, -2) @ adjoint
         grad_initial = torch.zeros_like(initial_state)
         sequence_starts = torch.ones_like(segment, dtype=torch.bool)
         sequence_starts[1:] = segment[1:] != segment[:-1]
@@ -1477,10 +1431,3 @@ class _TileLangDenseAffinePrefix(torch.autograd.Function):
         )
         grad_initial.index_add_(0, start_segments, initial_adjoint)
         return grad_left, grad_right, adjoint, None, grad_initial
-
-
-
-
-
-
-

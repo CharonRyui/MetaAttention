@@ -3,6 +3,7 @@ import warnings
 from core.lower.lower_linear import lower_tl
 from .stateful_operator import load_generated_callable
 
+
 class LinearAttentionEngine:
     """Deprecated modifier adapter for the IR-first StatefulOperator seam."""
 
@@ -37,7 +38,6 @@ class LinearAttentionEngine:
 
     def __call__(self, *args, **kargs):
         return self.attention(*args, **kargs)
-
 
     def _compile_tl(
         self,

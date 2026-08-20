@@ -47,9 +47,7 @@ def tilelang_fused_chunk_gdr_bwd(
         g_shape = (1, num_tokens, H)
         b_shape = (1, num_tokens, H)
         h_shape = (
-            (1, num_chunks, H, DV, DK)
-            if state_v_first
-            else (1, num_chunks, H, DK, DV)
+            (1, num_chunks, H, DV, DK) if state_v_first else (1, num_chunks, H, DK, DV)
         )
     else:
         q_shape = (batch_size, num_tokens, Hg, DK)
@@ -64,16 +62,8 @@ def tilelang_fused_chunk_gdr_bwd(
             if state_v_first
             else (batch_size, num_chunks, H, DK, DV)
         )
-    h0_shape = (
-        (batch_size, H, DV, DK)
-        if state_v_first
-        else (batch_size, H, DK, DV)
-    )
-    ht_shape = (
-        (batch_size, H, DV, DK)
-        if state_v_first
-        else (batch_size, H, DK, DV)
-    )
+    h0_shape = (batch_size, H, DV, DK) if state_v_first else (batch_size, H, DK, DV)
+    ht_shape = (batch_size, H, DV, DK) if state_v_first else (batch_size, H, DK, DV)
 
     @T.prim_func
     def tilelang_fused_chunk_gdr_bwd_kernel(
@@ -361,17 +351,13 @@ def tilelang_fused_chunk_gdr_bwd(
                     if state_v_first:
                         for j_v, j_k in T.Parallel(DV, DK):
                             reduce_fragment[
-                                j_v % 64 // 16 * 32
-                                + j_v % 8 * 4
-                                + j_k % 8 // 2,
+                                j_v % 64 // 16 * 32 + j_v % 8 * 4 + j_k % 8 // 2,
                                 j_k % 2,
                             ] += dh_fragment[j_v, j_k] * h_shared[j_v, j_k]
                     else:
                         for j_k, j_v in T.Parallel(DK, DV):
                             reduce_fragment[
-                                j_k % 64 // 16 * 32
-                                + j_k % 8 * 4
-                                + j_v % 8 // 2,
+                                j_k % 64 // 16 * 32 + j_k % 8 * 4 + j_v % 8 // 2,
                                 j_v % 2,
                             ] += dh_fragment[j_k, j_v] * h_shared[j_k, j_v]
                     T.barrier_arrive(bar_08)
@@ -478,9 +464,7 @@ def tilelang_fused_chunk_gdr_bwd(
                             clear_accum=True,
                         )
                     else:
-                        T.gemm(
-                            k_shared, tmp_shared_4_1, dv_fragment, clear_accum=True
-                        )
+                        T.gemm(k_shared, tmp_shared_4_1, dv_fragment, clear_accum=True)
                     # dV' = g_last/g * dV'
                     for j_s, j_v in T.Parallel(block_S, DV):
                         dv_fragment[j_s, j_v] *= g_rev_exp_shared[j_s]
@@ -724,9 +708,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         clear_accum=True,
                     )
                     # V' = Ag @ W
-                    T.gemm(
-                        tmp_shared_1_2, tmp_shared_2_2, u_fragment, clear_accum=True
-                    )
+                    T.gemm(tmp_shared_1_2, tmp_shared_2_2, u_fragment, clear_accum=True)
                     # S2[1] V'
                     T.copy(u_fragment, tmp_shared_2_1)
                     T.fence_proxy_async()
@@ -825,7 +807,7 @@ def tilelang_fused_chunk_gdr_bwd(
                         a_fragment[j_s, j_t] += p_fragment[j_s, j_t]
                     for j_s, j_t in T.Parallel(block_S, block_S):
                         x = T.reinterpret(a_fragment[j_s, j_t], dtype="uint32")
-                        lo_fragment[j_s, j_t] = x & 0xffff
+                        lo_fragment[j_s, j_t] = x & 0xFFFF
                         hi_fragment[j_s, j_t] = x >> 16
                     for j_s, j_t in T.Parallel(block_S, block_S // 2):
                         for j_t_vec in T.vectorized(2):
@@ -852,8 +834,9 @@ def tilelang_fused_chunk_gdr_bwd(
                                 dtype="uint16",
                             )
                     for j_s, j_t in T.Parallel(block_S, block_S):
-                        uint32_fragment[j_s, j_t] = (hi_fragment[j_s, j_t] << 16) + \
-                            lo_fragment[j_s, j_t]
+                        uint32_fragment[j_s, j_t] = (
+                            hi_fragment[j_s, j_t] << 16
+                        ) + lo_fragment[j_s, j_t]
                         p_fragment[j_s, j_t] = T.reinterpret(
                             uint32_fragment[j_s, j_t],
                             dtype=accum_dtype,
@@ -1164,9 +1147,7 @@ def fused_gdr_bwd(
     use_dht = dht is not None
     if dht is None:
         dht = torch.empty(
-            (real_batch_size, H, V, K)
-            if state_v_first
-            else (real_batch_size, H, K, V),
+            (real_batch_size, H, V, K) if state_v_first else (real_batch_size, H, K, V),
             dtype=torch.float32,
             device=k.device,
         )

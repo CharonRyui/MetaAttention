@@ -15,15 +15,20 @@ def main() -> None:
     operator(query=query, key=key, value=value, gate=gate)
     torch.cuda.synchronize()
     with torch.profiler.profile(
-        activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA],
+        activities=[
+            torch.profiler.ProfilerActivity.CPU,
+            torch.profiler.ProfilerActivity.CUDA,
+        ],
         profile_memory=True,
         record_shapes=True,
     ) as profiler:
         operator(query=query, key=key, value=value, gate=gate)
     torch.cuda.synchronize()
-    print(profiler.key_averages(group_by_input_shape=True).table(
-        sort_by="self_cuda_memory_usage", row_limit=20
-    ))
+    print(
+        profiler.key_averages(group_by_input_shape=True).table(
+            sort_by="self_cuda_memory_usage", row_limit=20
+        )
+    )
 
 
 if __name__ == "__main__":

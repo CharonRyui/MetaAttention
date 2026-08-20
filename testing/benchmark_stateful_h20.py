@@ -65,7 +65,9 @@ def _paired_median_bootstrap(
     generator = torch.Generator().manual_seed(seed)
     new = torch.tensor(new_values, dtype=torch.float64)
     old = torch.tensor(old_values, dtype=torch.float64)
-    draws = torch.randint(0, len(new_values), (20_000, len(new_values)), generator=generator)
+    draws = torch.randint(
+        0, len(new_values), (20_000, len(new_values)), generator=generator
+    )
     ratios = new[draws].median(dim=1).values / old[draws].median(dim=1).values
     interval = torch.quantile(ratios, torch.tensor((0.025, 0.975), dtype=new.dtype))
     return interval[0].item(), interval[1].item()
@@ -73,9 +75,13 @@ def _paired_median_bootstrap(
 
 def _profile(device: torch.device):
     generator = torch.Generator(device=device).manual_seed(11)
-    query = torch.randn(1, 2, 128, 64, device=device, dtype=torch.bfloat16, generator=generator)
+    query = torch.randn(
+        1, 2, 128, 64, device=device, dtype=torch.bfloat16, generator=generator
+    )
     key = torch.randn_like(query)
-    value = torch.randn(1, 2, 128, 64, device=device, dtype=torch.bfloat16, generator=generator)
+    value = torch.randn(
+        1, 2, 128, 64, device=device, dtype=torch.bfloat16, generator=generator
+    )
     gate = -torch.rand(1, 2, 128, device=device, generator=generator)
     return query, key, value, gate
 
@@ -98,6 +104,7 @@ def main() -> None:
 
     def old_call():
         return old(query, key, value, gate)
+
     new_samples, old_samples = [], []
     peak_new, peak_old = [], []
     for batch in range(BATCHES):

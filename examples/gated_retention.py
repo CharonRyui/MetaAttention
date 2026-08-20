@@ -42,9 +42,29 @@ def gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("gate"))),),
-            injections=(ProductInjection((ProductFactor(Input("key"), (KEY,)), ProductFactor(Input("value"), (VALUE,)))),),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("value"), (VALUE,)),
+                    )
+                ),
+            ),
         ),
-        readouts=(StateContraction("output", "memory", Input("query") * (D**-0.5), KEY, dtype),),
-        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}),
+        readouts=(
+            StateContraction(
+                "output", "memory", Input("query") * (D**-0.5), KEY, dtype
+            ),
+        ),
+        head_mapping=HeadMapping(
+            {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
+        ),
     )
-    return StatefulOperator(algorithm, compile_options=CompileOptions(tune=tune, tune_filename=f"tuned_config/{get_attn_device().name}/simple_gla", tune_backward=tune))
+    return StatefulOperator(
+        algorithm,
+        compile_options=CompileOptions(
+            tune=tune,
+            tune_filename=f"tuned_config/{get_attn_device().name}/simple_gla",
+            tune_backward=tune,
+        ),
+    )

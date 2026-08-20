@@ -597,10 +597,19 @@ def test_linear_stateful_operator_supports_initial_and_final_state(gpu_device, s
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("gate"))),),
-            injections=(ProductInjection((ProductFactor(Input("key"), (KEY,)), ProductFactor(Input("value"), (VALUE,)))),),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("value"), (VALUE,)),
+                    )
+                ),
+            ),
         ),
         readouts=(StateContraction("output", "memory", Input("query"), KEY, dtype),),
-        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}),
+        head_mapping=HeadMapping(
+            {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
+        ),
     )
     operator = StatefulOperator(algorithm)
     query = torch.randn(1, 1, 64, 64, device=gpu_device, dtype=dtype)
@@ -627,14 +636,20 @@ def test_linear_stateful_operator_supports_initial_and_final_state(gpu_device, s
             "bhk,bhv->bhkv", key[..., token, :].float(), value[..., token, :].float()
         )
         expected_states.append(
-            torch.einsum("bhk,bhkv->bhv", query[..., token, :].float(), expected_state).to(dtype)
+            torch.einsum(
+                "bhk,bhkv->bhv", query[..., token, :].float(), expected_state
+            ).to(dtype)
         )
     expected_output = torch.stack(expected_states, dim=2)
     torch.testing.assert_close(output, expected_output, rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(final_state["memory"], expected_state, rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(
+        final_state["memory"], expected_state, rtol=1e-1, atol=1e-1
+    )
 
 
-def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequence(gpu_device, seed):
+def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequence(
+    gpu_device, seed
+):
     dtype = torch.bfloat16
     algorithm = AlgorithmIR(
         inputs=(
@@ -647,34 +662,68 @@ def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequenc
         transition=StateTransition(
             "memory",
             propagations=(AxisScale(Exp(Input("gate"))),),
-            injections=(ProductInjection((ProductFactor(Input("key"), (KEY,)), ProductFactor(Input("value"), (VALUE,)))),),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("value"), (VALUE,)),
+                    )
+                ),
+            ),
         ),
         readouts=(StateContraction("output", "memory", Input("query"), KEY, dtype),),
-        head_mapping=HeadMapping({QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}),
+        head_mapping=HeadMapping(
+            {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
+        ),
     )
     operator = StatefulOperator(algorithm)
     query = torch.randn(1, 1, 128, 64, device=gpu_device, dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn(1, 1, 128, 64, device=gpu_device, dtype=dtype)
     gate = torch.zeros(1, 1, 128, device=gpu_device, dtype=torch.float32)
-    zero = StateTuple(("memory",), (torch.zeros(1, 1, 64, 64, device=gpu_device, dtype=torch.float32),))
+    zero = StateTuple(
+        ("memory",),
+        (torch.zeros(1, 1, 64, 64, device=gpu_device, dtype=torch.float32),),
+    )
 
-    full = operator(query=query, key=key, value=value, gate=gate, return_final_state=True)
+    full = operator(
+        query=query, key=key, value=value, gate=gate, return_final_state=True
+    )
     explicit = operator(
-        query=query, key=key, value=value, gate=gate, initial_state=zero, return_final_state=True
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        initial_state=zero,
+        return_final_state=True,
     )
     prefix = operator(
-        query=query[:, :, :64].contiguous(), key=key[:, :, :64].contiguous(), value=value[:, :, :64].contiguous(), gate=gate[:, :, :64].contiguous(),
+        query=query[:, :, :64].contiguous(),
+        key=key[:, :, :64].contiguous(),
+        value=value[:, :, :64].contiguous(),
+        gate=gate[:, :, :64].contiguous(),
         return_final_state=True,
     )
     assert prefix.final_state is not None
     suffix = operator(
-        query=query[:, :, 64:].contiguous(), key=key[:, :, 64:].contiguous(), value=value[:, :, 64:].contiguous(), gate=gate[:, :, 64:].contiguous(),
+        query=query[:, :, 64:].contiguous(),
+        key=key[:, :, 64:].contiguous(),
+        value=value[:, :, 64:].contiguous(),
+        gate=gate[:, :, 64:].contiguous(),
         initial_state=prefix.final_state,
     )
 
     assert full.final_state is not None
     assert explicit.final_state is not None
-    torch.testing.assert_close(full.outputs[0], explicit.outputs[0], rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(full.final_state[0], explicit.final_state[0], rtol=1e-1, atol=1e-1)
-    torch.testing.assert_close(torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2), full.outputs[0], rtol=1e-1, atol=1e-1)
+    torch.testing.assert_close(
+        full.outputs[0], explicit.outputs[0], rtol=1e-1, atol=1e-1
+    )
+    torch.testing.assert_close(
+        full.final_state[0], explicit.final_state[0], rtol=1e-1, atol=1e-1
+    )
+    torch.testing.assert_close(
+        torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2),
+        full.outputs[0],
+        rtol=1e-1,
+        atol=1e-1,
+    )

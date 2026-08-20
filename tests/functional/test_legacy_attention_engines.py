@@ -208,6 +208,8 @@ def test_legacy_gated_retention(gpu_device, seed):
         rtol=1e-1,
         atol=1e-1,
     )
+
+
 def test_legacy_gated_retention_unaligned_scalar_carry(gpu_device, seed):
     batch, heads, seqlen, dim, dim_value = 1, 2, 129, 64, 64
     dtype = torch.bfloat16
@@ -216,7 +218,9 @@ def test_legacy_gated_retention_unaligned_scalar_carry(gpu_device, seed):
     key = torch.randn_like(query)
     gate = torch.full((batch, heads, seqlen), -0.001, device=gpu_device)
     value = torch.randn(batch, heads, seqlen, dim_value, device=gpu_device, dtype=dtype)
-    initial = torch.randn(batch, heads, dim, dim_value, device=gpu_device, dtype=torch.float32)
+    initial = torch.randn(
+        batch, heads, dim, dim_value, device=gpu_device, dtype=torch.float32
+    )
     actual = module(
         query=query,
         key=key,
@@ -235,6 +239,8 @@ def test_legacy_gated_retention_unaligned_scalar_carry(gpu_device, seed):
             "bhd,bhdf->bhf", scale * query_f[:, :, token], state
         )
     torch.testing.assert_close(actual, expected.to(dtype), rtol=1e-1, atol=1e-1)
+
+
 def test_gated_retention_packed_scalar_inference(gpu_device, seed):
     lengths = (0, 65, 64, 0)
     token_count = sum(lengths)
@@ -264,7 +270,10 @@ def test_gated_retention_packed_scalar_inference(gpu_device, seed):
         state = initial[sequence]
         for token in range(start, start + length):
             state = gate[token, :, None, None].exp() * state
-            state = state + key[token, :, :, None].float() * value[token, :, None, :].float()
+            state = (
+                state
+                + key[token, :, :, None].float() * value[token, :, None, :].float()
+            )
             expected[token] = torch.einsum(
                 "hd,hdf->hf", scale * query[token].float(), state
             ).to(dtype)
@@ -272,9 +281,9 @@ def test_gated_retention_packed_scalar_inference(gpu_device, seed):
         start += length
     assert result.final_state is not None
     torch.testing.assert_close(result.outputs["output"], expected, rtol=0.1, atol=0.1)
-    torch.testing.assert_close(result.final_state["memory"], expected_final, rtol=0.1, atol=0.1)
-
-
+    torch.testing.assert_close(
+        result.final_state["memory"], expected_final, rtol=0.1, atol=0.1
+    )
 
 
 def test_legacy_sigmoid(gpu_device, seed):
