@@ -278,23 +278,23 @@ def _compile_scalar_factorized_forward(
                 sequence_start = offsets[sequence]
                 sequence_length = offsets[sequence + 1] - sequence_start
                 state = T.alloc_shared((rows, block_columns), dtype="float32")
-                state_cast = T.alloc_shared(
-                    (rows, block_columns), dtype=input_dtype
-                )
                 query_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype=input_dtype
+                    (chunk_tokens, rows), dtype="float32"
+                )
+                readout_float = T.alloc_shared(
+                    (chunk_tokens, rows), dtype="float32"
                 )
                 key_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype=input_dtype
+                    (chunk_tokens, rows), dtype="float32"
                 )
                 value_shared = T.alloc_shared(
-                    (chunk_tokens, block_columns), dtype=input_dtype
+                    (chunk_tokens, block_columns), dtype="float32"
                 )
                 weighted_key_shared = T.alloc_shared(
-                    (chunk_tokens, rows), dtype=input_dtype
+                    (chunk_tokens, rows), dtype="float32"
                 )
                 scores_shared = T.alloc_shared(
-                    (chunk_tokens, chunk_tokens), dtype=input_dtype
+                    (chunk_tokens, chunk_tokens), dtype="float32"
                 )
                 log_prefix = T.alloc_shared((chunk_tokens,), dtype="float32")
                 scores = T.alloc_fragment(
@@ -322,12 +322,16 @@ def _compile_scalar_factorized_forward(
                             query_shared[token, row] = readout[
                                 head, physical_token, row
                             ]
+                            readout_float[token, row] = readout[
+                                head, physical_token, row
+                            ]
                             key_shared[token, row] = left[
                                 head, physical_token, row
                             ]
                         else:
                             query_shared[token, row] = 0.0
                             key_shared[token, row] = 0.0
+                            readout_float[token, row] = 0.0
                     for token, column in T.Parallel(
                         chunk_tokens, block_columns
                     ):
@@ -353,14 +357,12 @@ def _compile_scalar_factorized_forward(
                                     scale[head, physical_token]
                                 )
                             log_prefix[token] = running_log[0]
-                    for row, column in T.Parallel(rows, block_columns):
-                        state_cast[row, column] = state[row, column]
                     T.sync_threads()
 
                     T.clear(output_fragment)
                     T.gemm(
-                        query_shared,
-                        state_cast,
+                        readout_float,
+                        state,
                         output_fragment,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
