@@ -230,6 +230,7 @@ def _publish_manifest(plan: TileLangPlan) -> None:
                 Path(temporary).unlink(missing_ok=True)
 
 
+@lru_cache(maxsize=None)
 def _compile_scalar_factorized_forward(
     sequence_count: int,
     max_sequence_length: int,
