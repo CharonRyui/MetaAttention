@@ -55,7 +55,16 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
         1, 2, 128, 128, device=gpu_device, dtype=torch.float32, requires_grad=True
     )
     operator = gated_delta_rule(1, 2, 64, 128, 128, HQ=1)
-    result = operator(
+    compiled = operator.compile(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        beta=beta,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    result = compiled(
         query=query,
         key=key,
         value=value,
@@ -86,7 +95,7 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
 def test_gdn_continuation_matches_full_invocation(gpu_device):
     query, key, value, gate, beta = _bindings(gpu_device, length=128)
     operator = gated_delta_rule(1, 2, 128, 128, 128, HQ=1)
-    full = operator(
+    full_compiled = operator.compile(
         query=query,
         key=key,
         value=value,
@@ -94,21 +103,56 @@ def test_gdn_continuation_matches_full_invocation(gpu_device):
         beta=beta,
         return_final_state=True,
     )
-    prefix = operator(
-        query=query[:, :, :64].contiguous(),
-        key=key[:, :, :64].contiguous(),
-        value=value[:, :, :64].contiguous(),
-        gate=gate[:, :, :64].contiguous(),
-        beta=beta[:, :, :64].contiguous(),
+    prefix_query = query[:, :, :64].contiguous()
+    prefix_key = key[:, :, :64].contiguous()
+    prefix_value = value[:, :, :64].contiguous()
+    prefix_gate = gate[:, :, :64].contiguous()
+    prefix_beta = beta[:, :, :64].contiguous()
+    prefix_compiled = operator.compile(
+        query=prefix_query,
+        key=prefix_key,
+        value=prefix_value,
+        gate=prefix_gate,
+        beta=prefix_beta,
+        return_final_state=True,
+    )
+    full = full_compiled(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        beta=beta,
+        return_final_state=True,
+    )
+    prefix = prefix_compiled(
+        query=prefix_query,
+        key=prefix_key,
+        value=prefix_value,
+        gate=prefix_gate,
+        beta=prefix_beta,
         return_final_state=True,
     )
     assert prefix.final_state is not None
-    suffix = operator(
-        query=query[:, :, 64:].contiguous(),
-        key=key[:, :, 64:].contiguous(),
-        value=value[:, :, 64:].contiguous(),
-        gate=gate[:, :, 64:].contiguous(),
-        beta=beta[:, :, 64:].contiguous(),
+    suffix_query = query[:, :, 64:].contiguous()
+    suffix_key = key[:, :, 64:].contiguous()
+    suffix_value = value[:, :, 64:].contiguous()
+    suffix_gate = gate[:, :, 64:].contiguous()
+    suffix_beta = beta[:, :, 64:].contiguous()
+    suffix_compiled = operator.compile(
+        query=suffix_query,
+        key=suffix_key,
+        value=suffix_value,
+        gate=suffix_gate,
+        beta=suffix_beta,
+        initial_state=prefix.final_state,
+        return_final_state=True,
+    )
+    suffix = suffix_compiled(
+        query=suffix_query,
+        key=suffix_key,
+        value=suffix_value,
+        gate=suffix_gate,
+        beta=suffix_beta,
         initial_state=prefix.final_state,
         return_final_state=True,
     )
@@ -231,7 +275,13 @@ def test_compositional_pressure_profile_packed_forward_backward(gpu_device):
     ).requires_grad_()
     reference_initial = actual_initial.detach().clone().requires_grad_()
     operator = compositional_pressure_profile()
-    result = operator(
+    compiled = operator.compile(
+        **actual_bindings,
+        sequence_offsets=offsets,
+        initial_state=StateTuple(("memory",), (actual_initial,)),
+        return_final_state=True,
+    )
+    result = compiled(
         **actual_bindings,
         sequence_offsets=offsets,
         initial_state=StateTuple(("memory",), (actual_initial,)),
@@ -276,7 +326,13 @@ def test_compositional_pressure_profile_dense_unaligned_tail(gpu_device):
         for name, value in packed.items()
     }
     initial = 0.05 * torch.randn(1, 4, 64, 128, device=gpu_device)
-    result = compositional_pressure_profile()(
+    operator = compositional_pressure_profile()
+    compiled = operator.compile(
+        **dense,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    result = compiled(
         **dense,
         initial_state=StateTuple(("memory",), (initial,)),
         return_final_state=True,
@@ -306,9 +362,16 @@ def test_compositional_pressure_profile_all_empty(gpu_device):
     operator = compositional_pressure_profile()
     bindings = _pressure_bindings(gpu_device, (0, 0))
     initial = torch.randn(2, 4, 64, 128, device=gpu_device)
-    result = operator(
+    offsets = torch.tensor((0, 0, 0), device=gpu_device, dtype=torch.int32)
+    compiled = operator.compile(
         **bindings,
-        sequence_offsets=torch.tensor((0, 0, 0), device=gpu_device, dtype=torch.int32),
+        sequence_offsets=offsets,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    result = compiled(
+        **bindings,
+        sequence_offsets=offsets,
         initial_state=StateTuple(("memory",), (initial,)),
         return_final_state=True,
     )

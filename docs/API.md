@@ -80,12 +80,32 @@ def mask_mod(b, h, q_idx, kv_idx) -> Bool:
 
 ## Stateful Operator API
 
-Stateful sequence operators are authored by constructing explicit Algorithm IR
-and compiling it through `StatefulOperator`. The IR is model-independent: GLA,
-RetNet recurrent state evolution, selective state evolution, GDN, and custom
-compositions use the same typed nodes. Runtime tensors bind by keyword to named
-Tensor Inputs. `LinearAttentionEngine` remains a separate legacy generator and
-is not routed through this compiler.
+Stateful sequence operators are authored by constructing explicit Algorithm IR.
+Compilation is explicit: `compile()` specializes and JITs device kernels, while
+the returned operator launches the materialized executable on each call. The
+IR is model-independent: GLA, RetNet recurrent state evolution, selective state
+evolution, GDN, and custom compositions use the same typed nodes. Runtime
+tensors bind by keyword to named Tensor Inputs. `LinearAttentionEngine` remains
+a separate legacy generator and is not routed through this compiler.
+
+```py
+from attn_engine import StatefulOperator
+
+operator = StatefulOperator(algorithm)
+compiled = operator.compile(query=query, key=key, value=value, gate=gate)
+result = compiled(
+    query=query, key=key, value=value, gate=gate, return_final_state=True
+)
+output = result.outputs["output"]
+state = result.final_state["memory"]
+```
+
+`compile()` does not execute the operator. Its tensor arguments define the
+specialization: shape, dtype, device, packed layout, and gradient mode. They
+must match subsequent calls. Use another `compile()` call for another
+specialization. Calling an uncompiled operator remains supported and lazily
+compiles for compatibility.
+
 
 The first compiler schema has one named matrix State with two ordered Feature
 roles. It supports typed Input Expressions (`Input`, BF16/FP32 `Constant`,

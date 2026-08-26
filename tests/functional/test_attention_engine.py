@@ -617,8 +617,16 @@ def test_linear_stateful_operator_supports_initial_and_final_state(gpu_device, s
     value = torch.randn(1, 1, 64, 64, device=gpu_device, dtype=dtype)
     gate = torch.zeros(1, 1, 64, device=gpu_device, dtype=torch.float32)
     initial = torch.eye(64, device=gpu_device, dtype=torch.float32).view(1, 1, 64, 64)
+    compiled = operator.compile(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
 
-    result = operator(
+    result = compiled(
         query=query,
         key=key,
         value=value,
@@ -685,11 +693,29 @@ def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequenc
         ("memory",),
         (torch.zeros(1, 1, 64, 64, device=gpu_device, dtype=torch.float32),),
     )
+    full_compiled = operator.compile(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        return_final_state=True,
+    )
+    prefix_query = query[:, :, :64].contiguous()
+    prefix_key = key[:, :, :64].contiguous()
+    prefix_value = value[:, :, :64].contiguous()
+    prefix_gate = gate[:, :, :64].contiguous()
+    prefix_compiled = operator.compile(
+        query=prefix_query,
+        key=prefix_key,
+        value=prefix_value,
+        gate=prefix_gate,
+        return_final_state=True,
+    )
 
-    full = operator(
+    full = full_compiled(
         query=query, key=key, value=value, gate=gate, return_final_state=True
     )
-    explicit = operator(
+    explicit = full_compiled(
         query=query,
         key=key,
         value=value,
@@ -697,19 +723,30 @@ def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequenc
         initial_state=zero,
         return_final_state=True,
     )
-    prefix = operator(
-        query=query[:, :, :64].contiguous(),
-        key=key[:, :, :64].contiguous(),
-        value=value[:, :, :64].contiguous(),
-        gate=gate[:, :, :64].contiguous(),
+    prefix = prefix_compiled(
+        query=prefix_query,
+        key=prefix_key,
+        value=prefix_value,
+        gate=prefix_gate,
         return_final_state=True,
     )
     assert prefix.final_state is not None
-    suffix = operator(
-        query=query[:, :, 64:].contiguous(),
-        key=key[:, :, 64:].contiguous(),
-        value=value[:, :, 64:].contiguous(),
-        gate=gate[:, :, 64:].contiguous(),
+    suffix_query = query[:, :, 64:].contiguous()
+    suffix_key = key[:, :, 64:].contiguous()
+    suffix_value = value[:, :, 64:].contiguous()
+    suffix_gate = gate[:, :, 64:].contiguous()
+    suffix_compiled = operator.compile(
+        query=suffix_query,
+        key=suffix_key,
+        value=suffix_value,
+        gate=suffix_gate,
+        initial_state=prefix.final_state,
+    )
+    suffix = suffix_compiled(
+        query=suffix_query,
+        key=suffix_key,
+        value=suffix_value,
+        gate=suffix_gate,
         initial_state=prefix.final_state,
     )
 

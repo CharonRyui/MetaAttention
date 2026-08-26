@@ -505,6 +505,22 @@ class _Runtime:
     offsets: torch.Tensor | None
 
 
+class CompiledStatefulOperator:
+    """A pre-specialized StatefulOperator launch handle."""
+
+    def __init__(self, operator, specialization, input_shapes, return_final_state):
+        self.operator = operator
+        self.specialization = specialization
+        self.input_shapes = input_shapes
+        self.return_final_state = return_final_state
+
+    def __call__(self, **inputs: torch.Tensor) -> ExecutionResult:
+        """Launch the precompiled specialization."""
+        return self.operator._execute_compiled(
+            self.specialization, self.return_final_state, **inputs
+        )
+
+
 class StatefulOperator:
     def __init__(
         self,
@@ -531,6 +547,65 @@ class StatefulOperator:
         )
         return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
 
+    def compile(
+        self,
+        *,
+        initial_state: StateTuple | None = None,
+        sequence_offsets: torch.Tensor | None = None,
+        return_final_state: bool = False,
+        **inputs: torch.Tensor,
+    ) -> CompiledStatefulOperator:
+        """Compile a fixed specialization and return its launch handle."""
+        from ._stateful_runtime_validation import validate_input_names
+
+        validate_input_names({item.name for item in self.algorithm.inputs}, inputs)
+        runtime, _ = self._validate_runtime(inputs, sequence_offsets)
+        self._validate_target(runtime.device)
+        self._validate_aliases(inputs)
+        state = self._validate_state(
+            initial_state,
+            runtime,
+            cache_default=not (runtime.token_count == 0 and return_final_state),
+        )
+        specialization = self._specialization_key(
+            inputs, state, runtime, return_final_state
+        )
+        self._specializations.add(specialization)
+        self._compile_specialization(specialization, runtime)
+        return CompiledStatefulOperator(
+            self, specialization, tuple(inputs[name].shape for name in inputs),
+            return_final_state,
+        )
+
+    def _compile_specialization(self, specialization, runtime):
+        if specialization in self._plans:
+            return self._plans[specialization]
+        from ._stateful_tilelang import compile_plan
+
+        needs_dense = any(
+            isinstance(node, RankOnePropagation)
+            or isinstance(node, AxisScale) and len(node.roles) == 1
+            for node in self.algorithm.transition.propagations
+        )
+        plan = compile_plan(
+            source_identity=specialization,
+            mode="packed" if runtime.packed else "dense",
+            feature_sizes=runtime.feature_sizes,
+            device=runtime.device,
+            backward_ir=self.algorithm._analysis.backward,
+            dense_summary=needs_dense,
+            scalar_factorized=self.algorithm._analysis.scalar_factorized,
+        )
+        self._plans[specialization] = plan
+        return plan
+
+    def _get_or_compile_plan(self, inputs, state, runtime, return_final_state):
+        specialization = self._specialization_key(
+            inputs, state, runtime, return_final_state
+        )
+        self._specializations.add(specialization)
+        return self._compile_specialization(specialization, runtime)
+
     def __call__(
         self,
         *,
@@ -539,6 +614,25 @@ class StatefulOperator:
         return_final_state: bool = False,
         **inputs: torch.Tensor,
     ) -> ExecutionResult:
+        raise RuntimeError(
+            "StatefulOperator must be explicitly compiled before invocation; "
+            "call operator.compile(...) and invoke the returned handle"
+        )
+
+    def _execute_compiled(
+        self,
+        specialization: str,
+        compiled_return_final_state: bool,
+        *,
+        initial_state: StateTuple | None = None,
+        sequence_offsets: torch.Tensor | None = None,
+        return_final_state: bool = False,
+        **inputs: torch.Tensor,
+    ) -> ExecutionResult:
+        if return_final_state != compiled_return_final_state:
+            raise StatefulCompilationError(
+                "RUNTIME_SPECIALIZATION", "return_final_state", {}
+            )
         if (
             initial_state is None
             and sequence_offsets is None
@@ -559,30 +653,14 @@ class StatefulOperator:
             runtime,
             cache_default=not (runtime.token_count == 0 and return_final_state),
         )
-        specialization = self._specialization_key(
+        actual_specialization = self._specialization_key(
             inputs, state, runtime, return_final_state
         )
-        self._specializations.add(specialization)
-        plan = self._plans.get(specialization)
-        if plan is None:
-            from ._stateful_tilelang import compile_plan
-
-            needs_dense = any(
-                isinstance(node, RankOnePropagation)
-                or isinstance(node, AxisScale)
-                and len(node.roles) == 1
-                for node in self.algorithm.transition.propagations
+        if actual_specialization != specialization:
+            raise StatefulCompilationError(
+                "RUNTIME_SPECIALIZATION", "inputs", {}
             )
-            plan = compile_plan(
-                source_identity=specialization,
-                mode="packed" if runtime.packed else "dense",
-                feature_sizes=runtime.feature_sizes,
-                device=runtime.device,
-                backward_ir=self.algorithm._analysis.backward,
-                dense_summary=needs_dense,
-                scalar_factorized=self.algorithm._analysis.scalar_factorized,
-            )
-            self._plans[specialization] = plan
+        plan = self._plans[specialization]
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
             runtime.device.type == "cuda"
@@ -595,9 +673,7 @@ class StatefulOperator:
         if raw_dense:
             assert runtime.uniform_length is not None
             output, fused_final = plan.scalar_factorized_dense_raw(
-                inputs,
-                state,
-                sequence_count=runtime.sequence_count,
+                inputs, state, sequence_count=runtime.sequence_count,
                 sequence_length=runtime.uniform_length,
                 output_dtype=self.algorithm.readouts[0].output_dtype,
                 return_final_state=return_final_state,
@@ -605,17 +681,8 @@ class StatefulOperator:
             outputs = (output,)
             final_state = (
                 StateTuple((self.algorithm.states[0].name,), (fused_final,))
-                if return_final_state
-                else None
+                if return_final_state else None
             )
-            if (
-                initial_state is None
-                and sequence_offsets is None
-                and not return_final_state
-            ):
-                self._dense_cached_call = self._build_dense_cached_call(
-                    inputs, runtime, state, plan
-                )
         else:
             values = self._normalize_inputs(inputs, runtime, role_sizes)
             outputs, final_state = self._lower_parallel_scan(

@@ -157,5 +157,6 @@ if __name__ == "__main__":
     )
     gate = -torch.rand(batch, state_heads, length, device=device)
     beta = torch.rand(batch, state_heads, length, device=device)
-    result = operator(query=query, key=key, value=value, gate=gate, beta=beta)
+    compiled = operator.compile(query=query, key=key, value=value, gate=gate, beta=beta)
+    result = compiled(query=query, key=key, value=value, gate=gate, beta=beta)
     print(f"output={tuple(result.outputs['output'].shape)}")
