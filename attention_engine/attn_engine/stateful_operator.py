@@ -464,60 +464,15 @@ class AlgorithmIR:
         self._validate()
 
     def _validate(self) -> None:
-        _reject_duplicate_names(self.inputs, "inputs")
-        _reject_duplicate_names(self.states, "states")
-        if len(self.states) != 1:
-            raise StatefulCompilationError("IR_SCHEMA", "states", {"expected": 1})
-        state = self.states[0]
-        if self.transition.state != state.name:
-            raise StatefulCompilationError(
-                "IR_TYPE", "transition.state", {"unknown_state": self.transition.state}
-            )
-        if not self.readouts:
-            raise StatefulCompilationError(
-                "IR_SCHEMA", "readouts", {"expected": "at least one"}
-            )
-        _reject_duplicate_names(self.readouts, "readouts")
+        from ._stateful_ir_validation import (
+            validate_algorithm_structure,
+            validate_transition_structure,
+        )
         from ._stateful_analysis import analyze_algorithm
 
+        validate_algorithm_structure(self)
         object.__setattr__(self, "_analysis", analyze_algorithm(self))
-        features = set(state.feature_roles)
-        for index, propagation in enumerate(self.transition.propagations):
-            if isinstance(propagation, AxisScale):
-                if not set(propagation.roles) <= features:
-                    raise StatefulCompilationError(
-                        "IR_TYPE",
-                        f"transition.propagations[{index}].roles",
-                        {"roles": [str(role) for role in propagation.roles]},
-                    )
-            elif isinstance(propagation, RankOnePropagation):
-                if propagation.role not in features:
-                    raise StatefulCompilationError(
-                        "IR_TYPE",
-                        f"transition.propagations[{index}].role",
-                        {"role": str(propagation.role)},
-                    )
-            elif not isinstance(propagation, Identity):
-                raise StatefulCompilationError(
-                    "IR_SCHEMA",
-                    f"transition.propagations[{index}]",
-                    {"node": type(propagation).__name__},
-                )
-        for index, injection in enumerate(self.transition.injections):
-            covered = {role for factor in injection.factors for role in factor.roles}
-            if not features <= covered:
-                raise StatefulCompilationError(
-                    "IR_TYPE",
-                    f"transition.injections[{index}]",
-                    {"missing_roles": sorted(str(role) for role in features - covered)},
-                )
-        for index, readout in enumerate(self.readouts):
-            if readout.state != state.name or readout.role not in features:
-                raise StatefulCompilationError(
-                    "IR_TYPE",
-                    f"readouts[{index}]",
-                    {"state": readout.state, "role": str(readout.role)},
-                )
+        validate_transition_structure(self)
 
     @property
     def _structural_identity(self) -> str:
@@ -593,17 +548,9 @@ class StatefulOperator:
             cached = self._dense_cached_call
             if cached is not None:
                 return cached(inputs)
-        expected = {item.name for item in self.algorithm.inputs}
-        missing = expected - inputs.keys()
-        unknown = inputs.keys() - expected
-        if missing:
-            raise StatefulCompilationError(
-                "RUNTIME_BINDING", "inputs", {"missing": sorted(missing)}
-            )
-        if unknown:
-            raise StatefulCompilationError(
-                "RUNTIME_BINDING", "inputs", {"unknown": sorted(unknown)}
-            )
+        from ._stateful_runtime_validation import validate_input_names
+
+        validate_input_names({item.name for item in self.algorithm.inputs}, inputs)
         runtime, role_sizes = self._validate_runtime(inputs, sequence_offsets)
         self._validate_target(runtime.device)
         self._validate_aliases(inputs)
@@ -706,15 +653,9 @@ class StatefulOperator:
         sequence_length = runtime.uniform_length
 
         def cached_call(current: Mapping[str, torch.Tensor]) -> ExecutionResult:
-            if current.keys() != expected_names:
-                missing = expected_names - current.keys()
-                unknown = current.keys() - expected_names
-                details = (
-                    {"missing": sorted(missing)}
-                    if missing
-                    else {"unknown": sorted(unknown)}
-                )
-                raise StatefulCompilationError("RUNTIME_BINDING", "inputs", details)
+            from ._stateful_runtime_validation import validate_input_names
+
+            validate_input_names(set(expected_names), current)
             for spec, (name, shape, dtype, device) in zip(
                 specs, expected_metadata, strict=True
             ):
@@ -921,61 +862,15 @@ class StatefulOperator:
         )
 
     def _validate_target(self, device: torch.device) -> None:
-        if device.type == "cpu" and os.environ.get("STATEFUL_OPERATOR_TEST_CPU") == "1":
-            return
-        if device.type != "cuda" or torch.version.hip is not None:
-            raise StatefulCompilationError(
-                "TARGET", "target", {"expected": "CUDA H20", "actual": device.type}
-            )
-        index = device.index
-        if index is None:
-            index = torch.cuda.current_device()
-        product = torch.cuda.get_device_name(index)
-        capability = torch.cuda.get_device_capability(index)
-        if (
-            "MIG" in product.upper()
-            or "H20" not in product.upper()
-            or capability != (9, 0)
-        ):
-            raise StatefulCompilationError(
-                "TARGET",
-                "target",
-                {
-                    "expected_product": "H20",
-                    "actual_product": product,
-                    "capability": capability,
-                },
-            )
-        if self.target is not None and (
-            self.target.device_type != "cuda"
-            or self.target.product_family.upper() not in product.upper()
-            or self.target.capability != capability
-        ):
-            raise StatefulCompilationError(
-                "TARGET_CONSTRAINT", "target", {"constraint": _canonical(self.target)}
-            )
+        from ._stateful_runtime_validation import validate_target
+
+        validate_target(device, self.target)
 
     @staticmethod
     def _validate_aliases(inputs: Mapping[str, torch.Tensor]) -> None:
-        tensors = list(inputs.items())
-        for index, (left_name, left) in enumerate(tensors):
-            for right_name, right in tensors[index + 1 :]:
-                if (
-                    left is right
-                    or left.untyped_storage().data_ptr()
-                    != right.untyped_storage().data_ptr()
-                ):
-                    continue
-                left_start = left.storage_offset() * left.element_size()
-                right_start = right.storage_offset() * right.element_size()
-                left_end = left_start + left.numel() * left.element_size()
-                right_end = right_start + right.numel() * right.element_size()
-                if max(left_start, right_start) < min(left_end, right_end):
-                    raise StatefulCompilationError(
-                        "RUNTIME_ALIAS",
-                        "inputs",
-                        {"overlapping": [left_name, right_name]},
-                    )
+        from ._stateful_runtime_validation import validate_aliases
+
+        validate_aliases(inputs)
 
     def _validate_state(
         self,
