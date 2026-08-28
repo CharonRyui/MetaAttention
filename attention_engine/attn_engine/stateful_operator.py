@@ -488,9 +488,17 @@ class Target:
 
 @dataclass(frozen=True)
 class CompileOptions:
-    tune: bool = False
-    tune_filename: str = "tune_result"
-    tune_backward: bool = False
+    optimized: bool = True
+    autotune: bool = False
+    backward: bool = False
+
+
+@dataclass(frozen=True)
+class _Compilation:
+    role_sizes: tuple[tuple[LogicalRole, int], ...]
+    target: Target
+    mode: str
+    options: CompileOptions
 
 
 @dataclass(frozen=True)
@@ -506,105 +514,99 @@ class _Runtime:
 
 
 class CompiledStatefulOperator:
-    """A pre-specialized StatefulOperator launch handle."""
+    """A metadata-specialized Stateful Operator callable."""
 
-    def __init__(self, operator, specialization, input_shapes, return_final_state):
+    def __init__(self, operator, compilation, specialization):
         self.operator = operator
+        self.compilation = compilation
         self.specialization = specialization
-        self.input_shapes = input_shapes
-        self.return_final_state = return_final_state
 
-    def __call__(self, **inputs: torch.Tensor) -> ExecutionResult:
-        """Launch the precompiled specialization."""
-        return self.operator._execute_compiled(
-            self.specialization, self.return_final_state, **inputs
-        )
-
-
-class StatefulOperator:
-    def __init__(
-        self,
-        algorithm: AlgorithmIR,
-        *,
-        target: Target | None = None,
-        compile_options: CompileOptions | None = None,
-    ) -> None:
-        self.algorithm = algorithm
-        self.target = target
-        self.compile_options = compile_options or CompileOptions()
-        self._specializations: set[str] = set()
-        self._plans: dict[str, Any] = {}
-        self._zero_states: dict[tuple[Any, ...], torch.Tensor] = {}
-        self._dense_cached_call: Callable[..., ExecutionResult] | None = None
-
-    @property
-    def _structural_identity(self) -> str:
-        payload = (
-            SCHEMA_VERSION,
-            self.algorithm._structural_identity,
-            _canonical(self.target),
-            _canonical(self.compile_options),
-        )
-        return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-    def compile(
+    def __call__(
         self,
         *,
         initial_state: StateTuple | None = None,
         sequence_offsets: torch.Tensor | None = None,
         return_final_state: bool = False,
         **inputs: torch.Tensor,
+    ) -> ExecutionResult:
+        return self.operator._execute_compiled(
+            self,
+            initial_state=initial_state,
+            sequence_offsets=sequence_offsets,
+            return_final_state=return_final_state,
+            **inputs,
+        )
+
+
+class StatefulOperator:
+    def __init__(self, algorithm: AlgorithmIR) -> None:
+        self.algorithm = algorithm
+        self._specializations: set[str] = set()
+        self._plans: dict[str, Any] = {}
+        self._zero_states: dict[tuple[Any, ...], torch.Tensor] = {}
+
+    @property
+    def _structural_identity(self) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                (SCHEMA_VERSION, self.algorithm._structural_identity), sort_keys=True
+            ).encode()
+        ).hexdigest()
+
+    def compile(
+        self,
+        *,
+        role_sizes: Mapping[HeadRole | FeatureRole, int],
+        target: Target,
+        mode: str,
+        optimized: bool = True,
+        autotune: bool = False,
+        backward: bool = False,
     ) -> CompiledStatefulOperator:
-        """Compile a fixed specialization and return its launch handle."""
-        from ._stateful_runtime_validation import validate_input_names
-
-        validate_input_names({item.name for item in self.algorithm.inputs}, inputs)
-        runtime, _ = self._validate_runtime(inputs, sequence_offsets)
-        self._validate_target(runtime.device)
-        self._validate_aliases(inputs)
-        state = self._validate_state(
-            initial_state,
-            runtime,
-            cache_default=not (runtime.token_count == 0 and return_final_state),
+        """Compile one fixed-role implementation for dynamic runtime workloads."""
+        compilation = self._validate_compilation(
+            role_sizes,
+            target,
+            mode,
+            CompileOptions(optimized, autotune, backward),
         )
-        specialization = self._specialization_key(
-            inputs, state, runtime, return_final_state
-        )
+        specialization = self._compilation_key(compilation)
         self._specializations.add(specialization)
-        self._compile_specialization(specialization, runtime)
-        return CompiledStatefulOperator(
-            self, specialization, tuple(inputs[name].shape for name in inputs),
-            return_final_state,
-        )
+        self._compile_specialization(specialization, compilation)
+        return CompiledStatefulOperator(self, compilation, specialization)
 
-    def _compile_specialization(self, specialization, runtime):
+    def _compile_specialization(self, specialization, compilation):
         if specialization in self._plans:
             return self._plans[specialization]
         from ._stateful_tilelang import compile_plan
 
+        state = self.algorithm.states[0]
+        role_sizes = dict(compilation.role_sizes)
         needs_dense = any(
             isinstance(node, RankOnePropagation)
             or isinstance(node, AxisScale) and len(node.roles) == 1
             for node in self.algorithm.transition.propagations
         )
         plan = compile_plan(
-            source_identity=specialization,
-            mode="packed" if runtime.packed else "dense",
-            feature_sizes=runtime.feature_sizes,
-            device=runtime.device,
-            backward_ir=self.algorithm._analysis.backward,
+            mode=compilation.mode,
+            source_identity=_canonical_identity(
+                (specialization, self.algorithm._analysis.simplified)
+            ),
+            feature_sizes=tuple(role_sizes[role] for role in state.feature_roles),
+            target=compilation.target,
+            backward_ir=(
+                self.algorithm._analysis.backward
+                if compilation.options.backward
+                else None
+            ),
             dense_summary=needs_dense,
             scalar_factorized=self.algorithm._analysis.scalar_factorized,
+            optimized=compilation.options.optimized,
+            autotune=compilation.options.autotune,
+            structural_features=self.algorithm._analysis.structural_features,
         )
         self._plans[specialization] = plan
         return plan
-
-    def _get_or_compile_plan(self, inputs, state, runtime, return_final_state):
-        specialization = self._specialization_key(
-            inputs, state, runtime, return_final_state
-        )
-        self._specializations.add(specialization)
-        return self._compile_specialization(specialization, runtime)
 
     def __call__(
         self,
@@ -621,46 +623,46 @@ class StatefulOperator:
 
     def _execute_compiled(
         self,
-        specialization: str,
-        compiled_return_final_state: bool,
+        compiled: CompiledStatefulOperator,
         *,
         initial_state: StateTuple | None = None,
         sequence_offsets: torch.Tensor | None = None,
         return_final_state: bool = False,
         **inputs: torch.Tensor,
     ) -> ExecutionResult:
-        if return_final_state != compiled_return_final_state:
-            raise StatefulCompilationError(
-                "RUNTIME_SPECIALIZATION", "return_final_state", {}
-            )
-        if (
-            initial_state is None
-            and sequence_offsets is None
-            and not return_final_state
-            and not any(tensor.requires_grad for tensor in inputs.values())
-        ):
-            cached = self._dense_cached_call
-            if cached is not None:
-                return cached(inputs)
         from ._stateful_runtime_validation import validate_input_names
 
         validate_input_names({item.name for item in self.algorithm.inputs}, inputs)
         runtime, role_sizes = self._validate_runtime(inputs, sequence_offsets)
-        self._validate_target(runtime.device)
+        expected_packed = compiled.compilation.mode == "packed"
+        if runtime.packed != expected_packed:
+            raise StatefulCompilationError(
+                "RUNTIME_MODE",
+                "sequence_offsets",
+                {"expected": compiled.compilation.mode},
+            )
+        self._validate_target(runtime.device, compiled.compilation.target)
         self._validate_aliases(inputs)
+        self._validate_fixed_roles(role_sizes, compiled.compilation)
         state = self._validate_state(
             initial_state,
             runtime,
             cache_default=not (runtime.token_count == 0 and return_final_state),
         )
-        actual_specialization = self._specialization_key(
-            inputs, state, runtime, return_final_state
-        )
-        if actual_specialization != specialization:
+        if not compiled.compilation.options.backward and (
+            torch.is_grad_enabled()
+            and (state.requires_grad or any(tensor.requires_grad for tensor in inputs.values()))
+        ):
             raise StatefulCompilationError(
-                "RUNTIME_SPECIALIZATION", "inputs", {}
+                "RUNTIME_GRAD", "inputs", {"backward": "not compiled"}
             )
-        plan = self._plans[specialization]
+        plan = self._plans[compiled.specialization]
+        try:
+            plan.plan.workspace.required_bytes(runtime.token_count)
+        except RuntimeError as error:
+            raise StatefulCompilationError(
+                "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
+            ) from error
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
             runtime.device.type == "cuda"
@@ -673,7 +675,9 @@ class StatefulOperator:
         if raw_dense:
             assert runtime.uniform_length is not None
             output, fused_final = plan.scalar_factorized_dense_raw(
-                inputs, state, sequence_count=runtime.sequence_count,
+                inputs,
+                state,
+                sequence_count=runtime.sequence_count,
                 sequence_length=runtime.uniform_length,
                 output_dtype=self.algorithm.readouts[0].output_dtype,
                 return_final_state=return_final_state,
@@ -681,7 +685,8 @@ class StatefulOperator:
             outputs = (output,)
             final_state = (
                 StateTuple((self.algorithm.states[0].name,), (fused_final,))
-                if return_final_state else None
+                if return_final_state
+                else None
             )
         else:
             values = self._normalize_inputs(inputs, runtime, role_sizes)
@@ -695,80 +700,83 @@ class StatefulOperator:
             final_state,
         )
 
-    def _build_dense_cached_call(
+
+    def _validate_compilation(
         self,
-        inputs: Mapping[str, torch.Tensor],
-        runtime: _Runtime,
-        state: torch.Tensor,
-        plan: Any,
-    ) -> Callable[[Mapping[str, torch.Tensor]], ExecutionResult]:
-        specs = self.algorithm.inputs
-        expected_names = frozenset(spec.name for spec in specs)
-        expected_metadata = tuple(
-            (
-                spec.name,
-                tuple(inputs[spec.name].shape),
-                spec.dtype,
-                inputs[spec.name].device,
+        role_sizes: Mapping[HeadRole | FeatureRole, int],
+        target: Target,
+        mode: str,
+        options: CompileOptions,
+    ) -> _Compilation:
+        if not isinstance(target, Target):
+            raise StatefulCompilationError("COMPILE_TARGET", "target", {})
+        if mode not in ("dense", "packed"):
+            raise StatefulCompilationError(
+                "COMPILE_MODE", "mode", {"expected": ["dense", "packed"]}
             )
-            for spec in specs
+        declared = {
+            role
+            for spec in self.algorithm.inputs
+            for role in spec.roles
+            if isinstance(role, (HeadRole, FeatureRole))
+        }
+        declared.update(
+            role
+            for state in self.algorithm.states
+            for role in state.roles
+            if isinstance(role, (HeadRole, FeatureRole))
         )
-        output_names = tuple(readout.name for readout in self.algorithm.readouts)
-        output_dtype = self.algorithm.readouts[0].output_dtype
-        assert runtime.uniform_length is not None
-        sequence_count = runtime.sequence_count
-        sequence_length = runtime.uniform_length
-
-        def cached_call(current: Mapping[str, torch.Tensor]) -> ExecutionResult:
-            from ._stateful_runtime_validation import validate_input_names
-
-            validate_input_names(set(expected_names), current)
-            for spec, (name, shape, dtype, device) in zip(
-                specs, expected_metadata, strict=True
-            ):
-                tensor = current[name]
-                path = f"inputs.{name}"
-                if not isinstance(tensor, torch.Tensor):
-                    raise StatefulCompilationError(
-                        "RUNTIME_BINDING", path, {"expected": "torch.Tensor"}
-                    )
-                if tensor.dtype != dtype:
-                    raise StatefulCompilationError(
-                        "RUNTIME_DTYPE",
-                        path,
-                        {"expected": str(dtype), "actual": str(tensor.dtype)},
-                    )
-                if tensor.device != device:
-                    raise StatefulCompilationError("RUNTIME_DEVICE", "inputs", {})
-                if tuple(tensor.shape) != shape:
-                    raise StatefulCompilationError(
-                        "RUNTIME_SHAPE", path, {"expected": shape}
-                    )
-                if not tensor.is_contiguous():
-                    raise StatefulCompilationError(
-                        "RUNTIME_LAYOUT", path, {"expected": "contiguous"}
-                    )
-                if not spec.differentiable and tensor.requires_grad:
-                    raise StatefulCompilationError(
-                        "RUNTIME_GRAD", path, {"differentiable": False}
-                    )
-                if tensor.requires_grad:
-                    self._dense_cached_call = None
-                    return self(**current)
-            self._validate_aliases(current)
-            output, _ = plan.scalar_factorized_dense_raw(
-                current,
-                state,
-                sequence_count=sequence_count,
-                sequence_length=sequence_length,
-                output_dtype=output_dtype,
-                return_final_state=False,
+        actual = set(role_sizes)
+        invalid = [role for role in actual if not isinstance(role, (HeadRole, FeatureRole))]
+        if invalid:
+            raise StatefulCompilationError(
+                "COMPILE_ROLE_SIZE", "role_sizes", {"runtime_roles": invalid}
             )
-            return ExecutionResult(
-                NamedOutputTuple._unchecked(output_names, (output,)), None
+        missing = declared - actual
+        unknown = actual - declared
+        if missing or unknown:
+            raise StatefulCompilationError(
+                "COMPILE_ROLE_SIZE",
+                "role_sizes",
+                {"missing": sorted(map(str, missing)), "unknown": sorted(map(str, unknown))},
             )
+        for role, size in role_sizes.items():
+            if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+                raise StatefulCompilationError(
+                    "COMPILE_ROLE_SIZE", f"role_sizes.{role}", {"size": size}
+                )
+        state = self.algorithm.states[0]
+        feature_sizes = tuple(role_sizes[role] for role in state.feature_roles)
+        if target.device_type == "cuda" and any(size not in (64, 128) for size in feature_sizes):
+            if os.environ.get("STATEFUL_OPERATOR_TEST_CPU") != "1":
+                raise StatefulCompilationError(
+                    "SPECIALIZATION",
+                    "role_sizes",
+                    {"feature_sizes": feature_sizes, "supported": [64, 128]},
+                )
+        state_heads = role_sizes[state.head_role]
+        for source, mapped_target in self.algorithm.head_mapping.mappings:
+            if mapped_target != state.head_role or state_heads % role_sizes[source]:
+                raise StatefulCompilationError(
+                    "COMPILE_ROLE_SIZE", "head_mapping", {"source": source}
+                )
+        ordered = tuple(sorted(role_sizes.items(), key=lambda item: _identity(item[0])))
+        return _Compilation(ordered, target, mode, options)
 
-        return cached_call
+    def _compilation_key(self, compilation: _Compilation) -> str:
+        return _canonical_identity((self._structural_identity, compilation))
+
+    @staticmethod
+    def _validate_fixed_roles(
+        actual: Mapping[LogicalRole, int], compilation: _Compilation
+    ) -> None:
+        for role, expected in compilation.role_sizes:
+            if actual.get(role) != expected:
+                raise StatefulCompilationError(
+                    "RUNTIME_SHAPE",
+                    "inputs",
+                    {"role": role, "expected": expected, "actual": actual.get(role)},
+                )
 
     def _validate_runtime(
         self,
@@ -777,7 +785,7 @@ class StatefulOperator:
     ) -> tuple[_Runtime, dict[str, int]]:
         packed = offsets is not None
         device: torch.device | None = None
-        role_sizes: dict[str, int] = {}
+        role_sizes: dict[LogicalRole, int] = {}
         token_count: int | None = None
         uniform_length: int | None = None
         for spec in self.algorithm.inputs:
@@ -928,10 +936,11 @@ class StatefulOperator:
             role_sizes,
         )
 
-    def _validate_target(self, device: torch.device) -> None:
+    @staticmethod
+    def _validate_target(device: torch.device, target: Target) -> None:
         from ._stateful_runtime_validation import validate_target
 
-        validate_target(device, self.target)
+        validate_target(device, target)
 
     @staticmethod
     def _validate_aliases(inputs: Mapping[str, torch.Tensor]) -> None:
@@ -1486,6 +1495,41 @@ def _reject_duplicate_names(items: Iterable[Any], path: str) -> None:
         if item.name in seen:
             raise StatefulCompilationError("IR_SCHEMA", path, {"duplicate": item.name})
         seen.add(item.name)
+
+
+def _compile_factory_profile(
+    operator: StatefulOperator,
+    *,
+    query_heads: int,
+    state_heads: int,
+    key_size: int,
+    value_size: int,
+    key_heads: int | None = None,
+    value_heads: int | None = None,
+    mode: str = "dense",
+    autotune: bool = False,
+    backward: bool = False,
+) -> CompiledStatefulOperator:
+    roles = {
+        role.name: role
+        for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
+        for role in spec.roles
+        if isinstance(role, (HeadRole, FeatureRole))
+    }
+    return operator.compile(
+        role_sizes={
+            roles["query_heads"]: query_heads,
+            roles["key_heads"]: key_heads if key_heads is not None else state_heads,
+            roles["value_heads"]: value_heads if value_heads is not None else state_heads,
+            roles["state_heads"]: state_heads,
+            roles["key_dim"]: key_size,
+            roles["value_dim"]: value_size,
+        },
+        target=Target(),
+        mode=mode,
+        autotune=autotune,
+        backward=backward,
+    )
 
 
 def _expressions(value: Any) -> Iterable[InputExpression]:

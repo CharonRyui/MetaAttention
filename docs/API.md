@@ -80,77 +80,77 @@ def mask_mod(b, h, q_idx, kv_idx) -> Bool:
 
 ## Stateful Operator API
 
-Stateful sequence operators are authored by constructing explicit Algorithm IR.
-Compilation is explicit: `compile()` specializes and JITs device kernels, while
-the returned operator launches the materialized executable on each call. The
-IR is model-independent: GLA, RetNet recurrent state evolution, selective state
-evolution, GDN, and custom compositions use the same typed nodes. Runtime
-tensors bind by keyword to named Tensor Inputs. `LinearAttentionEngine` remains
-a separate legacy generator and is not routed through this compiler.
+Stateful sequence operators are authored as model-independent Algorithm IR and
+compiled explicitly from logical metadata. Compilation accepts fixed Head and
+Feature role sizes, an explicit Target, one physical mode, and independent
+optimization, autotuning, and backward choices. It never accepts example
+Tensors. Batch size, dense Sequence length, packed logical-sequence count,
+packed token count, and offsets remain dynamic at invocation.
 
 ```py
-from attn_engine import StatefulOperator
+from attn_engine import StatefulOperator, Target
 
 operator = StatefulOperator(algorithm)
-compiled = operator.compile(query=query, key=key, value=value, gate=gate)
-result = compiled(
-    query=query, key=key, value=value, gate=gate, return_final_state=True
+compiled = operator.compile(
+    role_sizes={
+        query_heads: 2,
+        key_heads: 2,
+        value_heads: 2,
+        state_heads: 2,
+        key_dim: 64,
+        value_dim: 128,
+    },
+    target=Target(),
+    mode="dense",
+    optimized=True,
+    autotune=False,
+    backward=True,
 )
-output = result.outputs["output"]
-state = result.final_state["memory"]
-```
-
-`compile()` does not execute the operator. Its tensor arguments define the
-specialization: shape, dtype, device, packed layout, and gradient mode. They
-must match subsequent calls. Use another `compile()` call for another
-specialization. Calling an uncompiled operator remains supported and lazily
-compiles for compatibility.
-
-
-The first compiler schema has one named matrix State with two ordered Feature
-roles. It supports typed Input Expressions (`Input`, BF16/FP32 `Constant`,
-`Add`, `Multiply`, `Negate`, `Exp`), role-directed Axis Scale, general
-Rank-One propagation, Product Injection tuples, explicit Head Mapping, and
-single-role State Contractions. Arbitrary Python callbacks, generic einsum,
-multi-state programs, and other State ranks are not supported.
-
-```py
-from attn_engine import StatefulOperator
-
-operator = StatefulOperator(algorithm)  # Target is optional
-result = operator(
+result = compiled(
     query=query,
     key=key,
     value=value,
-    initial_state=state_tuple,       # optional StateTuple
-    sequence_offsets=offsets,        # packed mode only
+    gate=gate,
     return_final_state=True,
 )
-
 output = result.outputs["output"]
 state = result.final_state["memory"]
 ```
 
-Every invocation returns immutable `ExecutionResult`, containing immutable named
-outputs and optional named final State. Single outputs and State are never
-unwrapped. The first schema has one matrix State with two ordered Feature roles;
-GLA, RetNet, selective state evolution, Mamba2-style compositions, GDN, and
-custom pressure programs use the same generic IR. Missing initial State means
-one FP32 zero State per logical sequence. Final State is materialized only when
-requested. Packed values are contiguous token-major tensors with shared int32
-sequence offsets. Empty sequences and inactive tail lanes have identity semantics
-and do not read padding.
+One dense compiled callable accepts different positive Batch and Sequence
+sizes. A packed callable uses `mode="packed"`; invocation supplies contiguous
+token-major inputs and a device-local contiguous int32 `sequence_offsets`
+vector. Different offsets shapes and values, including empty sequences and
+all-empty workloads, reuse the same artifact. Runtime tensors must preserve the
+compiled role sizes, Algorithm IR dtypes, Target, mode, and canonical contiguous
+layout. No implicit copy, transpose, dtype conversion, device move, replanning,
+or recompilation occurs.
+
+Every invocation returns immutable `ExecutionResult`, containing immutable
+named outputs and optional named final State. Missing initial State means one
+FP32 zero State per logical sequence. Final State is materialized only when
+requested. Calling an uncompiled `StatefulOperator` raises; only the callable
+returned by `compile()` executes.
+
+With `backward=False`, grad-enabled invocation is rejected. With
+`backward=True`, ordinary PyTorch autograd transports cotangents and saved
+context through the compiler-selected forward/backward composition. The
+compiler owns Backward IR and context semantics; no eager or framework-derived
+fallback is used.
+
+The first schema has one named matrix State with two ordered Feature roles. It
+supports typed Input Expressions (`Input`, BF16/FP32 `Constant`, `Add`,
+`Multiply`, `Negate`, `Exp`), role-directed Axis Scale, general Rank-One
+propagation, Product Injection tuples, explicit Head Mapping, and single-role
+State Contractions. Compiler analysis, Mathematical Plans, Lowered Candidates,
+KernelConfig, context contracts, and caches are internal.
 
 The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
 outputs, FP32 State, canonical contiguous layouts, and Feature pairs in
-`{64,128} × {64,128}`. H100, ROCm, CPU, unknown products, and unidentifiable
-MIG devices are rejected. No implicit copies, transposes, eager recurrence,
-token-serial fallback, model-name dispatch, or dedicated GDN backend exists.
-
-Compiler analysis is internal. Invalid IR, unsupported composition, target
-mismatch, invalid packed offsets, unsupported specialization, and codegen
-failures surface as structured `StatefulCompilationError` values. The complete
-contract is in `docs/stateful-operator-ir-spec.md`.
+`{64,128} × {64,128}`. Invalid IR, unsupported composition, Target mismatch,
+invalid packed offsets, unsupported specialization, resource failure, and
+codegen failure surface as structured `StatefulCompilationError` values. The
+complete contract is in `docs/stateful-operator-ir-spec.md`.
 
 ## Legacy Customized Linear Attention API
 

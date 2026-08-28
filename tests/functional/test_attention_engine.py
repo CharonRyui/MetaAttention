@@ -21,6 +21,7 @@ from attn_engine import (
     StatefulOperator,
     StateTuple,
     TensorInput,
+    Target,
 )
 from benchmark.bench_utils import assert_close
 from core import CustomIO, SymbolScalar, Var, meta_tensor
@@ -618,12 +619,16 @@ def test_linear_stateful_operator_supports_initial_and_final_state(gpu_device, s
     gate = torch.zeros(1, 1, 64, device=gpu_device, dtype=torch.float32)
     initial = torch.eye(64, device=gpu_device, dtype=torch.float32).view(1, 1, 64, 64)
     compiled = operator.compile(
-        query=query,
-        key=key,
-        value=value,
-        gate=gate,
-        initial_state=StateTuple(("memory",), (initial,)),
-        return_final_state=True,
+        role_sizes={
+            QUERY_HEADS: 1,
+            KEY_HEADS: 1,
+            VALUE_HEADS: 1,
+            STATE_HEADS: 1,
+            KEY: 64,
+            VALUE: 64,
+        },
+        target=Target(),
+        mode="dense",
     )
 
     result = compiled(
@@ -693,29 +698,28 @@ def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequenc
         ("memory",),
         (torch.zeros(1, 1, 64, 64, device=gpu_device, dtype=torch.float32),),
     )
-    full_compiled = operator.compile(
-        query=query,
-        key=key,
-        value=value,
-        gate=gate,
-        return_final_state=True,
+    compiled = operator.compile(
+        role_sizes={
+            QUERY_HEADS: 1,
+            KEY_HEADS: 1,
+            VALUE_HEADS: 1,
+            STATE_HEADS: 1,
+            KEY: 64,
+            VALUE: 64,
+        },
+        target=Target(),
+        mode="dense",
     )
     prefix_query = query[:, :, :64].contiguous()
     prefix_key = key[:, :, :64].contiguous()
     prefix_value = value[:, :, :64].contiguous()
     prefix_gate = gate[:, :, :64].contiguous()
-    prefix_compiled = operator.compile(
-        query=prefix_query,
-        key=prefix_key,
-        value=prefix_value,
-        gate=prefix_gate,
-        return_final_state=True,
-    )
+    prefix_compiled = compiled
 
-    full = full_compiled(
+    full = compiled(
         query=query, key=key, value=value, gate=gate, return_final_state=True
     )
-    explicit = full_compiled(
+    explicit = compiled(
         query=query,
         key=key,
         value=value,
@@ -735,13 +739,7 @@ def test_linear_stateful_operator_zero_state_and_continuation_match_full_sequenc
     suffix_key = key[:, :, 64:].contiguous()
     suffix_value = value[:, :, 64:].contiguous()
     suffix_gate = gate[:, :, 64:].contiguous()
-    suffix_compiled = operator.compile(
-        query=suffix_query,
-        key=suffix_key,
-        value=suffix_value,
-        gate=suffix_gate,
-        initial_state=prefix.final_state,
-    )
+    suffix_compiled = compiled
     suffix = suffix_compiled(
         query=suffix_query,
         key=suffix_key,

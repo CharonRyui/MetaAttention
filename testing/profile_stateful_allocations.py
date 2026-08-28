@@ -2,7 +2,15 @@ from __future__ import annotations
 
 import torch
 
-from examples.gated_retention import gated_retention
+from examples.gated_retention import (
+    KEY,
+    KEY_HEADS,
+    QUERY_HEADS,
+    STATE_HEADS,
+    VALUE,
+    VALUE_HEADS,
+    gated_retention,
+)
 
 
 def main() -> None:
@@ -12,7 +20,21 @@ def main() -> None:
     value = torch.randn_like(query)
     gate = -torch.rand(1, 2, 128, device=device)
     operator = gated_retention(1, 2, 128, 64, 64)
-    operator(query=query, key=key, value=value, gate=gate)
+    from attn_engine import Target
+
+    compiled = operator.compile(
+        role_sizes={
+            QUERY_HEADS: 2,
+            KEY_HEADS: 2,
+            VALUE_HEADS: 2,
+            STATE_HEADS: 2,
+            KEY: 64,
+            VALUE: 64,
+        },
+        target=Target(),
+        mode="dense",
+    )
+    compiled(query=query, key=key, value=value, gate=gate)
     torch.cuda.synchronize()
     with torch.profiler.profile(
         activities=[
@@ -22,7 +44,7 @@ def main() -> None:
         profile_memory=True,
         record_shapes=True,
     ) as profiler:
-        operator(query=query, key=key, value=value, gate=gate)
+        compiled(query=query, key=key, value=value, gate=gate)
     torch.cuda.synchronize()
     print(
         profiler.key_averages(group_by_input_shape=True).table(

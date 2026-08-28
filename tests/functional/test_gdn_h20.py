@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from attention_engine.attn_engine.gdn_reference import gated_delta_rule_reference
-from attn_engine import StateTuple
+from attn_engine import StateTuple, Target
 from examples.gated_delta_rule import (
     compositional_pressure_profile,
     gated_delta_rule,
@@ -18,6 +18,44 @@ pytestmark = [
     pytest.mark.usefixtures("gpu_device", "seed"),
 ]
 
+
+def _compile_gdn(operator, *, packed=False, backward=True):
+    return operator.compile(
+        role_sizes={
+            operator.algorithm.inputs[0].roles[1]: 1,
+            operator.algorithm.inputs[1].roles[1]: 1,
+            operator.algorithm.inputs[2].roles[1]: 2,
+            operator.algorithm.states[0].head_role: 2,
+            operator.algorithm.states[0].feature_roles[0]: 128,
+            operator.algorithm.states[0].feature_roles[1]: 128,
+        },
+        target=Target(),
+        mode="packed" if packed else "dense",
+        backward=backward,
+    )
+
+
+def _compile_pressure(operator, *, packed):
+    roles = {
+        role
+        for spec in operator.algorithm.inputs
+        for role in spec.roles
+        if hasattr(role, "name") and str(role) not in ("batch", "sequence", "one")
+    }
+    sizes = {}
+    for role in roles:
+        if role == operator.algorithm.states[0].head_role:
+            sizes[role] = 4
+        elif role in operator.algorithm.states[0].feature_roles:
+            sizes[role] = 64 if role == operator.algorithm.states[0].feature_roles[0] else 128
+        else:
+            sizes[role] = 2
+    return operator.compile(
+        role_sizes=sizes,
+        target=Target(),
+        mode="packed" if packed else "dense",
+        backward=True,
+    )
 
 def _bindings(device: torch.device, *, length: int = 64):
     batch, query_heads, state_heads, dim = 1, 1, 2, 128
@@ -55,15 +93,7 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
         1, 2, 128, 128, device=gpu_device, dtype=torch.float32, requires_grad=True
     )
     operator = gated_delta_rule(1, 2, 64, 128, 128, HQ=1)
-    compiled = operator.compile(
-        query=query,
-        key=key,
-        value=value,
-        gate=gate,
-        beta=beta,
-        initial_state=StateTuple(("memory",), (initial,)),
-        return_final_state=True,
-    )
+    compiled = _compile_gdn(operator)
     result = compiled(
         query=query,
         key=key,
@@ -95,28 +125,14 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
 def test_gdn_continuation_matches_full_invocation(gpu_device):
     query, key, value, gate, beta = _bindings(gpu_device, length=128)
     operator = gated_delta_rule(1, 2, 128, 128, 128, HQ=1)
-    full_compiled = operator.compile(
-        query=query,
-        key=key,
-        value=value,
-        gate=gate,
-        beta=beta,
-        return_final_state=True,
-    )
+    compiled = _compile_gdn(operator)
     prefix_query = query[:, :, :64].contiguous()
     prefix_key = key[:, :, :64].contiguous()
     prefix_value = value[:, :, :64].contiguous()
     prefix_gate = gate[:, :, :64].contiguous()
     prefix_beta = beta[:, :, :64].contiguous()
-    prefix_compiled = operator.compile(
-        query=prefix_query,
-        key=prefix_key,
-        value=prefix_value,
-        gate=prefix_gate,
-        beta=prefix_beta,
-        return_final_state=True,
-    )
-    full = full_compiled(
+    prefix_compiled = compiled
+    full = compiled(
         query=query,
         key=key,
         value=value,
@@ -138,15 +154,7 @@ def test_gdn_continuation_matches_full_invocation(gpu_device):
     suffix_value = value[:, :, 64:].contiguous()
     suffix_gate = gate[:, :, 64:].contiguous()
     suffix_beta = beta[:, :, 64:].contiguous()
-    suffix_compiled = operator.compile(
-        query=suffix_query,
-        key=suffix_key,
-        value=suffix_value,
-        gate=suffix_gate,
-        beta=suffix_beta,
-        initial_state=prefix.final_state,
-        return_final_state=True,
-    )
+    suffix_compiled = compiled
     suffix = suffix_compiled(
         query=suffix_query,
         key=suffix_key,
@@ -275,12 +283,7 @@ def test_compositional_pressure_profile_packed_forward_backward(gpu_device):
     ).requires_grad_()
     reference_initial = actual_initial.detach().clone().requires_grad_()
     operator = compositional_pressure_profile()
-    compiled = operator.compile(
-        **actual_bindings,
-        sequence_offsets=offsets,
-        initial_state=StateTuple(("memory",), (actual_initial,)),
-        return_final_state=True,
-    )
+    compiled = _compile_pressure(operator, packed=True)
     result = compiled(
         **actual_bindings,
         sequence_offsets=offsets,
@@ -327,11 +330,7 @@ def test_compositional_pressure_profile_dense_unaligned_tail(gpu_device):
     }
     initial = 0.05 * torch.randn(1, 4, 64, 128, device=gpu_device)
     operator = compositional_pressure_profile()
-    compiled = operator.compile(
-        **dense,
-        initial_state=StateTuple(("memory",), (initial,)),
-        return_final_state=True,
-    )
+    compiled = _compile_pressure(operator, packed=False)
     result = compiled(
         **dense,
         initial_state=StateTuple(("memory",), (initial,)),
@@ -363,12 +362,7 @@ def test_compositional_pressure_profile_all_empty(gpu_device):
     bindings = _pressure_bindings(gpu_device, (0, 0))
     initial = torch.randn(2, 4, 64, 128, device=gpu_device)
     offsets = torch.tensor((0, 0, 0), device=gpu_device, dtype=torch.int32)
-    compiled = operator.compile(
-        **bindings,
-        sequence_offsets=offsets,
-        initial_state=StateTuple(("memory",), (initial,)),
-        return_final_state=True,
-    )
+    compiled = _compile_pressure(operator, packed=True)
     result = compiled(
         **bindings,
         sequence_offsets=offsets,

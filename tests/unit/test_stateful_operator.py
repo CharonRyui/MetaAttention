@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import json
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -47,6 +46,73 @@ QUERY_HEADS = HeadRole("query_heads")
 KEY_HEADS = HeadRole("key_heads")
 VALUE_HEADS = HeadRole("value_heads")
 STATE_HEADS = HeadRole("state_heads")
+ROLE_SIZES = {
+    QUERY_HEADS: 1,
+    KEY_HEADS: 1,
+    VALUE_HEADS: 1,
+    STATE_HEADS: 1,
+    KEY: 2,
+    VALUE: 3,
+}
+
+
+def _compile(
+    operator,
+    *,
+    mode="dense",
+    backward=False,
+    role_sizes=None,
+    optimized=True,
+    autotune=False,
+):
+    from attn_engine import Target
+
+    return operator.compile(
+        role_sizes=ROLE_SIZES if role_sizes is None else role_sizes,
+        target=Target(),
+        mode=mode,
+        optimized=optimized,
+        autotune=autotune,
+        backward=backward,
+    )
+
+
+def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator)
+
+    first = _inputs(length=1)
+    second = {
+        name: value.repeat(2, 1, 5 // value.shape[2] + 1, *([1] * (value.ndim - 3)))[
+            :, :, :5
+        ].contiguous()
+        for name, value in _inputs(length=1).items()
+    }
+    first_result = compiled(**first)
+    second_result = compiled(**second)
+
+    torch.testing.assert_close(first_result.outputs[0], _reference(first)[0])
+    torch.testing.assert_close(second_result.outputs[0], _reference(second)[0])
+    assert len(operator._plans) == 1
+
+
+def test_metadata_only_compile_rejects_runtime_roles_and_tensor_arguments():
+    from attn_engine import Target
+
+    operator = StatefulOperator(_accumulator_ir())
+    with pytest.raises(StatefulCompilationError) as captured:
+        operator.compile(
+            role_sizes={**ROLE_SIZES, Batch: 1}, target=Target(), mode="dense"
+        )
+    assert captured.value.category == "COMPILE_ROLE_SIZE"
+
+    with pytest.raises(TypeError):
+        operator.compile(
+            role_sizes=ROLE_SIZES,
+            target=Target(),
+            mode="dense",
+            query=_inputs()["query"],
+        )
 
 
 def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
@@ -143,7 +209,10 @@ def test_batch_static_inputs_preserve_per_sequence_values():
     key = torch.ones(2, 1, 2, 2)
     weight = torch.tensor([[[1.0, 2.0, 3.0]], [[4.0, 5.0, 6.0]]])
     operator = StatefulOperator(algorithm)
-    compiled = operator.compile(query=query, key=key, weight=weight)
+    compiled = _compile(
+        operator,
+        role_sizes={STATE_HEADS: 1, KEY: 2, VALUE: 3},
+    )
     output = compiled(query=query, key=key, weight=weight).outputs[0]
     expected = torch.tensor(
         [
@@ -176,7 +245,7 @@ def test_dense_invocation_returns_immutable_named_result_and_gradients():
     inputs = _inputs(requires_grad=True)
     expected_output, expected_state = _reference(inputs)
     operator = StatefulOperator(_accumulator_ir())
-    compiled = operator.compile(**inputs, return_final_state=True)
+    compiled = _compile(operator, backward=True)
     result = compiled(**inputs, return_final_state=True)
 
     assert isinstance(result, ExecutionResult)
@@ -196,15 +265,12 @@ def test_omitted_state_and_continuation_match_full_invocation():
     operator = StatefulOperator(_accumulator_ir())
     prefix_inputs = {name: value[:, :, :2] for name, value in inputs.items()}
     suffix_inputs = {name: value[:, :, 2:] for name, value in inputs.items()}
-    full_compiled = operator.compile(**inputs, return_final_state=True)
-    full = full_compiled(**inputs, return_final_state=True)
-    prefix_compiled = operator.compile(**prefix_inputs, return_final_state=True)
+    compiled = _compile(operator)
+    full = compiled(**inputs, return_final_state=True)
+    prefix_compiled = compiled
     prefix = prefix_compiled(**prefix_inputs, return_final_state=True)
     assert prefix.final_state is not None
-    suffix_compiled = operator.compile(
-        **suffix_inputs,
-        initial_state=prefix.final_state,
-    )
+    suffix_compiled = compiled
     suffix = suffix_compiled(
         **suffix_inputs,
         initial_state=prefix.final_state,
@@ -228,12 +294,7 @@ def test_packed_empty_sequences_preserve_state_and_offsets_are_runtime_data():
     offsets = torch.tensor([0, 0, 3, 3], dtype=torch.int32)
     initial = torch.randn(3, 1, 2, 3)
     initial_state = StateTuple(("memory",), (initial,))
-    compiled = operator.compile(
-        **packed,
-        sequence_offsets=offsets,
-        initial_state=initial_state,
-        return_final_state=True,
-    )
+    compiled = _compile(operator, mode="packed")
     result = compiled(
         **packed,
         sequence_offsets=offsets,
@@ -258,21 +319,16 @@ def test_specialization_identity_reuses_offset_metadata_and_tracks_training_mode
         for name, value in packed.items()
     }
     first_offsets = torch.tensor([0, 1, 3], dtype=torch.int32)
-    first_compiled = operator.compile(**packed, sequence_offsets=first_offsets)
-    first_compiled(**packed, sequence_offsets=first_offsets)
+    compiled = _compile(operator, mode="packed")
+    compiled(**packed, sequence_offsets=first_offsets)
     second_offsets = torch.tensor([0, 2, 3], dtype=torch.int32)
-    second_compiled = operator.compile(**packed, sequence_offsets=second_offsets)
-    second_compiled(**packed, sequence_offsets=second_offsets)
+    compiled(**packed, sequence_offsets=second_offsets)
     assert len(operator._specializations) == 1
 
+    backward_compiled = _compile(operator, mode="packed", backward=True)
     initial = torch.zeros(2, 1, 2, 3, requires_grad=True)
     initial_state = StateTuple(("memory",), (initial,))
-    training_compiled = operator.compile(
-        **packed,
-        sequence_offsets=second_offsets,
-        initial_state=initial_state,
-    )
-    training_compiled(
+    backward_compiled(
         **packed,
         sequence_offsets=second_offsets,
         initial_state=initial_state,
@@ -297,7 +353,7 @@ def test_analysis_derives_scanable_affine_summary_and_backward_ir():
 def test_compiled_plan_owns_parallel_forward_and_derived_backward():
     operator = StatefulOperator(_accumulator_ir())
     inputs = _inputs()
-    compiled = operator.compile(**inputs)
+    compiled = _compile(operator, backward=True)
     compiled(**inputs)
     executable = next(iter(operator._plans.values()))
 
@@ -307,6 +363,40 @@ def test_compiled_plan_owns_parallel_forward_and_derived_backward():
         step.operation == "state_recurrence"
         for step in executable.backward_ir.reverse_steps
     )
+
+
+def test_structured_plans_and_kernel_config_have_separate_identities():
+    operator = StatefulOperator(_accumulator_ir())
+    generic = _compile(operator, optimized=False)
+    structured = _compile(operator, optimized=True)
+    generic_plan = operator._plans[generic.specialization].plan
+    structured_plan = operator._plans[structured.specialization].plan
+
+    assert generic_plan.mathematical_plan.representation == "generic-dense-affine"
+    assert structured_plan.mathematical_plan.rewrites == (
+        "axis-scale",
+        "product-injection-gemm",
+    )
+    assert structured_plan.mathematical_plan.identity != structured_plan.candidate.identity
+    assert structured_plan.candidate.identity != structured_plan.kernel_config.identity
+
+
+def test_shared_readouts_and_rank_one_are_model_independent_planner_features():
+    from examples.gated_delta_rule import compositional_pressure_profile
+
+    operator = compositional_pressure_profile()
+    roles = {
+        role: 4 if isinstance(role, HeadRole) else 64
+        for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
+        for role in spec.roles
+        if isinstance(role, (HeadRole, FeatureRole))
+    }
+    roles[operator.algorithm.states[0].feature_roles[1]] = 128
+    compiled = _compile(operator, role_sizes=roles)
+    rewrites = operator._plans[compiled.specialization].plan.mathematical_plan.rewrites
+    assert "rank-one-factorized" in rewrites
+    assert "shared-state-contraction" in rewrites
+
 
 
 def test_analysis_maps_expression_head_roles_to_state_heads():
@@ -330,22 +420,14 @@ def test_analysis_derives_raw_dense_recipe_from_structure():
     assert dense.readout[0].name == "query"
 
 
-def test_cached_dense_call_revalidates_runtime_metadata(monkeypatch):
+def test_runtime_revalidates_metadata():
     operator = StatefulOperator(_accumulator_ir())
-    inputs = _inputs()
-    compiled = operator.compile(**inputs)
-    monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "0")
-    operator._dense_cached_call = operator._build_dense_cached_call(
-        inputs,
-        SimpleNamespace(uniform_length=3, sequence_count=1),
-        torch.zeros(1, 1, 2, 3),
-        object(),
-    )
+    compiled = _compile(operator)
     invalid = _inputs()
     invalid["query"] = invalid["query"].transpose(-1, -2)
     with pytest.raises(StatefulCompilationError) as captured:
         compiled(**invalid)
-    assert captured.value.category == "RUNTIME_SHAPE"
+    assert captured.value.category in ("RUNTIME_LAYOUT", "RUNTIME_SHAPE")
 
 
 def test_analysis_rejects_unmapped_incompatible_head_roles():
@@ -388,11 +470,7 @@ def test_output_and_final_state_cotangent_modes_match_reference(loss_mode):
     reference_initial = actual_initial.detach().clone().requires_grad_()
     operator = StatefulOperator(_accumulator_ir())
     initial_state = StateTuple(("memory",), (actual_initial,))
-    compiled = operator.compile(
-        **actual_inputs,
-        initial_state=initial_state,
-        return_final_state=True,
-    )
+    compiled = _compile(operator, backward=True)
     result = compiled(
         **actual_inputs,
         initial_state=initial_state,
@@ -430,8 +508,9 @@ def test_untyped_roles_are_rejected_without_compatibility_shim():
 
 def test_structured_errors_are_json_safe_and_have_canonical_paths():
     operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator)
     with pytest.raises(StatefulCompilationError) as captured:
-        operator.compile(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0))
+        compiled(query=torch.empty(0), key=torch.empty(0), value=torch.empty(0))
     error = captured.value
     assert error.category == "RUNTIME_BINDING"
     assert error.path == "inputs"

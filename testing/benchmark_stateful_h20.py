@@ -10,7 +10,15 @@ import torch
 from attn_engine import LinearAttentionEngine
 from core import CustomIO
 from core.utils import meta_tensor
-from examples.gated_retention import gated_retention
+from examples.gated_retention import (
+    KEY,
+    KEY_HEADS,
+    QUERY_HEADS,
+    STATE_HEADS,
+    VALUE,
+    VALUE_HEADS,
+    gated_retention,
+)
 
 
 BATCHES = 10
@@ -92,7 +100,21 @@ def main() -> None:
     device = torch.device("cuda")
     query, key, value, gate = _profile(device)
     compile_start = time.perf_counter()
-    new = gated_retention(1, 2, 128, 64, 64)
+    operator = gated_retention(1, 2, 128, 64, 64)
+    from attn_engine import Target
+
+    new = operator.compile(
+        role_sizes={
+            QUERY_HEADS: 2,
+            KEY_HEADS: 2,
+            VALUE_HEADS: 2,
+            STATE_HEADS: 2,
+            KEY: 64,
+            VALUE: 64,
+        },
+        target=Target(),
+        mode="dense",
+    )
 
     def new_call():
         return new(query=query, key=key, value=value, gate=gate).outputs["output"]

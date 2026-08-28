@@ -18,6 +18,7 @@ from examples.reluattn import relu_attention
 from examples.retnet_recurrent import retnet_recurrent
 from examples.sigmoid_attn import sigmoid_attention
 from examples.sparse_gqa_decode import sparse_gqa_decode
+from attn_engine.stateful_operator import _compile_factory_profile
 
 
 def run_test_with_info(func, *args, **kwargs):
@@ -164,6 +165,16 @@ def check_mamba2(
     B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, require_grad=True
 ):
     attention_module = mamba2(B, HQ, S, D, DV, HK=HK, HV=HV, dtype=dtype)
+    attention_module = _compile_factory_profile(
+        attention_module,
+        query_heads=HQ,
+        key_heads=HK,
+        value_heads=HV,
+        state_heads=HV,
+        key_size=D,
+        value_size=DV,
+        backward=require_grad,
+    )
 
     # init input
     query = torch.randn(B, S, HQ, D, device="cuda", dtype=dtype)
@@ -465,6 +476,14 @@ def check_gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, require_grad=Tru
 
     # ours
     attention_module = gated_retention(B, H, S, D, DV, dtype=dtype)
+    attention_module = _compile_factory_profile(
+        attention_module,
+        query_heads=H,
+        state_heads=H,
+        key_size=D,
+        value_size=DV,
+        backward=require_grad,
+    )
     o = attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
     if require_grad:
         o.backward(do, retain_graph=True)
@@ -809,6 +828,14 @@ def check_sparse_gqa_decode(B, H, G, S, D, DV, device="cuda", dtype=torch.float1
 
 def check_retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16, require_grad=True):
     attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype)
+    attention_module = _compile_factory_profile(
+        attention_module,
+        query_heads=H,
+        state_heads=H,
+        key_size=D,
+        value_size=DV,
+        backward=require_grad,
+    )
 
     def ref(q, k, v):
         orig_type = q.dtype

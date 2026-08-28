@@ -7,7 +7,6 @@ from attn_engine import (
     Sequence,
     AlgorithmIR,
     AxisScale,
-    CompileOptions,
     HeadMapping,
     Input,
     ProductFactor,
@@ -18,7 +17,6 @@ from attn_engine import (
     StatefulOperator,
     TensorInput,
 )
-from autotuner.arch import get_attn_device
 
 KEY = FeatureRole("key_dim")
 VALUE = FeatureRole("value_dim")
@@ -28,7 +26,7 @@ VALUE_HEADS = HeadRole("value_heads")
 STATE_HEADS = HeadRole("state_heads")
 
 
-def retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
+def retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16):
     """RetNet recurrent acceptance profile expressed only with generic IR nodes."""
     algorithm = AlgorithmIR(
         inputs=(
@@ -59,11 +57,4 @@ def retnet_recurrent(B, H, S, D, DV, dtype=torch.bfloat16, tune=False):
             {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
         ),
     )
-    return StatefulOperator(
-        algorithm,
-        compile_options=CompileOptions(
-            tune=tune,
-            tune_filename=f"tuned_config/{get_attn_device().name}/retention_linear",
-            tune_backward=tune,
-        ),
-    )
+    return StatefulOperator(algorithm)

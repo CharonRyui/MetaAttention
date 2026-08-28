@@ -157,6 +157,19 @@ if __name__ == "__main__":
     )
     gate = -torch.rand(batch, state_heads, length, device=device)
     beta = torch.rand(batch, state_heads, length, device=device)
-    compiled = operator.compile(query=query, key=key, value=value, gate=gate, beta=beta)
+    from attn_engine import Target
+
+    compiled = operator.compile(
+        role_sizes={
+            QUERY_HEADS: query_heads,
+            KEY_HEADS: query_heads,
+            VALUE_HEADS: state_heads,
+            STATE_HEADS: state_heads,
+            KEY: dim,
+            VALUE: dim,
+        },
+        target=Target(),
+        mode="dense",
+    )
     result = compiled(query=query, key=key, value=value, gate=gate, beta=beta)
     print(f"output={tuple(result.outputs['output'].shape)}")

@@ -14,14 +14,74 @@ import torch
 
 
 @dataclass(frozen=True)
+class MathematicalPlan:
+    identity: str
+    representation: str
+    rewrites: tuple[str, ...]
+    semantic_regions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class LoweredCandidate:
+    identity: str
+    plan_identity: str
+    lowerer: str
+    direction: str
+
+
+@dataclass(frozen=True)
+class KernelConfig:
+    identity: str
+    values: tuple[tuple[str, int], ...]
+
+@dataclass(frozen=True)
+class ContextValue:
+    name: str
+    dtype: str
+    roles: tuple[str, ...]
+    shape_rule: str
+
+
+@dataclass(frozen=True)
+class ContextContract:
+    produced: tuple[ContextValue, ...]
+    required: tuple[ContextValue, ...]
+    recomputable: tuple[ContextValue, ...]
+
+    def validate(self) -> None:
+        available = {value.name: value for value in (*self.produced, *self.recomputable)}
+        for required in self.required:
+            if available.get(required.name) != required:
+                raise ValueError(f"incompatible context value: {required.name}")
+
+
+@dataclass(frozen=True)
+class WorkspacePolicy:
+    bytes_per_token: int
+    maximum_bytes: int
+
+    def required_bytes(self, token_count: int) -> int:
+        required = token_count * self.bytes_per_token
+        if required > self.maximum_bytes:
+            raise RuntimeError("runtime workload exceeds compiled resource envelope")
+        return required
+
+
+
+@dataclass(frozen=True)
 class TileLangPlan:
     """Portable identity and environment descriptor for one specialization."""
 
     semantic_identity: str
+    mathematical_plan: MathematicalPlan
+    candidate: LoweredCandidate
+    kernel_config: KernelConfig
     binary_identity: str
     tuning_identity: str
     mode: str
     feature_sizes: tuple[int, int]
+    context_contract: ContextContract
+    workspace: WorkspacePolicy
     uses_parallel_summary: bool = True
 
     @property
@@ -34,7 +94,7 @@ class TileLangExecutable:
     """Compiler-owned forward/backward dispatch for one analyzed specialization."""
 
     plan: TileLangPlan
-    backward_ir: Any
+    backward_ir: Any | None
     dense_summary: bool
     scalar_factorized: Any | None
 
@@ -75,41 +135,89 @@ class TileLangExecutable:
         return tilelang_scalar_factorized_forward(*args, **kwargs)
 
 
+
 def compile_plan(
     *,
     source_identity: str,
     mode: str,
     feature_sizes: tuple[int, int],
-    device: torch.device,
-    backward_ir: Any,
+    target: Any,
+    backward_ir: Any | None,
     dense_summary: bool,
     scalar_factorized: Any | None,
+    structural_features: Any,
+    optimized: bool,
+    autotune: bool,
 ) -> TileLangExecutable:
     """Compile an executable and atomically publish its portable descriptor."""
+    rewrites = _structured_rewrites(structural_features) if optimized else ()
+    representation = rewrites[0] if rewrites else "generic-dense-affine"
+    mathematical_plan = MathematicalPlan(
+        _digest((source_identity, representation, rewrites)),
+        representation,
+        rewrites,
+        ("state-transition", "state-readouts"),
+    )
+    candidate = LoweredCandidate(
+        _digest((mathematical_plan.identity, "tilelang", "forward")),
+        mathematical_plan.identity,
+        "tilelang-generic" if not rewrites else f"tilelang-{representation}",
+        "forward",
+    )
+    kernel_config = KernelConfig(
+        _digest((candidate.identity, "stable-default", autotune)), ()
+    )
     toolchain = _toolchain_fingerprint()
-    environment = _environment_fingerprint(device)
+    environment = _target_fingerprint(target)
     binary_identity = _digest(
-        (source_identity, mode, feature_sizes, toolchain, environment)
+        (candidate.identity, kernel_config.identity, mode, feature_sizes, toolchain, environment)
     )
     tuning_identity = _digest(
-        (binary_identity, environment, _clock_fingerprint(device))
+        (candidate.identity, environment, "workload-policy/pending-h20-v1")
+    )
+    context_value = ContextValue(
+        "inputs", "algorithm-declared", ("named-inputs",), "runtime-workload"
+    )
+    context_contract = ContextContract(
+        produced=(context_value,) if backward_ir is not None else (),
+        required=(context_value,) if backward_ir is not None else (),
+        recomputable=(),
+    )
+    context_contract.validate()
+    workspace = WorkspacePolicy(
+        bytes_per_token=feature_sizes[0] * feature_sizes[1] * 4,
+        maximum_bytes=target.capability[0] * 1024**3,
     )
     plan = TileLangPlan(
         source_identity,
+        mathematical_plan,
+        candidate,
+        kernel_config,
         binary_identity,
         tuning_identity,
         mode,
         feature_sizes,
+        context_contract,
+        workspace,
     )
-    if device.type == "cuda":
-        try:
-            import tilelang  # noqa: F401
-        except ImportError as error:
-            raise RuntimeError(
-                "TileLang is required for CUDA Stateful Operator plans"
-            ) from error
-        _publish_manifest(plan)
     return TileLangExecutable(plan, backward_ir, dense_summary, scalar_factorized)
+
+
+def _structured_rewrites(features: Any) -> tuple[str, ...]:
+    rewrites = []
+    if features.axis_scale:
+        rewrites.append("axis-scale")
+    if features.product_injection:
+        rewrites.append("product-injection-gemm")
+    if features.rank_one:
+        rewrites.append("rank-one-factorized")
+    if features.shared_state_contraction:
+        rewrites.append("shared-state-contraction")
+    return tuple(rewrites)
+
+
+def _target_fingerprint(target: Any) -> tuple[Any, ...]:
+    return (target.device_type, target.product_family, target.capability)
 
 
 def _toolchain_fingerprint() -> tuple[str, ...]:

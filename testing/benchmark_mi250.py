@@ -4,6 +4,7 @@ from examples.retnet_recurrent import retnet_recurrent
 from examples.mamba2 import mamba2
 from examples.mla_decode import mla_decode
 from examples.mha_decode import softmax_attention_decode
+from attn_engine.stateful_operator import _compile_factory_profile
 
 
 from plot_fig_mi250 import plot_figure14
@@ -353,7 +354,16 @@ def bench_retnet_recurrent(
     v1.detach_().requires_grad_(require_grad)
 
     # ours
-    attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype, tune=True)
+    attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype)
+    attention_module = _compile_factory_profile(
+        attention_module,
+        query_heads=H,
+        state_heads=H,
+        key_size=D,
+        value_size=DV,
+        autotune=True,
+        backward=require_grad,
+    )
     fwd_lat = do_bench(
         lambda: attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
     )
@@ -420,7 +430,18 @@ def bench_mamba2_ssm(
     A_ours = A_ours.detach().requires_grad_(require_grad)
     dt_ours = dt_ours.detach().requires_grad_(require_grad)
 
-    attention_module = mamba2(B, HQ, S, D, DV, HK, HV, dtype=dtype, tune=True)
+    attention_module = mamba2(B, HQ, S, D, DV, HK, HV, dtype=dtype)
+    attention_module = _compile_factory_profile(
+        attention_module,
+        query_heads=HQ,
+        key_heads=HK,
+        value_heads=HV,
+        state_heads=HV,
+        key_size=D,
+        value_size=DV,
+        autotune=True,
+        backward=require_grad,
+    )
     fwd_lat = do_bench(
         lambda: attention_module(
             query=q_ours, key=k_ours, value=v_ours, A=A_ours, dt=dt_ours

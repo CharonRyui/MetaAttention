@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from attn_engine import StateTuple
+from attn_engine import StateTuple, Target
 from examples.gated_retention import gated_retention
 from examples.mamba2 import mamba2
 from examples.mha import causal_softmax_attention
@@ -29,6 +29,39 @@ from .reference import (
     sigmoid_attention as sigmoid_reference,
     sparse_gqa_decode as sparse_reference,
 )
+
+
+def _compile_stateful(
+    operator,
+    *,
+    query_heads,
+    key_heads,
+    value_heads,
+    state_heads,
+    key_dim,
+    value_dim,
+    mode="dense",
+    backward=False,
+):
+    roles = {
+        role.name: role
+        for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
+        for role in spec.roles
+        if hasattr(role, "name")
+    }
+    return operator.compile(
+        role_sizes={
+            roles["query_heads"]: query_heads,
+            roles["key_heads"]: key_heads,
+            roles["value_heads"]: value_heads,
+            roles["state_heads"]: state_heads,
+            roles["key_dim"]: key_dim,
+            roles["value_dim"]: value_dim,
+        },
+        target=Target(),
+        mode=mode,
+        backward=backward,
+    )
 
 
 pytestmark = [pytest.mark.functional, pytest.mark.gpu, pytest.mark.slow]
@@ -107,6 +140,16 @@ def test_legacy_mamba2(gpu_device, seed):
         HV=value_heads,
         dtype=dtype,
     )
+    module = _compile_stateful(
+        module,
+        query_heads=query_heads,
+        key_heads=key_heads,
+        value_heads=value_heads,
+        state_heads=value_heads,
+        key_dim=dim,
+        value_dim=dim_value,
+        backward=True,
+    )
     query = torch.randn(batch, seqlen, query_heads, dim, device=gpu_device, dtype=dtype)
     key = 0.5 * torch.randn(
         batch, seqlen, key_heads, dim, device=gpu_device, dtype=dtype
@@ -176,6 +219,16 @@ def test_legacy_gated_retention(gpu_device, seed):
     batch, heads, seqlen, dim, dim_value = 1, 2, 128, 64, 64
     dtype = torch.bfloat16
     module = gated_retention(batch, heads, seqlen, dim, dim_value, dtype=dtype)
+    module = _compile_stateful(
+        module,
+        query_heads=heads,
+        key_heads=heads,
+        value_heads=heads,
+        state_heads=heads,
+        key_dim=dim,
+        value_dim=dim_value,
+        backward=True,
+    )
     query = torch.randn(
         batch, heads, seqlen, dim, device=gpu_device, dtype=dtype
     ).requires_grad_()
@@ -214,6 +267,15 @@ def test_legacy_gated_retention_unaligned_scalar_carry(gpu_device, seed):
     batch, heads, seqlen, dim, dim_value = 1, 2, 129, 64, 64
     dtype = torch.bfloat16
     module = gated_retention(batch, heads, seqlen, dim, dim_value, dtype=dtype)
+    module = _compile_stateful(
+        module,
+        query_heads=heads,
+        key_heads=heads,
+        value_heads=heads,
+        state_heads=heads,
+        key_dim=dim,
+        value_dim=dim_value,
+    )
     query = torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype)
     key = torch.randn_like(query)
     gate = torch.full((batch, heads, seqlen), -0.001, device=gpu_device)
@@ -247,6 +309,16 @@ def test_gated_retention_packed_scalar_inference(gpu_device, seed):
     heads, dim = 2, 64
     dtype = torch.bfloat16
     module = gated_retention(4, heads, 65, dim, dim, dtype=dtype)
+    module = _compile_stateful(
+        module,
+        query_heads=heads,
+        key_heads=heads,
+        value_heads=heads,
+        state_heads=heads,
+        key_dim=dim,
+        value_dim=dim,
+        mode="packed",
+    )
     query = torch.randn(token_count, heads, dim, device=gpu_device, dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn_like(query)
@@ -367,7 +439,17 @@ def test_legacy_retnet_recurrent(gpu_device, seed):
     batch, heads, seqlen, dim, dim_value = 1, 2, 128, 64, 128
     dtype = torch.bfloat16
     module = retnet_recurrent(
-        batch, heads, seqlen, dim, dim_value, dtype=dtype, tune=False
+        batch, heads, seqlen, dim, dim_value, dtype=dtype
+    )
+    module = _compile_stateful(
+        module,
+        query_heads=heads,
+        key_heads=heads,
+        value_heads=heads,
+        state_heads=heads,
+        key_dim=dim,
+        value_dim=dim_value,
+        backward=True,
     )
     query = torch.randn(
         batch, heads, seqlen, dim, device=gpu_device, dtype=dtype

@@ -89,12 +89,30 @@ class BackwardIR:
 
 
 @dataclass(frozen=True)
+class SimplifiedIR:
+    """Deterministic mandatory-safe optimization view."""
+
+    identity: str
+    rewrites: tuple[str, ...]
+
+
+
+
+@dataclass(frozen=True)
+class StructuralFeatures:
+    axis_scale: bool
+    product_injection: bool
+    rank_one: bool
+    shared_state_contraction: bool
+@dataclass(frozen=True)
 class Analysis:
     execution_class: ExecutionClass
     affine_summary: AffineSummaryIR
     backward: BackwardIR
     expression_types: tuple[tuple[str, TypedExpression], ...]
     scalar_factorized: ScalarFactorizedIR | None
+    simplified: SimplifiedIR
+    structural_features: StructuralFeatures
     canonical_identity: str
 
 
@@ -329,13 +347,27 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             len(algorithm.transition.propagations),
             dense_scalar,
         )
+    canonical_identity = _canonical_identity(algorithm)
+    simplified = SimplifiedIR(canonical_identity, ("identity-propagation-removal",))
+    structural_features = StructuralFeatures(
+        axis_scale=any(isinstance(node, AxisScale) for node in algorithm.transition.propagations),
+        product_injection=bool(algorithm.transition.injections),
+        rank_one=any(
+            isinstance(node, RankOnePropagation)
+            for node in algorithm.transition.propagations
+        ),
+        shared_state_contraction=len(algorithm.readouts) > 1
+        and len({readout.state for readout in algorithm.readouts}) == 1,
+    )
     return Analysis(
         ExecutionClass.SCANABLE,
         AffineSummaryIR(state.name),
         backward,
         tuple(types),
         scalar_factorized,
-        _canonical_identity(algorithm),
+        simplified,
+        structural_features,
+        canonical_identity,
     )
 
 

@@ -8,7 +8,6 @@ from attn_engine import (
     AlgorithmIR,
     Sequence,
     AxisScale,
-    CompileOptions,
     Exp,
     HeadMapping,
     Input,
@@ -20,7 +19,6 @@ from attn_engine import (
     StatefulOperator,
     TensorInput,
 )
-from autotuner.arch import get_attn_device
 
 KEY = FeatureRole("key_dim")
 VALUE = FeatureRole("value_dim")
@@ -30,7 +28,7 @@ VALUE_HEADS = HeadRole("value_heads")
 STATE_HEADS = HeadRole("state_heads")
 
 
-def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, tune=False):
+def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16):
     """Selective-state acceptance profile expressed only with generic IR nodes."""
     algorithm = AlgorithmIR(
         inputs=(
@@ -58,11 +56,4 @@ def mamba2(B, HQ, S, D, DV, HK=None, HV=None, dtype=torch.bfloat16, tune=False):
             {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
         ),
     )
-    return StatefulOperator(
-        algorithm,
-        compile_options=CompileOptions(
-            tune=tune,
-            tune_filename=f"tuned_config/{get_attn_device().name}/mamba2",
-            tune_backward=tune,
-        ),
-    )
+    return StatefulOperator(algorithm)
