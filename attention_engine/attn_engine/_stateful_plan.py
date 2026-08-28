@@ -1,4 +1,5 @@
 from dataclasses import asdict, dataclass
+from enum import Enum
 import fcntl
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
@@ -13,12 +14,64 @@ from typing import Any
 import torch
 
 
+class PlanRepresentation(str, Enum):
+    GENERIC_DENSE_AFFINE = "generic-dense-affine"
+    AXIS_SCALE = "axis-scale"
+    PRODUCT_INJECTION_GEMM = "product-injection-gemm"
+    RANK_ONE_FACTORIZED = "rank-one-factorized"
+    SHARED_STATE_CONTRACTION = "shared-state-contraction"
+    SCALAR_FACTORIZED = "scalar-factorized"
+
+
 @dataclass(frozen=True)
 class MathematicalPlan:
     identity: str
-    representation: str
+    representation: PlanRepresentation
     rewrites: tuple[str, ...]
     semantic_regions: tuple[str, ...]
+    preconditions: tuple[str, ...] = ()
+    vjp_equivalence: str = "compiler-derived-vjp"
+    conflicts: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class PlanRule:
+    representation: PlanRepresentation
+    preconditions: tuple[str, ...]
+    conflicts: tuple[str, ...] = ()
+
+
+PLAN_RULES = {
+    PlanRepresentation.GENERIC_DENSE_AFFINE: PlanRule(
+        PlanRepresentation.GENERIC_DENSE_AFFINE,
+        ("validated-scanable-affine-program",),
+    ),
+    PlanRepresentation.AXIS_SCALE: PlanRule(
+        PlanRepresentation.AXIS_SCALE,
+        ("typed-axis-scale-propagation", "authored-propagation-order"),
+        (PlanRepresentation.RANK_ONE_FACTORIZED.value,),
+    ),
+    PlanRepresentation.PRODUCT_INJECTION_GEMM: PlanRule(
+        PlanRepresentation.PRODUCT_INJECTION_GEMM,
+        ("typed-role-compatible-product-injection",),
+    ),
+    PlanRepresentation.RANK_ONE_FACTORIZED: PlanRule(
+        PlanRepresentation.RANK_ONE_FACTORIZED,
+        ("typed-ordered-rank-one-propagation",),
+    ),
+    PlanRepresentation.SHARED_STATE_CONTRACTION: PlanRule(
+        PlanRepresentation.SHARED_STATE_CONTRACTION,
+        ("multiple-independent-readouts-of-shared-state",),
+    ),
+    PlanRepresentation.SCALAR_FACTORIZED: PlanRule(
+        PlanRepresentation.SCALAR_FACTORIZED,
+        ("scalar-propagation", "two-disjoint-single-feature-factors", "one-readout"),
+        (
+            PlanRepresentation.RANK_ONE_FACTORIZED.value,
+            PlanRepresentation.SHARED_STATE_CONTRACTION.value,
+        ),
+    ),
+}
 
 
 @dataclass(frozen=True)
@@ -46,11 +99,18 @@ class CandidateEstimate:
 @dataclass(frozen=True)
 class CandidateLowerer:
     name: str
-    representations: tuple[str, ...]
+    representations: tuple[PlanRepresentation, ...]
     static_cost: int
+    runtime_family: str = "generic"
 
-    def lower(self, plan: MathematicalPlan, feature_sizes: tuple[int, int]) -> LoweredCandidate | None:
-        if plan.representation not in self.representations:
+    def lower(
+        self, plan: MathematicalPlan, feature_sizes: tuple[int, int]
+    ) -> LoweredCandidate | None:
+        try:
+            representation = PlanRepresentation(plan.representation)
+        except ValueError:
+            return None
+        if representation not in self.representations:
             return None
         estimate = self.estimate(plan, feature_sizes)
         if not estimate.feasible:
@@ -71,12 +131,18 @@ class CandidateLowerer:
 
 
 LOWERERS = (
-    CandidateLowerer("tilelang-generic", ("generic-dense-affine",), 100),
-    CandidateLowerer("tilelang-elementwise", ("axis-scale",), 30),
-    CandidateLowerer("tilelang-product-injection", ("product-injection-gemm",), 40),
-    CandidateLowerer("tilelang-rank-one", ("rank-one-factorized",), 50),
-    CandidateLowerer("tilelang-shared-readout", ("shared-state-contraction",), 60),
-    CandidateLowerer("tilelang-scalar-factorized", ("scalar-factorized",), 20),
+    CandidateLowerer(
+        "tilelang-generic", (PlanRepresentation.GENERIC_DENSE_AFFINE,), 100
+    ),
+    CandidateLowerer(
+        "tilelang-elementwise", (PlanRepresentation.AXIS_SCALE,), 30, "elementwise"
+    ),
+    CandidateLowerer(
+        "tilelang-scalar-factorized",
+        (PlanRepresentation.SCALAR_FACTORIZED,),
+        20,
+        "scalar-factorized",
+    ),
 )
 
 
@@ -264,6 +330,14 @@ class TileLangExecutable:
     workspace_allocator: WorkspaceAllocator
     composition: Composition | None = None
 
+    @property
+    def runtime_family(self) -> str:
+        return next(
+            lowerer.runtime_family
+            for lowerer in LOWERERS
+            if lowerer.name == self.plan.candidate.lowerer
+        )
+
     def prefix(self, transform, bias, segment, initial_state):
         if self.dense_summary:
             from ._stateful_affine import tilelang_dense_affine_prefix
@@ -347,22 +421,30 @@ def compile_plan(
 ) -> TileLangExecutable:
     """Enumerate mathematical plans, then bind one stable executable candidate."""
     rewrites = _structured_rewrites(structural_features) if optimized else ()
-    representations = ("generic-dense-affine", *rewrites)
+    representations = (PlanRepresentation.GENERIC_DENSE_AFFINE, *rewrites)
     if optimized and scalar_factorized is not None:
-        representations += ("scalar-factorized",)
+        representations += (PlanRepresentation.SCALAR_FACTORIZED,)
     mathematical_plans = tuple(
         MathematicalPlan(
-            _digest((source_identity, representation)),
+            _digest((source_identity, representation.value)),
             representation,
-            rewrites if representation != "generic-dense-affine" else (),
+            tuple(item.value for item in rewrites)
+            if representation is not PlanRepresentation.GENERIC_DENSE_AFFINE
+            else (),
             ("state-transition", "state-readouts"),
+            PLAN_RULES[representation].preconditions,
+            "compiler-derived-vjp",
+            PLAN_RULES[representation].conflicts,
         )
         for representation in representations
     )
+    active_rewrites = {item.value for item in rewrites}
     candidates = tuple(
         candidate
         for item in mathematical_plans
+        if not active_rewrites.intersection(item.conflicts)
         for lowerer in LOWERERS
+        if not (backward_ir is not None and lowerer.runtime_family == "scalar-factorized")
         if (candidate := lowerer.lower(item, feature_sizes)) is not None
     )
     candidate = select_candidate(candidates)
@@ -397,7 +479,7 @@ def compile_plan(
     )
     workspace = WorkspacePolicy(
         bytes_per_token=feature_sizes[0] * feature_sizes[1] * 4,
-        maximum_bytes=target.capability[0] * 1024**3,
+        maximum_bytes=target.workspace_bytes,
     )
     backward_candidate = None
     backward_kernel_config = None
@@ -456,16 +538,16 @@ def compile_plan(
     )
 
 
-def _structured_rewrites(features: Any) -> tuple[str, ...]:
+def _structured_rewrites(features: Any) -> tuple[PlanRepresentation, ...]:
     rewrites = []
     if features.axis_scale:
-        rewrites.append("axis-scale")
+        rewrites.append(PlanRepresentation.AXIS_SCALE)
     if features.product_injection:
-        rewrites.append("product-injection-gemm")
+        rewrites.append(PlanRepresentation.PRODUCT_INJECTION_GEMM)
     if features.rank_one:
-        rewrites.append("rank-one-factorized")
+        rewrites.append(PlanRepresentation.RANK_ONE_FACTORIZED)
     if features.shared_state_contraction:
-        rewrites.append("shared-state-contraction")
+        rewrites.append(PlanRepresentation.SHARED_STATE_CONTRACTION)
     return tuple(rewrites)
 
 
@@ -552,33 +634,6 @@ def _digest(value: Any) -> str:
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
 
-
-def _publish_manifest(plan: TileLangPlan) -> None:
-    root = Path(
-        os.environ.get(
-            "STATEFUL_OPERATOR_CACHE_DIR",
-            Path.home() / ".cache" / "meta-attention" / "stateful-operator",
-        )
-    )
-    root.mkdir(parents=True, exist_ok=True)
-    destination = root / f"{plan.binary_identity}.json"
-    lock_path = root / f"{plan.binary_identity}.lock"
-    with lock_path.open("a+") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        if destination.exists():
-            return
-        temporary: str | None = None
-        try:
-            descriptor, temporary = tempfile.mkstemp(prefix=".plan-", dir=root)
-            with os.fdopen(descriptor, "w") as stream:
-                json.dump(asdict(plan), stream, sort_keys=True, separators=(",", ":"))
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, destination)
-            temporary = None
-        finally:
-            if temporary is not None:
-                Path(temporary).unlink(missing_ok=True)
 
 
 def is_parallel_plan(plan: Any) -> bool:

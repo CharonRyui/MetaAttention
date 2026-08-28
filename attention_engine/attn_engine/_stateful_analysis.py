@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 
@@ -351,9 +351,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     simplified_expressions = tuple(
         (path, simplify_expression(typed.expression)) for path, typed in types
     )
-    simplified_identity = _canonical_identity(
-        (canonical_identity, simplified_expressions)
-    )
+    simplified_identity = _canonical_identity(_simplified_identity_payload(algorithm))
     original_expression_identity = _canonical_identity(
         tuple((path, typed.expression) for path, typed in types)
     )
@@ -421,6 +419,51 @@ def simplify_expression(expression):
             return left
         return Multiply(left, right)
     raise TypeError(f"unsupported expression: {type(expression).__name__}")
+
+
+
+
+
+
+def _simplified_identity_payload(algorithm):
+    """Build a canonical identity payload without recursively validating a new IR."""
+    from .stateful_operator import AxisScale, ProductFactor, RankOnePropagation
+
+    propagations = tuple(
+        replace(node, factor=simplify_expression(node.factor))
+        if isinstance(node, AxisScale)
+        else replace(
+            node,
+            left=simplify_expression(node.left),
+            right=simplify_expression(node.right),
+            coefficient=simplify_expression(node.coefficient),
+        )
+        if isinstance(node, RankOnePropagation)
+        else node
+        for node in algorithm.transition.propagations
+    )
+    injections = tuple(
+        replace(
+            injection,
+            factors=tuple(
+                ProductFactor(simplify_expression(factor.expression), factor.roles)
+                for factor in injection.factors
+            ),
+        )
+        for injection in algorithm.transition.injections
+    )
+    transition = replace(
+        algorithm.transition,
+        propagations=propagations,
+        injections=injections,
+    )
+    readouts = tuple(
+        replace(readout, operand=simplify_expression(readout.operand))
+        for readout in algorithm.readouts
+    )
+    return algorithm.inputs, algorithm.states, transition, readouts, algorithm.head_mapping
+
+
 
 
 def _is_constant(expression, value: float) -> bool:

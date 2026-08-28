@@ -130,6 +130,23 @@ def test_empty_packed_workload_allocates_no_workspace():
     assert executable.workspace_allocator._buffers == {}
 
 
+def test_runtime_workspace_uses_explicit_target_resource_envelope():
+    from attn_engine import Target
+
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = operator.compile(
+        role_sizes=ROLE_SIZES,
+        target=Target(workspace_bytes=23),
+        mode="dense",
+    )
+
+    with pytest.raises(StatefulCompilationError) as captured:
+        compiled(**_inputs(length=1))
+
+    assert captured.value.category == "RUNTIME_RESOURCE"
+    assert captured.value.path == "workspace"
+
+
 def test_backward_compilation_publishes_compiler_owned_backward_candidate():
     operator = StatefulOperator(_accumulator_ir())
     compiled = _compile(operator, backward=True)
@@ -489,6 +506,23 @@ def test_specialization_identity_reuses_offset_metadata_and_tracks_training_mode
     assert len(operator._specializations) == 2
 
 
+def test_simplified_identity_ignores_removed_expression_identities():
+    original = _accumulator_ir()
+    rewritten = AlgorithmIR(
+        inputs=original.inputs,
+        states=original.states,
+        transition=StateTransition(
+            "memory",
+            propagations=(AxisScale(Exp(Add(Input("gate"), Constant(0.0)))),),
+            injections=original.transition.injections,
+        ),
+        readouts=original.readouts,
+        head_mapping=original.head_mapping,
+    )
+
+    assert original._analysis.canonical_identity != rewritten._analysis.canonical_identity
+    assert original._analysis.simplified.identity == rewritten._analysis.simplified.identity
+
 def test_analysis_derives_scanable_affine_summary_and_backward_ir():
     analysis = _accumulator_ir()._analysis
     assert analysis.execution_class.value == "scanable"
@@ -596,9 +630,15 @@ def test_shared_readouts_and_rank_one_are_model_independent_planner_features():
     }
     roles[operator.algorithm.states[0].feature_roles[1]] = 128
     compiled = _compile(operator, role_sizes=roles)
-    rewrites = operator._plans[compiled.specialization].plan.mathematical_plan.rewrites
+    plan = operator._plans[compiled.specialization].plan
+    rewrites = {
+        rewrite
+        for mathematical_plan in plan.mathematical_plans
+        for rewrite in mathematical_plan.rewrites
+    }
     assert "rank-one-factorized" in rewrites
     assert "shared-state-contraction" in rewrites
+    assert plan.mathematical_plan.representation == "generic-dense-affine"
 
 
 

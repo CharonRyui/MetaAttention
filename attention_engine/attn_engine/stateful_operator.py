@@ -484,6 +484,7 @@ class Target:
     device_type: str = "cuda"
     product_family: str = "H20"
     capability: tuple[int, int] = (9, 0)
+    workspace_bytes: int = 1 << 30
 
 
 @dataclass(frozen=True)
@@ -589,9 +590,7 @@ class StatefulOperator:
         )
         plan = compile_plan(
             mode=compilation.mode,
-            source_identity=_canonical_identity(
-                (self.algorithm._structural_identity, self.algorithm._analysis.simplified)
-            ),
+            source_identity=self.algorithm._analysis.simplified.identity,
             feature_sizes=tuple(role_sizes[role] for role in state.feature_roles),
             target=compilation.target,
             backward_ir=(
