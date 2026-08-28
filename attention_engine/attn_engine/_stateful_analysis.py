@@ -348,7 +348,22 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             dense_scalar,
         )
     canonical_identity = _canonical_identity(algorithm)
-    simplified = SimplifiedIR(canonical_identity, ("identity-propagation-removal",))
+    simplified_expressions = tuple(
+        (path, simplify_expression(typed.expression)) for path, typed in types
+    )
+    simplified_identity = _canonical_identity(
+        (canonical_identity, simplified_expressions)
+    )
+    original_expression_identity = _canonical_identity(
+        tuple((path, typed.expression) for path, typed in types)
+    )
+    simplified_rewrites = (
+        ("safe-zero-one",)
+        if _canonical_identity(simplified_expressions)
+        != original_expression_identity
+        else ()
+    )
+    simplified = SimplifiedIR(simplified_identity, simplified_rewrites)
     structural_features = StructuralFeatures(
         axis_scale=any(isinstance(node, AxisScale) for node in algorithm.transition.propagations),
         product_injection=bool(algorithm.transition.injections),
@@ -373,6 +388,46 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
 
 def _promote(left: torch.dtype, right: torch.dtype) -> torch.dtype:
     return torch.float32 if torch.float32 in (left, right) else torch.bfloat16
+
+
+def simplify_expression(expression):
+    """Apply representation-safe identities without reassociating arithmetic."""
+    from .stateful_operator import Add, Constant, Exp, Input, Multiply, Negate
+
+    if isinstance(expression, (Input, Constant)):
+        return expression
+    if isinstance(expression, Negate):
+        operand = simplify_expression(expression.operand)
+        if isinstance(operand, Constant):
+            return Constant(-operand.value, operand.dtype)
+        return Negate(operand)
+    if isinstance(expression, Exp):
+        operand = simplify_expression(expression.operand)
+        if isinstance(operand, Constant) and operand.value == 0:
+            return Constant(1.0, operand.dtype)
+        return Exp(operand)
+    if isinstance(expression, (Add, Multiply)):
+        left = simplify_expression(expression.left)
+        right = simplify_expression(expression.right)
+        if isinstance(expression, Add):
+            if _is_constant(left, 0):
+                return right
+            if _is_constant(right, 0):
+                return left
+            return Add(left, right)
+        if _is_constant(left, 1):
+            return right
+        if _is_constant(right, 1):
+            return left
+        return Multiply(left, right)
+    raise TypeError(f"unsupported expression: {type(expression).__name__}")
+
+
+def _is_constant(expression, value: float) -> bool:
+    from .stateful_operator import Constant
+
+    return isinstance(expression, Constant) and expression.value == value
+
 
 
 def _broadcastable(

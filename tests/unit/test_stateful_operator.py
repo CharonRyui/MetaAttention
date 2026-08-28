@@ -96,6 +96,143 @@ def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
     assert len(operator._plans) == 1
 
 
+def test_dynamic_workloads_reuse_binary_and_workspace_buffers():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator)
+    executable = operator._plans[compiled.specialization]
+    binary_identity = executable.plan.binary_identity
+
+    compiled(**_inputs(length=3))
+    first = tuple(executable.workspace_allocator._buffers.values())
+    compiled(**_inputs(length=3))
+    second = tuple(executable.workspace_allocator._buffers.values())
+    compiled(**_inputs(length=5))
+
+    assert first == second
+    assert len(executable.workspace_allocator._buffers) == 2
+    assert executable.plan.binary_identity == binary_identity
+
+
+def test_empty_packed_workload_allocates_no_workspace():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator, mode="packed")
+    inputs = {
+        "query": torch.empty(0, 1, 2),
+        "key": torch.empty(0, 1, 2),
+        "value": torch.empty(0, 1, 3),
+        "gate": torch.empty(0, 1),
+    }
+    offsets = torch.tensor([0, 0, 0], dtype=torch.int32)
+
+    compiled(**inputs, sequence_offsets=offsets)
+
+    executable = operator._plans[compiled.specialization]
+    assert executable.workspace_allocator._buffers == {}
+
+
+def test_backward_compilation_publishes_compiler_owned_backward_candidate():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator, backward=True)
+    executable = operator._plans[compiled.specialization]
+
+    assert executable.backward_ir is operator.algorithm._analysis.backward
+    assert executable.plan.backward_candidate is not None
+    assert executable.plan.backward_candidate.direction == "backward"
+    assert executable.plan.backward_kernel_config is not None
+    assert executable.plan.context_contract.required == executable.plan.context_contract.produced
+
+
+def test_context_contract_rejects_dtype_role_and_shape_mismatches():
+    from attn_engine._stateful_plan import ContextContract, ContextValue
+
+    produced = ContextValue(
+        "inputs.query", "torch.float32", ("batch", "heads", "sequence", "key"), "runtime"
+    )
+    mismatches = (
+        ContextValue(produced.name, "torch.bfloat16", produced.roles, produced.shape_rule),
+        ContextValue(produced.name, produced.dtype, ("batch", "sequence"), produced.shape_rule),
+        ContextValue(produced.name, produced.dtype, produced.roles, "token-major"),
+    )
+
+    for required in mismatches:
+        with pytest.raises(ValueError, match="incompatible context value"):
+            ContextContract((produced,), (required,), ()).validate()
+
+
+def test_context_contract_identity_separates_backward_behavior():
+    operator = StatefulOperator(_accumulator_ir())
+    forward = _compile(operator, backward=False)
+    backward = _compile(operator, backward=True)
+    forward_plan = operator._plans[forward.specialization].plan
+    backward_plan = operator._plans[backward.specialization].plan
+
+    assert forward_plan.context_contract.identity != backward_plan.context_contract.identity
+    assert forward_plan.binary_identity != backward_plan.binary_identity
+
+
+
+def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallback():
+    from attn_engine._stateful_plan import LoweredCandidate, select_candidate
+
+    generic = LoweredCandidate("g", "p0", "tilelang-generic", "forward")
+    specialized = LoweredCandidate("s", "p1", "tilelang-elementwise", "forward")
+    assert select_candidate((generic, specialized)) is specialized
+    assert select_candidate((generic,)) is generic
+
+
+
+def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
+    from attn_engine._stateful_plan import WORKLOAD_POLICY, normalized_geometric_mean
+
+    assert {point.distribution for point in WORKLOAD_POLICY.points("packed")} >= {
+        "uniform",
+        "long-tail",
+        "empty-containing",
+    }
+    assert len(WORKLOAD_POLICY.points("dense")) >= 2
+    scores = normalized_geometric_mean(
+        {"first": (1.0, 4.0), "second": (2.0, 2.0)}
+    )
+    assert scores["first"] == pytest.approx(2**0.5)
+    assert scores["second"] == pytest.approx(2**0.5)
+
+
+def test_autotune_config_is_derived_only_for_selected_candidate():
+    from attn_engine._stateful_plan import LoweredCandidate, choose_kernel_config
+
+    selected = LoweredCandidate("selected", "plan", "tilelang-elementwise", "forward")
+    config = choose_kernel_config(
+        selected,
+        {"selected": (1.0, 2.0), "loser": (2.0, 1.0)},
+        autotune=True,
+    )
+    stable = choose_kernel_config(selected, None, autotune=False)
+
+    assert config.identity != stable.identity
+    assert config.values[0][0] == "probe-score-millionths"
+    assert stable.values == ()
+
+
+
+def test_successful_artifacts_publish_atomically_by_layer(tmp_path, monkeypatch):
+    from attn_engine._stateful_plan import publish_successful_artifact
+
+    monkeypatch.setenv("STATEFUL_OPERATOR_CACHE_DIR", str(tmp_path))
+    destination = publish_successful_artifact("artifact", {"ok": True}, layer="plans")
+    same = publish_successful_artifact("artifact", {"ok": False}, layer="plans")
+
+    assert destination == same
+    assert json.loads(destination.read_text()) == {"ok": True}
+
+
+def test_h20_evidence_remains_pending_until_idle_hardware_measurement():
+    from attn_engine._stateful_plan import H20_EVIDENCE, WORKLOAD_POLICY
+
+    assert H20_EVIDENCE.target == "NVIDIA H20"
+    assert H20_EVIDENCE.workload_policy == WORKLOAD_POLICY.version
+    assert H20_EVIDENCE.status == "pending"
+
+
 def test_metadata_only_compile_rejects_runtime_roles_and_tensor_arguments():
     from attn_engine import Target
 
@@ -228,6 +365,22 @@ def test_constant_bits_and_commutative_identity_are_canonical():
     with pytest.raises(ValueError, match="NaN and infinity"):
         Constant(float("nan"))
     assert Add(Input("x"), Input("y")) == Add(Input("y"), Input("x"))
+
+
+def test_mandatory_simplification_removes_safe_zero_and_one_constants():
+    from attn_engine._stateful_analysis import simplify_expression
+
+    x = Input("x")
+    assert simplify_expression(x + Constant(0.0)) == x
+    assert simplify_expression(x * Constant(1.0)) == x
+    assert simplify_expression(Exp(Constant(0.0))) == Constant(1.0)
+
+
+def test_simplification_preserves_authored_association():
+    from attn_engine._stateful_analysis import simplify_expression
+
+    x, y, z = Input("x"), Input("y"), Input("z")
+    assert simplify_expression((x + y) + z) != simplify_expression(x + (y + z))
     assert Multiply(Input("x"), Input("y")) == Multiply(Input("y"), Input("x"))
     assert Add(Add(Input("x"), Input("y")), Input("z")) != Add(
         Input("x"), Add(Input("y"), Input("z"))
@@ -379,6 +532,56 @@ def test_structured_plans_and_kernel_config_have_separate_identities():
     )
     assert structured_plan.mathematical_plan.identity != structured_plan.candidate.identity
     assert structured_plan.candidate.identity != structured_plan.kernel_config.identity
+
+
+def test_planner_enumerates_generic_baseline_and_registered_structured_candidates():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator, optimized=True)
+    plan = operator._plans[compiled.specialization].plan
+
+    representations = {item.representation for item in plan.mathematical_plans}
+    assert "generic-dense-affine" in representations
+    assert "axis-scale" in representations
+    assert "product-injection-gemm" in representations
+    assert "scalar-factorized" in representations
+    assert any(
+        candidate.plan_identity
+        == next(
+            item.identity
+            for item in plan.mathematical_plans
+            if item.representation == "generic-dense-affine"
+        )
+        for candidate in plan.lowered_candidates
+    )
+
+
+def test_optimization_disabled_enumerates_only_generic_plan():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator, optimized=False)
+    plan = operator._plans[compiled.specialization].plan
+
+    assert tuple(item.representation for item in plan.mathematical_plans) == (
+        "generic-dense-affine",
+    )
+    assert plan.mathematical_plan == plan.mathematical_plans[0]
+
+
+def test_lowerer_registry_allows_multiple_implementations_per_plan():
+    from attn_engine._stateful_plan import CandidateLowerer, MathematicalPlan
+
+    plan = MathematicalPlan(
+        "semantic", "axis-scale", ("axis-scale",), ("state-transition",)
+    )
+    first = CandidateLowerer("first", ("axis-scale",), 3).lower(plan, (64, 128))
+    second = CandidateLowerer("second", ("axis-scale",), 4).lower(plan, (64, 128))
+    mismatch = CandidateLowerer("other", ("generic-dense-affine",), 1).lower(
+        plan, (64, 128)
+    )
+
+    assert first is not None and second is not None
+    assert first.plan_identity == second.plan_identity
+    assert first.identity != second.identity
+    assert mismatch is None
 
 
 def test_shared_readouts_and_rank_one_are_model_independent_planner_features():

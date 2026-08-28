@@ -590,7 +590,7 @@ class StatefulOperator:
         plan = compile_plan(
             mode=compilation.mode,
             source_identity=_canonical_identity(
-                (specialization, self.algorithm._analysis.simplified)
+                (self.algorithm._structural_identity, self.algorithm._analysis.simplified)
             ),
             feature_sizes=tuple(role_sizes[role] for role in state.feature_roles),
             target=compilation.target,
@@ -658,11 +658,12 @@ class StatefulOperator:
             )
         plan = self._plans[compiled.specialization]
         try:
-            plan.plan.workspace.required_bytes(runtime.token_count)
+            workspace_size = plan.plan.workspace.required_bytes(runtime.token_count)
         except RuntimeError as error:
             raise StatefulCompilationError(
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
+        plan.workspace_allocator.acquire(runtime.device, workspace_size)
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
             runtime.device.type == "cuda"
