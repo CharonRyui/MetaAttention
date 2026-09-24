@@ -135,7 +135,23 @@ LOWERERS = (
         "tilelang-generic", (PlanRepresentation.GENERIC_DENSE_AFFINE,), 100
     ),
     CandidateLowerer(
-        "tilelang-elementwise", (PlanRepresentation.AXIS_SCALE,), 30, "elementwise"
+        "tilelang-elementwise", (PlanRepresentation.AXIS_SCALE,), 30, "axis-scale"
+    ),
+    CandidateLowerer(
+        "tilelang-product-gemm",
+        (PlanRepresentation.PRODUCT_INJECTION_GEMM,),
+        40,
+        "product-injection-gemm",
+    ),
+    CandidateLowerer(
+        "tilelang-rank-one", (PlanRepresentation.RANK_ONE_FACTORIZED,), 35,
+        "rank-one-factorized",
+    ),
+    CandidateLowerer(
+        "tilelang-shared-contraction",
+        (PlanRepresentation.SHARED_STATE_CONTRACTION,),
+        45,
+        "shared-state-contraction",
     ),
     CandidateLowerer(
         "tilelang-scalar-factorized",
@@ -146,21 +162,10 @@ LOWERERS = (
 )
 
 
-def choose_kernel_config(
-    candidate: LoweredCandidate,
-    measurements: dict[str, tuple[float, ...]] | None,
-    *,
-    autotune: bool,
-) -> KernelConfig:
-    """Tune only the selected candidate; disabled mode uses its stable default."""
-    if not autotune or not measurements:
-        values: tuple[tuple[str, int], ...] = ()
-    else:
-        scores = normalized_geometric_mean(measurements)
-        if candidate.identity not in scores:
-            raise ValueError("selected candidate has no successful measurements")
-        values = (("probe-score-millionths", int(scores[candidate.identity] * 1_000_000)),)
-    return KernelConfig(_digest((candidate.identity, values)), values)
+def kernel_configurations(candidate: LoweredCandidate) -> tuple[tuple[tuple[str, int], ...], ...]:
+    if candidate.lowerer == "tilelang-elementwise":
+        return tuple((("block_tokens", size),) for size in (128, 64, 256))
+    return tuple((("threads", size),) for size in (128, 256))
 
 
 def select_candidate(candidates: tuple[LoweredCandidate, ...]) -> LoweredCandidate:
@@ -329,6 +334,7 @@ class TileLangExecutable:
     scalar_factorized: Any | None
     workspace_allocator: WorkspaceAllocator
     composition: Composition | None = None
+    backward_binding: Any | None = None
 
     @property
     def runtime_family(self) -> str:
@@ -338,18 +344,38 @@ class TileLangExecutable:
             if lowerer.name == self.plan.candidate.lowerer
         )
 
+    def _validate_gradient_dispatch(self, *tensors: torch.Tensor) -> None:
+        if not torch.is_grad_enabled() or not any(tensor.requires_grad for tensor in tensors):
+            return
+        if (
+            self.backward_ir is None
+            or self.backward_binding is None
+            or self.plan.backward_candidate is None
+            or self.composition is None
+            or self.composition.backward_candidate != self.plan.backward_candidate
+        ):
+            raise RuntimeError("gradient execution has no compiler-selected backward candidate")
+
     def prefix(self, transform, bias, segment, initial_state):
-        if self.dense_summary:
+        transform_inputs = transform if isinstance(transform, tuple) else (transform,)
+        self._validate_gradient_dispatch(*transform_inputs, bias, initial_state)
+        if isinstance(transform, tuple):
             from ._stateful_affine import tilelang_dense_affine_prefix
 
-            assert isinstance(transform, tuple)
             return tilelang_dense_affine_prefix(
-                transform[0], transform[1], bias, segment, initial_state
+                transform[0], transform[1], bias, segment, initial_state,
+                backward=self.backward_binding,
+                config=self.plan.backward_kernel_config.values
+                if self.plan.backward_kernel_config else (),
             )
         from ._stateful_elementwise import tilelang_elementwise_prefix
 
-        assert isinstance(transform, torch.Tensor)
-        return tilelang_elementwise_prefix(transform, bias, segment, initial_state)
+        return tilelang_elementwise_prefix(
+            transform, bias, segment, initial_state,
+            backward=self.backward_binding,
+            config=self.plan.backward_kernel_config.values
+            if self.plan.backward_kernel_config else (),
+        )
 
     def scalar_factorized_dense_raw(self, raw_inputs, initial_state, **kwargs):
         from ._stateful_scalar import tilelang_scalar_factorized_dense_raw
@@ -357,7 +383,8 @@ class TileLangExecutable:
         if self.scalar_factorized is None or self.scalar_factorized.dense is None:
             raise ValueError("plan has no raw dense scalar lowering")
         return tilelang_scalar_factorized_dense_raw(
-            raw_inputs, initial_state, self.scalar_factorized.dense, **kwargs
+            raw_inputs, initial_state, self.scalar_factorized.dense,
+            threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
         )
 
     def scalar_factorized_dense(self, *args, **kwargs):
@@ -365,14 +392,18 @@ class TileLangExecutable:
 
         if self.scalar_factorized is None:
             raise ValueError("plan is not scalar-factorized")
-        return tilelang_scalar_factorized_dense(*args, **kwargs)
+        return tilelang_scalar_factorized_dense(
+            *args, threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
+        )
 
     def scalar_factorized_packed(self, *args, **kwargs):
         from ._stateful_scalar import tilelang_scalar_factorized_forward
 
         if self.scalar_factorized is None:
             raise ValueError("plan is not scalar-factorized")
-        return tilelang_scalar_factorized_forward(*args, **kwargs)
+        return tilelang_scalar_factorized_forward(
+            *args, threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
+        )
 
 
 def publish_successful_artifact(identity: str, payload: Any, *, layer: str) -> Path:
@@ -418,6 +449,8 @@ def compile_plan(
     structural_features: Any,
     optimized: bool,
     autotune: bool,
+    operator: Any,
+    compilation: Any,
 ) -> TileLangExecutable:
     """Enumerate mathematical plans, then bind one stable executable candidate."""
     rewrites = _structured_rewrites(structural_features) if optimized else ()
@@ -438,6 +471,7 @@ def compile_plan(
         )
         for representation in representations
     )
+    from ._stateful_structured import RUNTIME_FAMILY_ELIGIBILITY
     active_rewrites = {item.value for item in rewrites}
     candidates = tuple(
         candidate
@@ -445,23 +479,80 @@ def compile_plan(
         if not active_rewrites.intersection(item.conflicts)
         for lowerer in LOWERERS
         if not (backward_ir is not None and lowerer.runtime_family == "scalar-factorized")
+        if item.representation is PlanRepresentation.GENERIC_DENSE_AFFINE
+        or RUNTIME_FAMILY_ELIGIBILITY.get(lowerer.runtime_family, lambda _: (True, None))(operator.algorithm)[0]
         if (candidate := lowerer.lower(item, feature_sizes)) is not None
     )
     candidate = select_candidate(candidates)
     selected_plan = next(
         item for item in mathematical_plans if item.identity == candidate.plan_identity
     )
-    kernel_config = choose_kernel_config(candidate, None, autotune=autotune)
+    values = kernel_configurations(candidate)[0]
+    tuning_result = None
+    if autotune:
+        from ._stateful_benchmark import invocation_factory
+        from ._stateful_tuning import MeasurementCache, tune_candidates
+
+        provisional_plan = TileLangPlan(
+            source_identity,
+            selected_plan,
+            candidate,
+            KernelConfig(_digest((candidate.identity, "probe")), ()),
+            "probe-binary",
+            "probe-tuning",
+            mode,
+            feature_sizes,
+            ContextContract((), (), ()),
+            WorkspacePolicy(feature_sizes[0] * feature_sizes[1] * 4, target.workspace_bytes),
+            mathematical_plans,
+            candidates,
+        )
+        provisional = TileLangExecutable(
+            provisional_plan, backward_ir, dense_summary, scalar_factorized,
+            WorkspaceAllocator()
+        )
+        device = torch.device(target.device_type)
+        cache = None
+        cache_root = os.environ.get("STATEFUL_OPERATOR_CACHE_DIR")
+        if cache_root:
+            cache = MeasurementCache(str(Path(cache_root) / "tuning" / "measurements.json"))
+        factory = invocation_factory(operator, compilation, provisional, mathematical_plans, device)
+        costs = {lowerer.name: lowerer.static_cost for lowerer in LOWERERS}
+        generic = next(item for item in candidates if item.lowerer == "tilelang-generic")
+        tuning_result = tune_candidates(
+            candidates,
+            {item: kernel_configurations(item) for item in candidates},
+            WORKLOAD_POLICY,
+            factory,
+            autotune=True,
+            mode=mode,
+            environment=_target_fingerprint(target),
+            cache=cache,
+            generic_candidate=generic,
+            static_costs={item: costs[item.lowerer] for item in candidates},
+        )
+        candidate = tuning_result.winner
+        selected_plan = next(
+            item for item in mathematical_plans if item.identity == candidate.plan_identity
+        )
+        values = tuning_result.winner_config
+    kernel_config = KernelConfig(_digest((candidate.identity, values)), values)
     toolchain = _toolchain_fingerprint()
     environment = _target_fingerprint(target)
-    context_value = ContextValue(
-        "inputs", "algorithm-declared", ("named-inputs",), "runtime-workload"
+    fixed_roles = tuple((str(role), size) for role, size in compilation.role_sizes)
+    backward_binding = None
+    backward_values: tuple[tuple[str, int], ...] = ()
+    if backward_ir is not None:
+        from ._stateful_backward import bind_backward
+
+        family = "dense" if dense_summary or candidate.lowerer == "tilelang-generic" else "elementwise"
+        backward_values = (("threads", 128),) if family == "dense" else (("block_tokens", 128),)
+        backward_binding = bind_backward(backward_ir, family, backward_values)
+    context_values = (
+        tuple(ContextValue(*value) for value in backward_binding.context_values)
+        if backward_binding is not None else ()
     )
-    context_contract = ContextContract(
-        produced=(context_value,) if backward_ir is not None else (),
-        required=(context_value,) if backward_ir is not None else (),
-        recomputable=(),
-    )
+    context_contract = ContextContract(context_values, context_values, ())
     context_contract.validate()
     binary_identity = _digest(
         (
@@ -470,15 +561,18 @@ def compile_plan(
             context_contract.identity,
             mode,
             feature_sizes,
+            fixed_roles,
             toolchain,
             environment,
         )
     )
     tuning_identity = _digest(
-        (candidate.identity, environment, WORKLOAD_POLICY.version, mode)
+        (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
     )
+    state_heads = dict(compilation.role_sizes)[operator.algorithm.states[0].head_role]
+    rows, columns = feature_sizes
     workspace = WorkspacePolicy(
-        bytes_per_token=feature_sizes[0] * feature_sizes[1] * 4,
+        bytes_per_token=state_heads * (rows * rows + columns * columns + rows * columns) * 4,
         maximum_bytes=target.workspace_bytes,
     )
     backward_candidate = None
@@ -491,7 +585,8 @@ def compile_plan(
             "backward",
         )
         backward_kernel_config = KernelConfig(
-            _digest((backward_candidate.identity, "stable-default", autotune)), ()
+            _digest((backward_candidate.identity, backward_values, autotune)),
+            backward_values,
         )
     plan = TileLangPlan(
         source_identity,
@@ -535,6 +630,7 @@ def compile_plan(
         scalar_factorized,
         WorkspaceAllocator(),
         composition,
+        backward_binding,
     )
 
 
@@ -552,7 +648,7 @@ def _structured_rewrites(features: Any) -> tuple[PlanRepresentation, ...]:
 
 
 def _target_fingerprint(target: Any) -> tuple[Any, ...]:
-    return (target.device_type, target.product_family, target.capability)
+    return (target.device_type, target.product_family, target.capability, target.workspace_bytes)
 
 
 def _toolchain_fingerprint() -> tuple[str, ...]:
@@ -601,7 +697,7 @@ def _nvidia_smi_fingerprint(index: int, fields: str) -> str:
                 "nvidia-smi",
                 f"--query-gpu={fields}",
                 "--format=csv,noheader,nounits",
-                f"--id={index}",
+                "--id=" + str(torch.cuda.get_device_properties(index).uuid),
             ],
             check=True,
             capture_output=True,

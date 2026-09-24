@@ -10,15 +10,26 @@ def tilelang_elementwise_prefix(
     bias: torch.Tensor,
     segment: torch.Tensor,
     initial_state: torch.Tensor,
+    backward=None,
+    config: tuple[tuple[str, int], ...] = (),
 ) -> torch.Tensor:
-    """Compose affine summaries and apply sequence initial State in one compiler seam."""
+    """Compose affine summaries through a compiler-selected VJP binding."""
     if segment.shape != (bias.shape[0],):
         raise ValueError("invalid segmented affine prefix shapes")
     if scale.shape not in (bias.shape, (*bias.shape[:2], 1, 1)):
         raise ValueError("invalid affine scale shape")
     if bias.numel() == 0:
         return bias
-    return _TileLangElementwisePrefix.apply(scale, bias, segment, initial_state)
+    if isinstance(config, int):
+        config = (("block_tokens", config),)
+    if backward is None:
+        from ._stateful_backward import default_backward
+        backward = default_backward("elementwise", config)
+    return _TileLangElementwisePrefix.apply(
+        scale, bias, segment, initial_state, backward, tuple(config)
+    )
+
+
 
 
 @lru_cache(maxsize=None)
@@ -31,11 +42,14 @@ def _compile_elementwise_prefix(
     columns: int,
     dtype: torch.dtype,
     device_index: int,
+    block_tokens: int = 128,
 ):
     import tilelang
     import tilelang.language as T
 
-    block_tokens = 128
+    block_tokens = int(block_tokens)
+    if block_tokens <= 0 or block_tokens & (block_tokens - 1):
+        raise ValueError("block_tokens must be a positive power of two")
     matrix_lanes = 4
     matrix_size = rows * columns
     matrix_blocks = tilelang.cdiv(matrix_size, matrix_lanes)
@@ -106,7 +120,7 @@ def _compile_elementwise_prefix(
                             shared_bias[thread, lane] = 0.0
                     T.sync_threads()
 
-                    for stage in T.Serial(7):
+                    for stage in T.Serial(block_tokens.bit_length() - 1):
                         offset = 1 << stage
                         for lane in T.Serial(matrix_lanes):
                             local_scale[lane] = shared_scale[thread, lane]
@@ -194,6 +208,7 @@ def _tilelang_segmented_elementwise_scan(
     segment: torch.Tensor,
     *,
     inplace: bool = False,
+    block_tokens: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output_scale = torch.empty_like(scale)
     output_bias = bias if inplace else torch.empty_like(bias)
@@ -209,79 +224,41 @@ def _tilelang_segmented_elementwise_scan(
         bias.shape[3],
         scale.dtype,
         device_index,
+        block_tokens,
     )
     kernel(scale, bias, segment, output_scale, output_bias)
     return output_scale, output_bias
 
 
 class _TileLangElementwisePrefix(torch.autograd.Function):
-    """Native TileLang scalar-affine composition with compiler-derived VJP."""
+    """Autograd transport for a compiler-selected elementwise VJP binding."""
 
     @staticmethod
-    def forward(
-        ctx,
-        scale: torch.Tensor,
-        bias: torch.Tensor,
-        segment: torch.Tensor,
-        initial_state: torch.Tensor,
-    ):
-        inference = not any(
-            tensor.requires_grad for tensor in (scale, bias, initial_state)
-        )
+    def forward(ctx, scale, bias, segment, initial_state, backward, config):
+        config = tuple(config)
+        block_tokens = dict(config).get("block_tokens", 128)
+        inference = not any(tensor.requires_grad for tensor in (scale, bias, initial_state))
         output_scale, output_bias = _tilelang_segmented_elementwise_scan(
-            scale,
-            bias,
-            segment,
-            inplace=inference,
+            scale, bias, segment, inplace=inference, block_tokens=block_tokens
         )
         initial = initial_state[segment.long()]
-        if inference:
-            states = output_bias.addcmul_(output_scale, initial)
-        else:
-            states = output_scale * initial + output_bias
+        states = output_bias.addcmul_(output_scale, initial) if inference else output_scale * initial + output_bias
+        ctx.backward_binding = backward
         ctx.save_for_backward(scale, segment, output_scale, output_bias, initial_state)
         return states
 
     @staticmethod
-    def backward(ctx, grad_states: torch.Tensor | None):
+    def backward(ctx, grad_states):
         scale, segment, output_scale, output_bias, initial_state = ctx.saved_tensors
-        grad_states = (
-            torch.zeros_like(output_bias) if grad_states is None else grad_states
-        )
-        grad_output_scale = grad_states * initial_state[segment.long()]
-        continuation = torch.zeros_like(output_scale)
-        continuation[:-1] = torch.where(
-            (segment[:-1] == segment[1:]).view(-1, 1, 1, 1),
-            scale[1:].expand_as(output_scale[1:]),
-            torch.zeros_like(output_scale[1:]),
-        )
-        reverse_segment = segment.flip(0).contiguous()
-        adjoint_scale = _tilelang_segmented_elementwise_scan(
-            continuation.flip(0).contiguous(),
-            grad_output_scale.flip(0).contiguous(),
-            reverse_segment,
-        )[1].flip(0)
-        adjoint_bias = _tilelang_segmented_elementwise_scan(
-            continuation.flip(0).contiguous(),
-            grad_states.flip(0).contiguous(),
-            reverse_segment,
-        )[1].flip(0)
-        previous_scale = torch.ones_like(output_scale)
-        previous_bias = torch.zeros_like(output_bias)
-        same_segment = (segment[1:] == segment[:-1]).view(-1, 1, 1, 1)
-        previous_scale[1:] = torch.where(
-            same_segment, output_scale[:-1], previous_scale[1:]
-        )
-        previous_bias[1:] = torch.where(
-            same_segment, output_bias[:-1], previous_bias[1:]
-        )
-        scale_gradient = _sum_to_shape(
-            adjoint_scale * previous_scale + adjoint_bias * previous_bias,
-            scale.shape,
-        )
-        state_gradient = torch.zeros_like(initial_state)
-        state_gradient.index_add_(0, segment.long(), grad_states * output_scale)
-        return scale_gradient, adjoint_bias, None, state_gradient
+        context = {
+            "transition.scale": scale,
+            "transition.segment": segment,
+            "transition.output_scale": output_scale,
+            "transition.output_bias": output_bias,
+            "transition.initial_state": initial_state,
+        }
+        return (*ctx.backward_binding(context, grad_states), None, None)
+
 
 
 def _sum_to_shape(value: torch.Tensor, shape: torch.Size) -> torch.Tensor:

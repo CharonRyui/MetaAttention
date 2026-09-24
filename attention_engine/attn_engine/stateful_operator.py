@@ -603,6 +603,8 @@ class StatefulOperator:
             optimized=compilation.options.optimized,
             autotune=compilation.options.autotune,
             structural_features=self.algorithm._analysis.structural_features,
+            operator=self,
+            compilation=compilation,
         )
         self._plans[specialization] = plan
         return plan
@@ -657,15 +659,15 @@ class StatefulOperator:
             )
         plan = self._plans[compiled.specialization]
         try:
-            workspace_size = plan.plan.workspace.required_bytes(runtime.token_count)
+            plan.plan.workspace.required_bytes(runtime.token_count)
         except RuntimeError as error:
             raise StatefulCompilationError(
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
-        plan.workspace_allocator.acquire(runtime.device, workspace_size)
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
-            runtime.device.type == "cuda"
+            plan.runtime_family == "scalar-factorized"
+            and runtime.device.type == "cuda"
             and not runtime.packed
             and scalar_profile is not None
             and scalar_profile.dense is not None
@@ -1142,6 +1144,13 @@ class StatefulOperator:
                 else None
             )
             return outputs, final
+        from ._stateful_structured import (
+            _axis_scale_summary,
+            product_injection_terms,
+            rank_one_summary,
+            shared_readouts,
+        )
+        family = getattr(executable, "runtime_family", "generic")
         identity_only = not self.algorithm.transition.propagations
         has_rank = any(
             isinstance(node, RankOnePropagation)
@@ -1151,78 +1160,89 @@ class StatefulOperator:
             isinstance(node, AxisScale) and len(node.roles) == 1
             for node in self.algorithm.transition.propagations
         )
-        if needs_dense_transform:
-            identity_left = (
-                torch.eye(left_size, device=device)
-                .expand(token_count, heads, left_size, left_size)
-                .contiguous()
+        if family == "axis-scale":
+            left, right, elementwise = _axis_scale_summary(
+                self.algorithm.transition.propagations,
+                evaluate=_evaluate,
+                values=values,
+                state_spec=state_spec,
+                token_count=token_count,
+                heads=heads,
+                left_size=left_size,
+                right_size=right_size,
+                device=device,
+                dense=needs_dense_transform,
             )
-            identity_right = (
-                torch.eye(right_size, device=device)
-                .expand(token_count, heads, right_size, right_size)
-                .contiguous()
+            identity_left = left if needs_dense_transform else None
+            identity_right = right if needs_dense_transform else None
+        elif family == "rank-one-factorized":
+            left, right, elementwise = rank_one_summary(
+                self.algorithm.transition.propagations,
+                evaluate=_evaluate,
+                feature_vector=_feature_vector,
+                values=values,
+                state_spec=state_spec,
+                token_count=token_count,
+                heads=heads,
+                left_size=left_size,
+                right_size=right_size,
+                device=device,
             )
-            left: torch.Tensor | None = identity_left
-            right: torch.Tensor | None = identity_right
-        else:
             identity_left = identity_right = None
-            left = right = None
-        elementwise: torch.Tensor | None = (
-            torch.ones(token_count, heads, 1, 1, device=device)
-            if identity_only
-            else None
-        )
-        for index, node in enumerate(self.algorithm.transition.propagations):
-            if isinstance(node, Identity):
-                continue
-            if isinstance(node, AxisScale):
-                factor = _evaluate(node.factor, values).float()
-                if len(node.roles) == 2:
-                    if needs_dense_transform:
+        else:
+            if needs_dense_transform or family in {
+                "generic", "product-injection-gemm", "shared-state-contraction"
+            }:
+                identity_left = torch.eye(left_size, device=device).expand(
+                    token_count, heads, left_size, left_size
+                ).contiguous()
+                identity_right = torch.eye(right_size, device=device).expand(
+                    token_count, heads, right_size, right_size
+                ).contiguous()
+                left: torch.Tensor | None = identity_left
+                right: torch.Tensor | None = identity_right
+            else:
+                identity_left = identity_right = None
+                left = right = None
+            elementwise: torch.Tensor | None = (
+                torch.ones(token_count, heads, 1, 1, device=device)
+                if identity_only else None
+            )
+            for node in self.algorithm.transition.propagations:
+                if isinstance(node, Identity):
+                    continue
+                if isinstance(node, AxisScale):
+                    factor = _evaluate(node.factor, values).float()
+                    if len(node.roles) == 2 or not node.roles:
+                        if needs_dense_transform:
+                            assert left is not None
+                            left = factor * left
+                        else:
+                            elementwise = factor if elementwise is None else elementwise * factor
+                    elif node.roles[0] == state_spec.feature_roles[0]:
                         assert left is not None
-                        left = factor * left
+                        left = torch.diag_embed(factor[..., :, 0]) @ left
                     else:
-                        elementwise = (
-                            factor if elementwise is None else elementwise * factor
-                        )
-                elif not node.roles:
-                    if needs_dense_transform:
-                        assert left is not None
-                        left = factor * left
+                        assert right is not None
+                        right = right @ torch.diag_embed(factor[..., 0, :])
+                elif isinstance(node, RankOnePropagation):
+                    left_vector = _feature_vector(_evaluate(node.left, values), node.role, state_spec)
+                    right_vector = _feature_vector(_evaluate(node.right, values), node.role, state_spec)
+                    coefficient = _evaluate(node.coefficient, values).float()[..., :1, :1]
+                    assert identity_left is not None and identity_right is not None
+                    assert left is not None and right is not None
+                    if node.role == state_spec.feature_roles[0]:
+                        update = identity_left + coefficient * left_vector.unsqueeze(-1) * right_vector.unsqueeze(-2)
+                        left = update @ left
                     else:
-                        elementwise = (
-                            factor if elementwise is None else elementwise * factor
-                        )
-                elif node.roles[0] == state_spec.feature_roles[0]:
-                    assert left is not None
-                    left = torch.diag_embed(factor[..., :, 0]) @ left
-                else:
-                    assert right is not None
-                    right = right @ torch.diag_embed(factor[..., 0, :])
-            elif isinstance(node, RankOnePropagation):
-                left_vector = _feature_vector(
-                    _evaluate(node.left, values), node.role, state_spec
-                )
-                right_vector = _feature_vector(
-                    _evaluate(node.right, values), node.role, state_spec
-                )
-                coefficient = _evaluate(node.coefficient, values).float()[..., :1, :1]
-                assert identity_left is not None and identity_right is not None
-                assert left is not None and right is not None
-                if node.role == state_spec.feature_roles[0]:
-                    update = identity_left + coefficient * (
-                        left_vector.unsqueeze(-1) * right_vector.unsqueeze(-2)
-                    )
-                    left = update @ left
-                else:
-                    update = identity_right + coefficient * (
-                        right_vector.unsqueeze(-1) * left_vector.unsqueeze(-2)
-                    )
-                    right = right @ update
-
+                        update = identity_right + coefficient * right_vector.unsqueeze(-1) * left_vector.unsqueeze(-2)
+                        right = right @ update
         scalar_profile = getattr(executable, "scalar_factorized", None)
+
+
         can_fuse_scalar = (
-            scalar_profile is not None
+            executable.runtime_family == "scalar-factorized"
+            and scalar_profile is not None
             and runtime.device.type == "cuda"
             and scalar_profile.injection_count == 1
             and scalar_profile.readout_count == 1
@@ -1276,15 +1296,28 @@ class StatefulOperator:
             )
             return tuple(output_values), final_state
 
-        injection: torch.Tensor | None = None
-        for term in self.algorithm.transition.injections:
-            product: torch.Tensor | float = 1.0
-            for factor in term.factors:
-                product = product * _evaluate(factor.expression, values).float()
-            if injection is None:
-                injection = product.contiguous()
-            else:
-                injection.add_(product)
+        if executable.runtime_family == "product-injection-gemm":
+            injection = product_injection_terms(
+                self.algorithm.transition.injections,
+                evaluate=_evaluate,
+                values=values,
+                feature_roles=state_spec.feature_roles,
+                token_count=token_count,
+                heads=heads,
+                left_size=left_size,
+                right_size=right_size,
+                device=device,
+            )
+        else:
+            injection = None
+            for term in self.algorithm.transition.injections:
+                product: torch.Tensor | float = 1.0
+                for factor in term.factors:
+                    product = product * _evaluate(factor.expression, values).float()
+                if injection is None:
+                    injection = product.contiguous()
+                else:
+                    injection.add_(product)
         if injection is None:
             injection = torch.zeros(
                 token_count, heads, left_size, right_size, device=device
@@ -1311,7 +1344,31 @@ class StatefulOperator:
                 )
                 states = left @ initial_state[segment] @ right + injection
         output_values: list[torch.Tensor] = []
+        shared = (
+            shared_readouts(
+                self.algorithm.readouts,
+                evaluate=_evaluate,
+                feature_vector=_feature_vector,
+                values=values,
+                states=states,
+                state_spec=state_spec,
+            )
+            if executable.runtime_family == "shared-state-contraction"
+            else {}
+        )
         for readout in self.algorithm.readouts:
+            if readout.name in shared:
+                output = shared[readout.name]
+                if not runtime.packed:
+                    assert runtime.uniform_length is not None
+                    output = output.reshape(
+                        runtime.sequence_count,
+                        runtime.uniform_length,
+                        heads,
+                        output.shape[-1],
+                    ).permute(0, 2, 1, 3)
+                output_values.append(output)
+                continue
             operand = _feature_vector(
                 _evaluate(readout.operand, values), readout.role, state_spec
             ).float()

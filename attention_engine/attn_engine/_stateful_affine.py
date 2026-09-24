@@ -18,6 +18,7 @@ def _compile_dense_matmul_step(
     passthrough: int,
     addend: bool,
     device_index: int,
+    threads: int = 128,
 ):
     import tilelang
     import tilelang.language as T
@@ -42,7 +43,7 @@ def _compile_dense_matmul_step(
                 token_count * heads,
                 T.ceildiv(rows, block_rows),
                 T.ceildiv(columns, block_columns),
-                threads=128,
+                threads=threads,
             ) as (token_head, row_block, column_block):
                 token = token_head // heads
                 head = token_head % heads
@@ -161,6 +162,8 @@ def _tilelang_dense_affine_scan(
     right: torch.Tensor,
     bias: torch.Tensor,
     segment: torch.Tensor,
+    *,
+    threads: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     token_count, heads, rows, _ = left.shape
     columns = right.shape[-1]
@@ -177,56 +180,20 @@ def _tilelang_dense_affine_scan(
         empty_left = torch.empty_like(left)
         empty_right = torch.empty_like(right)
         _compile_dense_matmul_step(
-            token_count,
-            heads,
-            rows,
-            rows,
-            rows,
-            offset,
-            offset,
-            False,
-            1,
-            False,
-            device_index,
+            token_count, heads, rows, rows, rows, offset, offset, False, 1, False,
+            device_index, threads,
         )(left, left, segment, empty_left, next_left)
         _compile_dense_matmul_step(
-            token_count,
-            heads,
-            columns,
-            columns,
-            columns,
-            offset,
-            offset,
-            True,
-            2,
-            False,
-            device_index,
+            token_count, heads, columns, columns, columns, offset, offset, True, 2, False,
+            device_index, threads,
         )(right, right, segment, empty_right, next_right)
         _compile_dense_matmul_step(
-            token_count,
-            heads,
-            rows,
-            rows,
-            columns,
-            offset,
-            offset,
-            False,
-            0,
-            False,
-            device_index,
+            token_count, heads, rows, rows, columns, offset, offset, False, 0, False,
+            device_index, threads,
         )(left, bias, segment, empty_bias, temporary)
         _compile_dense_matmul_step(
-            token_count,
-            heads,
-            rows,
-            columns,
-            columns,
-            offset,
-            0,
-            False,
-            0,
-            True,
-            device_index,
+            token_count, heads, rows, columns, columns, offset, 0, False, 0, True,
+            device_index, threads,
         )(temporary, right, segment, bias, next_bias)
         left, right, bias = next_left, next_right, next_bias
         offset *= 2
@@ -239,8 +206,10 @@ def tilelang_dense_affine_prefix(
     bias: torch.Tensor,
     segment: torch.Tensor,
     initial_state: torch.Tensor,
+    backward=None,
+    config: tuple[tuple[str, int], ...] = (),
 ) -> torch.Tensor:
-    """Compose dense affine summaries with an explicit parallel reverse VJP."""
+    """Compose dense summaries through a compiler-selected VJP binding."""
     if (
         left.ndim != 4
         or right.ndim != 4
@@ -250,73 +219,38 @@ def tilelang_dense_affine_prefix(
         or segment.shape != (bias.shape[0],)
     ):
         raise ValueError("invalid dense affine prefix shapes")
-    return _TileLangDenseAffinePrefix.apply(left, right, bias, segment, initial_state)
+    if isinstance(config, int):
+        config = (("threads", config),)
+    if backward is None:
+        from ._stateful_backward import default_backward
+        backward = default_backward("dense", config)
+    return _TileLangDenseAffinePrefix.apply(
+        left, right, bias, segment, initial_state, backward, tuple(config)
+    )
 
 
 class _TileLangDenseAffinePrefix(torch.autograd.Function):
-    """Explicit recurrence VJP derived from dense affine Backward IR."""
+    """Autograd transport for a compiler-selected dense VJP binding."""
 
     @staticmethod
-    def forward(
-        ctx,
-        left: torch.Tensor,
-        right: torch.Tensor,
-        bias: torch.Tensor,
-        segment: torch.Tensor,
-        initial_state: torch.Tensor,
-    ) -> torch.Tensor:
+    def forward(ctx, left, right, bias, segment, initial_state, backward, config):
+        config = tuple(config)
         prefix_left, prefix_right, prefix_bias = _tilelang_dense_affine_scan(
-            left, right, bias, segment
+            left, right, bias, segment, threads=dict(config).get("threads", 128)
         )
-        states = (
-            prefix_left @ initial_state[segment.long()] @ prefix_right + prefix_bias
-        )
+        states = prefix_left @ initial_state[segment.long()] @ prefix_right + prefix_bias
+        ctx.backward_binding = backward
         ctx.save_for_backward(left, right, segment, initial_state, states)
         return states
 
     @staticmethod
-    def backward(ctx, grad_states: torch.Tensor | None):
+    def backward(ctx, grad_states):
         left, right, segment, initial_state, states = ctx.saved_tensors
-        grad_states = torch.zeros_like(states) if grad_states is None else grad_states
-        same_next = (segment[:-1] == segment[1:]).view(-1, 1, 1, 1)
-        continuation_left = torch.zeros_like(left)
-        continuation_right = torch.zeros_like(right)
-        continuation_left[:-1] = torch.where(
-            same_next,
-            left[1:].transpose(-1, -2),
-            continuation_left[:-1],
-        )
-        continuation_right[:-1] = torch.where(
-            same_next,
-            right[1:].transpose(-1, -2),
-            continuation_right[:-1],
-        )
-        reverse_segment = segment.flip(0).contiguous()
-        _, _, adjoint = _tilelang_dense_affine_scan(
-            continuation_left.flip(0).contiguous(),
-            continuation_right.flip(0).contiguous(),
-            grad_states.flip(0).contiguous(),
-            reverse_segment,
-        )
-        adjoint = adjoint.flip(0)
-
-        previous_state = initial_state[segment.long()].clone()
-        previous_state[1:] = torch.where(
-            same_next,
-            states[:-1],
-            previous_state[1:],
-        )
-        grad_left = adjoint @ right.transpose(-1, -2) @ previous_state.transpose(-1, -2)
-        grad_right = previous_state.transpose(-1, -2) @ left.transpose(-1, -2) @ adjoint
-        grad_initial = torch.zeros_like(initial_state)
-        sequence_starts = torch.ones_like(segment, dtype=torch.bool)
-        sequence_starts[1:] = segment[1:] != segment[:-1]
-        start_indices = sequence_starts.nonzero().flatten()
-        start_segments = segment[start_indices].long()
-        initial_adjoint = (
-            left[start_indices].transpose(-1, -2)
-            @ adjoint[start_indices]
-            @ right[start_indices].transpose(-1, -2)
-        )
-        grad_initial.index_add_(0, start_segments, initial_adjoint)
-        return grad_left, grad_right, adjoint, None, grad_initial
+        context = {
+            "transition.left": left,
+            "transition.right": right,
+            "transition.segment": segment,
+            "transition.initial_state": initial_state,
+            "transition.states": states,
+        }
+        return (*ctx.backward_binding(context, grad_states), None, None)

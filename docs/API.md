@@ -100,7 +100,10 @@ compiled = operator.compile(
         key_dim: 64,
         value_dim: 128,
     },
-    target=Target(),
+    target=Target(
+        # Optional compiled envelope; larger runtime workloads fail explicitly.
+        workspace_bytes=1 << 30,
+    ),
     mode="dense",
     optimized=True,
     autotune=False,

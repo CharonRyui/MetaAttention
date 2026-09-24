@@ -28,6 +28,7 @@ def _compile_scalar_factorized_dense_raw(
     right_scale: float,
     readout_scale: float,
     return_final_state: bool,
+    threads: int,
 ):
     import tilelang
     import tilelang.language as T
@@ -61,7 +62,7 @@ def _compile_scalar_factorized_dense_raw(
             with T.Kernel(
                 sequence_count * heads,
                 T.ceildiv(columns, block_columns),
-                threads=128,
+                threads=threads,
             ) as (sequence_head, column_block):
                 sequence = sequence_head // heads
                 head = sequence_head % heads
@@ -234,6 +235,7 @@ def tilelang_scalar_factorized_dense_raw(
     sequence_length: int,
     output_dtype: torch.dtype,
     return_final_state: bool,
+    threads: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     bindings = tuple(
         raw_inputs[item.name]
@@ -282,6 +284,7 @@ def tilelang_scalar_factorized_dense_raw(
         expressions[2].scale,
         expressions[3].scale,
         return_final_state,
+        threads,
     )
     kernel(propagation, left, right, readout, initial_state, output, final)
     return output, final if return_final_state else None
@@ -299,6 +302,7 @@ def _compile_scalar_factorized_forward(
     output_dtype: torch.dtype,
     device_index: int,
     return_final_state: bool,
+    threads: int,
 ):
     import tilelang
     import tilelang.language as T
@@ -323,7 +327,7 @@ def _compile_scalar_factorized_forward(
             with T.Kernel(
                 sequence_count * heads,
                 T.ceildiv(columns, block_columns),
-                threads=128,
+                threads=threads,
             ) as (sequence_head, column_block):
                 sequence = sequence_head // heads
                 head = sequence_head % heads
@@ -488,6 +492,7 @@ def tilelang_scalar_factorized_forward(
     max_sequence_length: int,
     output_dtype: torch.dtype,
     return_final_state: bool,
+    threads: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     heads, rows, columns = initial_state.shape[1:]
     token_count = scale.shape[0]
@@ -509,6 +514,7 @@ def tilelang_scalar_factorized_forward(
         output_dtype,
         device_index,
         return_final_state,
+        threads,
     )
     kernel(
         scale.reshape(token_count, heads).transpose(0, 1).contiguous(),
@@ -547,6 +553,7 @@ def tilelang_scalar_factorized_dense(
     sequence_length: int,
     output_dtype: torch.dtype,
     return_final_state: bool,
+    threads: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     device_index = scale.device.index
     if device_index is None:
@@ -563,6 +570,7 @@ def tilelang_scalar_factorized_dense(
         max_sequence_length=sequence_length,
         output_dtype=output_dtype,
         return_final_state=return_final_state,
+        threads=threads,
     )
     output = output.reshape(
         sequence_count, sequence_length, output.shape[1], output.shape[2]

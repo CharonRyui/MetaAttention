@@ -96,40 +96,6 @@ def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
     assert len(operator._plans) == 1
 
 
-def test_dynamic_workloads_reuse_binary_and_workspace_buffers():
-    operator = StatefulOperator(_accumulator_ir())
-    compiled = _compile(operator)
-    executable = operator._plans[compiled.specialization]
-    binary_identity = executable.plan.binary_identity
-
-    compiled(**_inputs(length=3))
-    first = tuple(executable.workspace_allocator._buffers.values())
-    compiled(**_inputs(length=3))
-    second = tuple(executable.workspace_allocator._buffers.values())
-    compiled(**_inputs(length=5))
-
-    assert first == second
-    assert len(executable.workspace_allocator._buffers) == 2
-    assert executable.plan.binary_identity == binary_identity
-
-
-def test_empty_packed_workload_allocates_no_workspace():
-    operator = StatefulOperator(_accumulator_ir())
-    compiled = _compile(operator, mode="packed")
-    inputs = {
-        "query": torch.empty(0, 1, 2),
-        "key": torch.empty(0, 1, 2),
-        "value": torch.empty(0, 1, 3),
-        "gate": torch.empty(0, 1),
-    }
-    offsets = torch.tensor([0, 0, 0], dtype=torch.int32)
-
-    compiled(**inputs, sequence_offsets=offsets)
-
-    executable = operator._plans[compiled.specialization]
-    assert executable.workspace_allocator._buffers == {}
-
-
 def test_runtime_workspace_uses_explicit_target_resource_envelope():
     from attn_engine import Target
 
@@ -214,23 +180,6 @@ def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
     assert scores["second"] == pytest.approx(2**0.5)
 
 
-def test_autotune_config_is_derived_only_for_selected_candidate():
-    from attn_engine._stateful_plan import LoweredCandidate, choose_kernel_config
-
-    selected = LoweredCandidate("selected", "plan", "tilelang-elementwise", "forward")
-    config = choose_kernel_config(
-        selected,
-        {"selected": (1.0, 2.0), "loser": (2.0, 1.0)},
-        autotune=True,
-    )
-    stable = choose_kernel_config(selected, None, autotune=False)
-
-    assert config.identity != stable.identity
-    assert config.values[0][0] == "probe-score-millionths"
-    assert stable.values == ()
-
-
-
 def test_successful_artifacts_publish_atomically_by_layer(tmp_path, monkeypatch):
     from attn_engine._stateful_plan import publish_successful_artifact
 
@@ -301,6 +250,49 @@ def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
     )
 
 
+def test_candidate_tuning_removes_failed_specialized_candidate_and_keeps_generic():
+    from attn_engine._stateful_plan import LoweredCandidate
+    from attn_engine._stateful_tuning import WorkloadPoint, tune_candidates
+
+    generic = LoweredCandidate("generic", "plan-g", "tilelang-generic", "forward")
+    specialized = LoweredCandidate("specialized", "plan-s", "tilelang-elementwise", "forward")
+
+    def factory(candidate, config, workload):
+        def invoke():
+            if candidate is specialized:
+                raise RuntimeError("specialized probe failed")
+        return invoke
+
+    result = tune_candidates(
+        (generic, specialized),
+        {generic: ((("threads", 128),),), specialized: ((("block_tokens", 128),),)},
+        (WorkloadPoint(1, 2),), factory, autotune=True,
+        timer=lambda invoke: (invoke() or 2.0), generic_candidate=generic,
+        static_costs={generic: 100, specialized: 1},
+    )
+    assert result.winner is generic
+    assert any(f.candidate == "specialized" for f in result.failures)
+
+
+def test_candidate_tuning_disabled_uses_static_default_without_factory():
+    from attn_engine._stateful_plan import LoweredCandidate
+    from attn_engine._stateful_tuning import WorkloadPoint, tune_candidates
+
+    generic = LoweredCandidate("generic", "plan-g", "tilelang-generic", "forward")
+    calls = []
+
+    def factory(*args):
+        calls.append(args)
+        return lambda: None
+
+    result = tune_candidates(
+        (generic,), {generic: ((("threads", 128),),)}, (WorkloadPoint(1, 1),),
+        factory, autotune=False, generic_candidate=generic, static_costs={generic: 1},
+    )
+    assert result.winner is generic
+    assert calls == []
+
+
 def _inputs(length: int = 3, *, requires_grad: bool = False):
     generator = torch.Generator().manual_seed(7)
     return {
@@ -333,6 +325,35 @@ def _reference(inputs, initial=None):
             torch.einsum("bhf,bhfg->bhg", inputs["query"][..., token, :], state)
         )
     return torch.stack(outputs, dim=2), state
+
+
+@pytest.mark.parametrize("cotangent", ["output", "state", "joint"])
+def test_generic_scalar_propagation_matches_reference_gradients(cotangent):
+    inputs = _inputs(length=5, requires_grad=True)
+    initial = torch.randn(1, 1, 2, 3, requires_grad=True)
+    compiled = _compile(StatefulOperator(_accumulator_ir()), optimized=False, backward=True)
+    result = compiled(
+        **inputs, initial_state=StateTuple(("memory",), (initial,)), return_final_state=True
+    )
+    expected_output, expected_state = _reference(inputs, initial)
+    torch.testing.assert_close(result.outputs[0], expected_output)
+    torch.testing.assert_close(result.final_state[0], expected_state)
+    actual_loss = initial.new_zeros(())
+    expected_loss = initial.new_zeros(())
+    if cotangent in ("output", "joint"):
+        actual_loss = actual_loss + result.outputs[0].square().sum()
+        expected_loss = expected_loss + expected_output.square().sum()
+    if cotangent in ("state", "joint"):
+        actual_loss = actual_loss + result.final_state[0].square().sum()
+        expected_loss = expected_loss + expected_state.square().sum()
+    differentiable = (*inputs.values(), initial)
+    actual_gradients = torch.autograd.grad(actual_loss, differentiable, allow_unused=True)
+    expected_gradients = torch.autograd.grad(expected_loss, differentiable, allow_unused=True)
+    for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
+        if expected is None:
+            assert actual is None
+        else:
+            torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
 
 
 def test_batch_static_inputs_preserve_per_sequence_values():
@@ -638,7 +659,9 @@ def test_shared_readouts_and_rank_one_are_model_independent_planner_features():
     }
     assert "rank-one-factorized" in rewrites
     assert "shared-state-contraction" in rewrites
-    assert plan.mathematical_plan.representation == "generic-dense-affine"
+    assert plan.mathematical_plan.representation in {
+        "generic-dense-affine", "rank-one-factorized", "shared-state-contraction"
+    }
 
 
 
