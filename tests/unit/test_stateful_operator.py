@@ -96,21 +96,18 @@ def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
     assert len(operator._plans) == 1
 
 
-def test_runtime_workspace_uses_explicit_target_resource_envelope():
+def test_compile_rejects_target_without_feasible_workspace():
     from attn_engine import Target
 
     operator = StatefulOperator(_accumulator_ir())
-    compiled = operator.compile(
-        role_sizes=ROLE_SIZES,
-        target=Target(workspace_bytes=23),
-        mode="dense",
-    )
-
     with pytest.raises(StatefulCompilationError) as captured:
-        compiled(**_inputs(length=1))
-
-    assert captured.value.category == "RUNTIME_RESOURCE"
-    assert captured.value.path == "workspace"
+        operator.compile(
+            role_sizes=ROLE_SIZES,
+            target=Target(workspace_bytes=23),
+            mode="dense",
+        )
+    assert captured.value.category == "COMPILE_RESOURCE"
+    assert captured.value.path == "target.workspace_bytes"
 
 
 def test_backward_compilation_publishes_compiler_owned_backward_candidate():

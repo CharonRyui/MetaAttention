@@ -104,7 +104,11 @@ class CandidateLowerer:
     runtime_family: str = "generic"
 
     def lower(
-        self, plan: MathematicalPlan, feature_sizes: tuple[int, int]
+        self,
+        plan: MathematicalPlan,
+        feature_sizes: tuple[int, int],
+        *,
+        maximum_workspace_bytes: int | None = None,
     ) -> LoweredCandidate | None:
         try:
             representation = PlanRepresentation(plan.representation)
@@ -114,6 +118,11 @@ class CandidateLowerer:
             return None
         estimate = self.estimate(plan, feature_sizes)
         if not estimate.feasible:
+            return None
+        if (
+            maximum_workspace_bytes is not None
+            and estimate.workspace_bytes_per_token > maximum_workspace_bytes
+        ):
             return None
         return LoweredCandidate(
             _digest((plan.identity, self.name, "forward")),
@@ -161,6 +170,11 @@ LOWERERS = (
     ),
 )
 
+
+def runtime_family_for(candidate: LoweredCandidate) -> str:
+    return next(
+        lowerer.runtime_family for lowerer in LOWERERS if lowerer.name == candidate.lowerer
+    )
 
 def kernel_configurations(candidate: LoweredCandidate) -> tuple[tuple[tuple[str, int], ...], ...]:
     if candidate.lowerer == "tilelang-elementwise":
@@ -481,8 +495,16 @@ def compile_plan(
         if not (backward_ir is not None and lowerer.runtime_family == "scalar-factorized")
         if item.representation is PlanRepresentation.GENERIC_DENSE_AFFINE
         or RUNTIME_FAMILY_ELIGIBILITY.get(lowerer.runtime_family, lambda _: (True, None))(operator.algorithm)[0]
-        if (candidate := lowerer.lower(item, feature_sizes)) is not None
+        if (candidate := lowerer.lower(
+            item, feature_sizes, maximum_workspace_bytes=target.workspace_bytes
+        )) is not None
     )
+    if not candidates:
+        from .stateful_operator import StatefulCompilationError
+
+        raise StatefulCompilationError(
+            "COMPILE_RESOURCE", "target.workspace_bytes", {"reason": "no feasible lowered candidate"}
+        )
     candidate = select_candidate(candidates)
     selected_plan = next(
         item for item in mathematical_plans if item.identity == candidate.plan_identity
@@ -545,7 +567,7 @@ def compile_plan(
     if backward_ir is not None:
         from ._stateful_backward import bind_backward
 
-        family = "dense" if dense_summary or candidate.lowerer == "tilelang-generic" else "elementwise"
+        family = "dense" if dense_summary or runtime_family_for(candidate) != "elementwise" else "elementwise"
         backward_values = (("threads", 128),) if family == "dense" else (("block_tokens", 128),)
         backward_binding = bind_backward(backward_ir, family, backward_values)
     context_values = (

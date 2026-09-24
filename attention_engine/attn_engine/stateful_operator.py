@@ -659,11 +659,12 @@ class StatefulOperator:
             )
         plan = self._plans[compiled.specialization]
         try:
-            plan.plan.workspace.required_bytes(runtime.token_count)
+            workspace_size = plan.plan.workspace.required_bytes(runtime.token_count)
         except RuntimeError as error:
             raise StatefulCompilationError(
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
+        plan.workspace_allocator.acquire(runtime.device, workspace_size)
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
             plan.runtime_family == "scalar-factorized"
