@@ -373,10 +373,29 @@ def _scan_state(
             prefix_left @ initial_matrix[segment.long()] @ prefix_right + prefix_bias
         )
     else:
-        prefix_scale, prefix_bias = _segmented_elementwise_scan(
-            elementwise, bias, segment
+        streamed = None
+        requires_grad = initial.requires_grad or any(
+            tensor.requires_grad for tensor in values.values()
         )
-        states = prefix_scale * initial_matrix[segment.long()] + prefix_bias
+        if device.type == "cuda" and not requires_grad:
+            # one streaming kernel instead of the host-driven doubling scan, which
+            # costs a pass per halving and materializes token-sized intermediates;
+            # a differentiable call keeps the torch scan so autograd still works
+            from ._stateful_elementwise import tilelang_elementwise_prefix
+
+            streamed = tilelang_elementwise_prefix(
+                elementwise.contiguous(),
+                bias,
+                segment.to(torch.int32),
+                initial_matrix,
+                config=(("block_tokens", 128),),
+            )
+        if streamed is None:
+            prefix_scale, prefix_bias = _segmented_elementwise_scan(
+                elementwise, bias, segment
+            )
+            streamed = prefix_scale * initial_matrix[segment.long()] + prefix_bias
+        states = streamed
     return states.squeeze(-1) if state.rank == 1 else states
 
 

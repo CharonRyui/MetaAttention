@@ -62,3 +62,17 @@ Measured with `testing/benchmark_stateful_plans.py` on an idle H20 (card 4):
 
 What is left in this ticket: the readout still costs one torch op per token (90-654 launches per family per the table above), so the readout epilogue against chunk States is the next lever, and with it the chunk scan for multi-State Programs. `rebased` needs the product-Feature charge revisited once its readout stops dominating.
 
+**Delivered: the reference State scan is the streaming kernel.** `_scan_state` no longer runs the host-driven doubling scan for an elementwise summary on CUDA. It calls the same streaming prefix kernel the v1 elementwise family uses, gated on no bound value requiring grad so a differentiable call keeps the torch scan and autograd is untouched. That removes the per-halving passes and their token-sized intermediates, which is where the launch counts in the table below came from.
+
+Measured with `testing/benchmark_stateful_plans.py --seqlen 2048` on an idle H20 (card 4), cumulative across this ticket's two commits:
+
+| family | baseline | after elementwise summary | after streaming scan | launches (baseline -> now) |
+| --- | --- | --- | --- | --- |
+| `gsa` | 40.0 ms | 8.16 ms | **2.13 ms** | 220 -> 48 |
+| `rwkv6` | 44.7 ms | 14.80 ms | **2.81 ms** | 122 -> 36 |
+| `hgrn` | 2.8 ms | 1.45 ms | **0.58 ms** | 106 -> 20 |
+| `based` | rejected | 66.2 ms | **11.36 ms** | 654 -> 139 |
+| `normalized-linear` | rejected | rejected | rejected | - |
+
+Against 0.14-0.32 ms for the specialized plans, that leaves `hgrn` inside this ticket's 3x bar and `gsa` (6.7x) and `rwkv6` (8.8x) still above it, where they started at 125x and 140x. `normalized-linear` is now the outlier: it still exceeds the envelope at T=2048 even though its siblings with the same shape do not, so its per-State charge needs the same treatment the others just got. The remaining structural levers are unchanged: the readout is still evaluated over the materialized per-token State rather than against chunk States, and multi-State Programs cannot reach the chunked schedule.
+
