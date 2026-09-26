@@ -23,7 +23,9 @@ Measured effect of 19a: the three backward scans fall from 7.5-8.5 ms to 1.0 ms,
 
 What remains for 19b, in the measured order of impact:
 
-1. **Rank-one States (gdn, rwkv7)**: `_tilelang_dense_affine_scan` still doubles over the token axis with four fused-matmul launches and six full-size temporaries per step (4*log2(T) launches, ~1.6 GiB per step at T=2048). These need a chunked factored kernel: per-token factors (`left [T,H,R,1]`, `right [T,H,1,C]`, coefficient) applied to a shared-memory State, with the readout contracted in the kernel.
+1. **Rank-one States (gdn, rwkv7)**: `_tilelang_dense_affine_scan` still doubles over the token axis with four fused-matmul launches and six full-size temporaries per step (4*log2(T) launches, ~1.6 GiB per step at T=2048). The dense per-token factor representation is `O(T*H*R*R)` (1 GiB at R=128, T=2048), so the fix is a factored representation, not a faster composition of the same one.
+
+   Design note for the implementation: within a chunk, a chain of rank-one updates `prod_s (I + c_s l_s r_s^T)` is `I + A W B^T` with `A = [l_1..l_n]`, `B = [r_1..r_n]` and an `n x n` coefficient matrix `W` from a triangular solve (the WY represention). That makes the chunk summary `O(n^2 R)` instead of `O(n R^2)`, the chunk scan cheap (`T/n` summaries), and the per-token epilogue a prefix of the same form. The same factors serve the VJP: the state adjoint recurrences in reverse over `(l, r, c)` plus the per-token gradients `dL/dl = ..., dL/dr = ..., dL/dc = l^T S r`, none of which need a `[T,H,R,R]` tensor.
 2. **Readout fusion (see 21)**: the elementwise family still materializes per-token States and then reads them back, which is why the VJP spends ~2 ms in token-sized torch passes and why GLA forward is 6x the scalar-factorized schedule. Fusing the contraction into the streaming kernel removes those passes entirely.
 3. **Chunk-level parallelism**: the streaming kernel parallelizes over State elements only (heads x R*C/threads blocks), which is enough at K=V=64..128 but not at small State sizes.
 
