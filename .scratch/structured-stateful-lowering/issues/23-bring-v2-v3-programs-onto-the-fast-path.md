@@ -121,3 +121,13 @@ Unlike GSA, the composition is purely elementwise over the two contracted output
 
 Why this is the cheapest real capability win: `based` looks similar but its readout also contains `StateTerm(name, Constant(1.0), None)` -- a whole-State reduction with no contract role -- so it needs a second kernel output form and should follow, not lead. `rebased` needs only what is listed above.
 
+**Attempted, blocked, reverted: TileLang refuses a second kernel for the same symbol.** The entry was refactored to per-State tuples and given a rank-1 promotion (a `[B, H, C]` State promoted to `[B, H, 1, C]` with `key=None` meaning "contracts over its single row, so the key factor is one"). With one State the change was inert and verified: ruff clean, 153 unit tests and both GPU chunked suites (6 tests) unchanged. With two States of *different* sizes it failed at kernel launch:
+
+    RuntimeError: kernel chunk_recurrence_kernel input query shape[2] violates packed ABI constraint; expected: 5, got: 3
+
+The diagnosis is the same hazard this branch hit before, now confirmed on a second path. The TileLang log shows `boundary_pair_kernel` and `chunk_recurrence_kernel` each compiled exactly **once** although two distinct `(rows, columns)` shapes were requested, so the second compilation was not used. The failing call is then validated against the *first* kernel's ABI: `got: 3` is that State's key/row-gate (`[T, H, rows]`), which no caller could have placed in a `query` slot -- the `query` passed for both States was `[T, H, columns]`, so its extent is 5 on both calls. The only argument whose third dimension is 3 is the key, i.e. a boundary call matched against the recurrence kernel.
+
+**Consequence for the design.** Multi-State chunking is blocked on one symbol per State shape, not on the loop: `@lru_cache` keys the *Python* compile function by shape, but TileLang keys its own per-symbol cache by the kernel name, so distinct shapes collide under one symbol. Fixing it means giving each compiled kernel a shape-distinct symbol (thread the shape into the jit name, or into whatever identifies the kernel to TileLang), and that is the first thing the next attempt must settle -- before the per-State entry, since the entry is otherwise correct. The refactor itself is worth redoing in that attempt: it was inert and green with the singular caller passing one-element tuples, and the rank-1 promotion is ten lines.
+
+The work was reverted rather than committed because the rank-1 path would otherwise be unreachable dead code -- nothing in the corpus routes a rank-1 State to this entry -- and a test cannot reach it until the symbol collision is fixed.
+
