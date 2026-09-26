@@ -13,9 +13,13 @@ import torch
 from attn_engine import Target
 from examples.fla_coverage import (
     EPS,
+    based_attention,
+    gated_slot_attention,
     hgrn,
     normalized_linear_attention,
+    rebased_attention,
     retention_attention,
+    rwkv6_attention,
 )
 from examples.fla_coverage import retention_decay
 
@@ -254,4 +258,201 @@ def test_retention_matches_fla_chunk_retention(gpu_device):
         .contiguous(),
     ).outputs["output"]
     expected = chunk_retention(query, key, value, head_first=True)[0]
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_rwkv6_matches_fla_chunk_rwkv6(gpu_device):
+    """Prior-State Readout with a bonus term vs ``chunk_rwkv6``."""
+    from fla.ops.rwkv6 import chunk_rwkv6
+
+    batch, heads, length, dim, dim_value = 1, 2, 128, 64, 64
+    generator = torch.Generator(device=gpu_device).manual_seed(3)
+    def randn(shape):
+        return torch.randn(
+            shape, device=gpu_device, dtype=torch.bfloat16, generator=generator
+        )
+
+    query, key, value = (
+        randn((batch, heads, length, dim)),
+        randn((batch, heads, length, dim)),
+        randn((batch, heads, length, dim_value)),
+    )
+    decay = torch.nn.functional.logsigmoid(
+        torch.randn(batch, heads, length, dim, device=gpu_device, generator=generator)
+    )
+    bonus = torch.randn(heads, dim, device=gpu_device, generator=generator).to(
+        torch.bfloat16
+    )
+
+    compiled = _compile(
+        rwkv6_attention,
+        {
+            "query_heads": heads,
+            "key_heads": heads,
+            "value_heads": heads,
+            "state_heads": heads,
+            "key_dim": dim,
+            "value_dim": dim_value,
+        },
+        batch=batch,
+        heads=heads,
+        seqlen=length,
+        dim=dim,
+        dim_value=dim_value,
+    )
+    actual = compiled(
+        query=query,
+        key=key,
+        value=value,
+        decay=decay,
+        bonus=bonus[None, :, None, :].expand(batch, heads, length, dim).contiguous(),
+    ).outputs["output"]
+    expected = chunk_rwkv6(
+        query,
+        key,
+        value,
+        decay,
+        bonus.float(),
+        scale=dim**-0.5,
+        head_first=True,
+    )[0]
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_based_matches_fla_fused_chunk_based(gpu_device):
+    """Second-order Taylor Program vs ``fused_chunk_based``."""
+    from fla.ops.based import fused_chunk_based
+
+    batch, heads, length, dim, dim_value = 1, 2, 128, 16, 64
+    generator = torch.Generator(device=gpu_device).manual_seed(4)
+    query = torch.randn(
+        batch, heads, length, dim, device=gpu_device, dtype=torch.bfloat16, generator=generator
+    )
+    key = torch.randn(
+        batch, heads, length, dim, device=gpu_device, dtype=torch.bfloat16, generator=generator
+    )
+    value = torch.randn(
+        batch,
+        heads,
+        length,
+        dim_value,
+        device=gpu_device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+
+    compiled = _compile(
+        based_attention,
+        {
+            "query_heads": heads,
+            "key_heads": heads,
+            "value_heads": heads,
+            "state_heads": heads,
+            "unit_dim": 1,
+            "key_dim": dim,
+            "key_dim_x_key_dim": dim * dim,
+            "value_dim": dim_value,
+        },
+        batch=batch,
+        heads=heads,
+        seqlen=length,
+        dim=dim,
+        dim_value=dim_value,
+    )
+    actual = compiled(query=query, key=key, value=value).outputs["output"]
+    expected = fused_chunk_based(query, key, value, head_first=True)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_rebased_matches_fla_parallel_rebased(gpu_device):
+    """Product-Feature Program vs ``parallel_rebased``."""
+    from fla.ops.rebased import parallel_rebased
+
+    batch, heads, length, dim, dim_value = 1, 2, 128, 16, 64
+    generator = torch.Generator(device=gpu_device).manual_seed(5)
+    query = torch.randn(
+        batch, heads, length, dim, device=gpu_device, dtype=torch.bfloat16, generator=generator
+    )
+    key = torch.randn(
+        batch, heads, length, dim, device=gpu_device, dtype=torch.bfloat16, generator=generator
+    )
+    value = torch.randn(
+        batch,
+        heads,
+        length,
+        dim_value,
+        device=gpu_device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+
+    compiled = _compile(
+        rebased_attention,
+        {
+            "query_heads": heads,
+            "key_heads": heads,
+            "value_heads": heads,
+            "state_heads": heads,
+            "key_dim": dim,
+            "key_dim_x_key_dim": dim * dim,
+            "value_dim": dim_value,
+        },
+        batch=batch,
+        heads=heads,
+        seqlen=length,
+        dim=dim,
+        dim_value=dim_value,
+    )
+    actual = compiled(query=query, key=key, value=value).outputs["output"]
+    expected = parallel_rebased(query, key, value, head_first=True)
+    torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_gated_slot_matches_fla_chunk_gsa(gpu_device):
+    """Two-State Program joined by a slot Softmax vs ``chunk_gsa``."""
+    from fla.ops.gsa import chunk_gsa
+
+    batch, heads, length, dim, dim_slot, dim_value = 1, 2, 128, 64, 16, 64
+    generator = torch.Generator(device=gpu_device).manual_seed(6)
+    def randn(shape):
+        return torch.randn(
+            shape, device=gpu_device, dtype=torch.bfloat16, generator=generator
+        )
+
+    query, key = randn((batch, heads, length, dim)), randn(
+        (batch, heads, length, dim)
+    )
+    slot, value = randn((batch, heads, length, dim_slot)), randn(
+        (batch, heads, length, dim_value)
+    )
+    gate = torch.nn.functional.logsigmoid(
+        torch.randn(
+            batch, heads, length, dim_slot, device=gpu_device, generator=generator
+        )
+    )
+
+    compiled = _compile(
+        gated_slot_attention,
+        {
+            "query_heads": heads,
+            "key_heads": heads,
+            "value_heads": heads,
+            "state_heads": heads,
+            "key_dim": dim,
+            "slot_dim": dim_slot,
+            "value_dim": dim_value,
+        },
+        batch=batch,
+        heads=heads,
+        seqlen=length,
+        dim=dim,
+        dim_slot=dim_slot,
+        dim_value=dim_value,
+    )
+    actual = compiled(
+        query=query, key=key, slot=slot, value=value, gate=gate.to(query.dtype)
+    ).outputs["output"]
+    expected = chunk_gsa(
+        query, key, value, slot, gate, scale=dim**-0.5, head_first=True
+    )[0]
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)

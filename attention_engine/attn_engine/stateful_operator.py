@@ -18,7 +18,7 @@ from typing import (
 
 import torch
 
-SCHEMA_VERSION = "stateful-operator-ir/2"
+SCHEMA_VERSION = "stateful-operator-ir/3"
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
@@ -57,6 +57,27 @@ class FeatureRole:
 
     def __str__(self) -> str:
         return self.name
+
+
+@dataclass(frozen=True, init=False)
+class ProductFeatureRole(FeatureRole):
+    """A Feature role whose axis is the flattened product of two Feature roles.
+
+    Second-order feature maps such as Based's ``k (x) k`` state are declared with
+    this role instead of a hand-made name, so the compiler can check that
+    ``size(role) == size(left) * size(right)`` and know how an :class:`Outer`
+    node lays its result out.
+    """
+
+    left: FeatureRole
+    right: FeatureRole
+
+    def __init__(self, left: FeatureRole, right: FeatureRole) -> None:
+        if not isinstance(left, FeatureRole) or not isinstance(right, FeatureRole):
+            raise TypeError("Product Feature role requires two Feature roles")
+        object.__setattr__(self, "name", f"{left.name}_x_{right.name}")
+        object.__setattr__(self, "left", left)
+        object.__setattr__(self, "right", right)
 
 
 LogicalRole = _SingletonRole | HeadRole | FeatureRole
@@ -200,6 +221,17 @@ class InputExpression:
     def clamp(self, minimum: float, maximum: float) -> Clamp:
         return Clamp(self, minimum, maximum)
 
+    def outer(
+        self, other: InputExpression | float | int, role: ProductFeatureRole
+    ) -> Outer:
+        return Outer(self, other, role)
+
+    def contract(self, other: InputExpression | float | int, role: FeatureRole) -> Contract:
+        return Contract(self, other, role)
+
+    def softmax(self, role: FeatureRole) -> Softmax:
+        return Softmax(self, role)
+
 
 @dataclass(frozen=True)
 class Input(InputExpression):
@@ -327,25 +359,92 @@ class Shift(InputExpression):
 
 
 @dataclass(frozen=True, init=False)
+class Outer(InputExpression):
+    """Flattened outer product of two Feature-carrying expressions.
+
+    The result carries :class:`ProductFeatureRole` ``role`` in row-major order:
+    element ``i * size(right) + j`` is ``left[i] * right[j]``.
+    """
+
+    left: InputExpression
+    right: InputExpression
+    role: ProductFeatureRole
+
+    def __init__(
+        self,
+        left: InputExpression | float | int,
+        right: InputExpression | float | int,
+        role: ProductFeatureRole,
+    ) -> None:
+        if not isinstance(role, ProductFeatureRole):
+            raise TypeError("Outer requires a Product Feature role")
+        object.__setattr__(self, "left", as_expression(left))
+        object.__setattr__(self, "right", as_expression(right))
+        object.__setattr__(self, "role", role)
+
+
+@dataclass(frozen=True, init=False)
+class Contract(InputExpression):
+    """Feature-axis contraction of two expressions carrying the same role."""
+
+    left: InputExpression
+    right: InputExpression
+    role: FeatureRole
+
+    def __init__(
+        self,
+        left: InputExpression | float | int,
+        right: InputExpression | float | int,
+        role: FeatureRole,
+    ) -> None:
+        if not isinstance(role, FeatureRole):
+            raise TypeError("Contract requires a Feature role")
+        object.__setattr__(self, "left", as_expression(left))
+        object.__setattr__(self, "right", as_expression(right))
+        object.__setattr__(self, "role", role)
+
+
+@dataclass(frozen=True, init=False)
+class Softmax(InputExpression):
+    """Softmax over the axis of one Feature role."""
+
+    operand: InputExpression
+    role: FeatureRole
+
+    def __init__(
+        self, operand: InputExpression | float | int, role: FeatureRole
+    ) -> None:
+        if not isinstance(role, FeatureRole):
+            raise TypeError("Softmax requires a Feature role")
+        object.__setattr__(self, "operand", as_expression(operand))
+        object.__setattr__(self, "role", role)
+
+
+@dataclass(frozen=True, init=False)
 class StateTerm(InputExpression):
     """Contraction of one named State inside a readout expression.
 
     ``role`` selects the contracted Feature role; the term carries the State's
     other Feature role. ``role=None`` reads a rank-1 State itself without
     contraction, which is how identity readouts such as HGRN's ``o = h`` are
-    expressed. Readouts observe post-transition State; Transitions are driven by
-    Inputs only, so a State Term never appears inside a Transition.
+    expressed. ``prior=True`` reads the State from before the current token's
+    Transition, which is what a readout such as RWKV-6's
+    ``o = (h_{t-1} + u (x) k v) q`` needs. Transitions are driven by Inputs only,
+    so a State Term never appears inside a Transition.
     """
 
     state: str
     operand: InputExpression
     role: FeatureRole | None
+    prior: bool
 
     def __init__(
         self,
         state: str,
         operand: InputExpression | float | int,
         role: FeatureRole | None,
+        *,
+        prior: bool = False,
     ) -> None:
         if not isinstance(state, str) or not state:
             raise TypeError("State Term requires a State name")
@@ -354,6 +453,7 @@ class StateTerm(InputExpression):
         object.__setattr__(self, "state", state)
         object.__setattr__(self, "operand", as_expression(operand))
         object.__setattr__(self, "role", role)
+        object.__setattr__(self, "prior", bool(prior))
 
 
 def as_expression(value: InputExpression | float | int) -> InputExpression:
@@ -964,12 +1064,20 @@ class StatefulOperator:
                     "actual": sorted(str(role) for role in head_roles),
                 },
             )
-        for spec in self.algorithm.states:
-            feature_sizes = tuple(role_sizes[role] for role in spec.feature_roles)
-            if target.device_type == "cuda" and any(
-                size not in (64, 128) for size in feature_sizes
-            ):
-                if os.environ.get("STATEFUL_OPERATOR_TEST_CPU") != "1":
+        _verify_product_roles(dict(role_sizes), "role_sizes")
+        # The {64,128} pair is a capability of the specialized matrix kernels; a
+        # v2 Program is executed by the reference lowering, which has no such
+        # block constraint.
+        from ._stateful_reference import requires_reference_lowering
+
+        if (
+            target.device_type == "cuda"
+            and not requires_reference_lowering(self.algorithm)
+            and os.environ.get("STATEFUL_OPERATOR_TEST_CPU") != "1"
+        ):
+            for spec in self.algorithm.states:
+                feature_sizes = tuple(role_sizes[role] for role in spec.feature_roles)
+                if any(size not in (64, 128) for size in feature_sizes):
                     raise StatefulCompilationError(
                         "SPECIALIZATION",
                         "role_sizes",
@@ -1137,6 +1245,8 @@ class StatefulOperator:
             raise StatefulCompilationError(
                 "RUNTIME_SHAPE", "states[0].roles", {"missing_role": error.args[0]}
             ) from error
+        from ._stateful_reference import requires_reference_lowering as _v2
+
         for spec in self.algorithm.states:
             try:
                 sizes = tuple(role_sizes[role] for role in spec.feature_roles)
@@ -1146,12 +1256,17 @@ class StatefulOperator:
                     f"states.{spec.name}",
                     {"missing_role": error.args[0]},
                 ) from error
-            if device.type == "cuda" and any(size not in (64, 128) for size in sizes):
+            if (
+                device.type == "cuda"
+                and not _v2(self.algorithm)
+                and any(size not in (64, 128) for size in sizes)
+            ):
                 raise StatefulCompilationError(
                     "SPECIALIZATION",
                     "states[0].roles",
                     {"state": spec.name, "feature_sizes": sizes, "supported": [64, 128]},
                 )
+        _verify_product_roles(role_sizes, "inputs")
         for source, target in self.algorithm.head_mapping.mappings:
             if target != state_spec.head_role or source not in role_sizes:
                 raise StatefulCompilationError(
@@ -1831,6 +1946,36 @@ def _segmented_elementwise_scan(
     return scale, bias
 
 
+def _verify_product_roles(
+    role_sizes: Mapping[LogicalRole, int], path: str
+) -> None:
+    """Every Product Feature role axis must equal the product of its factors."""
+    for role, size in role_sizes.items():
+        if not isinstance(role, ProductFeatureRole):
+            continue
+        left = role_sizes.get(role.left)
+        right = role_sizes.get(role.right)
+        if left is None or right is None:
+            raise StatefulCompilationError(
+                "IR_TYPE",
+                path,
+                {
+                    "product_role": role.name,
+                    "missing_factors": [
+                        str(item)
+                        for item, value in ((role.left, left), (role.right, right))
+                        if value is None
+                    ],
+                },
+            )
+        if left * right != size:
+            raise StatefulCompilationError(
+                "RUNTIME_SHAPE",
+                f"{path}.{role.name}",
+                {"expected": left * right, "actual": size},
+            )
+
+
 def _evaluate(
     expression: InputExpression,
     values: Mapping[str, torch.Tensor],
@@ -1840,6 +1985,7 @@ def _evaluate(
     feature_axes: Mapping[Any, int] | None = None,
     segment: torch.Tensor | None = None,
     squeeze_features: bool = False,
+    prior_states: Mapping[str, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Evaluate an Input Expression; State Terms need the State binding.
 
@@ -1856,36 +2002,44 @@ def _evaluate(
     if isinstance(expression, Add):
         return _evaluate(
             expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         ) + _evaluate(
             expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         )
     if isinstance(expression, Multiply):
         return _evaluate(
             expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         ) * _evaluate(
             expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         )
     if isinstance(expression, Divide):
         return _evaluate(
             expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         ) / _evaluate(
             expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         )
     if isinstance(expression, Negate):
         return -_evaluate(
             expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         )
     if isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
         operand = _evaluate(
             expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         ).float()
         if isinstance(expression, Exp):
             return operand.exp()
@@ -1905,7 +2059,8 @@ def _evaluate(
             )
         operand = _evaluate(
             expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         )
         return _shift_within_segment(operand, expression.lag, segment)
     if isinstance(expression, StateTerm):
@@ -1916,9 +2071,53 @@ def _evaluate(
         spec = state_specs[expression.state]
         operand = _evaluate(
             expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            prior_states=prior_states,
         )
-        return _contract_state_term(operand, spec, expression.role, states[expression.state], feature_axes)
+        binding = states
+        if expression.prior:
+            if prior_states is None:
+                raise StatefulCompilationError(
+                    "IR_TYPE", "expression.StateTerm", {"prior": "no prior State binding"}
+                )
+            binding = prior_states
+        return _contract_state_term(
+            operand, spec, expression.role, binding[expression.state], feature_axes
+        )
+    if isinstance(expression, Outer):
+        left = _evaluate(
+            expression.left, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            prior_states=prior_states,
+        )
+        right = _evaluate(
+            expression.right, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            prior_states=prior_states,
+        )
+        expanded = left.float().unsqueeze(-1) * right.float().unsqueeze(-2)
+        return expanded.reshape(*left.shape[:2], left.shape[-1] * right.shape[-1])
+    if isinstance(expression, Contract):
+        left = _evaluate(
+            expression.left, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            prior_states=prior_states,
+        )
+        right = _evaluate(
+            expression.right, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            prior_states=prior_states,
+        )
+        # keep one singleton axis so the result broadcasts against a
+        # Feature-carrying term, exactly like a rank-1 State Term
+        return (left.float() * right.float()).sum(dim=-1, keepdim=True)
+    if isinstance(expression, Softmax):
+        operand = _evaluate(
+            expression.operand, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            prior_states=prior_states,
+        )
+        return torch.softmax(operand.float(), dim=-1)
     raise StatefulCompilationError(
         "IR_TYPE", "expression", {"node": type(expression).__name__}
     )

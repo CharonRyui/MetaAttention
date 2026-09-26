@@ -165,6 +165,27 @@ Attention families need:
 - **Independent States stay Scanable**: a Transition is driven by Inputs only,
   so the per-token summary remains affine and the parallel scan still applies.
 
+Schema v3 keeps every v2 form and adds the vocabulary the product-Feature
+families need (`docs/adr/0003-product-features-and-prior-state-readouts.md`):
+
+- **Product Feature roles.** `ProductFeatureRole(left, right)` declares a Feature
+  whose axis is the flattened product of two Features (named `left_x_right`); a
+  State may use it as an axis, and `Outer(left, right, role)` builds that axis
+  from two expressions. Based and Rebased keep their `[K*K, V]` numerator as an
+  ordinary matrix State.
+- **Feature reductions.** `Contract(operand, coefficient, role)` reduces one
+  Feature axis and keeps a singleton axis, so a Program can write a coefficient
+  term such as RWKV6's `(q * u * k)` bonus. Its `coefficient` may be feature-free.
+- **Axis softmax.** `Softmax(operand, role)` normalizes one Feature axis, which is
+  how a Program joins two States through a slot distribution (Gated Slot
+  Attention) rather than through a fixed contraction.
+- **Prior-State readouts.** `StateTerm(..., prior=True)` reads the State before
+  the current token's transition, which pre-transition readouts such as RWKV6
+  require.
+- **Feature-free Injection factors.** An Injection factor may declare a Feature
+  role its expression does not carry; the value broadcasts along that axis, so a
+  constant `+1` Injection expresses a token count.
+
 Schema-v2 Programs execute through the reference lowering in
 `attention_engine/attn_engine/_stateful_reference.py`: the same parallel
 segmented scans the specialized lowerings use, with per-State affine summaries

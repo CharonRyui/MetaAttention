@@ -24,7 +24,6 @@ from typing import Any, Mapping
 
 import torch
 
-from ._stateful_structured import product_injection_terms
 from .stateful_operator import (
     Batch,
     FeatureRole,
@@ -36,9 +35,9 @@ from .stateful_operator import (
     StateTerm,
     StatefulCompilationError,
     _evaluate,
-    _feature_vector,
     _segmented_affine_scan,
     _segmented_elementwise_scan,
+    _squeeze_singleton_features,
 )
 
 
@@ -108,25 +107,15 @@ def feature_layout(
 ) -> tuple[tuple[FeatureRole, ...], dict[FeatureRole, int]]:
     """Ordered union of every State Feature role, and its axis in a token tensor.
 
-    Readouts combine Feature-carrying terms by broadcast, so a Program may use at
-    most two distinct Feature roles across all of its States. The value layout is
-    always ``[tokens, heads, first, second]``; a Program that uses a single
-    Feature keeps a trailing singleton axis.
+    The value layout is ``[tokens, heads, *roles]`` with at least two axes, so a
+    Program that uses a single Feature keeps a trailing singleton axis and one
+    that uses more Feature roles keeps one axis each.
     """
     order: list[FeatureRole] = []
-    for state in algorithm.states:
-        for role in state.feature_roles:
-            if role not in order:
+    for spec in (*algorithm.inputs, *algorithm.states):
+        for role in spec.roles:
+            if isinstance(role, FeatureRole) and role not in order:
                 order.append(role)
-    if len(order) > 2:
-        raise StatefulCompilationError(
-            "IR_SCHEMA",
-            "states",
-            {
-                "expected": "at most two distinct Feature roles",
-                "actual": [str(role) for role in order],
-            },
-        )
     return tuple(order), {role: 2 + index for index, role in enumerate(order)}
 
 
@@ -270,6 +259,7 @@ def execute_reference(
     """Run one invocation of a v2 Program through the reference lowering."""
     order, axes = feature_layout(algorithm)
     state_values: dict[str, torch.Tensor] = {}
+    prior_values: dict[str, torch.Tensor] = {}
     for state in algorithm.states:
         state_values[state.name] = _scan_state(
             algorithm,
@@ -282,6 +272,9 @@ def execute_reference(
             heads=heads,
             token_count=token_count,
             device=device,
+        )
+        prior_values[state.name] = _prior_state(
+            state_values[state.name], initial_states[state.name], segment
         )
     state_specs = {state.name: state for state in algorithm.states}
     outputs: dict[str, torch.Tensor] = {}
@@ -302,6 +295,7 @@ def execute_reference(
             feature_axes=axes,
             segment=segment,
             squeeze_features=True,
+            prior_states=prior_values,
         )
         outputs[readout.name] = output.to(readout.output_dtype)
     final_states = None
@@ -354,29 +348,15 @@ def _scan_state(
         device=device,
         dense=dense,
     )
-    bias = (
-        _rank1_injection(
-            transition.injections,
-            evaluate=evaluate,
-            values=values,
-            feature_role=view.feature_roles[0],
-            feature_axis=feature_axes[view.feature_roles[0]],
-            token_count=token_count,
-            heads=heads,
-            size=left_size,
-        )
-        if state.rank == 1
-        else product_injection_terms(
-            transition.injections,
-            evaluate=evaluate,
-            values=values,
-            feature_roles=view.feature_roles,
-            token_count=token_count,
-            heads=heads,
-            left_size=left_size,
-            right_size=right_size,
-            device=device,
-        )
+    bias = _injection_terms(
+        transition.injections,
+        evaluate=evaluate,
+        values=values,
+        feature_roles=view.feature_roles,
+        token_count=token_count,
+        heads=heads,
+        left_size=left_size,
+        right_size=right_size,
     )
     if state.rank == 1 and not dense:
         # A promoted vector State scales every Feature with the same per-token
@@ -399,39 +379,83 @@ def _scan_state(
     return states.squeeze(-1) if state.rank == 1 else states
 
 
-def _rank1_injection(
+def _role_vector(value: torch.Tensor, token_count: int, heads: int) -> torch.Tensor:
+    """Reduce a value carrying exactly one Feature role to ``[tokens, heads, size]``."""
+    squeezed = _squeeze_singleton_features(value.float())
+    if squeezed.ndim != 3:
+        raise StatefulCompilationError(
+            "IR_TYPE",
+            "expression",
+            {"reason": "operand must carry exactly one Feature role"},
+        )
+    return squeezed.reshape(token_count, heads, squeezed.shape[-1])
+
+
+def _injection_terms(
     injections,
     *,
     evaluate,
     values: Mapping[str, torch.Tensor],
-    feature_role: Any,
-    feature_axis: int,
+    feature_roles: tuple[Any, ...],
     token_count: int,
     heads: int,
-    size: int,
-) -> torch.Tensor:
-    """Materialize rank-1 State injections as ``[tokens, heads, size, 1]``."""
+    left_size: int,
+    right_size: int,
+) -> torch.Tensor | None:
+    """Materialize additive Injections as ``[tokens, heads, left, right]``.
+
+    A factor carrying the first State Feature (including a Product Feature role)
+    lands on the left axis and a factor carrying the second lands on the right
+    axis; a factor without Feature roles broadcasts over the whole State. Rank-1
+    States use the same builder through their promoted matrix view.
+    """
     result: torch.Tensor | None = None
     for injection in injections:
         product: torch.Tensor | None = None
         for factor in injection.factors:
             value = evaluate(factor.expression, values).float()
-            if tuple(factor.roles) == (feature_role,):
-                value = value.movedim(feature_axis, 2).reshape(token_count, heads, size)
-            else:
-                if any(dimension != 1 for dimension in value.shape[2:]):
+            roles = tuple(factor.roles)
+            if not roles:
+                shaped = value.reshape(token_count, heads, 1, 1)
+            elif len(roles) == 1:
+                squeezed = _squeeze_singleton_features(value)
+                if squeezed.ndim == 0:
+                    # a literal Constant broadcasts along every declared role
+                    shaped = squeezed.reshape(1, 1, 1, 1)
+                elif squeezed.ndim == 2:
+                    # feature-free per token: broadcast along the declared role
+                    shaped = squeezed.reshape(token_count, heads, 1, 1)
+                elif roles[0] == feature_roles[0]:
+                    shaped = _role_vector(value, token_count, heads).reshape(
+                        token_count, heads, left_size, 1
+                    )
+                elif len(feature_roles) > 1 and roles[0] == feature_roles[1]:
+                    shaped = _role_vector(value, token_count, heads).reshape(
+                        token_count, heads, 1, right_size
+                    )
+                else:
                     raise StatefulCompilationError(
                         "IR_TYPE",
                         "transitions.injections",
-                        {
-                            "reason": "rank-1 Injection factors must be scalar or carry the State Feature"
-                        },
+                        {"factor_role": str(roles[0])},
                     )
-                value = value.reshape(token_count, heads, 1)
-            product = value if product is None else product * value
+            else:
+                raise StatefulCompilationError(
+                    "IR_TYPE",
+                    "transitions.injections",
+                    {
+                        "factor_roles": [str(role) for role in roles],
+                        "expected": "one Feature role per factor",
+                    },
+                )
+            product = shaped if product is None else product * shaped
         assert product is not None
         result = product if result is None else result + product
-    return result.unsqueeze(-1)
+    if result is None:
+        return None
+    return torch.broadcast_to(
+        result, (token_count, heads, left_size, right_size)
+    ).contiguous()
 
 
 def _affine_summary(
@@ -476,12 +500,15 @@ def _affine_summary(
         if isinstance(node, AxisScale):
             factor = evaluate(node.factor, values).float()
             if len(node.roles) == 2 or not node.roles:
+                # a whole-State scale broadcasts over both axes
+                scale = torch.broadcast_to(
+                    factor.reshape(*([1] * (4 - factor.ndim)), *factor.shape),
+                    (token_count, heads, 1, 1),
+                ).float()
                 if dense:
-                    left = factor * left
+                    left = scale * left
                 else:
-                    elementwise = (
-                        factor if elementwise is None else elementwise * factor
-                    )
+                    elementwise = scale if elementwise is None else elementwise * scale
             elif node.roles[0] == view.feature_roles[0]:
                 if left is None:
                     raise StatefulCompilationError(
@@ -489,7 +516,7 @@ def _affine_summary(
                         "propagations",
                         {"reason": "left diagonal needs dense"},
                     )
-                left = torch.diag_embed(factor[..., :, 0]) @ left
+                left = torch.diag_embed(_role_vector(factor, token_count, heads)) @ left
             elif node.roles[0] == view.feature_roles[1]:
                 if right is None:
                     raise StatefulCompilationError(
@@ -497,7 +524,7 @@ def _affine_summary(
                         "propagations",
                         {"reason": "right diagonal needs dense"},
                     )
-                right = right @ torch.diag_embed(factor[..., 0, :])
+                right = right @ torch.diag_embed(_role_vector(factor, token_count, heads))
             else:
                 raise StatefulCompilationError(
                     "IR_TYPE", "propagations", {"role": str(node.roles[0])}
@@ -511,8 +538,8 @@ def _affine_summary(
             raise StatefulCompilationError(
                 "IR_SCHEMA", "propagations", {"reason": "rank-one needs dense factors"}
             )
-        left_vector = _feature_vector(evaluate(node.left, values), node.role, view)
-        right_vector = _feature_vector(evaluate(node.right, values), node.role, view)
+        left_vector = _role_vector(evaluate(node.left, values), token_count, heads)
+        right_vector = _role_vector(evaluate(node.right, values), token_count, heads)
         raw_coefficient = evaluate(node.coefficient, values).float()
         coefficient = raw_coefficient.reshape(
             *raw_coefficient.shape, *([1] * max(0, 4 - raw_coefficient.ndim))
@@ -545,6 +572,22 @@ def _matrix_view(state: Any):
             FeatureRole(f"{state.name}__unit"),
         ),
     )
+
+
+def _prior_state(
+    states: torch.Tensor, initial: torch.Tensor, segment: torch.Tensor
+) -> torch.Tensor:
+    """State before each token's Transition, per logical sequence."""
+    prior = torch.empty_like(states)
+    if states.shape[0] == 0:
+        return prior
+    prior[0] = initial[segment[0].long()]
+    if states.shape[0] > 1:
+        same = (segment[1:] == segment[:-1]).view(
+            -1, *([1] * (states.ndim - 1))
+        )
+        prior[1:] = torch.where(same, states[:-1], initial[segment[1:].long()])
+    return prior
 
 
 def _final_state(

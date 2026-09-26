@@ -127,17 +127,20 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         Clamp,
         Constant,
         Divide,
+        Contract,
         Exp,
         FeatureRole,
         Identity,
         Input,
         Log,
+        Outer,
         Multiply,
         Negate,
         RankOnePropagation,
         Reciprocal,
         Shift,
         Sigmoid,
+        Softmax,
         Sqrt,
         StateContraction,
         StateTerm,
@@ -151,9 +154,84 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     ordered = tuple(
         (state, transitions[state.name]) for state in algorithm.states
     )
+    known_features = {
+        role
+        for spec in (*algorithm.inputs, *algorithm.states)
+        for role in spec.roles
+        if isinstance(role, FeatureRole)
+    }
     state = algorithm.states[0]
     feature_roles = state.feature_roles
     types: list[tuple[str, TypedExpression]] = []
+
+    def _type_outer(expression, path: str, recurse) -> TypedExpression:
+        left = recurse(expression.left, f"{path}.left")
+        right = recurse(expression.right, f"{path}.right")
+        for name, typed, expected in (
+            ("left", left, expression.role.left),
+            ("right", right, expression.role.right),
+        ):
+            features = tuple(
+                role for role in typed.roles if isinstance(role, FeatureRole)
+            )
+            if features != (expected,):
+                raise StatefulCompilationError(
+                    "IR_TYPE",
+                    f"{path}.{name}",
+                    {
+                        "expected_feature": str(expected),
+                        "operand_features": _role_names(features),
+                    },
+                )
+        heads = tuple(
+            role for role in left.roles if not isinstance(role, FeatureRole)
+        )
+        typed = TypedExpression(expression, torch.float32, (*heads, expression.role))
+        types.append((path, typed))
+        return typed
+
+    def _type_contract_or_softmax(expression, path: str, recurse) -> TypedExpression:
+        if isinstance(expression, Softmax):
+            operand = recurse(expression.operand, f"{path}.operand")
+            features = tuple(
+                role for role in operand.roles if isinstance(role, FeatureRole)
+            )
+            if features != (expression.role,):
+                raise StatefulCompilationError(
+                    "IR_TYPE",
+                    f"{path}.operand",
+                    {
+                        "expected_feature": str(expression.role),
+                        "operand_features": _role_names(features),
+                    },
+                )
+            typed = TypedExpression(expression, torch.float32, operand.roles)
+            types.append((path, typed))
+            return typed
+        left = recurse(expression.left, f"{path}.left")
+        right = recurse(expression.right, f"{path}.right")
+        for name, typed in (("left", left), ("right", right)):
+            features = tuple(
+                role for role in typed.roles if isinstance(role, FeatureRole)
+            )
+            # A Contract operand either carries exactly the contracted role or no
+            # Feature at all, in which case it broadcasts: that is how a
+            # Feature-axis reduction of a single expression is authored.
+            if features not in ((), (expression.role,)):
+                raise StatefulCompilationError(
+                    "IR_TYPE",
+                    f"{path}.{name}",
+                    {
+                        "expected_feature": str(expression.role),
+                        "operand_features": _role_names(features),
+                    },
+                )
+        heads = tuple(
+            role for role in left.roles if not isinstance(role, FeatureRole)
+        )
+        typed = TypedExpression(expression, torch.float32, heads)
+        types.append((path, typed))
+        return typed
 
     def type_expression(expression: InputExpression, path: str) -> TypedExpression:
         if isinstance(expression, Input):
@@ -203,6 +281,20 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 role for role in operand.roles if not isinstance(role, FeatureRole)
             )
             typed = TypedExpression(expression, torch.float32, (*kept_heads, *produced))
+        elif isinstance(expression, (Outer, Contract, Softmax)):
+            named = (
+                (expression.role.left, expression.role.right)
+                if isinstance(expression, Outer)
+                else (expression.role,)
+            )
+            for role in named:
+                if role not in known_features:
+                    raise StatefulCompilationError(
+                        "IR_TYPE", path, {"unknown_feature": str(role)}
+                    )
+            if isinstance(expression, Outer):
+                return _type_outer(expression, path, type_expression)
+            return _type_contract_or_softmax(expression, path, type_expression)
         elif isinstance(expression, (Add, Multiply, Divide)):
             left = type_expression(expression.left, f"{path}.left")
             right = type_expression(expression.right, f"{path}.right")
@@ -300,7 +392,10 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 actual = tuple(
                     role for role in typed.roles if role in state_spec.feature_roles
                 )
-                if set(actual) != set(factor.roles):
+                # A factor may declare a Feature role that its expression does not
+                # carry: the value broadcasts along that axis. It may not carry a
+                # Feature role it does not declare.
+                if not set(actual) <= set(factor.roles):
                     raise StatefulCompilationError(
                         "IR_TYPE",
                         f"{path}.factors[{factor_index}].roles",
@@ -491,15 +586,18 @@ def simplify_expression(expression):
         Add,
         Clamp,
         Constant,
+        Contract,
         Divide,
         Exp,
         Input,
         Log,
         Multiply,
+        Outer,
         Negate,
         Reciprocal,
         Shift,
         Sigmoid,
+        Softmax,
         Sqrt,
         StateTerm,
     )
@@ -510,6 +608,7 @@ def simplify_expression(expression):
                 expression.state,
                 simplify_expression(expression.operand),
                 expression.role,
+                prior=expression.prior,
             )
         return expression
     if isinstance(expression, Negate):
@@ -539,6 +638,20 @@ def simplify_expression(expression):
         return Clamp(operand, expression.minimum, expression.maximum)
     if isinstance(expression, Shift):
         return Shift(simplify_expression(expression.operand), expression.lag)
+    if isinstance(expression, Softmax):
+        return Softmax(simplify_expression(expression.operand), expression.role)
+    if isinstance(expression, Outer):
+        return Outer(
+            simplify_expression(expression.left),
+            simplify_expression(expression.right),
+            expression.role,
+        )
+    if isinstance(expression, Contract):
+        return Contract(
+            simplify_expression(expression.left),
+            simplify_expression(expression.right),
+            expression.role,
+        )
     if isinstance(expression, (Add, Multiply, Divide)):
         left = simplify_expression(expression.left)
         right = simplify_expression(expression.right)
@@ -589,15 +702,18 @@ def _all_state_terms(expression):
         Add,
         Clamp,
         Constant,
+        Contract,
         Divide,
         Exp,
         Input,
         Log,
         Multiply,
+        Outer,
         Negate,
         Reciprocal,
         Shift,
         Sigmoid,
+        Softmax,
         Sqrt,
         StateTerm,
     )
@@ -608,10 +724,10 @@ def _all_state_terms(expression):
         return
     if isinstance(expression, (Input, Constant)):
         return
-    if isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift)):
+    if isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)):
         yield from _all_state_terms(expression.operand)
         return
-    if isinstance(expression, (Add, Multiply, Divide)):
+    if isinstance(expression, (Add, Multiply, Divide, Outer, Contract)):
         yield from _all_state_terms(expression.left)
         yield from _all_state_terms(expression.right)
         return
@@ -742,15 +858,18 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
     from .stateful_operator import (
         Add,
         Clamp,
+        Contract,
         Divide,
         Exp,
         Input,
         Log,
         Multiply,
+        Outer,
         Negate,
         Reciprocal,
         Shift,
         Sigmoid,
+        Softmax,
         Sqrt,
         StateTerm,
     )
@@ -759,9 +878,9 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
     for expression in expressions:
         if isinstance(expression, Input):
             result.append(expression.name)
-        elif isinstance(expression, (Add, Multiply, Divide)):
+        elif isinstance(expression, (Add, Multiply, Divide, Outer, Contract)):
             result.extend(_input_names(expression.left, expression.right))
-        elif isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift)):
+        elif isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)):
             result.extend(_input_names(expression.operand))
         elif isinstance(expression, StateTerm):
             result.extend(_input_names(expression.operand))

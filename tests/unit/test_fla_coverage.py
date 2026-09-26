@@ -1,8 +1,8 @@
 """CPU expressibility and numeric checks for the FLA coverage Programs.
 
 Every factory in ``examples/fla_coverage.py`` must construct, type-check, compile,
-and execute; the two Programs that cannot be checked against a library operator
-directly are compared with independent token recurrences.
+and execute; the Programs whose library operator is not directly callable here are
+compared with independent token recurrences written from the mathematics.
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ import pathlib
 import pytest
 import torch
 
-from attn_engine import Target
+from attn_engine import FeatureRole, HeadRole, Target
 from examples import fla_coverage as coverage
 
 pytestmark = pytest.mark.unit
 
-BATCH, HEADS, LENGTH, DIM, DIM_VALUE = 1, 2, 4, 3, 2
+BATCH, HEADS, LENGTH, DIM, DIM_VALUE, DIM_SLOT = 1, 2, 4, 3, 2, 2
 
 
 @pytest.fixture(autouse=True)
@@ -26,27 +26,56 @@ def _allow_cpu_stateful_operator(monkeypatch):
 
 
 def _role_sizes(operator, heads=HEADS):
-    from attn_engine import FeatureRole, HeadRole
+    sizes: dict[object, int | None] = {}
+    for spec in (*operator.algorithm.inputs, *operator.algorithm.states):
+        for role in spec.roles:
+            if isinstance(role, HeadRole):
+                sizes[role] = heads
+            elif isinstance(role, FeatureRole):
+                if "_x_" in role.name:
+                    sizes[role] = None
+                elif role.name == "value_dim":
+                    sizes[role] = DIM_VALUE
+                elif role.name == "slot_dim":
+                    sizes[role] = DIM_SLOT
+                elif role.name == "unit_dim":
+                    sizes[role] = 1
+                else:
+                    sizes[role] = DIM
+    for role, size in list(sizes.items()):
+        if size is None:
+            sizes[role] = sizes[role.left] * sizes[role.right]
+    return sizes
 
-    return {
-        role: (DIM_VALUE if role.name == "value_dim" else DIM)
-        if isinstance(role, FeatureRole)
-        else heads
-        for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
-        for role in spec.roles
-        if isinstance(role, (HeadRole, FeatureRole))
-    }
+
+def _run(factory, inputs, kwargs, heads=HEADS):
+    operator = factory(**kwargs)
+    compiled = operator.compile(
+        role_sizes=_role_sizes(operator, heads),
+        target=Target(),
+        mode="dense",
+        optimized=True,
+    )
+    return compiled(**inputs).outputs["output"].float()
+
+
+def _generator():
+    return torch.Generator().manual_seed(0)
+
+
+def _tensors():
+    generator = _generator()
+    return (
+        torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+        torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+        torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
+    )
 
 
 CASES = {
     "normalized_linear_attention": dict(
-        heads=HEADS,
         kwargs=dict(
-            batch=BATCH,
-            heads=HEADS,
-            seqlen=LENGTH,
-            dim=DIM,
-            dim_value=DIM_VALUE,
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_value=DIM_VALUE,
             dtype=torch.float32,
         ),
         inputs=lambda generator: {
@@ -58,45 +87,30 @@ CASES = {
     "hgrn": dict(
         heads=1,
         kwargs=dict(
-            batch=BATCH,
-            heads=1,
-            seqlen=LENGTH,
-            dim_value=DIM_VALUE,
+            batch=BATCH, heads=1, seqlen=LENGTH, dim_value=DIM_VALUE,
             dtype=torch.float32,
         ),
         inputs=lambda generator: {
             "value": torch.randn(BATCH, 1, LENGTH, DIM_VALUE, generator=generator),
-            "gate": torch.randn(BATCH, 1, LENGTH, DIM_VALUE, generator=generator).clamp(
-                -1, 0
-            ),
+            "gate": torch.randn(BATCH, 1, LENGTH, DIM_VALUE, generator=generator).clamp(-1, 0),
         },
     ),
-    "rwkv6_recurrence": dict(
+    "rwkv6_attention": dict(
         kwargs=dict(
-            batch=BATCH,
-            heads=HEADS,
-            seqlen=LENGTH,
-            dim=DIM,
-            dim_value=DIM_VALUE,
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_value=DIM_VALUE,
             dtype=torch.float32,
         ),
         inputs=lambda generator: {
             "query": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
             "key": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
             "value": torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
-            "decay": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator).clamp(
-                -1, 0
-            ),
-            "mix": torch.rand(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "decay": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator).clamp(-1, 0),
+            "bonus": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
         },
     ),
     "retention_attention": dict(
         kwargs=dict(
-            batch=BATCH,
-            heads=HEADS,
-            seqlen=LENGTH,
-            dim=DIM,
-            dim_value=DIM_VALUE,
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_value=DIM_VALUE,
             dtype=torch.float32,
         ),
         inputs=lambda generator: {
@@ -110,11 +124,7 @@ CASES = {
     ),
     "rwkv7_state": dict(
         kwargs=dict(
-            batch=BATCH,
-            heads=HEADS,
-            seqlen=LENGTH,
-            dim=DIM,
-            dim_value=DIM_VALUE,
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_value=DIM_VALUE,
             dtype=torch.float32,
         ),
         inputs=lambda generator: {
@@ -122,10 +132,43 @@ CASES = {
             "key": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
             "value": torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
             "removal": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
-            "decay": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator).clamp(
-                -1, 0
-            ),
+            "decay": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator).clamp(-1, 0),
             "beta": torch.rand(BATCH, HEADS, LENGTH, generator=generator),
+        },
+    ),
+    "based_attention": dict(
+        kwargs=dict(
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_value=DIM_VALUE,
+            dtype=torch.float32,
+        ),
+        inputs=lambda generator: {
+            "query": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "key": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "value": torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
+        },
+    ),
+    "rebased_attention": dict(
+        kwargs=dict(
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_value=DIM_VALUE,
+            dtype=torch.float32,
+        ),
+        inputs=lambda generator: {
+            "query": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "key": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "value": torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
+        },
+    ),
+    "gated_slot_attention": dict(
+        kwargs=dict(
+            batch=BATCH, heads=HEADS, seqlen=LENGTH, dim=DIM, dim_slot=DIM_SLOT,
+            dim_value=DIM_VALUE, dtype=torch.float32,
+        ),
+        inputs=lambda generator: {
+            "query": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "key": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
+            "slot": torch.randn(BATCH, HEADS, LENGTH, DIM_SLOT, generator=generator),
+            "value": torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
+            "gate": torch.randn(BATCH, HEADS, LENGTH, DIM_SLOT, generator=generator).clamp(-1, 0),
         },
     ),
 }
@@ -134,60 +177,152 @@ CASES = {
 @pytest.mark.parametrize("name", sorted(CASES))
 def test_coverage_factory_compiles_and_runs_on_cpu(name):
     case = CASES[name]
-    operator = coverage.FACTORIES[name](**case["kwargs"])
-    compiled = operator.compile(
-        role_sizes=_role_sizes(operator, case.get("heads", HEADS)),
-        target=Target(),
-        mode="dense",
-        optimized=True,
+    output = _run(
+        coverage.FACTORIES[name],
+        case["inputs"](_generator()),
+        case["kwargs"],
+        case.get("heads", HEADS),
     )
-    result = compiled(**case["inputs"](torch.Generator().manual_seed(3)))
-    output = result.outputs[0]
     assert output.shape == (BATCH, case.get("heads", HEADS), LENGTH, DIM_VALUE)
     assert torch.isfinite(output).all()
 
 
-def test_rwkv6_recurrence_matches_token_recurrence():
-    inputs = CASES["rwkv6_recurrence"]["inputs"](torch.Generator().manual_seed(4))
-    operator = coverage.rwkv6_recurrence(
-        BATCH, HEADS, LENGTH, DIM, DIM_VALUE, dtype=torch.float32
+def test_rwkv6_attention_matches_prior_state_readout_recurrence():
+    inputs = CASES["rwkv6_attention"]["inputs"](_generator())
+    actual = _run(
+        coverage.rwkv6_attention,
+        inputs,
+        CASES["rwkv6_attention"]["kwargs"],
     )
-    compiled = operator.compile(
-        role_sizes=_role_sizes(operator), target=Target(), mode="dense", optimized=True
-    )
-    actual = compiled(**inputs).outputs["output"].float()
-
-    memory = torch.zeros(BATCH, HEADS, DIM, DIM_VALUE)
+    scale = DIM**-0.5
+    state = torch.zeros(BATCH, HEADS, DIM, DIM_VALUE)
     outputs = []
-    previous = torch.zeros(BATCH, HEADS, DIM)
     for token in range(LENGTH):
-        shifted = previous * inputs["mix"][:, :, token] + inputs["key"][:, :, token] * (
-            1 - inputs["mix"][:, :, token]
+        outputs.append(
+            torch.einsum(
+                "bhf,bhfg->bhg", inputs["query"][:, :, token] * scale, state
+            )
+            + (
+                (inputs["query"][:, :, token]
+                 * scale
+                 * inputs["bonus"][:, :, token]
+                 * inputs["key"][:, :, token])
+                .sum(-1)
+                .unsqueeze(-1)
+            )
+            * inputs["value"][:, :, token]
         )
-        memory = memory * (-inputs["decay"][:, :, token]).exp().unsqueeze(-1)
-        removal = torch.einsum("bhf,bhfg->bhg", shifted, memory)
-        memory = memory - torch.einsum("bhf,bhg->bhfg", shifted, removal)
-        memory = memory + torch.einsum(
-            "bhf,bhg->bhfg", shifted, inputs["value"][:, :, token]
+        state = state * inputs["decay"][:, :, token].exp().unsqueeze(-1) + torch.einsum(
+            "bhf,bhg->bhfg", inputs["key"][:, :, token], inputs["value"][:, :, token]
+        )
+    torch.testing.assert_close(actual, torch.stack(outputs, dim=2), rtol=1e-5, atol=1e-6)
+
+
+def test_rebased_attention_matches_squared_attention_recurrence():
+    inputs = CASES["rebased_attention"]["inputs"](_generator())
+    actual = _run(
+        coverage.rebased_attention, inputs, CASES["rebased_attention"]["kwargs"]
+    )
+    scale = DIM**-0.5
+    numerator = torch.zeros(BATCH, HEADS, DIM * DIM, DIM_VALUE)
+    denominator = torch.zeros(BATCH, HEADS, DIM * DIM)
+    outputs = []
+    for token in range(LENGTH):
+        pair = torch.einsum(
+            "bhf,bhg->bhfg", inputs["key"][:, :, token], inputs["key"][:, :, token]
+        ).reshape(BATCH, HEADS, DIM * DIM)
+        numerator = numerator + pair.unsqueeze(-1) * inputs["value"][:, :, token].unsqueeze(-2)
+        denominator = denominator + pair
+        query_pair = torch.einsum(
+            "bhf,bhg->bhfg",
+            inputs["query"][:, :, token] * scale,
+            inputs["query"][:, :, token] * scale,
+        ).reshape(BATCH, HEADS, DIM * DIM)
+        outputs.append(
+            (query_pair.unsqueeze(-1) * numerator).sum(-2)
+            / ((query_pair * denominator).sum(-1) + 1e-5).unsqueeze(-1)
+        )
+    torch.testing.assert_close(actual, torch.stack(outputs, dim=2), rtol=1e-5, atol=1e-6)
+
+
+def test_based_attention_matches_second_order_taylor_recurrence():
+    inputs = CASES["based_attention"]["inputs"](_generator())
+    actual = _run(
+        coverage.based_attention, inputs, CASES["based_attention"]["kwargs"]
+    )
+    scale = DIM**-0.5
+    zero = torch.zeros(BATCH, HEADS, DIM_VALUE)
+    first = torch.zeros(BATCH, HEADS, DIM, DIM_VALUE)
+    second = torch.zeros(BATCH, HEADS, DIM * DIM, DIM_VALUE)
+    count = torch.zeros(BATCH, HEADS)
+    key_first = torch.zeros(BATCH, HEADS, DIM)
+    key_second = torch.zeros(BATCH, HEADS, DIM * DIM)
+    outputs = []
+    for token in range(LENGTH):
+        pair = torch.einsum(
+            "bhf,bhg->bhfg", inputs["key"][:, :, token], inputs["key"][:, :, token]
+        ).reshape(BATCH, HEADS, DIM * DIM)
+        zero = zero + inputs["value"][:, :, token]
+        first = first + torch.einsum(
+            "bhf,bhg->bhfg", inputs["key"][:, :, token], inputs["value"][:, :, token]
+        )
+        second = second + pair.unsqueeze(-1) * inputs["value"][:, :, token].unsqueeze(-2)
+        count = count + 1
+        key_first = key_first + inputs["key"][:, :, token]
+        key_second = key_second + pair
+        scaled = inputs["query"][:, :, token] * scale
+        query_pair = torch.einsum("bhf,bhg->bhfg", scaled, scaled).reshape(
+            BATCH, HEADS, DIM * DIM
+        )
+        numerator = (
+            zero
+            + (first * scaled.unsqueeze(-1)).sum(-2)
+            + 0.5 * (second * query_pair.unsqueeze(-1)).sum(-2)
+        )
+        denominator = (
+            count
+            + (key_first * scaled).sum(-1)
+            + 0.5 * (key_second * query_pair).sum(-1)
+        )
+        outputs.append(numerator / (denominator.unsqueeze(-1) + 1e-6))
+    torch.testing.assert_close(actual, torch.stack(outputs, dim=2), rtol=1e-5, atol=1e-6)
+
+
+def test_gated_slot_attention_matches_two_state_softmax_recurrence():
+    inputs = CASES["gated_slot_attention"]["inputs"](_generator())
+    actual = _run(
+        coverage.gated_slot_attention,
+        inputs,
+        CASES["gated_slot_attention"]["kwargs"],
+    )
+    scale = DIM**-0.5
+    key_slot = torch.zeros(BATCH, HEADS, DIM, DIM_SLOT)
+    slot_scores = torch.zeros(BATCH, HEADS, LENGTH, DIM_SLOT)
+    for token in range(LENGTH):
+        gate = inputs["gate"][:, :, token].exp()
+        key_slot = key_slot * gate[:, :, None, :] + torch.einsum(
+            "bhf,bhm->bhfm", inputs["key"][:, :, token], inputs["slot"][:, :, token]
+        )
+        slot_scores[:, :, token] = torch.einsum(
+            "bhf,bhfm->bhm", inputs["query"][:, :, token] * scale, key_slot
+        )
+    slot_weights = torch.softmax(slot_scores, dim=-1)
+    slot_value = torch.zeros(BATCH, HEADS, DIM_SLOT, DIM_VALUE)
+    outputs = []
+    for token in range(LENGTH):
+        gate = inputs["gate"][:, :, token].exp()
+        slot_value = slot_value * gate[:, :, :, None] + torch.einsum(
+            "bhm,bhg->bhmg", inputs["slot"][:, :, token], inputs["value"][:, :, token]
         )
         outputs.append(
-            torch.einsum("bhf,bhfg->bhg", inputs["query"][:, :, token], memory)
+            torch.einsum("bhm,bhmg->bhg", slot_weights[:, :, token], slot_value)
         )
-        previous = inputs["key"][:, :, token]
-    expected = torch.stack(outputs, dim=2)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual, torch.stack(outputs, dim=2), rtol=1e-5, atol=1e-6)
 
 
 def test_rwkv7_state_matches_dplr_recurrence():
-    inputs = CASES["rwkv7_state"]["inputs"](torch.Generator().manual_seed(5))
-    operator = coverage.rwkv7_state(
-        BATCH, HEADS, LENGTH, DIM, DIM_VALUE, dtype=torch.float32
-    )
-    compiled = operator.compile(
-        role_sizes=_role_sizes(operator), target=Target(), mode="dense", optimized=True
-    )
-    actual = compiled(**inputs).outputs["output"].float()
-
+    inputs = CASES["rwkv7_state"]["inputs"](_generator())
+    actual = _run(coverage.rwkv7_state, inputs, CASES["rwkv7_state"]["kwargs"])
     memory = torch.zeros(BATCH, HEADS, DIM, DIM_VALUE)
     outputs = []
     for token in range(LENGTH):
@@ -205,8 +340,21 @@ def test_rwkv7_state_matches_dplr_recurrence():
         outputs.append(
             torch.einsum("bhf,bhfg->bhg", inputs["query"][:, :, token], memory)
         )
-    expected = torch.stack(outputs, dim=2)
-    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+    torch.testing.assert_close(actual, torch.stack(outputs, dim=2), rtol=1e-5, atol=1e-6)
+
+
+@pytest.mark.parametrize("name", ["based_attention", "rebased_attention"])
+def test_product_feature_roles_must_match_their_factor_sizes(name):
+    from attn_engine import StatefulCompilationError
+
+    case = CASES[name]
+    operator = coverage.FACTORIES[name](**case["kwargs"])
+    sizes = _role_sizes(operator)
+    product = next(role for role in sizes if "_x_" in role.name)
+    sizes[product] = sizes[product] + 1
+    with pytest.raises(StatefulCompilationError) as captured:
+        operator.compile(role_sizes=sizes, target=Target(), mode="dense")
+    assert captured.value.category in ("COMPILE_ROLE_SIZE", "RUNTIME_SHAPE")
 
 
 def test_fla_coverage_table_covers_every_installed_fla_op_module():
@@ -216,9 +364,7 @@ def test_fla_coverage_table_covers_every_installed_fla_op_module():
     modules = {
         path.name
         for path in root.iterdir()
-        if path.is_dir()
-        and (path / "__init__.py").exists()
-        and not path.name.startswith("_")
+        if path.is_dir() and (path / "__init__.py").exists() and not path.name.startswith("_")
     } - {"common", "utils"}
     covered = {
         entry[0].split(".")[2]

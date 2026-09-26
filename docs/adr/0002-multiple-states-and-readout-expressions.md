@@ -53,7 +53,8 @@ parallel. Those operators need an inner-loop construct and a separate decision.
 Higher-order States with a product Feature (Based, Rebased: a `[K*K, V]`
 numerator) were rejected for this schema: they need more than two Feature roles
 and Product Injections with three or more factors. They remain expressible only
-after a later schema revision.
+after a later schema revision. (ADR 0003 makes that revision: Feature roles of
+any arity, `Outer`, `Contract`, `Softmax`, and prior-State readouts.)
 
 ## Consequences
 
