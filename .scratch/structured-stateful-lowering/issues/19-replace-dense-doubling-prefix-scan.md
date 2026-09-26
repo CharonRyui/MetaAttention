@@ -19,7 +19,7 @@ Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64):
 
 19a (delivered): `_compile_elementwise_prefix` is now a streaming kernel. Every thread owns one State element and walks its segment accumulating `(A_t, B_t)` with `S_t = A_t S_0 + B_t`, so the cross-thread scan, its barriers, and the shared-memory chunk loop are gone; per-axis, per-token-scalar, and full elementwise factors all lower to the same accumulation. The kernel also composes in reverse (`reverse=True`), which removed the seven flipped token-sized copies the elementwise VJP used to make.
 
-Measured effect of 19a: the three backward scans fall from 7.5-8.5 ms to 1.0 ms, forward falls 2.4x, and the whole training step falls ~2x.
+Measured effect of 19a: the three backward scans fall from 7.5-8.5 ms to 1.0 ms, forward falls 2.4x, and the whole training step falls ~2x. Against Flash Linear Attention at T=2048 (`testing/benchmark_linear_attention.py`, both sides VALID against the FP32 oracle) `gla` moves 250x -> 11.9x -> 5.84x end-to-end and 366x -> 16.4x on graph replay across 20 and 19a. The remaining 5.84x is the per-token State materialization and the token-serial accumulation, which 21 and 19b remove.
 
 What remains for 19b, in the measured order of impact:
 
