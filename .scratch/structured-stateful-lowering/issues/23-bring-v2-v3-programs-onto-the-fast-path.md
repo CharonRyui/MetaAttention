@@ -103,3 +103,21 @@ So the pipeline is: contract `key_slot` over KEY with the scaled query, softmax 
 
 **Superseded checklist (kept for the record; step 2 is wrong as written).**
 
+**Concrete target for boxes 2 and 3: `rebased`.** `examples/rebased_attention.py` exercises both remaining boxes in one Program, and it is currently rejected:
+
+    StateSpec("numerator",   (Batch, STATE_HEADS, second_order, VALUE)),
+    StateSpec("denominator", (Batch, STATE_HEADS, second_order)),      # rank-1
+    # both transitions carry injections and no propagations: unit diagonal decay
+    readouts=(Readout("output",
+        StateTerm("numerator", query_pair, second_order)
+        / (StateTerm("denominator", query_pair, second_order) + Constant(eps)),
+        dtype),)
+
+Unlike GSA, the composition is purely elementwise over the two contracted outputs (`num / (den + eps)`), so no softmax sits between the contractions and independent per-State kernels compose. Three changes, in this order:
+
+1. `_stateful_chunked.py`: accept a rank-1 `initial_state` (`[B, H, C]`) by promoting it to `[B, H, 1, C]` with a key of ones, and take per-State tuples so the two kernels run once per State with their own carry pair. The kernels stay as they are: rows/columns are already arguments and each shape gets its own cached instance, and `rows == 1` makes the boundary pair trivial. A unit-scale State simply passes a gate of ones.
+2. The lowering: a new path for "N diagonal States whose transitions have one injection, plus a readout that is an elementwise expression over per-State contractions". Per State derive the affine summary, the injection product and the readout operand, run the kernels, then evaluate the readout expression with each `StateTerm` replaced by its precomputed contracted output -- a small evaluator that leaves `Sum`/`Div`/`Constant` to torch. Gate it to contraction-only `StateTerm`s with no interior nonlinearity, which is what keeps GSA out until its intra-chunk form exists (its readout softmaxes one State's contraction before contracting the other, so that softmax would have to run over a materialized chunk State).
+3. Estimate and policy: charge the aligned bound summed per State, `sum(heads * rows_i * columns_i * 4 // CHUNK_TOKENS)` per token, then re-measure `rebased` at T=512 and T=2048.
+
+Why this is the cheapest real capability win: `based` looks similar but its readout also contains `StateTerm(name, Constant(1.0), None)` -- a whole-State reduction with no contract role -- so it needs a second kernel output form and should follow, not lead. `rebased` needs only what is listed above.
+
