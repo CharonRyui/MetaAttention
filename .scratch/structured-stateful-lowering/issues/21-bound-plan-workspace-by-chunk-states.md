@@ -14,4 +14,13 @@ Evidence: every plan reports the same 384 KiB/token (`WorkspacePolicy.bytes_per_
 - [ ] Every coverage family compiles and runs at T=32768 in dense and packed modes within the H20 envelope.
 - [ ] Output and final State are unchanged against the pre-change implementation for every family the functional suite covers.
 
+**Measured gap (T=512, H=8, K=V=64, `testing/benchmark_linear_attention.py`).** Kernel-only graph replay separates the schedule from launch and readout overhead:
+
+| Program | MetaAttention kernel | stock FLA kernel | MetaAttention end to end | stock FLA end to end |
+| --- | --- | --- | --- | --- |
+| `simple-gla` (scalar decay, scalar-factorized) | 0.062 ms | 0.024 ms | 0.135 ms | 0.253 ms |
+| `gla` (per-feature decay, elementwise) | 0.450 ms | 0.044 ms | 0.690 ms | 0.330 ms |
+
+Two separate gaps. The `gla` kernel is 10.2x off `chunk_gla`, which is the schedule difference the design note below explains, and its end-to-end time carries a further 0.24 ms because the elementwise family materializes the per-token State and contracts the readout in a separate torch pass -- exactly the buffer this ticket removes. The scalar-decay kernel is 2.6x off `chunk_simple_gla` but wins end to end, and stock FLA is reported INVALID against the oracle there (its toggle semantics differ), so only the `gla` row is a like-for-like baseline.
+
 **Design note (measured).** The factored family's structure -- one block per (sequence, head), one State column in registers per thread, all operations replayed in the thread -- removes the per-token State but is *not* the schedule the summary families should adopt: for the same 8x128x128 State shape at T=2048 it runs in 4.65 ms while `tilelang-scalar-factorized` runs the same State in 0.30 ms. One block per sequence and head with 128 threads walks the whole sequence serially, which is latency bound, whereas the scalar-factorized kernel tiles the sequence and uses tensor-core GEMMs. The remaining families therefore need a *tile+GEMM chunked* kernel that generalizes the scalar-factorized one to a per-feature decay: inside a chunk the constant decay can be folded into the operands, but a per-feature decay makes the causal weight `exp(P_t[i] - P_s[i])` depend on the summed axis, so it does not reduce to rescaling one [T, T] score matrix. The form that keeps the tensor cores is a per-chunk state build (`M_t = diag(exp(-P_t)) * cumsum(diag(exp(P_s)) k_s v_s^T)`, cheap and tile-parallel) followed by a GEMM with the pre-scaled queries, with the chunk-end state carried by the existing block-level scan.
