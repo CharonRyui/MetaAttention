@@ -391,6 +391,75 @@ def _compose_readout(
     return None
 
 
+def _axis_factors(
+    propagations: Any,
+    *,
+    view: Any,
+    evaluate: Any,
+    values: Mapping[str, torch.Tensor],
+    token_count: int,
+    heads: int,
+    left_size: int,
+    right_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+    """A diagonal Transition's per-axis decay factors, kept separate.
+
+    ``_affine_summary`` returns their outer product, which costs
+    ``token_count * heads * rows * columns`` elements -- 268 MB for a 64x64 State
+    at T=2048, and 1 GiB for the 256x64 one `rebased` carries. The chunked kernels
+    take one gate per axis, so that product is pure overhead here. ``None`` means a
+    propagation is not a diagonal scale, which sends the caller to the reference.
+    """
+    from .stateful_operator import AxisScale, Identity
+
+    from ._stateful_reference import _role_vector
+
+    def per_token(expression: Any, size: int | None) -> torch.Tensor | None:
+        factor = evaluate(expression, values).float()
+        if size is None:
+            broadcast = factor.reshape(token_count, heads, -1)
+            return broadcast if broadcast.shape[-1] == 1 else None
+        return _role_vector(factor, token_count, heads).reshape(token_count, heads, size)
+
+    rows = torch.ones(token_count, heads, left_size, device=device)
+    columns = (
+        None
+        if right_size == 1
+        else torch.ones(token_count, heads, right_size, device=device)
+    )
+    for node in propagations:
+        if isinstance(node, Identity):
+            continue
+        if not isinstance(node, AxisScale):
+            return None
+        roles = tuple(node.roles)
+        whole = len(roles) == 2 or not roles
+        if whole:
+            scale = per_token(node.factor, None)
+            if scale is None:
+                return None
+            rows = rows * scale
+            if columns is not None:
+                columns = columns * scale
+            continue
+        if roles[0] == view.feature_roles[0]:
+            row_factor = per_token(node.factor, left_size)
+            if row_factor is None:
+                return None
+            rows = rows * row_factor
+        elif roles[0] == view.feature_roles[-1]:
+            if columns is None:
+                continue
+            column_factor = per_token(node.factor, right_size)
+            if column_factor is None:
+                return None
+            columns = columns * column_factor
+        else:
+            return None
+    return rows, columns
+
+
 def chunked_states_eligible(algorithm: Any) -> bool:
     """Whether ``execute_chunked_states`` can express this Program's algebra.
 
@@ -471,11 +540,7 @@ def execute_chunked_states(
         return None
     from .stateful_operator import AxisScale, StateContraction, StateTerm, _evaluate
 
-    from ._stateful_reference import (
-        _affine_summary,
-        _matrix_view,
-        _role_vector,
-    )
+    from ._stateful_reference import _matrix_view, _role_vector
 
     def evaluate(
         expression: Any, bound: Mapping[str, torch.Tensor]
@@ -517,7 +582,7 @@ def execute_chunked_states(
         first_role = view.feature_roles[0]
         left_size = role_sizes[first_role]
         right_size = 1 if state.rank == 1 else role_sizes[view.feature_roles[1]]
-        left, right, elementwise = _affine_summary(
+        factors = _axis_factors(
             transition.propagations,
             view=view,
             evaluate=evaluate,
@@ -527,10 +592,10 @@ def execute_chunked_states(
             left_size=left_size,
             right_size=right_size,
             device=device,
-            dense=False,
         )
-        if left is not None or right is not None or elementwise is None:
+        if factors is None:
             return None
+        row_factor, column_factor = factors
         term = terms_by_state[state.name][0]
         if term.role != first_role:
             return None
@@ -555,12 +620,10 @@ def execute_chunked_states(
             return None
         if column is None:
             column = torch.ones(token_count, heads, 1, device=device)
-        # a whole-State scale is a single factor over both axes, so only the row
-        # gate carries it; the kernels expand an extent-one row gate themselves
-        gate_rows.append(elementwise[:, :, :, 0])
-        gate_columns.append(
-            None if elementwise.shape[3] == 1 else elementwise[:, :, 0, :]
-        )
+        # a whole-State scale is one factor over both axes, so only the row gate
+        # carries it; the kernels expand an extent-one row gate themselves
+        gate_rows.append(row_factor)
+        gate_columns.append(column_factor)
         keys.append(key)
         values_per_state.append(column)
         queries.append(
