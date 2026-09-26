@@ -4,7 +4,7 @@
 
 **Blocked by:** 12/Add Rank One Factorized Plan; 17/Compose Optimized Forward and Backward.
 
-**Status:** in progress (19a and 19b-i delivered, 19b-ii open)
+**Status:** in progress (19a, 19b-i, 19b-ii delivered; rank-one backward throughput and the diagonal-family fusion remain)
 
 Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64):
 
@@ -16,6 +16,15 @@ Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64):
 | `linear` | scalar-factorized | 0.30 ms | 0.30 ms | 15.5 ms | 7.6 ms |
 | `gdn` | rank-one | 81.6 ms | 81.6 ms | 169.5 ms | 169.5 ms |
 | `rwkv7` | rank-one | 81.6 ms | 81.6 ms | — | — |
+
+19b-ii (delivered): the factored family now compiles with a backward. The forward records the per-token State (bf16) when a backward is present; one reverse-walk kernel reads those States, replays each token's authored chain forward to recover an operation's input State, and writes every gradient -- op factors and coefficients, injection factors, the readout operand, and the initial State. `_factored_vjp` and the `factored` backward context carry the stacked factors between the kernels, and the plan charges the recorded States as workspace only for backward-enabled compilations, so inference still runs with zero sequence-scaled workspace.
+
+| family | T=2048 forward | T=2048 forward+backward |
+| --- | --- | --- |
+| `gdn` | 81.6 -> 4.65 ms | 169.4 -> 24.0 ms |
+| `rwkv7` | 81.6 -> 5.01 ms | 169.5 -> 23.8 ms |
+
+Evidence: `test_gdn_factored_recurrence_gradients_match_independent_reference` compares every gradient against `torch.autograd.grad` of the FP64 oracle at T=130; the residual is about 0.5% and comes from the bf16 State recording. The remaining backward throughput, the `19a`-family readout fusion, and the packed mode are the open items above.
 
 19b-i (delivered): a `factored-recurrence` Plan Representation and `tilelang-factored-recurrence` lowerer add `_stateful_factored.py`, one kernel that keeps every State column in registers, replays the authored whole-State or first-feature Axis Scale and first-feature Rank One operations per token, adds the injection outer products, and contracts the readout. Eligibility (`rank_one_factored_eligible`) requires one Transition, one contracting first-feature readout, disjoint single-feature injection factors, and at least one rank-one contraction, so the diagonal-only Programs keep the scalar and elementwise kernels that already fuse the same work into fewer, shorter kernels. The family is forward-only: with a compiled backward the plan stays on the previous path, exactly as `scalar-factorized` does.
 
@@ -33,7 +42,7 @@ Measured effect of 19a: the three backward scans fall from 7.5-8.5 ms to 1.0 ms,
 
 What remains for 19b, in the measured order of impact:
 
-1. **Rank-one backward (19b-ii)**: the factored family has no VJP yet, so a Program compiled with `backward=True` keeps the doubling scan and the dense per-token factor matrices (`gdn` training is still 169 ms at T=2048). The backward needs the State adjoint recurrence in reverse over `(l, r, c)`, the per-token gradients `dL/dl`, `dL/dr`, `dL/dc`, the injection and readout operand gradients, and the initial-State gradient; the `grad_r`/`grad_readout` terms need the per-token State, so the kernel must either recompute it per chunk or carry the WY matrix described below.
+1. **Rank-one backward throughput**: the reverse walk is now the slower half (19 ms of the 24 ms training step at T=2048) because one block per sequence and head walks the whole sequence with 128 threads. Splitting the column axis into blocks, or the WY form below, is the next step. Packed mode also still falls back to the doubling scan.
 
    Two findings from 19b-i that shape 19b-ii: every per-token parameter gradient (`dL/dr`, `dL/dq`, `dL/dc`, `dL/d(scale)`) is a reduction across State columns, so the backward has to be tile based rather than thread-per-column like the forward; and the State must come from storage or a checkpointed replay, not from inverting the forward ops.
 
