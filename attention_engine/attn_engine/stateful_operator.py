@@ -1760,6 +1760,18 @@ class StatefulOperator:
                 token_count, heads, left_size, right_size, device=device
             )
         segment_i32 = segment.to(torch.int32)
+        if elementwise is not None and family == "axis-scale":
+            chunked = self._lower_chunked_elementwise(
+                values, initial_state, injection, elementwise, second_factor, runtime, executable
+            )
+            if chunked is not None:
+                output, chunked_final = chunked
+                final_state = (
+                    StateTuple((state_spec.name,), (chunked_final,))
+                    if return_final_state
+                    else None
+                )
+                return (output,), final_state
         if elementwise is not None:
             # the summary factors are derived from the token-major input views,
             # so they are not always contiguous; materializing them here is the
@@ -1861,6 +1873,61 @@ class StatefulOperator:
                 )[:, -1]
             final_state = StateTuple((state_spec.name,), (final,))
         return tuple(output_values), final_state
+
+    def _lower_chunked_elementwise(
+        self,
+        values: Mapping[str, torch.Tensor],
+        initial_state: torch.Tensor,
+        injection: torch.Tensor,
+        elementwise: torch.Tensor,
+        second_factor: torch.Tensor | None,
+        runtime: _Runtime,
+        executable: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Run a diagonal recurrence through the chunked schedule.
+
+        The kernels need one injection factor pair, one first-Feature readout,
+        chunk-aligned dense sequences, and no gradient. Anything else keeps the
+        per-token summary path.
+        """
+        if (
+            runtime.device.type != "cuda"
+            or runtime.packed
+            or runtime.uniform_length is None
+            or runtime.uniform_length != runtime.token_count
+            or runtime.uniform_length % 64
+            or len(self.algorithm.transition.injections) != 1
+            or len(self.algorithm.readouts) != 1
+            or any(tensor.requires_grad for tensor in values.values())
+            or initial_state.requires_grad
+        ):
+            return None
+        state_spec = self.algorithm.states[0]
+        first_role, second_role = state_spec.feature_roles
+        injection_term = self.algorithm.transition.injections[0]
+        factors = {
+            factor.roles[0]: _evaluate(factor.expression, values)
+            for factor in injection_term.factors
+        }
+        if set(factors) != {first_role, second_role}:
+            return None
+        readout = self.algorithm.readouts[0]
+        if not isinstance(readout, StateContraction) or readout.role != first_role:
+            return None
+        return executable.chunked_elementwise_dense(
+            gate_rows=_token_major(elementwise, runtime),
+            gate_columns=(
+                None if second_factor is None else _token_major(second_factor, runtime)
+            ),
+            key=_token_major(factors[first_role], runtime),
+            value=_token_major(factors[second_role], runtime),
+            query=_token_major(
+                _feature_vector(_evaluate(readout.operand, values), readout.role, state_spec),
+                runtime,
+            ),
+            initial_state=initial_state,
+            output_dtype=readout.output_dtype,
+        )
 
     def _lower_factored_recurrence(
         self,
@@ -1973,6 +2040,16 @@ class StatefulOperator:
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
         ).hexdigest()
+
+
+def _token_major(value: torch.Tensor, runtime: _Runtime) -> torch.Tensor:
+    """Materialize a per-token factor in the token-major layout the kernels read.
+
+    Runtime inputs are already normalized to token-major (a batch-major flattened
+    view for dense sequences), so this only makes the buffer contiguous, at one
+    declared point, rather than inside the kernel.
+    """
+    return value.contiguous()
 
 
 def _segmented_affine_scan(

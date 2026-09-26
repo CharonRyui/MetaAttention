@@ -583,6 +583,12 @@ class TileLangExecutable:
             second=second,
         )
 
+    def chunked_elementwise_dense(self, **kwargs):
+        """Run the chunked diagonal schedule; the caller guarantees no gradient."""
+        from ._stateful_chunked import chunked_elementwise_dense
+
+        return chunked_elementwise_dense(**kwargs)
+
     def factored_recurrence_dense(self, **kwargs):
         from ._stateful_factored import factored_recurrence_dense
 

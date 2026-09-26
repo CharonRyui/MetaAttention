@@ -66,3 +66,20 @@ Blocker: compiling the same `kernel` symbol in two output layouts (per-token row
 
 The dispatch that was evaluated and removed with it: `_lower_parallel_scan` routes `axis-scale` forward-only compilations (CUDA, dense, uniform chunk-aligned length, single injection and readout, single per-axis factor) to the chunked entry, with `_token_major` as the declared transposition seam for per-token factors. The two-axis pair needs both compact carries, so it stayed on the per-token path in that attempt.
 
+**Chunked path delivered (`_stateful_chunked.py`).** A diagonal Program on a chunk-aligned dense sequence now runs through two kernels that own their symbols and layouts, so they never share a TileLang cache entry (the collision that blocked the first attempt):
+
+- `boundary_pair_kernel` walks each sequence once and writes the running `(A, B)` pair only where a chunk ends, into a compact `[chunks, heads, rows, columns]` buffer.
+- `chunk_recurrence_kernel` gives every `(sequence, head, chunk, column block)` its own block, reads the pair from the previous boundary as `A * S_0 + B`, holds the State column in registers, replays the chunk's factors and the injection outer product from the two per-token factors, contracts the readout in place, and lets the last chunk write the final State.
+
+No per-token State reaches global memory except the output, and the block count scales with the chunk count (at T=2048, H=8, K=V=64: 256 blocks of 64 threads against the factored kernel's 8).
+
+Measured on an idle H20 (card 4, 4 MiB in use, 0% utilization), T=2048, H=8, K=V=64, inference:
+
+| Program | before | chunked | scalar-factorized group |
+| --- | --- | --- | --- |
+| `gla` (row decay, T=2048) | 1.870 ms | 1.232 ms | 0.304 ms |
+
+So `gla` moves from 6.2x to 4.05x of the scalar group: better, and not yet the 2x this ticket asks for. The remaining gap is the token-serial walk inside each chunk; the next lever is splitting the row axis across threads instead of holding the whole column in one thread. `gdn` and `rwkv7` are unchanged: they carry a rank-one propagation, which needs the WY form rather than this diagonal schedule.
+
+Correctness: `tests/functional/test_chunked_elementwise.py` covers a row-decay Program at a chunk-aligned length (chunk-boundary tokens 63/64/127 and the final State), a two-axis Program through the same carry, and the scalar family's unchanged selection. Final-State error against the FP32 recurrence is 4.8e-6.
+
