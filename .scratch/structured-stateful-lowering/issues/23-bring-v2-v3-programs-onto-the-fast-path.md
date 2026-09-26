@@ -171,3 +171,11 @@ The suspect is the per-State query: ``queries`` come from ``term.operand``, whic
 
 **Probing note.** External patching does not reliably reach this lowering: a spy installed on ``chunked_elementwise_dense`` before ``_compile`` never fired, and patching ``execute_chunked_states`` after ``_compile`` did not change the result. The next attempt must print from inside the function.
 
+**Delivered, `79a134a`.** `execute_reference` early-returns into `execute_chunked_states`, which runs one chunked recurrence per State and composes the readout over the contracted outputs. `chunked_states_eligible` is the static gate and also drives the plan's charge. Rank-1 States are one column per token with their injection factor as the key and `value=None` meaning the constant one, which is how `_injection_terms` and `_scan_state` already present them.
+
+The bug that took longest is worth recording because its symptom was subtle: the kernels write `[sequence, head, token, column]` and the reference lowering's caller consumes token before head, so the raw kernel output was permuted a second time on the way out. The signature was that only element (0, 0) of every tensor survived -- head 0 token 0 matched to bf16 rounding while everything else was 84% wrong -- which is exactly what applying a permutation to an already-permuted tensor does, and it is why the injection, query, readout and kernel all measured correct while the Program output did not.
+
+Evidence: `rebased` matches FLA; the per-State bound is published (`133120` bytes/token aligned against `25559040` per token at heads=8, dim=64; `2080` at heads=2, dim=16); the entry test covers a rank-1 State beside a dense one with `rows != columns`; the functional gate is 30 passed and the unit suite 153.
+
+**Still open in this ticket:** the latency and envelope evidence at length for the v2/v3 families (the charge is published and T=2048 fits the envelope on paper, but the runtime acceptance and the measured latency are not yet on record), and the packed form.
+
