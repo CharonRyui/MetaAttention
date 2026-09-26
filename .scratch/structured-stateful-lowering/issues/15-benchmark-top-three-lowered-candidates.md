@@ -4,7 +4,7 @@
 
 **Blocked by:** 14/Select feasible Lowered Candidates.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] The measured set contains the static Top Three and the generic baseline, with duplicates removed.
 - [ ] Each candidate receives the same fixed small parameter-probe budget before cross-plan comparison.

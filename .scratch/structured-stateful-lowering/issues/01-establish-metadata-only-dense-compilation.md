@@ -4,7 +4,7 @@
 
 **Blocked by:** None (can start immediately).
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] Compilation accepts fixed sizes only for declared HeadRole and FeatureRole values and rejects Batch, Sequence, missing, unknown, or inconsistent role sizes.
 - [ ] Algorithm IR remains the sole source for input names, logical roles, dtypes, State shape semantics, readout dtypes, and Head Mapping.

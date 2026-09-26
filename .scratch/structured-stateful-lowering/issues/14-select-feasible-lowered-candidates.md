@@ -4,7 +4,7 @@
 
 **Blocked by:** 10/Add the Axis Scale structured plan.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] The selector accepts multiple lowerers for one Mathematical Plan and multiple Mathematical Plans for one Simplified IR.
 - [ ] Semantic, Target-capability, context, workspace, register, shared-memory, and other resource failures remove a candidate before publication.

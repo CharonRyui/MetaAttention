@@ -4,7 +4,7 @@
 
 **Blocked by:** 15/Benchmark Top Three Lowered Candidates.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] KernelConfig remains separate from Mathematical Plan and Lowered Candidate identity.
 - [ ] Full search runs only for the selected candidate; losing candidates receive no full search budget.

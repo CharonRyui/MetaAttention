@@ -4,7 +4,7 @@
 
 **Blocked by:** 01/Establish metadata-only dense compilation; 02/Establish metadata-only packed compilation.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] The public compile contract accepts role sizes, explicit Target, dense or packed mode, and independent optimized, autotune, and backward choices.
 - [ ] Compile-time Tensor and offsets arguments are rejected; no compatibility alias or deprecated path remains.

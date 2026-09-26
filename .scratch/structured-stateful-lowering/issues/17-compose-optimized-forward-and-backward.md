@@ -4,7 +4,7 @@
 
 **Blocked by:** 11/Add the Product Injection GEMM plan; 12/Add the Rank-One factorized plan; 13/Add the shared State Contraction plan; 16/Autotune the winning KernelConfig.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] The planner composes legal non-conflicting representation rewrites and excludes mutually incompatible combinations.
 - [ ] Forward and backward may select different Mathematical Plans, lowerers, and KernelConfigs while remaining equivalent to canonical forward and Backward IR.

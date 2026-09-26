@@ -4,7 +4,7 @@
 
 **Blocked by:** 07/Support dynamic workspace and resource validation; 17/Compose independently optimized forward and backward.
 
-**Status:** ready-for-agent
+**Status:** delivered in code, acceptance evidence open (audited 2026-09-26: layered publication exists; `H20_EVIDENCE.status` is still `pending`, so the workload-policy freeze and the statistical gates the ticket asks for are not met)
 
 - [ ] Semantic, Mathematical Plan, Lowered Candidate, KernelConfig, context, tuning, and binary identities are distinct and deterministic.
 - [ ] Dynamic Batch, Sequence, packed counts, offsets shapes, and offsets values do not enter binary identity; fixed roles, dtype, mode, Target, plan, lowerer, config, and context behavior enter the appropriate identities.

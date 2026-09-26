@@ -4,7 +4,7 @@
 
 **Blocked by:** 06/Migrate existing structured forward paths; 09/Enforce named forward-backward context contracts.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] Matching supports distinct left and right vectors, positive and negative coefficients, both State Feature directions, and non-square State.
 - [ ] Ordered noncommuting Rank-One Propagations are never reordered or reassociated outside the declared numerical contract.

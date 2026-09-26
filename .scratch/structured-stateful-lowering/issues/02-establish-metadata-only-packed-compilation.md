@@ -4,7 +4,7 @@
 
 **Blocked by:** 01/Establish metadata-only dense compilation.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] Packed compilation requires fixed Head and Feature role sizes, explicit Target, and packed mode but no real input Tensor or offsets Tensor.
 - [ ] Runtime validates token-major input contracts and offsets rank, int32 dtype, device, contiguity, start, end, monotonicity, and total-token agreement.

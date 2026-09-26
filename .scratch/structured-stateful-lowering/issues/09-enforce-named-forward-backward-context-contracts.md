@@ -4,7 +4,7 @@
 
 **Blocked by:** 08/Generate generic compiler-derived backward.
 
-**Status:** ready-for-agent
+**Status:** delivered in code (audited 2026-09-26: every artifact the ticket names is present and exercised by the unit and functional suites; the ticket's own H20 acceptance evidence is not re-gathered in this pass)
 
 - [ ] Context values use stable semantic paths and declare dtype, logical roles, and shape rules.
 - [ ] Forward candidates declare produced context; backward candidates declare required and explicitly recomputable context.
