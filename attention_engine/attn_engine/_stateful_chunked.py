@@ -1,10 +1,12 @@
 """Chunked execution for diagonal State recurrences.
 
 A diagonal Transition (whole-State, first-Feature or second-Feature Axis Scale
-factors) needs no dense summary. This module runs such a Program through two
-kernels: one that walks each sequence once and writes the running affine pair
-only where a chunk ends, and one that replays each chunk independently with the
-State column in registers and the readout contracted in place. Nothing
+factors) needs no dense summary. This module runs such a Program through three
+kernels: one that computes each chunk's own affine pair, one that composes those
+pairs into the running pair at every chunk end, and one that replays each chunk
+independently with the State column in registers and the readout contracted in
+place. Splitting the pair walk per chunk is what keeps the serial depth at one
+chunk instead of the whole sequence. Nothing
 token-sized reaches global memory except the output.
 
 The kernels own their symbols and layouts, so they never share a TileLang cache
@@ -23,7 +25,7 @@ CHUNK_TOKENS = 64
 
 
 @lru_cache(maxsize=None)
-def _compile_boundary_pair(
+def _compile_chunk_pairs(
     sequence_count: int,
     sequence_length: int,
     heads: int,
@@ -33,11 +35,12 @@ def _compile_boundary_pair(
     threads: int,
     device_index: int,
 ):
-    """Write the running pair where each chunk of each sequence ends.
+    """Write each chunk's own affine pair, one block per (sequence, head, chunk).
 
-    One thread owns one State element and walks its sequence accumulating
-    ``(A_t, B_t)`` with ``S_t = A_t S_0 + B_t``. Only chunk boundaries are
-    written, into a compact ``[chunks, heads, rows, columns]`` buffer.
+    A running pair is the composition of the per-chunk pairs, so walking whole
+    sequences here is wasted serial depth: every element spent ``sequence_length``
+    dependent steps to reach the same answer that a single chunk's walk plus a
+    short composition gives. Chunks are independent, so they go on the grid.
     """
     import tilelang
     import tilelang.language as T
@@ -49,56 +52,104 @@ def _compile_boundary_pair(
     @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
     def build_kernel():
         @T.prim_func
-        def boundary_pair_kernel(
+        def chunk_pair_kernel(
             gate_rows: T.Tensor((sequence_length, heads, rows), "float32"),
             gate_columns: T.Tensor((sequence_length, heads, columns), "float32"),
             key: T.Tensor((sequence_length, heads, rows), "float32"),
             value: T.Tensor((sequence_length, heads, columns), "float32"),
+            local_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
+            local_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
+        ):
+            if False:
+                _ = (chunk_count, matrix_blocks, rows, columns, threads)
+            with T.Kernel(
+                sequence_count * heads, chunk_count, matrix_blocks, threads=threads
+            ) as (sequence_head, chunk, matrix_block):
+                sequence = sequence_head // heads
+                head = sequence_head % heads
+                index = matrix_block * threads + T.get_thread_binding()
+                scale = T.alloc_local((1,), dtype="float32")
+                bias = T.alloc_local((1,), dtype="float32")
+                if index < matrix_size:
+                    row = index // columns
+                    column = index % columns
+                    scale[0] = 1.0
+                    bias[0] = 0.0
+                    for step in T.serial(chunk_tokens):
+                        token = chunk * chunk_tokens + step
+                        if token < sequence_length:
+                            # factors are token-major with batch-major flattening
+                            flat = sequence * sequence_length + token
+                            bias[0] = (
+                                gate_rows[flat, head, row]
+                                * gate_columns[flat, head, column]
+                                * bias[0]
+                                + key[flat, head, row] * value[flat, head, column]
+                            )
+                            scale[0] = (
+                                gate_rows[flat, head, row]
+                                * gate_columns[flat, head, column]
+                                * scale[0]
+                            )
+                    local_scale[chunk, head, row, column] = scale[0]
+                    local_bias[chunk, head, row, column] = bias[0]
+
+        return chunk_pair_kernel
+
+    return build_kernel()
+
+
+@lru_cache(maxsize=None)
+def _compile_chunk_scan(
+    sequence_count: int,
+    heads: int,
+    rows: int,
+    columns: int,
+    chunk_count: int,
+    threads: int,
+    device_index: int,
+):
+    """Compose the per-chunk pairs into the running pair at every chunk end."""
+    import tilelang
+    import tilelang.language as T
+
+    matrix_size = rows * columns
+    matrix_blocks = tilelang.cdiv(matrix_size, threads)
+
+    @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+    def build_kernel():
+        @T.prim_func
+        def chunk_scan_kernel(
+            local_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
+            local_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
             carry_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
             carry_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
         ):
             if False:
-                _ = (chunk_count, matrix_blocks, rows, columns, threads)
+                _ = (matrix_blocks, rows, columns, threads)
             with T.Kernel(sequence_count * heads, matrix_blocks, threads=threads) as (
                 sequence_head,
                 matrix_block,
             ):
-                sequence = sequence_head // heads
                 head = sequence_head % heads
                 index = matrix_block * threads + T.get_thread_binding()
-                accumulated_scale = T.alloc_local((1,), dtype="float32")
-                accumulated_bias = T.alloc_local((1,), dtype="float32")
+                scale = T.alloc_local((1,), dtype="float32")
+                bias = T.alloc_local((1,), dtype="float32")
                 if index < matrix_size:
                     row = index // columns
                     column = index % columns
-                    accumulated_scale[0] = 1.0
-                    accumulated_bias[0] = 0.0
-                    for token in T.Serial(sequence_length):
-                        # factors are token-major with batch-major flattening
-                        flat = sequence * sequence_length + token
-                        accumulated_bias[0] = (
-                            gate_rows[flat, head, row]
-                            * gate_columns[flat, head, column]
-                            * accumulated_bias[0]
-                            + key[flat, head, row] * value[flat, head, column]
+                    scale[0] = 1.0
+                    bias[0] = 0.0
+                    for chunk in T.serial(chunk_count):
+                        bias[0] = (
+                            local_scale[chunk, head, row, column] * bias[0]
+                            + local_bias[chunk, head, row, column]
                         )
-                        accumulated_scale[0] = (
-                            gate_rows[flat, head, row]
-                            * gate_columns[flat, head, column]
-                            * accumulated_scale[0]
-                        )
-                        if (
-                            token % chunk_tokens == chunk_tokens - 1
-                            or token == sequence_length - 1
-                        ):
-                            carry_scale[
-                                token // chunk_tokens, head, row, column
-                            ] = accumulated_scale[0]
-                            carry_bias[
-                                token // chunk_tokens, head, row, column
-                            ] = accumulated_bias[0]
+                        scale[0] = local_scale[chunk, head, row, column] * scale[0]
+                        carry_scale[chunk, head, row, column] = scale[0]
+                        carry_bias[chunk, head, row, column] = bias[0]
 
-        return boundary_pair_kernel
+        return chunk_scan_kernel
 
     return build_kernel()
 
@@ -250,7 +301,7 @@ def _chunked_state(
     device_index = device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
-    boundary = _compile_boundary_pair(
+    pairs = _compile_chunk_pairs(
         sequence_count,
         token_count,
         heads,
@@ -260,18 +311,24 @@ def _chunked_state(
         128,
         device_index,
     )
-    carry_scale = torch.empty(
+    local_scale = torch.empty(
         chunk_count, heads, rows, columns, device=device, dtype=torch.float32
     )
-    carry_bias = torch.empty_like(carry_scale)
-    boundary(
+    local_bias = torch.empty_like(local_scale)
+    pairs(
         rows_gate,
         columns_gate,
         key.contiguous(),
         value.contiguous(),
-        carry_scale,
-        carry_bias,
+        local_scale,
+        local_bias,
     )
+    scan = _compile_chunk_scan(
+        sequence_count, heads, rows, columns, chunk_count, 128, device_index
+    )
+    carry_scale = torch.empty_like(local_scale)
+    carry_bias = torch.empty_like(local_scale)
+    scan(local_scale, local_bias, carry_scale, carry_bias)
     kernel = _compile_chunk_recurrence(
         sequence_count,
         token_count,
