@@ -133,3 +133,71 @@ def test_scalar_decay_keeps_the_factorized_selection(gpu_device):
         compiled.operator._plans[compiled.specialization].plan.candidate.lowerer
         == "tilelang-scalar-factorized"
     )
+
+
+def test_chunked_entry_runs_a_rank_one_state_beside_a_dense_one():
+    """The entry carries several States, one of them rank-1, with rows != columns.
+
+    A rank-1 State contracts over its single row and so carries no key factor:
+    ``key=None`` means the constant one. The two States differ in size, which
+    gives each its own compiled kernels. A first-Feature readout contracts the
+    rows and writes the columns, so the query spans the rows here -- every other
+    case in this file uses square States, where the two orientations coincide.
+    """
+    import torch
+
+    from attention_engine.attn_engine._stateful_chunked import chunked_elementwise_dense
+
+    torch.manual_seed(0)
+    device = torch.device("cuda")
+    sequences, heads, tokens, rows, columns = 1, 2, 128, 3, 5
+    gate = torch.rand(tokens, heads, rows, device=device) * 0.5 + 0.25
+    rank_gate = torch.rand(tokens, heads, 1, device=device) * 0.5 + 0.25
+    key = torch.rand(tokens, heads, rows, device=device)
+    value = torch.rand(tokens, heads, columns, device=device)
+    rank_value = torch.rand(tokens, heads, columns, device=device)
+    query = torch.rand(tokens, heads, rows, device=device)
+    rank_query = torch.rand(tokens, heads, 1, device=device)
+    initial = torch.rand(sequences, heads, rows, columns, device=device)
+    rank_initial = torch.rand(sequences, heads, columns, device=device)
+
+    outputs, finals = chunked_elementwise_dense(
+        gate_rows=(gate, rank_gate),
+        gate_columns=(None, None),
+        key=(key, None),
+        value=(value, rank_value),
+        query=(query, rank_query),
+        initial_state=(initial, rank_initial),
+        output_dtype=torch.float32,
+    )
+    assert len(outputs) == 2 and len(finals) == 2
+    assert outputs[0].shape == (sequences, heads, tokens, columns)
+    assert outputs[1].shape == (sequences, heads, tokens, columns)
+    assert finals[1].shape == (sequences, heads, columns)
+
+    state = initial.clone()
+    rank_state = rank_initial.unsqueeze(2).clone()
+    expected = torch.empty_like(outputs[0])
+    expected_rank = torch.empty_like(outputs[1])
+    for token in range(tokens):
+        injection = key[token].unsqueeze(-1) * value[token].unsqueeze(-2)
+        state = gate[token].unsqueeze(0).unsqueeze(-1) * state + injection.unsqueeze(0)
+        rank_state = rank_gate[token].view(1, heads, 1, 1) * rank_state + rank_value[
+            token
+        ].unsqueeze(-2)
+        expected[:, :, token] = torch.einsum("shfg,hf->shg", state, query[token])
+        expected_rank[:, :, token] = torch.einsum(
+            "shfg,hf->shg", rank_state, rank_query[token]
+        )
+    torch.testing.assert_close(outputs[0].float(), expected, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(outputs[1].float(), expected_rank, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(finals[0], state, atol=1e-4, rtol=1e-4)
+    torch.testing.assert_close(
+        finals[1], rank_state.squeeze(2), atol=1e-4, rtol=1e-4
+    )
+
+    # the composition a program's readout performs: numerator / (denominator + eps)
+    composed = outputs[0] / (outputs[1] + 1e-6)
+    torch.testing.assert_close(
+        composed, expected / (expected_rank + 1e-6), atol=1e-4, rtol=1e-4
+    )

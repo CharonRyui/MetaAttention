@@ -1914,20 +1914,27 @@ class StatefulOperator:
         readout = self.algorithm.readouts[0]
         if not isinstance(readout, StateContraction) or readout.role != first_role:
             return None
-        return executable.chunked_elementwise_dense(
-            gate_rows=_token_major(elementwise, runtime),
+        outputs, finals = executable.chunked_elementwise_dense(
+            gate_rows=(_token_major(elementwise, runtime),),
             gate_columns=(
-                None if second_factor is None else _token_major(second_factor, runtime)
+                None if second_factor is None else _token_major(second_factor, runtime),
             ),
-            key=_token_major(factors[first_role], runtime),
-            value=_token_major(factors[second_role], runtime),
-            query=_token_major(
-                _feature_vector(_evaluate(readout.operand, values), readout.role, state_spec),
-                runtime,
+            key=(_token_major(factors[first_role], runtime),),
+            value=(_token_major(factors[second_role], runtime),),
+            query=(
+                _token_major(
+                    _feature_vector(
+                        _evaluate(readout.operand, values), readout.role, state_spec
+                    ),
+                    runtime,
+                ),
             ),
-            initial_state=initial_state,
+            initial_state=(initial_state,),
             output_dtype=readout.output_dtype,
         )
+        # one State reaches this path today; the entry returns a per-State pair so
+        # a readout that composes several States can consume them
+        return outputs[0], finals[0]
 
     def _lower_factored_recurrence(
         self,

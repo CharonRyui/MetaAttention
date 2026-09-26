@@ -192,11 +192,11 @@ def _compile_chunk_recurrence(
     return build_kernel()
 
 
-def chunked_elementwise_dense(
+def _chunked_state(
     *,
     gate_rows: torch.Tensor,
     gate_columns: torch.Tensor | None,
-    key: torch.Tensor,
+    key: torch.Tensor | None,
     value: torch.Tensor,
     query: torch.Tensor,
     initial_state: torch.Tensor,
@@ -207,11 +207,21 @@ def chunked_elementwise_dense(
 
     Every per-token tensor is token-major and contiguous. ``gate_columns`` may be
     omitted for a whole-State or first-Feature decay, in which case the column
-    factor is one.
+    factor is one. A rank-1 State is promoted to one row and contracts over that
+    row alone, so it carries no key factor: ``key`` is then the constant one.
     """
+    promoted = initial_state.dim() == 3
+    if promoted:
+        # [sequences, heads, columns] is a single row per token
+        initial_state = initial_state.unsqueeze(2)
     rows, columns = initial_state.shape[2], initial_state.shape[3]
     sequence_count, heads = initial_state.shape[0], initial_state.shape[1]
-    token_count = key.shape[0]
+    token_count = value.shape[0]
+    if key is None:
+        assert rows == 1, "only a rank-1 State contracts without a key factor"
+        key = torch.ones(
+            token_count, heads, 1, device=value.device, dtype=value.dtype
+        )
     if token_count % chunk_tokens and sequence_count > 1:
         raise ValueError("chunked recurrence needs chunk-aligned dense sequences")
     device = initial_state.device
@@ -285,4 +295,48 @@ def chunked_elementwise_dense(
         output,
         final,
     )
+    if promoted:
+        # a rank-1 State keeps its declared rank
+        final = final.squeeze(2)
     return output, final
+
+
+def chunked_elementwise_dense(
+    *,
+    gate_rows: tuple[torch.Tensor, ...],
+    gate_columns: tuple[torch.Tensor | None, ...],
+    key: tuple[torch.Tensor | None, ...],
+    value: tuple[torch.Tensor, ...],
+    query: tuple[torch.Tensor, ...],
+    initial_state: tuple[torch.Tensor, ...],
+    output_dtype: torch.dtype,
+    chunk_tokens: int = CHUNK_TOKENS,
+) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+    """Run every diagonal recurrence of a program through the chunked schedule.
+
+    One ``(output, final)`` pair per State, in the order the States were given.
+    The States are independent here: a program whose readouts compose them must
+    apply that composition to the returned outputs. Each State compiles its own
+    kernels, since the sizes are part of their cache key, so a rank-1 State and a
+    dense one coexist without sharing a kernel instance.
+    """
+    state_count = len(initial_state)
+    per_state = (gate_rows, gate_columns, key, value, query)
+    if any(len(entry) != state_count for entry in per_state):
+        raise ValueError("every per-State argument must name the same States")
+    outputs: list[torch.Tensor] = []
+    finals: list[torch.Tensor] = []
+    for index in range(state_count):
+        output, final = _chunked_state(
+            gate_rows=gate_rows[index],
+            gate_columns=gate_columns[index],
+            key=key[index],
+            value=value[index],
+            query=query[index],
+            initial_state=initial_state[index],
+            output_dtype=output_dtype,
+            chunk_tokens=chunk_tokens,
+        )
+        outputs.append(output)
+        finals.append(final)
+    return tuple(outputs), tuple(finals)
