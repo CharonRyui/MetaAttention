@@ -306,8 +306,18 @@ class CandidateLowerer:
                 3,
                 heads * (2 * dense + 2 * state) * 4,
             )
-        # the reference lowering materializes every State in one union layout
         states = state * shape.state_count
+        if not shape.dense_summary:
+            # without a rank-one contraction the reference lowering keeps one
+            # elementwise factor per axis, so it materializes the factor, the
+            # injection, and the per-token State rather than dense matrices
+            return CandidateEstimate(
+                True,
+                heads * (3 * states + shape.columns) * 4,
+                3 * heads * states,
+                3,
+                heads * 3 * states * 4,
+            )
         return CandidateEstimate(
             True,
             heads * (2 * dense + 4 * states) * 4,

@@ -45,3 +45,20 @@ That means the ticket's stated evidence ("the reference lowering materializes pe
 
 So the first box closes by inspection; the work starts at `_affine_summary`.
 
+**Delivered: per-axis scales stay elementwise in the reference lowering.** `_affine_summary` no longer forces dense `[T,H,R,R]`/`[T,H,C,C]` factors for a single-feature Axis Scale; it composes one factor per axis exactly as tickets 20 and 24 do for the v1 families, and `_scan_state` only asks for dense matrices when a rank-one contraction is present. The reference estimate was updated with it: without a rank-one contraction it now charges the factor, the injection, and the per-token State instead of the dense pair (previously it over-charged because the model assumed the matrices were still there, which briefly pushed gsa and rwkv6 past the envelope at T=2048).
+
+Measured with `testing/benchmark_stateful_plans.py` on an idle H20 (card 4):
+
+| family | T=512 before | T=512 after | T=2048 before | T=2048 after | workspace/token (T=2048) |
+| --- | --- | --- | --- | --- | --- |
+| `gsa` | 9.6 ms | 2.66 ms | 40.0 ms | 8.16 ms | 192 KiB |
+| `rwkv6` | 9.9 ms | 3.61 ms | 44.7 ms | 14.80 ms | 384 KiB |
+| `hgrn` | 2.2 ms | 1.24 ms | 2.8 ms | 1.45 ms | 0.8 KiB |
+| `normalized-linear` | 4.8 ms | 4.40 ms | rejected | rejected | 768 KiB |
+| `based` | rejected | 17.2 ms | rejected | 66.2 ms | 36 KiB |
+| `rebased` | rejected | rejected | rejected | rejected | - |
+
+`based` and `rebased` are the product-Feature cases: `based` now runs where it was rejected, `rebased` still exceeds the envelope. Verified by the H20 coverage suites (`test_fla_coverage.py`, `test_gdn_h20.py`, `test_linear_attention_examples.py`, `test_chunked_elementwise.py`: 25 pass) and 153 unit tests.
+
+What is left in this ticket: the readout still costs one torch op per token (90-654 launches per family per the table above), so the readout epilogue against chunk States is the next lever, and with it the chunk scan for multi-State Programs. `rebased` needs the product-Feature charge revisited once its readout stops dominating.
+

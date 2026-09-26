@@ -328,9 +328,10 @@ def _scan_state(
     )
     left_size = role_sizes[view.feature_roles[0]]
     right_size = 1 if state.rank == 1 else role_sizes[view.feature_roles[1]]
+    # only a rank-one contraction composes a non-diagonal update; a single-feature
+    # Axis Scale stays one elementwise factor per axis, as the v1 families do
     dense = any(
         type(node).__name__ == "RankOnePropagation"
-        or (type(node).__name__ == "AxisScale" and len(node.roles) == 1)
         for node in transition.propagations
     )
     evaluate = lambda expression, bound: _evaluate(  # noqa: E731
@@ -511,20 +512,31 @@ def _affine_summary(
                     elementwise = scale if elementwise is None else elementwise * scale
             elif node.roles[0] == view.feature_roles[0]:
                 if left is None:
-                    raise StatefulCompilationError(
-                        "IR_SCHEMA",
-                        "propagations",
-                        {"reason": "left diagonal needs dense"},
+                    # one factor per row rather than a [rows, rows] matrix
+                    row_factor = _role_vector(factor, token_count, heads).reshape(
+                        token_count, heads, left_size, 1
                     )
-                left = torch.diag_embed(_role_vector(factor, token_count, heads)) @ left
+                    elementwise = (
+                        row_factor if elementwise is None else elementwise * row_factor
+                    )
+                else:
+                    left = (
+                        torch.diag_embed(_role_vector(factor, token_count, heads)) @ left
+                    )
             elif node.roles[0] == view.feature_roles[1]:
                 if right is None:
-                    raise StatefulCompilationError(
-                        "IR_SCHEMA",
-                        "propagations",
-                        {"reason": "right diagonal needs dense"},
+                    column_factor = _role_vector(factor, token_count, heads).reshape(
+                        token_count, heads, 1, right_size
                     )
-                right = right @ torch.diag_embed(_role_vector(factor, token_count, heads))
+                    elementwise = (
+                        column_factor
+                        if elementwise is None
+                        else elementwise * column_factor
+                    )
+                else:
+                    right = right @ torch.diag_embed(
+                        _role_vector(factor, token_count, heads)
+                    )
             else:
                 raise StatefulCompilationError(
                     "IR_TYPE", "propagations", {"role": str(node.roles[0])}
