@@ -84,3 +84,5 @@ All five non-product coverage families now run at T=2048 (`rebased` was still re
 
 That makes the three remaining boxes one piece of work: extend `_stateful_chunked.py` from one State to many, give each State its own carry pair, and evaluate the readout epilogue for contractions against chunk States (expression readouts over several States need the per-token State and would keep the reference path until a chunk-level form exists for them).
 
+**Note for pinning the estimate per family.** A first attempt at a regression test that pins each family's declared charge was reverted mid-edit rather than committed half-applied, but it produced one useful datum: `hgrn` at `heads=1, dim_value=64` declares 6144 bytes per token, which is `1 * 3 * 512 * 4` -- so its State carries 512 elements, not the 64 a single per-Feature vector would suggest (its roles include the input feature axis alongside the state axis). A per-family pin must therefore read the roles from the operator and derive the expected charge from them, rather than assuming one element per role; the two estimate bugs this session were both silent capability changes, so such a pin is worth having.
+
