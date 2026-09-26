@@ -558,8 +558,10 @@ class TileLangExecutable:
         ):
             raise RuntimeError("gradient execution has no compiler-selected backward candidate")
 
-    def prefix(self, transform, bias, segment, initial_state):
+    def prefix(self, transform, bias, segment, initial_state, second=None):
         transform_inputs = transform if isinstance(transform, tuple) else (transform,)
+        if second is not None:
+            transform_inputs = (*transform_inputs, second)
         self._validate_gradient_dispatch(*transform_inputs, bias, initial_state)
         if isinstance(transform, tuple):
             from ._stateful_affine import tilelang_dense_affine_prefix
@@ -577,6 +579,7 @@ class TileLangExecutable:
             backward=self.backward_binding,
             config=self.plan.backward_kernel_config.values
             if self.plan.backward_kernel_config else (),
+            second=second,
         )
 
     def factored_recurrence_dense(self, **kwargs):

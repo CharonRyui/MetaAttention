@@ -73,15 +73,32 @@ def _operator(
                 "gate", (Batch, VALUE_HEADS, Sequence, KEY), torch.float32
             )
         )
+    elif gate == "dual":
+        inputs.append(
+            TensorInput(
+                "key_gate", (Batch, VALUE_HEADS, Sequence, KEY), torch.float32
+            )
+        )
+        inputs.append(
+            TensorInput(
+                "value_gate", (Batch, VALUE_HEADS, Sequence, VALUE), torch.float32
+            )
+        )
     elif gate is not None:
         raise ValueError(f"unknown gate kind: {gate!r}")
 
-    propagation_roles = (KEY,) if gate == "feature" else ()
-    propagations = (
-        (AxisScale(Exp(Input("gate")), propagation_roles),)
-        if gate in {"scalar", "feature"}
-        else ()
-    )
+    if gate == "dual":
+        propagations = (
+            AxisScale(Exp(Input("key_gate")), (KEY,)),
+            AxisScale(Exp(Input("value_gate")), (VALUE,)),
+        )
+    else:
+        propagation_roles = (KEY,) if gate == "feature" else ()
+        propagations = (
+            (AxisScale(Exp(Input("gate")), propagation_roles),)
+            if gate in {"scalar", "feature"}
+            else ()
+        )
     algorithm = AlgorithmIR(
         inputs=tuple(inputs),
         states=(StateSpec("memory", (Batch, VALUE_HEADS, KEY, VALUE)),),
@@ -164,6 +181,27 @@ def gla_attention(
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
     return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="feature")
+
+
+def dual_gate_gla_attention(
+    batch: int,
+    heads: int,
+    seqlen: int,
+    dim: int,
+    dim_value: int,
+    *,
+    kv_heads: int | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+) -> StatefulOperator:
+    """Build FLA ``chunk_gla`` with a gate on each State axis.
+
+    This is ``fused_recurrent_gla(gk, gv)``'s shape and the two-Axis Scale
+    profile of Gated Delta Rule's ``left_gate``/``right_gate``: one feature-wise
+    log gate decays the key axis and one decays the value axis.
+    """
+    kv_heads = heads if kv_heads is None else kv_heads
+    _validate_kv_heads(heads, kv_heads)
+    return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="dual")
 
 
 def lightning_attention(

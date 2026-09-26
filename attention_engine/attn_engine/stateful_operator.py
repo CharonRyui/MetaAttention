@@ -872,7 +872,11 @@ class StatefulOperator:
 
         state = self.algorithm.states[0]
         role_sizes = dict(compilation.role_sizes)
-        needs_dense = _dense_summary_required(self.algorithm)
+        # a two-axis elementwise pair has no compiler-derived VJP yet, so a
+        # compilation that asks for a backward keeps the dense summary factors
+        needs_dense = _dense_summary_required(self.algorithm) or (
+            compilation.options.backward and _two_axis_scale_required(self.algorithm)
+        )
         plan = compile_plan(
             mode=compilation.mode,
             source_identity=self.algorithm._analysis.simplified.identity,
@@ -1595,9 +1599,10 @@ class StatefulOperator:
                 values, initial_state, runtime, return_final_state, executable
             )
         identity_only = not self.algorithm.transition.propagations
-        needs_dense_transform = _dense_summary_required(self.algorithm)
+        needs_dense_transform = bool(getattr(executable, "dense_summary", False))
+        second_factor: torch.Tensor | None = None
         if family == "axis-scale":
-            left, right, elementwise = _axis_scale_summary(
+            left, right, elementwise, second_factor = _axis_scale_summary(
                 self.algorithm.transition.propagations,
                 evaluate=_evaluate,
                 values=values,
@@ -1761,9 +1766,21 @@ class StatefulOperator:
         segment_i32 = segment.to(torch.int32)
         if elementwise is not None:
             scale = elementwise.contiguous()
+            second_operand = (
+                second_factor.contiguous() if second_factor is not None else None
+            )
             if runtime.device.type == "cuda":
-                states = executable.prefix(scale, injection, segment_i32, initial_state)
+                states = executable.prefix(
+                    scale,
+                    injection,
+                    segment_i32,
+                    initial_state,
+                    second=second_operand,
+                )
             else:
+                if second_operand is not None:
+                    # the CPU reference composes the pair before the scan
+                    scale = scale * second_operand
                 scale, injection = _segmented_elementwise_scan(
                     scale, injection, segment
                 )
@@ -2015,19 +2032,26 @@ def _dense_summary_required(algorithm: AlgorithmIR) -> bool:
     """Whether the per-token summary needs dense (left, right) factors.
 
     A rank-one propagation composes a non-diagonal update, so its summary stays
-    dense until the chunk-summary scan lands. A single-feature Axis Scale is
-    diagonal and lowers to a per-axis elementwise factor; two different scaled
-    axes compose row-by-column, which needs a second factor slot the elementwise
-    prefix kernel does not carry yet.
+    dense until the chunk-summary scan lands. Axis Scales are diagonal: one
+    feature axis lowers to one elementwise factor and two axes lower to one
+    factor each, which the prefix kernel composes per element.
     """
-    scaled_roles: set[Any] = set()
     for transition in algorithm.transitions:
         for node in transition.propagations:
             if isinstance(node, RankOnePropagation):
                 return True
+    return False
+
+
+def _two_axis_scale_required(algorithm: AlgorithmIR) -> bool:
+    """Whether the Transition scales both State Features in one elementwise pair."""
+    scaled_roles: set[Any] = set()
+    for transition in algorithm.transitions:
+        for node in transition.propagations:
             if isinstance(node, AxisScale) and len(node.roles) == 1:
                 scaled_roles.add(node.roles[0])
-    return len(scaled_roles) > 1
+    features = set(algorithm.states[0].feature_roles)
+    return len(scaled_roles & features) > 1
 
 
 def _verify_product_roles(

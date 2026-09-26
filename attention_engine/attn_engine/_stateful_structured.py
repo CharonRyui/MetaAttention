@@ -114,68 +114,84 @@ def _axis_scale_summary(
     right_size: int,
     device: torch.device,
     dense: bool,
-) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
+) -> tuple[
+    torch.Tensor | None, torch.Tensor | None, torch.Tensor | None, torch.Tensor | None
+]:
     """Build authored AxisScale transforms without reassociation.
 
     A dense request materializes one diagonal matrix per token, which is only
-    needed when a propagation on the same axis is not diagonal. A pure diagonal
-    transform stays an elementwise factor of shape ``[tokens, heads, size, 1]``
-    for a first-feature scale and ``[tokens, heads, 1, size]`` for a
-    second-feature scale, so the prefix kernel never materializes ``[T,H,K,K]``.
+    needed when a propagation on the same axis is not diagonal. A diagonal
+    transform stays an elementwise factor: ``[tokens, heads, size, 1]`` for a
+    first-feature scale, ``[tokens, heads, 1, size]`` for a second-feature scale,
+    and one factor per axis when both carry a scale, which the prefix kernel
+    composes per element instead of materializing ``[T,H,K,V]``.
+
+    Whole-State scales multiply either factor, since elementwise scales commute
+    and no authored noncommutative node is reordered.
     """
     left: torch.Tensor | None = None
     right: torch.Tensor | None = None
-    elementwise: torch.Tensor | None = (
-        torch.ones(token_count, heads, 1, 1, device=device) if not dense else None
-    )
-    identity_left = (
-        torch.eye(left_size, device=device)
-        .expand(token_count, heads, left_size, left_size)
-        .contiguous()
-        if dense
-        else None
-    )
-    identity_right = (
-        torch.eye(right_size, device=device)
-        .expand(token_count, heads, right_size, right_size)
-        .contiguous()
-        if dense
-        else None
-    )
     if dense:
-        left, right = identity_left, identity_right
-    elementwise_roles: set[Any] = set()
+        left = (
+            torch.eye(left_size, device=device)
+            .expand(token_count, heads, left_size, left_size)
+            .contiguous()
+        )
+        right = (
+            torch.eye(right_size, device=device)
+            .expand(token_count, heads, right_size, right_size)
+            .contiguous()
+        )
+        for node in propagations:
+            if type(node).__name__ != "AxisScale":
+                raise ValueError("axis-scale runtime received an unsupported propagation")
+            factor = evaluate(node.factor, values).float()
+            if len(node.roles) == 2 or not node.roles:
+                left = factor * left
+            elif node.roles[0] == state_spec.feature_roles[0]:
+                left = torch.diag_embed(factor[..., :, 0]) @ left
+            elif node.roles[0] == state_spec.feature_roles[1]:
+                right = right @ torch.diag_embed(factor[..., 0, :])
+            else:
+                raise ValueError("AxisScale role is not a State Feature role")
+        return left, right, None, None
+
+    single: torch.Tensor | None = torch.ones(
+        token_count, heads, 1, 1, device=device
+    )
+    rows_factor: torch.Tensor | None = None
+    columns_factor: torch.Tensor | None = None
     for node in propagations:
         if type(node).__name__ != "AxisScale":
             raise ValueError("axis-scale runtime received an unsupported propagation")
         factor = evaluate(node.factor, values).float()
-        if len(node.roles) == 2 or not node.roles:
-            if dense:
-                assert left is not None
-                left = factor * left
+        whole_state = len(node.roles) == 2 or not node.roles
+        if whole_state and rows_factor is None and columns_factor is None:
+            single = factor if single is None else single * factor
+        elif whole_state:
+            # a whole-State scale commutes with the per-axis factors
+            if rows_factor is None:
+                columns_factor = factor * columns_factor
             else:
-                elementwise = factor if elementwise is None else elementwise * factor
+                rows_factor = rows_factor * factor
         elif node.roles[0] == state_spec.feature_roles[0]:
-            if dense:
-                assert left is not None
-                left = torch.diag_embed(factor[..., :, 0]) @ left
-            else:
-                elementwise_roles.add(node.roles[0])
-                elementwise = factor if elementwise is None else elementwise * factor
+            if single is not None and rows_factor is None and columns_factor is None:
+                single = None
+            rows_factor = factor if rows_factor is None else rows_factor * factor
         elif node.roles[0] == state_spec.feature_roles[1]:
-            if dense:
-                assert right is not None
-                right = right @ torch.diag_embed(factor[..., 0, :])
-            else:
-                elementwise_roles.add(node.roles[0])
-                elementwise = factor if elementwise is None else elementwise * factor
+            if single is not None and rows_factor is None and columns_factor is None:
+                single = None
+            columns_factor = (
+                factor if columns_factor is None else columns_factor * factor
+            )
         else:
             raise ValueError("AxisScale role is not a State Feature role")
-        if len(elementwise_roles) > 1:
-            raise ValueError(
-                "two single-feature AxisScales compose both axes: dense transform required"
-            )
-    return left, right, elementwise
+    if rows_factor is not None and columns_factor is not None:
+        # one factor per axis: the kernel composes them per element
+        return None, None, rows_factor, columns_factor
+    if rows_factor is not None or columns_factor is not None:
+        return None, None, rows_factor if rows_factor is not None else columns_factor, None
+    return None, None, single, None
 
 
 def rank_one_summary(

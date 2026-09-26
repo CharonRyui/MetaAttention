@@ -237,14 +237,14 @@ def _elementwise_vjp(
         segment,
         block_tokens=block_tokens,
         reverse=True,
-    )[1]
+    )[2]
     adjoint_bias = _tilelang_segmented_elementwise_scan(
         continuation,
         grad_states,
         segment,
         block_tokens=block_tokens,
         reverse=True,
-    )[1]
+    )[2]
     previous_scale = torch.ones_like(output_scale)
     previous_bias = torch.zeros_like(output_bias)
     same_segment = (segment[1:] == segment[:-1]).view(-1, 1, 1, 1)
