@@ -47,17 +47,26 @@ def _compile_elementwise_prefix(
     dtype: torch.dtype,
     device_index: int,
     block_tokens: int = 128,
+    reverse: bool = False,
 ):
+    """Compose a per-element affine prefix in one streaming kernel.
+
+    Every thread owns one State element and walks the tokens of its segment
+    accumulating the affine pair ``(A_t, B_t)`` with ``S_t = A_t S_0 + B_t``.
+    A thread-local accumulation removes the cross-thread scan and its barriers,
+    which dominated the previous schedule, and it composes per-axis diagonal
+    factors exactly like the scalar ones. ``reverse`` walks the tokens from the
+    end so a reverse pass needs no flipped copies.
+    """
     import tilelang
     import tilelang.language as T
 
     block_tokens = int(block_tokens)
     if block_tokens <= 0 or block_tokens & (block_tokens - 1):
         raise ValueError("block_tokens must be a positive power of two")
-    matrix_lanes = 4
     matrix_size = rows * columns
-    matrix_blocks = tilelang.cdiv(matrix_size, matrix_lanes)
-    chunk_count = tilelang.cdiv(token_count, block_tokens)
+    matrix_blocks = tilelang.cdiv(matrix_size, block_tokens)
+    write_every_element = scale_rows != 1 and scale_columns != 1
 
     @tilelang.jit(
         pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
@@ -84,134 +93,51 @@ def _compile_elementwise_prefix(
                 matrix_block,
             ):
                 thread = T.get_thread_binding()
-                local_scale = T.alloc_local((matrix_lanes,), dtype="float32")
-                local_bias = T.alloc_local((matrix_lanes,), dtype="float32")
-                previous_scale = T.alloc_local((matrix_lanes,), dtype="float32")
-                previous_bias = T.alloc_local((matrix_lanes,), dtype="float32")
-                shared_scale = T.alloc_shared(
-                    (block_tokens, matrix_lanes), dtype="float32"
-                )
-                shared_bias = T.alloc_shared(
-                    (block_tokens, matrix_lanes), dtype="float32"
-                )
-                shared_segment = T.alloc_shared((block_tokens,), dtype="int32")
-                carry_scale = T.alloc_shared((matrix_lanes,), dtype="float32")
-                carry_bias = T.alloc_shared((matrix_lanes,), dtype="float32")
-                carry_segment = T.alloc_shared((1,), dtype="int32")
-
-                if thread == 0:
-                    carry_segment[0] = -1
-                    for lane in T.Serial(matrix_lanes):
-                        carry_scale[lane] = 1.0
-                        carry_bias[lane] = 0.0
-                T.sync_threads()
-
-                for chunk in T.Serial(chunk_count):
-                    token = chunk * block_tokens + thread
-                    if token < token_count:
-                        shared_segment[thread] = segment[token]
+                index = matrix_block * block_tokens + thread
+                accumulated_scale = T.alloc_local((1,), dtype="float32")
+                accumulated_bias = T.alloc_local((1,), dtype="float32")
+                current_segment = T.alloc_local((1,), dtype="int32")
+                if index < matrix_size:
+                    row = index // columns
+                    column = index % columns
+                    scale_row = 0 if scale_rows == 1 else row
+                    scale_column = 0 if scale_columns == 1 else column
+                    write_scale = T.alloc_local((1,), dtype="bool")
+                    if write_every_element:
+                        write_scale[0] = True
+                    elif scale_rows == 1 and scale_columns == 1:
+                        write_scale[0] = index == 0
+                    elif scale_columns == 1:
+                        # a first-feature factor holds one entry per row
+                        write_scale[0] = column == 0
                     else:
-                        shared_segment[thread] = -2
-                    for lane in T.Serial(matrix_lanes):
-                        matrix_index = matrix_block * matrix_lanes + lane
-                        if token < token_count and matrix_index < matrix_size:
-                            row = matrix_index // columns
-                            column = matrix_index % columns
-                            scale_row = 0 if scale_rows == 1 else row
-                            scale_column = 0 if scale_columns == 1 else column
-                            shared_scale[thread, lane] = scale[
-                                token, head, scale_row, scale_column
-                            ]
-                            shared_bias[thread, lane] = bias[token, head, row, column]
-                        else:
-                            shared_scale[thread, lane] = 1.0
-                            shared_bias[thread, lane] = 0.0
-                    T.sync_threads()
-
-                    for stage in T.Serial(block_tokens.bit_length() - 1):
-                        offset = 1 << stage
-                        for lane in T.Serial(matrix_lanes):
-                            local_scale[lane] = shared_scale[thread, lane]
-                            local_bias[lane] = shared_bias[thread, lane]
-                            if (
-                                thread >= offset
-                                and shared_segment[thread]
-                                == shared_segment[thread - offset]
-                            ):
-                                previous_scale[lane] = shared_scale[
-                                    thread - offset, lane
-                                ]
-                                previous_bias[lane] = shared_bias[thread - offset, lane]
-                                local_bias[lane] = (
-                                    local_scale[lane] * previous_bias[lane]
-                                    + local_bias[lane]
-                                )
-                                local_scale[lane] = (
-                                    local_scale[lane] * previous_scale[lane]
-                                )
-                        T.sync_threads()
-                        for lane in T.Serial(matrix_lanes):
-                            shared_scale[thread, lane] = local_scale[lane]
-                            shared_bias[thread, lane] = local_bias[lane]
-                        T.sync_threads()
-
-                    if token < token_count:
-                        for lane in T.Serial(matrix_lanes):
-                            matrix_index = matrix_block * matrix_lanes + lane
-                            if matrix_index < matrix_size:
-                                row = matrix_index // columns
-                                column = matrix_index % columns
-                                write_scale_row = 0 if scale_rows == 1 else row
-                                write_scale_column = 0 if scale_columns == 1 else column
-                                local_scale[lane] = shared_scale[thread, lane]
-                                local_bias[lane] = shared_bias[thread, lane]
-                                if shared_segment[thread] == carry_segment[0]:
-                                    local_bias[lane] = (
-                                        local_scale[lane] * carry_bias[lane]
-                                        + local_bias[lane]
-                                    )
-                                    local_scale[lane] = (
-                                        local_scale[lane] * carry_scale[lane]
-                                    )
-                                if (
-                                    scale_rows != 1
-                                    or scale_columns != 1
-                                    or (matrix_block == 0 and lane == 0)
-                                ):
-                                    output_scale[
-                                        token, head, write_scale_row, write_scale_column
-                                    ] = local_scale[lane]
-                                output_bias[token, head, row, column] = local_bias[lane]
-                    T.sync_threads()
-
-                    if thread == 0:
-                        last = T.min(
-                            block_tokens - 1,
-                            token_count - chunk * block_tokens - 1,
+                        # a second-feature factor holds one entry per column
+                        write_scale[0] = row == 0
+                    accumulated_scale[0] = 1.0
+                    accumulated_bias[0] = 0.0
+                    current_segment[0] = -1
+                    for step in T.Serial(token_count):
+                        token = (
+                            token_count - 1 - step if reverse else step
                         )
-                        for lane in T.Serial(matrix_lanes):
-                            matrix_index = matrix_block * matrix_lanes + lane
-                            if matrix_index < matrix_size:
-                                row = matrix_index // columns
-                                column = matrix_index % columns
-                                carry_bias[lane] = output_bias[
-                                    chunk * block_tokens + last,
-                                    head,
-                                    row,
-                                    column,
-                                ]
-                                # The carry must hold the previous chunk's prefix
-                                # factor for this matrix element: a per-axis factor
-                                # keeps one entry per row or per column instead of
-                                # one entry for the whole State.
-                                carry_scale[lane] = output_scale[
-                                    chunk * block_tokens + last,
-                                    head,
-                                    0 if scale_rows == 1 else row,
-                                    0 if scale_columns == 1 else column,
-                                ]
-                        carry_segment[0] = shared_segment[last]
-                    T.sync_threads()
+                        if segment[token] != current_segment[0]:
+                            accumulated_scale[0] = 1.0
+                            accumulated_bias[0] = 0.0
+                            current_segment[0] = segment[token]
+                        accumulated_bias[0] = (
+                            scale[token, head, scale_row, scale_column]
+                            * accumulated_bias[0]
+                            + bias[token, head, row, column]
+                        )
+                        accumulated_scale[0] = (
+                            scale[token, head, scale_row, scale_column]
+                            * accumulated_scale[0]
+                        )
+                        output_bias[token, head, row, column] = accumulated_bias[0]
+                        if write_scale[0]:
+                            output_scale[
+                                token, head, scale_row, scale_column
+                            ] = accumulated_scale[0]
 
         return kernel
 
@@ -225,6 +151,7 @@ def _tilelang_segmented_elementwise_scan(
     *,
     inplace: bool = False,
     block_tokens: int = 128,
+    reverse: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     output_scale = torch.empty_like(scale)
     output_bias = bias if inplace else torch.empty_like(bias)
@@ -241,6 +168,7 @@ def _tilelang_segmented_elementwise_scan(
         scale.dtype,
         device_index,
         block_tokens,
+        reverse,
     )
     kernel(scale, bias, segment, output_scale, output_bias)
     return output_scale, output_bias

@@ -204,19 +204,22 @@ def _elementwise_vjp(
         scale[1:].expand_as(output_scale[1:]),
         torch.zeros_like(output_scale[1:]),
     )
-    reverse_segment = segment.flip(0).contiguous()
+    # The reverse pass walks the tokens from the end inside the kernel, so no
+    # flipped copies of these token-sized tensors are needed.
     adjoint_scale = _tilelang_segmented_elementwise_scan(
-        continuation.flip(0).contiguous(),
-        grad_output_scale.flip(0).contiguous(),
-        reverse_segment,
+        continuation,
+        grad_output_scale,
+        segment,
         block_tokens=block_tokens,
-    )[1].flip(0)
+        reverse=True,
+    )[1]
     adjoint_bias = _tilelang_segmented_elementwise_scan(
-        continuation.flip(0).contiguous(),
-        grad_states.flip(0).contiguous(),
-        reverse_segment,
+        continuation,
+        grad_states,
+        segment,
         block_tokens=block_tokens,
-    )[1].flip(0)
+        reverse=True,
+    )[1]
     previous_scale = torch.ones_like(output_scale)
     previous_bias = torch.zeros_like(output_bias)
     same_segment = (segment[1:] == segment[:-1]).view(-1, 1, 1, 1)
