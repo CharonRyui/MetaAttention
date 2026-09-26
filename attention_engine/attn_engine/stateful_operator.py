@@ -872,12 +872,7 @@ class StatefulOperator:
 
         state = self.algorithm.states[0]
         role_sizes = dict(compilation.role_sizes)
-        needs_dense = any(
-            isinstance(node, RankOnePropagation)
-            or isinstance(node, AxisScale) and len(node.roles) == 1
-            for transition in self.algorithm.transitions
-            for node in transition.propagations
-        )
+        needs_dense = _dense_summary_required(self.algorithm)
         plan = compile_plan(
             mode=compilation.mode,
             source_identity=self.algorithm._analysis.simplified.identity,
@@ -1592,14 +1587,7 @@ class StatefulOperator:
         )
         family = getattr(executable, "runtime_family", "generic")
         identity_only = not self.algorithm.transition.propagations
-        has_rank = any(
-            isinstance(node, RankOnePropagation)
-            for node in self.algorithm.transition.propagations
-        )
-        needs_dense_transform = has_rank or any(
-            isinstance(node, AxisScale) and len(node.roles) == 1
-            for node in self.algorithm.transition.propagations
-        )
+        needs_dense_transform = _dense_summary_required(self.algorithm)
         if family == "axis-scale":
             left, right, elementwise = _axis_scale_summary(
                 self.algorithm.transition.propagations,
@@ -1944,6 +1932,25 @@ def _segmented_elementwise_scan(
         )
         offset *= 2
     return scale, bias
+
+
+def _dense_summary_required(algorithm: AlgorithmIR) -> bool:
+    """Whether the per-token summary needs dense (left, right) factors.
+
+    A rank-one propagation composes a non-diagonal update, so its summary stays
+    dense until the chunk-summary scan lands. A single-feature Axis Scale is
+    diagonal and lowers to a per-axis elementwise factor; two different scaled
+    axes compose row-by-column, which needs a second factor slot the elementwise
+    prefix kernel does not carry yet.
+    """
+    scaled_roles: set[Any] = set()
+    for transition in algorithm.transitions:
+        for node in transition.propagations:
+            if isinstance(node, RankOnePropagation):
+                return True
+            if isinstance(node, AxisScale) and len(node.roles) == 1:
+                scaled_roles.add(node.roles[0])
+    return len(scaled_roles) > 1
 
 
 def _verify_product_roles(

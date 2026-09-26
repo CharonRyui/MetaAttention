@@ -14,7 +14,7 @@ from examples.linear_attention import (
 pytestmark = [pytest.mark.functional, pytest.mark.gpu, pytest.mark.slow]
 
 
-def _compile(operator, heads: int, dim: int, dim_value: int):
+def _compile(operator, heads: int, dim: int, dim_value: int, *, backward: bool = False):
     roles = {
         role.name: role
         for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
@@ -32,6 +32,7 @@ def _compile(operator, heads: int, dim: int, dim_value: int):
         target=Target(),
         mode="dense",
         optimized=True,
+        backward=backward,
     )
 
 
@@ -153,4 +154,70 @@ def test_linear_attention_dsl_matches_fp32_recurrence(
         )
         torch.testing.assert_close(
             suffix.final_state["memory"], result.final_state["memory"], rtol=0.01, atol=0.02
+        )
+
+
+@pytest.mark.parametrize(
+    ("factory", "gate_kind"),
+    [
+        (linear_attention, None),
+        (simple_gla_attention, "scalar"),
+        (gla_attention, "feature"),
+    ],
+    ids=["linear", "simple-gla", "gla"],
+)
+def test_linear_attention_dsl_gradients_match_fp32_recurrence(
+    factory, gate_kind, gpu_device, seed
+):
+    """The compiled elementwise VJP must match the recurrence's own gradients.
+
+    A per-axis (feature-wise) gate lowers to a Broadcast Axis Scale, so this case
+    checks the VJP that reduces a ``[T,H,K,1]`` scale gradient, not just the
+    per-token scalar one.
+    """
+    batch, heads, seqlen, dim, dim_value = 2, 3, 130, 64, 64
+    dtype = torch.bfloat16
+    compiled = _compile(
+        factory(batch, heads, seqlen, dim, dim_value, dtype=dtype),
+        heads,
+        dim,
+        dim_value,
+        backward=True,
+    )
+    actual = {
+        "query": torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype),
+        "key": torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype),
+        "value": torch.randn(
+            batch, heads, seqlen, dim_value, device=gpu_device, dtype=dtype
+        ),
+    }
+    if gate_kind is not None:
+        actual["gate"] = _log_gate(gate_kind, batch, heads, seqlen, dim, gpu_device)
+    actual = {
+        name: tensor.detach().requires_grad_(True) for name, tensor in actual.items()
+    }
+    expected = {
+        name: tensor.detach().clone().requires_grad_(True)
+        for name, tensor in actual.items()
+    }
+
+    result = compiled(**actual)
+    reference = _reference(
+        expected["query"], expected["key"], expected["value"], expected.get("gate")
+    )[0]
+    torch.testing.assert_close(result.outputs["output"], reference, rtol=0.02, atol=0.05)
+
+    actual_gradients = torch.autograd.grad(
+        result.outputs["output"].float().square().mean(), tuple(actual.values())
+    )
+    expected_gradients = torch.autograd.grad(
+        reference.square().mean(), tuple(expected.values())
+    )
+    for name, actual_gradient, expected_gradient in zip(
+        actual, actual_gradients, expected_gradients, strict=True
+    ):
+        scale = expected_gradient.abs().max().item()
+        assert scale > 0.0, name
+        torch.testing.assert_close(
+            actual_gradient, expected_gradient, rtol=0.08, atol=0.05 * scale + 1e-5
         )

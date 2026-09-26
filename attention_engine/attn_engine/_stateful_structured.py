@@ -105,7 +105,14 @@ def _axis_scale_summary(
     device: torch.device,
     dense: bool,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]:
-    """Build authored AxisScale transforms without reassociation."""
+    """Build authored AxisScale transforms without reassociation.
+
+    A dense request materializes one diagonal matrix per token, which is only
+    needed when a propagation on the same axis is not diagonal. A pure diagonal
+    transform stays an elementwise factor of shape ``[tokens, heads, size, 1]``
+    for a first-feature scale and ``[tokens, heads, 1, size]`` for a
+    second-feature scale, so the prefix kernel never materializes ``[T,H,K,K]``.
+    """
     left: torch.Tensor | None = None
     right: torch.Tensor | None = None
     elementwise: torch.Tensor | None = (
@@ -127,6 +134,7 @@ def _axis_scale_summary(
     )
     if dense:
         left, right = identity_left, identity_right
+    elementwise_roles: set[Any] = set()
     for node in propagations:
         if type(node).__name__ != "AxisScale":
             raise ValueError("axis-scale runtime received an unsupported propagation")
@@ -138,15 +146,25 @@ def _axis_scale_summary(
             else:
                 elementwise = factor if elementwise is None else elementwise * factor
         elif node.roles[0] == state_spec.feature_roles[0]:
-            if left is None:
-                raise ValueError("first-feature AxisScale requires dense transform")
-            left = torch.diag_embed(factor[..., :, 0]) @ left
+            if dense:
+                assert left is not None
+                left = torch.diag_embed(factor[..., :, 0]) @ left
+            else:
+                elementwise_roles.add(node.roles[0])
+                elementwise = factor if elementwise is None else elementwise * factor
         elif node.roles[0] == state_spec.feature_roles[1]:
-            if right is None:
-                raise ValueError("second-feature AxisScale requires dense transform")
-            right = right @ torch.diag_embed(factor[..., 0, :])
+            if dense:
+                assert right is not None
+                right = right @ torch.diag_embed(factor[..., 0, :])
+            else:
+                elementwise_roles.add(node.roles[0])
+                elementwise = factor if elementwise is None else elementwise * factor
         else:
             raise ValueError("AxisScale role is not a State Feature role")
+        if len(elementwise_roles) > 1:
+            raise ValueError(
+                "two single-feature AxisScales compose both axes: dense transform required"
+            )
     return left, right, elementwise
 
 

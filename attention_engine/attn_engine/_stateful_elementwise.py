@@ -16,8 +16,12 @@ def tilelang_elementwise_prefix(
     """Compose affine summaries through a compiler-selected VJP binding."""
     if segment.shape != (bias.shape[0],):
         raise ValueError("invalid segmented affine prefix shapes")
-    if scale.shape not in (bias.shape, (*bias.shape[:2], 1, 1)):
+    if scale.ndim != 4 or scale.shape[:2] != bias.shape[:2]:
         raise ValueError("invalid affine scale shape")
+    rows, columns = bias.shape[2], bias.shape[3]
+    if scale.shape[2:] not in ((1, 1), (rows, 1), (1, columns), (rows, columns)):
+        # a per-axis factor, a per-token scalar, or a full elementwise map
+        raise ValueError(f"invalid affine scale shape {tuple(scale.shape)}")
     if bias.numel() == 0:
         return bias
     if isinstance(config, int):
@@ -157,6 +161,8 @@ def _compile_elementwise_prefix(
                             if matrix_index < matrix_size:
                                 row = matrix_index // columns
                                 column = matrix_index % columns
+                                write_scale_row = 0 if scale_rows == 1 else row
+                                write_scale_column = 0 if scale_columns == 1 else column
                                 local_scale[lane] = shared_scale[thread, lane]
                                 local_bias[lane] = shared_bias[thread, lane]
                                 if shared_segment[thread] == carry_segment[0]:
@@ -173,7 +179,7 @@ def _compile_elementwise_prefix(
                                     or (matrix_block == 0 and lane == 0)
                                 ):
                                     output_scale[
-                                        token, head, scale_row, scale_column
+                                        token, head, write_scale_row, write_scale_column
                                     ] = local_scale[lane]
                                 output_bias[token, head, row, column] = local_bias[lane]
                     T.sync_threads()
@@ -194,10 +200,16 @@ def _compile_elementwise_prefix(
                                     row,
                                     column,
                                 ]
-                                if scale_rows == 1 and scale_columns == 1:
-                                    carry_scale[lane] = output_scale[
-                                        chunk * block_tokens + last, head, 0, 0
-                                    ]
+                                # The carry must hold the previous chunk's prefix
+                                # factor for this matrix element: a per-axis factor
+                                # keeps one entry per row or per column instead of
+                                # one entry for the whole State.
+                                carry_scale[lane] = output_scale[
+                                    chunk * block_tokens + last,
+                                    head,
+                                    0 if scale_rows == 1 else row,
+                                    0 if scale_columns == 1 else column,
+                                ]
                         carry_segment[0] = shared_segment[last]
                     T.sync_threads()
 
