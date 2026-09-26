@@ -467,3 +467,76 @@ def test_gdn_factored_recurrence_continues_from_a_returned_state(gpu_device):
     torch.testing.assert_close(
         suffix.final_state[0], full.final_state[0], rtol=0.1, atol=0.1
     )
+
+
+def test_gdn_factored_recurrence_supports_non_square_state(gpu_device):
+    """A State whose Feature sizes differ must lower and match the reference.
+
+    The kernel stages one State column per thread, so the column axis and the
+    contracting axis are different sizes here.
+    """
+    rows, columns, heads, length = 64, 128, 2, 70
+    generator = torch.Generator(device=gpu_device).manual_seed(7)
+    query = torch.randn(
+        1, 1, length, rows, device=gpu_device, dtype=torch.bfloat16, generator=generator
+    )
+    key = torch.nn.functional.normalize(
+        torch.randn(
+            1, 1, length, rows, device=gpu_device, dtype=torch.bfloat16, generator=generator
+        ),
+        p=2,
+        dim=-1,
+    )
+    value = torch.randn(
+        1, heads, length, columns, device=gpu_device, dtype=torch.bfloat16, generator=generator
+    )
+    gate = -torch.rand(1, heads, length, device=gpu_device, generator=generator)
+    beta = torch.rand(1, heads, length, device=gpu_device, generator=generator)
+    initial = 0.1 * torch.randn(1, heads, rows, columns, device=gpu_device)
+    operator = gated_delta_rule(1, heads, length, rows, columns, HQ=1)
+    compiled = operator.compile(
+        role_sizes={
+            operator.algorithm.inputs[0].roles[1]: 1,
+            operator.algorithm.inputs[1].roles[1]: 1,
+            operator.algorithm.inputs[2].roles[1]: heads,
+            operator.algorithm.states[0].head_role: heads,
+            operator.algorithm.states[0].feature_roles[0]: rows,
+            operator.algorithm.states[0].feature_roles[1]: columns,
+        },
+        target=Target(),
+        mode="dense",
+        backward=False,
+    )
+    assert (
+        compiled.operator._plans[compiled.specialization].plan.candidate.lowerer
+        == "tilelang-factored-recurrence"
+    )
+    with torch.no_grad():
+        result = compiled(
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            initial_state=StateTuple(("memory",), (initial,)),
+            return_final_state=True,
+        )
+    # the oracle defaults to the 128-dim acceptance-profile scale; this Program
+    # scales the readout by its own key dimension
+    expected_output, expected_state = gated_delta_rule_reference(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        scale=rows**-0.5,
+        initial_state=initial,
+        output_final_state=True,
+    )
+    assert result.final_state is not None
+    torch.testing.assert_close(
+        result.outputs["output"], expected_output, rtol=0.1, atol=0.1
+    )
+    torch.testing.assert_close(
+        result.final_state["memory"], expected_state, rtol=0.1, atol=0.1
+    )
