@@ -133,6 +133,7 @@ class EstimationShape:
     columns: int
     dense_summary: bool
     state_count: int = 1
+    state_total_elements: int = 0
     backward: bool = False
     chunked: bool = False
 
@@ -144,6 +145,7 @@ class EstimationShape:
         dense_summary: bool,
         *,
         state_count: int = 1,
+        state_total_elements: int = 0,
         backward: bool = False,
         chunked: bool = False,
     ) -> "EstimationShape":
@@ -156,6 +158,7 @@ class EstimationShape:
             columns=columns,
             dense_summary=dense_summary,
             state_count=state_count,
+            state_total_elements=state_total_elements or state_count * rows * columns,
             backward=backward,
             chunked=chunked,
         )
@@ -306,7 +309,9 @@ class CandidateLowerer:
                 3,
                 heads * (2 * dense + 2 * state) * 4,
             )
-        states = state * shape.state_count
+        # every State pays for its own features, so the charge sums per State
+        # rather than multiplying the first State's size by their count
+        states = shape.state_total_elements
         if not shape.dense_summary:
             # without a rank-one contraction the reference lowering keeps one
             # elementwise factor per axis, so it materializes the factor, the
@@ -768,11 +773,16 @@ def compile_plan(
         and len(transitions[0].injections) == 1
         and len(operator.algorithm.readouts) == 1
     )
+    state_total = 0
+    for spec in operator.algorithm.states:
+        sizes = [fixed_sizes[role] for role in spec.feature_roles]
+        state_total += sizes[0] if len(sizes) == 1 else sizes[0] * sizes[1]
     shape = EstimationShape.of(
         fixed_sizes[state.head_role],
         feature_sizes,
         dense_summary,
         state_count=len(operator.algorithm.states),
+        state_total_elements=state_total,
         backward=backward_ir is not None,
         chunked=chunked_eligible,
     )
