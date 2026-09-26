@@ -161,3 +161,13 @@ The gathered tensors themselves are consistent by construction: they come from t
 
 Next measurement, which pins the offending tensor in one shot: print those four for both States beside the reference's own ``elementwise``/``bias`` for the same inputs, and compare the token-0 result against the hand computation ``out_0 = (q_pair . key_pair_0) v_0 / (q_pair . key_pair_0 + eps)``. Note that ``rebased``'s second State is rank-1 with 256 rows, which is the shape combination the committed entry test does not cover (it uses rows=3/columns=5 and rows=1/columns=5).
 
+**Narrowed to a scale asymmetry between the numerator and the denominator.** Three measured facts on ``feat/chunked-multistate`` with ``dim=16``, ``dim_value=64``:
+
+1. At token 0 the expected result is exactly the value input: with ``qp = q (x) q`` and ``kp = k (x) k`` the ratio ``(qp . (kp (x) v)) / (qp . kp)`` collapses to ``v``, and an independent pure-torch oracle reproduces FLA there (max absolute 0.008, i.e. bf16 rounding) with ``eps`` of either ``1e-6`` or ``0``.
+2. The chunked path returns ``[0.063, -0.208, 0.159]`` where the value is ``[-0.252, 0.828, -0.633]``: every component is the expected one times **-0.25**, and ``0.25 = dim ** -0.5``. The answer's shape is right and the scalar between numerator and denominator is wrong.
+3. ``git diff perf/structured-lowering..feat/chunked-multistate -- attention_engine/`` touches only ``_stateful_chunked.py`` (+233) and the early return in ``_stateful_reference.py`` (+18), so the reference path is untouched and the error is unambiguously in the chunked path.
+
+The suspect is the per-State query: ``queries`` come from ``term.operand``, which for `rebased` is the same ``query_pair`` expression for both States, so an asymmetry has to come from how that operand is scaled or read per State rather than from the expression. `rebased` scales its query by ``dim ** -0.5``, and a one-sided application of exactly that factor is what was measured.
+
+**Probing note.** External patching does not reliably reach this lowering: a spy installed on ``chunked_elementwise_dense`` before ``_compile`` never fired, and patching ``execute_chunked_states`` after ``_compile`` did not change the result. The next attempt must print from inside the function.
+
