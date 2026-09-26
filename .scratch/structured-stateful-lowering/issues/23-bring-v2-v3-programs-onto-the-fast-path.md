@@ -149,3 +149,15 @@ The next probe, which splits the remaining error between gathering and kernel: r
 
 What is actually established about ``rebased`` on the branch: the gate passes, the kernels run, outputs come back, and they mismatch FLA on 88.1% of elements at rtol/atol 5e-2. The cause is open.
 
+**Mismatch localized to the first token.** Measured on ``feat/chunked-multistate``: ``rebased`` differs from FLA already at token 0 -- max absolute difference 3.18, actual ``[0.063, -0.208, 0.159]`` against expected ``[-0.252, 0.828, -0.633]`` -- so the fault is in the first-token quantities (injection, query, or the initial State), not in the decay and not in the chunk carries. That rules out the carry/boundary machinery, which was the largest surface to suspect.
+
+The gathered tensors themselves are consistent by construction: they come from the reference's own ``_affine_summary`` and ``_injection_terms``, called with the same arguments ``_scan_state`` passes. What stays suspect is how the entry consumes them for a 256-row State, i.e. these four lines in ``execute_chunked_states``:
+
+    gate_rows = elementwise[:, :, :, 0]        # the row factor
+    gate_columns = None                        # when elementwise.shape[3] == 1
+    key = injection[:, :, :, 0]                # the row factor of the injection
+    value = injection[:, :, 0, :]               # its column factor
+    query = _role_vector(operand)               # over the contracted role
+
+Next measurement, which pins the offending tensor in one shot: print those four for both States beside the reference's own ``elementwise``/``bias`` for the same inputs, and compare the token-0 result against the hand computation ``out_0 = (q_pair . key_pair_0) v_0 / (q_pair . key_pair_0 + eps)``. Note that ``rebased``'s second State is rank-1 with 256 rows, which is the shape combination the committed entry test does not cover (it uses rows=3/columns=5 and rows=1/columns=5).
+
