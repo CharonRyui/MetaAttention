@@ -9,7 +9,7 @@ from pathlib import Path
 import platform
 import subprocess
 import tempfile
-from typing import Any
+from typing import Any, Mapping
 
 import torch
 
@@ -106,25 +106,108 @@ class KernelConfig:
     values: tuple[tuple[str, int], ...]
 
 
+# A moved byte is the unit of the static estimate. On this class of device a
+# floating-point operation costs a fraction of the byte that feeds it, and one
+# launch costs a fixed slab of traffic it could otherwise have overlapped.
+_FLOPS_PER_BYTE = 1 / 16
+_BYTES_PER_LAUNCH = 4_096
+
+# The representations whose runtime composes a per-token summary, runs one prefix
+# pass over it, and contracts the readout in a separate pass.
+_SUMMARY_REPRESENTATIONS = frozenset(
+    {
+        PlanRepresentation.AXIS_SCALE,
+        PlanRepresentation.PRODUCT_INJECTION_GEMM,
+        PlanRepresentation.RANK_ONE_FACTORIZED,
+        PlanRepresentation.SHARED_STATE_CONTRACTION,
+    }
+)
+
+
+@dataclass(frozen=True)
+class EstimationShape:
+    """The Feature sizes and Program structure a candidate is priced for."""
+
+    heads: int
+    rows: int
+    columns: int
+    dense_summary: bool
+    state_count: int = 1
+    backward: bool = False
+
+    @classmethod
+    def of(
+        cls,
+        heads: int,
+        feature_sizes: tuple[int, ...],
+        dense_summary: bool,
+        *,
+        state_count: int = 1,
+        backward: bool = False,
+    ) -> "EstimationShape":
+        """Price a rank-2 State by both Features and a rank-1 State by its one."""
+        rows = feature_sizes[0]
+        columns = feature_sizes[1] if len(feature_sizes) > 1 else 1
+        return cls(
+            heads=heads,
+            rows=rows,
+            columns=columns,
+            dense_summary=dense_summary,
+            state_count=state_count,
+            backward=backward,
+        )
+
+    @property
+    def state_elements(self) -> int:
+        return self.rows * self.columns
+
+    @property
+    def summary_elements(self) -> int:
+        """Per-token summary size: one elementwise tensor, or a dense pair."""
+        if self.dense_summary:
+            return (
+                self.rows * self.rows
+                + self.columns * self.columns
+                + self.state_elements
+            )
+        return self.state_elements
+
+
 @dataclass(frozen=True)
 class CandidateEstimate:
+    """Static cost components of one Lowered Candidate for one shape.
+
+    Every component is derived from the representation's own execution shape and
+    the concrete Feature sizes, so the same representation is priced differently
+    for different Shapes instead of carrying one constant.
+    """
+
     feasible: bool
-    static_cost: int
+    bytes_per_token: int
+    flops_per_token: int
+    launches: int
     workspace_bytes_per_token: int
     reason: str | None = None
+
+    @property
+    def cost(self) -> float:
+        return (
+            self.bytes_per_token
+            + self.flops_per_token * _FLOPS_PER_BYTE
+            + self.launches * _BYTES_PER_LAUNCH
+        )
 
 
 @dataclass(frozen=True)
 class CandidateLowerer:
     name: str
     representations: tuple[PlanRepresentation, ...]
-    static_cost: int
     runtime_family: str = "generic"
 
     def lower(
         self,
         plan: MathematicalPlan,
-        feature_sizes: tuple[int, int],
+        shape: EstimationShape,
         *,
         maximum_workspace_bytes: int | None = None,
     ) -> LoweredCandidate | None:
@@ -134,7 +217,7 @@ class CandidateLowerer:
             return None
         if representation not in self.representations:
             return None
-        estimate = self.estimate(plan, feature_sizes)
+        estimate = self.estimate(plan, shape)
         if not estimate.feasible:
             return None
         if (
@@ -150,53 +233,102 @@ class CandidateLowerer:
         )
 
     def estimate(
-        self, plan: MathematicalPlan, feature_sizes: tuple[int, ...]
+        self, plan: MathematicalPlan, shape: EstimationShape
     ) -> CandidateEstimate:
-        elements = 1
-        for size in feature_sizes:
-            elements *= size
-        return CandidateEstimate(True, self.static_cost, elements * 4)
+        """Price one representation for one Shape.
+
+        The summary families move their per-token summary, the State they write,
+        and the output. The factorized families move only their factors and the
+        output. The dense and reference families also move the summary matrices
+        and the union layout they materialize. The workspace component is the
+        per-token buffer the plan has to keep live, so the same number gates
+        feasibility and becomes the published `WorkspacePolicy`.
+        """
+        representation = PlanRepresentation(plan.representation)
+        heads = shape.heads
+        state = shape.state_elements
+        summary = shape.summary_elements
+        dense = shape.rows * shape.rows + shape.columns * shape.columns + state
+        if representation is PlanRepresentation.SCALAR_FACTORIZED:
+            # one fused kernel that moves the factors and the output only
+            return CandidateEstimate(
+                True,
+                heads * (shape.rows + 2 * shape.columns + 1) * 4,
+                3 * heads * state,
+                1,
+                0,
+            )
+        if representation is PlanRepresentation.FACTORED_RECURRENCE:
+            # inference writes only the output; a compiled backward records the
+            # per-token State so the reverse walk never inverts the recurrence
+            return CandidateEstimate(
+                True,
+                heads * (shape.rows + 2 * shape.columns) * 4,
+                4 * heads * state,
+                1,
+                heads * state * 2 if shape.backward else 0,
+            )
+        if representation in _SUMMARY_REPRESENTATIONS:
+            arithmetic = 2 * heads * state * (2 if shape.dense_summary else 1)
+            return CandidateEstimate(
+                True,
+                heads * (summary + 2 * state + shape.columns) * 4,
+                arithmetic,
+                3,
+                heads * (summary + 2 * state) * 4,
+            )
+        if representation is PlanRepresentation.GENERIC_DENSE_AFFINE:
+            return CandidateEstimate(
+                True,
+                heads * (2 * dense + 2 * state) * 4,
+                2 * heads * state * (shape.rows + shape.columns),
+                3,
+                heads * (2 * dense + 2 * state) * 4,
+            )
+        # the reference lowering materializes every State in one union layout
+        states = state * shape.state_count
+        return CandidateEstimate(
+            True,
+            heads * (2 * dense + 4 * states) * 4,
+            4 * heads * states * (shape.rows + shape.columns),
+            4,
+            heads * (2 * dense + 4 * states) * 4,
+        )
 
 
 LOWERERS = (
+    CandidateLowerer("tilelang-generic", (PlanRepresentation.GENERIC_DENSE_AFFINE,)),
     CandidateLowerer(
-        "tilelang-generic", (PlanRepresentation.GENERIC_DENSE_AFFINE,), 100
-    ),
-    CandidateLowerer(
-        "tilelang-elementwise", (PlanRepresentation.AXIS_SCALE,), 30, "axis-scale"
+        "tilelang-elementwise", (PlanRepresentation.AXIS_SCALE,), "axis-scale"
     ),
     CandidateLowerer(
         "tilelang-product-gemm",
         (PlanRepresentation.PRODUCT_INJECTION_GEMM,),
-        40,
         "product-injection-gemm",
     ),
     CandidateLowerer(
-        "tilelang-rank-one", (PlanRepresentation.RANK_ONE_FACTORIZED,), 35,
+        "tilelang-rank-one",
+        (PlanRepresentation.RANK_ONE_FACTORIZED,),
         "rank-one-factorized",
     ),
     CandidateLowerer(
         "tilelang-shared-contraction",
         (PlanRepresentation.SHARED_STATE_CONTRACTION,),
-        45,
         "shared-state-contraction",
     ),
     CandidateLowerer(
         "tilelang-scalar-factorized",
         (PlanRepresentation.SCALAR_FACTORIZED,),
-        20,
         "scalar-factorized",
     ),
     CandidateLowerer(
         "tilelang-factored-recurrence",
         (PlanRepresentation.FACTORED_RECURRENCE,),
-        15,
         "factored-recurrence",
     ),
     CandidateLowerer(
         "reference-stateful",
         (PlanRepresentation.STATEFUL_REFERENCE,),
-        200,
         "stateful-reference",
     ),
 )
@@ -234,14 +366,16 @@ def kernel_configurations(candidate: LoweredCandidate) -> tuple[tuple[tuple[str,
     return tuple((("threads", size),) for size in (128, 256))
 
 
-def select_candidate(candidates: tuple[LoweredCandidate, ...]) -> LoweredCandidate:
-    """Select by lowerer estimate with a deterministic identity tie-break."""
+def select_candidate(
+    candidates: tuple[LoweredCandidate, ...],
+    estimates: Mapping[Any, CandidateEstimate],
+) -> LoweredCandidate:
+    """Select by the shape-aware estimate with a deterministic identity tie-break."""
     if not candidates:
         raise ValueError("no feasible lowered candidates")
-    costs = {lowerer.name: lowerer.static_cost for lowerer in LOWERERS}
     return min(
         candidates,
-        key=lambda item: (costs[item.lowerer], item.lowerer, item.identity),
+        key=lambda item: (estimates[item].cost, item.lowerer, item.identity),
     )
 
 
@@ -384,6 +518,7 @@ class TileLangPlan:
     backward_candidate: LoweredCandidate | None = None
     backward_kernel_config: KernelConfig | None = None
     uses_parallel_summary: bool = True
+    candidate_estimates: tuple[tuple[str, CandidateEstimate], ...] = ()
 
     @property
     def backend(self) -> str:
@@ -563,25 +698,60 @@ def compile_plan(
     )
     from ._stateful_structured import RUNTIME_FAMILY_ELIGIBILITY
     active_rewrites = {item.value for item in rewrites}
-    candidates = tuple(
-        candidate
-        for item in mathematical_plans
-        if not active_rewrites.intersection(item.conflicts)
-        for lowerer in LOWERERS
-        if not (backward_ir is not None and lowerer.runtime_family == "scalar-factorized")
-        if item.representation is PlanRepresentation.GENERIC_DENSE_AFFINE
-        or RUNTIME_FAMILY_ELIGIBILITY.get(lowerer.runtime_family, lambda _: (True, None))(operator.algorithm)[0]
-        if (candidate := lowerer.lower(
-            item, feature_sizes, maximum_workspace_bytes=target.workspace_bytes
-        )) is not None
+    fixed_sizes = dict(compilation.role_sizes)
+    state = operator.algorithm.states[0]
+    shape = EstimationShape.of(
+        fixed_sizes[state.head_role],
+        feature_sizes,
+        dense_summary,
+        state_count=len(operator.algorithm.states),
+        backward=backward_ir is not None,
     )
+    candidate_list: list[LoweredCandidate] = []
+    estimates: dict[LoweredCandidate, CandidateEstimate] = {}
+    for item in mathematical_plans:
+        if active_rewrites.intersection(item.conflicts):
+            continue
+        for lowerer in LOWERERS:
+            if lowerer.runtime_family == "scalar-factorized" and (
+                backward_ir is not None
+                or scalar_factorized is None
+                or scalar_factorized.dense is None
+                or scalar_factorized.injection_count != 1
+                or scalar_factorized.readout_count != 1
+            ):
+                # the plan is only its fused kernel: a compiled backward has no
+                # binding for it, and anything else falls through to the summary
+                # path this candidate would mis-price
+                continue
+            if (
+                item.representation is not PlanRepresentation.GENERIC_DENSE_AFFINE
+                and not RUNTIME_FAMILY_ELIGIBILITY.get(
+                    lowerer.runtime_family, lambda _: (True, None)
+                )(operator.algorithm)[0]
+            ):
+                continue
+            candidate = lowerer.lower(
+                item, shape, maximum_workspace_bytes=target.workspace_bytes
+            )
+            if candidate is None:
+                continue
+            candidate_list.append(candidate)
+            estimates[candidate] = lowerer.estimate(item, shape)
+    candidates = tuple(candidate_list)
     if not candidates:
         from .stateful_operator import StatefulCompilationError
 
         raise StatefulCompilationError(
             "COMPILE_RESOURCE", "target.workspace_bytes", {"reason": "no feasible lowered candidate"}
         )
-    candidate = select_candidate(candidates)
+    candidate_estimates = tuple(
+        sorted(
+            ((item.identity, estimates[item]) for item in candidates),
+            key=lambda pair: (pair[1].cost, pair[0]),
+        )
+    )
+    candidate = select_candidate(candidates, estimates)
     selected_plan = next(
         item for item in mathematical_plans if item.identity == candidate.plan_identity
     )
@@ -604,6 +774,7 @@ def compile_plan(
             WorkspacePolicy(feature_sizes[0] * feature_sizes[1] * 4, target.workspace_bytes),
             mathematical_plans,
             candidates,
+            candidate_estimates=candidate_estimates,
         )
         provisional = TileLangExecutable(
             provisional_plan,
@@ -619,7 +790,6 @@ def compile_plan(
         if cache_root:
             cache = MeasurementCache(str(Path(cache_root) / "tuning" / "measurements.json"))
         factory = invocation_factory(operator, compilation, provisional, mathematical_plans, device)
-        costs = {lowerer.name: lowerer.static_cost for lowerer in LOWERERS}
         generic = next(item for item in candidates if item.lowerer == "tilelang-generic")
         tuning_result = tune_candidates(
             candidates,
@@ -631,7 +801,7 @@ def compile_plan(
             environment=_target_fingerprint(target),
             cache=cache,
             generic_candidate=generic,
-            static_costs={item: costs[item.lowerer] for item in candidates},
+            static_costs={item: int(estimates[item].cost) for item in candidates},
         )
         candidate = tuning_result.winner
         selected_plan = next(
@@ -675,20 +845,10 @@ def compile_plan(
     tuning_identity = _digest(
         (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
     )
-    if candidate.lowerer == "tilelang-factored-recurrence":
-        # inference writes only the output; a compiled backward records the
-        # per-token State so the reverse walk never inverts the recurrence
-        fixed_sizes = dict(compilation.role_sizes)
-        state_heads = fixed_sizes[operator.algorithm.states[0].head_role]
-        rows, columns = (
-            fixed_sizes[role] for role in operator.algorithm.states[0].feature_roles
-        )
-        per_token = state_heads * rows * columns * 2 if backward_ir is not None else 0
-        workspace = WorkspacePolicy(
-            bytes_per_token=per_token, maximum_bytes=target.workspace_bytes
-        )
-    else:
-        workspace = _summary_workspace(operator, compilation, target)
+    workspace = WorkspacePolicy(
+        bytes_per_token=estimates[candidate].workspace_bytes_per_token,
+        maximum_bytes=target.workspace_bytes,
+    )
     backward_candidate = None
     backward_kernel_config = None
     if backward_ir is not None and not requires_reference_lowering(operator.algorithm):
@@ -717,6 +877,7 @@ def compile_plan(
         candidates,
         backward_candidate,
         backward_kernel_config,
+        candidate_estimates=candidate_estimates,
     )
     composition = Composition(candidate, backward_candidate, context_contract)
     composition.validate()
@@ -750,24 +911,6 @@ def compile_plan(
         workspace_allocator=WorkspaceAllocator(),
         composition=composition,
         backward_binding=backward_binding,
-    )
-
-
-def _summary_workspace(operator: Any, compilation: Any, target: Any) -> WorkspacePolicy:
-    """Per-token workspace for the plans that materialize per-token summaries."""
-    fixed_sizes = dict(compilation.role_sizes)
-    state_heads = fixed_sizes[operator.algorithm.states[0].head_role]
-    per_token_elements = 0
-    for spec in operator.algorithm.states:
-        sizes = [fixed_sizes[role] for role in spec.feature_roles]
-        if spec.rank == 2:
-            rows, columns = sizes
-            per_token_elements += rows * rows + columns * columns + rows * columns
-        else:
-            per_token_elements += sizes[0] * sizes[0] + sizes[0]
-    return WorkspacePolicy(
-        bytes_per_token=state_heads * per_token_elements * 4,
-        maximum_bytes=target.workspace_bytes,
     )
 
 

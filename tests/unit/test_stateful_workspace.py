@@ -12,7 +12,7 @@ import pytest
 
 from attn_engine import HeadRole, ProductFeatureRole, Target
 from examples.gated_delta_rule import gated_delta_rule
-from examples.linear_attention import simple_gla_attention
+from examples.linear_attention import gla_attention, simple_gla_attention
 
 pytestmark = pytest.mark.unit
 
@@ -77,15 +77,24 @@ def test_factored_recurrence_charges_recorded_states_with_a_backward():
         workspace.required_bytes(32768)
 
 
-def test_summary_plans_charge_dense_per_token_summaries():
-    """The plans that still materialize per-token summaries state their cost."""
+def test_summary_plan_charges_the_per_token_state_it_materializes():
+    """A plan that still materializes per-token summaries states their cost."""
+    lowerer, workspace = _workspace(
+        _compile(gla_attention, seqlen=2048, backward=False, size=64)
+    )
+    assert lowerer == "tilelang-elementwise"
+    # the diagonal summary, the injection, and the per-token State
+    assert workspace.bytes_per_token == HEADS * (64 * 64 * 3) * 4
+    assert workspace.required_bytes(2048) < ENVELOPE
+    with pytest.raises(RuntimeError):
+        workspace.required_bytes(32768)
+
+
+def test_fused_scalar_plan_charges_nothing_and_is_accepted_at_long_sequences():
+    """The fused scalar kernel moves only its factors, so it has no cliff."""
     lowerer, workspace = _workspace(
         _compile(simple_gla_attention, seqlen=2048, backward=False, size=64)
     )
     assert lowerer == "tilelang-scalar-factorized"
-    summary = 64 * 64 + 64 * 64 + 64 * 64
-    assert workspace.bytes_per_token == HEADS * summary * 4
-    assert workspace.required_bytes(2048) < ENVELOPE
-    # the cliff this ticket exists to remove
-    with pytest.raises(RuntimeError):
-        workspace.required_bytes(32768)
+    assert workspace.bytes_per_token == 0
+    assert workspace.required_bytes(32768) == 0

@@ -98,12 +98,20 @@ def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
 
 def test_compile_rejects_target_without_feasible_workspace():
     from attn_engine import Target
+    from examples.linear_attention import gla_attention
 
-    operator = StatefulOperator(_accumulator_ir())
+    # a per-axis decay has no zero-workspace candidate, so a one-byte envelope
+    # leaves nothing to select
+    operator = gla_attention(1, 1, 8, 2, 3)
     with pytest.raises(StatefulCompilationError) as captured:
         operator.compile(
-            role_sizes=ROLE_SIZES,
-            target=Target(workspace_bytes=23),
+            role_sizes={
+                role: 1 if isinstance(role, HeadRole) else 2
+                for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
+                for role in spec.roles
+                if isinstance(role, (HeadRole, FeatureRole))
+            },
+            target=Target(workspace_bytes=1),
             mode="dense",
         )
     assert captured.value.category == "COMPILE_RESOURCE"
@@ -152,12 +160,35 @@ def test_context_contract_identity_separates_backward_behavior():
 
 
 def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallback():
-    from attn_engine._stateful_plan import LoweredCandidate, select_candidate
+    from attn_engine._stateful_plan import (
+        EstimationShape,
+        LOWERERS,
+        LoweredCandidate,
+        MathematicalPlan,
+        select_candidate,
+    )
 
+    shape = EstimationShape.of(heads=1, feature_sizes=(64, 64), dense_summary=False)
     generic = LoweredCandidate("g", "p0", "tilelang-generic", "forward")
     specialized = LoweredCandidate("s", "p1", "tilelang-elementwise", "forward")
-    assert select_candidate((generic, specialized)) is specialized
-    assert select_candidate((generic,)) is generic
+    lowerers = {lowerer.name: lowerer for lowerer in LOWERERS}
+    plans = {
+        lowerer.name: MathematicalPlan(
+            f"p{index}", lowerer.representations[0], (), ("state-transition",)
+        )
+        for index, lowerer in enumerate(LOWERERS)
+    }
+    estimates = {
+        generic: lowerers["tilelang-generic"].estimate(
+            plans["tilelang-generic"], shape
+        ),
+        specialized: lowerers["tilelang-elementwise"].estimate(
+            plans["tilelang-elementwise"], shape
+        ),
+    }
+    assert estimates[specialized].cost < estimates[generic].cost
+    assert select_candidate((generic, specialized), estimates) is specialized
+    assert select_candidate((generic,), {generic: estimates[generic]}) is generic
 
 
 
@@ -619,16 +650,21 @@ def test_optimization_disabled_enumerates_only_generic_plan():
 
 
 def test_lowerer_registry_allows_multiple_implementations_per_plan():
-    from attn_engine._stateful_plan import CandidateLowerer, MathematicalPlan
+    from attn_engine._stateful_plan import (
+        CandidateLowerer,
+        EstimationShape,
+        MathematicalPlan,
+    )
 
     plan = MathematicalPlan(
         "semantic", "axis-scale", ("axis-scale",), ("state-transition",)
     )
-    first = CandidateLowerer("first", ("axis-scale",), 3).lower(plan, (64, 128))
-    second = CandidateLowerer("second", ("axis-scale",), 4).lower(plan, (64, 128))
-    mismatch = CandidateLowerer("other", ("generic-dense-affine",), 1).lower(
-        plan, (64, 128)
+    shape = EstimationShape.of(heads=1, feature_sizes=(64, 128), dense_summary=False)
+    first = CandidateLowerer("first", ("axis-scale",)).lower(plan, shape)
+    second = CandidateLowerer("second", ("axis-scale",), "axis-scale").lower(
+        plan, shape
     )
+    mismatch = CandidateLowerer("other", ("generic-dense-affine",)).lower(plan, shape)
 
     assert first is not None and second is not None
     assert first.plan_identity == second.plan_identity
@@ -656,9 +692,11 @@ def test_shared_readouts_and_rank_one_are_model_independent_planner_features():
     }
     assert "rank-one-factorized" in rewrites
     assert "shared-state-contraction" in rewrites
-    assert plan.mathematical_plan.representation in {
-        "generic-dense-affine", "rank-one-factorized", "shared-state-contraction"
-    }
+    # the estimate may prefer any of the specialized representations for this
+    # shape; what matters is that the planner recognizes them and never falls
+    # back to the generic baseline
+    assert plan.mathematical_plan.representation == "product-injection-gemm"
+    assert plan.mathematical_plan.representation != "generic-dense-affine"
 
 
 
