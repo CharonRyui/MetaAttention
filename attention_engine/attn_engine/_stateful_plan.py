@@ -136,6 +136,7 @@ class EstimationShape:
     state_total_elements: int = 0
     backward: bool = False
     chunked: bool = False
+    chunked_states: bool = False
 
     @classmethod
     def of(
@@ -148,6 +149,7 @@ class EstimationShape:
         state_total_elements: int = 0,
         backward: bool = False,
         chunked: bool = False,
+        chunked_states: bool = False,
     ) -> "EstimationShape":
         """Price a rank-2 State by both Features and a rank-1 State by its one."""
         rows = feature_sizes[0]
@@ -161,6 +163,7 @@ class EstimationShape:
             state_total_elements=state_total_elements or state_count * rows * columns,
             backward=backward,
             chunked=chunked,
+            chunked_states=chunked_states,
         )
 
     @property
@@ -316,6 +319,22 @@ class CandidateLowerer:
             # without a rank-one contraction the reference lowering keeps one
             # elementwise factor per axis, so it materializes the factor, the
             # injection, and the per-token State rather than dense matrices
+            if shape.chunked_states:
+                # the multi-State chunked schedule keeps only the chunk-boundary
+                # carries, summed over the States, instead of a per-token State
+                from ._stateful_chunked import CHUNK_TOKENS
+
+                return CandidateEstimate(
+                    True,
+                    heads * (3 * states + shape.columns) * 4,
+                    3 * heads * states,
+                    2,
+                    heads * 3 * states * 4,
+                    aligned_workspace_bytes_per_token=max(
+                        1, heads * states * 4 // CHUNK_TOKENS
+                    ),
+                    alignment_tokens=CHUNK_TOKENS,
+                )
             return CandidateEstimate(
                 True,
                 heads * (3 * states + shape.columns) * 4,
@@ -773,6 +792,14 @@ def compile_plan(
         and len(transitions[0].injections) == 1
         and len(operator.algorithm.readouts) == 1
     )
+    from ._stateful_chunked import chunked_states_eligible
+
+    chunked_states = (
+        mode == "dense"
+        and backward_ir is None
+        and target.device_type == "cuda"
+        and chunked_states_eligible(operator.algorithm)
+    )
     state_total = 0
     for spec in operator.algorithm.states:
         sizes = [fixed_sizes[role] for role in spec.feature_roles]
@@ -785,6 +812,7 @@ def compile_plan(
         state_total_elements=state_total,
         backward=backward_ir is not None,
         chunked=chunked_eligible,
+        chunked_states=chunked_states,
     )
     candidate_list: list[LoweredCandidate] = []
     estimates: dict[LoweredCandidate, CandidateEstimate] = {}

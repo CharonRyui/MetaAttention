@@ -452,3 +452,41 @@ def test_gated_slot_matches_fla_chunk_gsa(gpu_device):
         query, key, value, slot, gate, scale=dim**-0.5, head_first=True
     )[0]
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
+
+
+def test_rebased_plan_publishes_a_per_state_chunk_bound(gpu_device):
+    """The multi-State chunked schedule charges the chunk States, summed per State.
+
+    `rebased` reads two States, one of them rank-1, through contraction readouts,
+    so it takes the chunked multi-State path. Its published bound must then be the
+    chunk-boundary carries -- summed over the States, each of its own size --
+    rather than the per-token States the reference lowering would materialize.
+    """
+    heads, dim, dim_value, seqlen = 2, 16, 64, 2048
+    compiled = _compile(
+        rebased_attention,
+        {
+            "query_heads": heads,
+            "key_heads": heads,
+            "value_heads": heads,
+            "state_heads": heads,
+            "key_dim": dim,
+            "key_dim_x_key_dim": dim * dim,
+            "value_dim": dim_value,
+        },
+        batch=1,
+        heads=heads,
+        seqlen=seqlen,
+        dim=dim,
+        dim_value=dim_value,
+    )
+    plan = compiled.operator._plans[compiled.specialization].plan
+    workspace = plan.workspace
+    states = dim * dim * dim_value + dim * dim
+    assert plan.candidate.lowerer == "reference-stateful"
+    assert workspace.aligned_bytes_per_token == heads * states * 4 // 64
+    assert workspace.alignment_tokens == 64
+    assert workspace.required_bytes(seqlen) == seqlen * heads * states * 4 // 64
+    # the per-token bound is two orders of magnitude larger, which is the
+    # difference between rejecting and accepting a long sequence here
+    assert workspace.bytes_per_token > workspace.aligned_bytes_per_token * 100

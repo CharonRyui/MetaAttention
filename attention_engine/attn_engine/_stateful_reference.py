@@ -257,6 +257,24 @@ def execute_reference(
     return_final_state: bool,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
     """Run one invocation of a v2 Program through the reference lowering."""
+    from ._stateful_chunked import execute_chunked_states
+
+    chunked = execute_chunked_states(
+        algorithm,
+        values=values,
+        initial_states=initial_states,
+        segment=segment,
+        role_sizes=role_sizes,
+        heads=heads,
+        token_count=token_count,
+        device=device,
+        return_final_state=return_final_state,
+    )
+    if chunked is not None:
+        # the chunked schedule keeps each State in registers and stores only the
+        # chunk-boundary carries, where the per-token path below materializes one
+        # State per token per State
+        return chunked
     order, axes = feature_layout(algorithm)
     state_values: dict[str, torch.Tensor] = {}
     prior_values: dict[str, torch.Tensor] = {}
