@@ -134,6 +134,7 @@ class EstimationShape:
     dense_summary: bool
     state_count: int = 1
     backward: bool = False
+    chunked: bool = False
 
     @classmethod
     def of(
@@ -144,6 +145,7 @@ class EstimationShape:
         *,
         state_count: int = 1,
         backward: bool = False,
+        chunked: bool = False,
     ) -> "EstimationShape":
         """Price a rank-2 State by both Features and a rank-1 State by its one."""
         rows = feature_sizes[0]
@@ -155,6 +157,7 @@ class EstimationShape:
             dense_summary=dense_summary,
             state_count=state_count,
             backward=backward,
+            chunked=chunked,
         )
 
     @property
@@ -187,6 +190,8 @@ class CandidateEstimate:
     flops_per_token: int
     launches: int
     workspace_bytes_per_token: int
+    aligned_workspace_bytes_per_token: int | None = None
+    alignment_tokens: int = 0
     reason: str | None = None
 
     @property
@@ -249,6 +254,8 @@ class CandidateLowerer:
         state = shape.state_elements
         summary = shape.summary_elements
         dense = shape.rows * shape.rows + shape.columns * shape.columns + state
+        if representation is PlanRepresentation.AXIS_SCALE and shape.chunked:
+            from ._stateful_chunked import CHUNK_TOKENS
         if representation is PlanRepresentation.SCALAR_FACTORIZED:
             # one fused kernel that moves the factors and the output only
             return CandidateEstimate(
@@ -270,6 +277,20 @@ class CandidateLowerer:
             )
         if representation in _SUMMARY_REPRESENTATIONS:
             arithmetic = 2 * heads * state * (2 if shape.dense_summary else 1)
+            if representation is PlanRepresentation.AXIS_SCALE and shape.chunked:
+                # the chunked schedule keeps only the chunk-level running pair, so
+                # a chunk-aligned workload needs no per-token buffer at all
+                return CandidateEstimate(
+                    True,
+                    heads * (3 * state + shape.columns) * 4,
+                    arithmetic,
+                    2,
+                    heads * (summary + 2 * state) * 4,
+                    aligned_workspace_bytes_per_token=max(
+                        1, heads * state * 4 // CHUNK_TOKENS
+                    ),
+                    alignment_tokens=CHUNK_TOKENS,
+                )
             return CandidateEstimate(
                 True,
                 heads * (summary + 2 * state + shape.columns) * 4,
@@ -409,11 +430,28 @@ class ContextContract:
 
 @dataclass(frozen=True)
 class WorkspacePolicy:
+    """Per-token workspace bound, tightest where the compiled path allows.
+
+    ``aligned_bytes_per_token`` applies when the runtime workload divides
+    ``alignment_tokens`` and the compilation can reach the chunked schedule;
+    every other workload is bounded by ``bytes_per_token``, which covers the
+    per-token fallback the same plan will take.
+    """
+
     bytes_per_token: int
     maximum_bytes: int
+    aligned_bytes_per_token: int | None = None
+    alignment_tokens: int = 0
 
     def required_bytes(self, token_count: int) -> int:
-        required = token_count * self.bytes_per_token
+        per_token = self.bytes_per_token
+        if (
+            self.aligned_bytes_per_token is not None
+            and self.alignment_tokens
+            and token_count % self.alignment_tokens == 0
+        ):
+            per_token = self.aligned_bytes_per_token
+        required = token_count * per_token
         if required > self.maximum_bytes:
             raise RuntimeError("runtime workload exceeds compiled resource envelope")
         return required
@@ -710,12 +748,23 @@ def compile_plan(
     active_rewrites = {item.value for item in rewrites}
     fixed_sizes = dict(compilation.role_sizes)
     state = operator.algorithm.states[0]
+    transitions = operator.algorithm.transitions
+    chunked_eligible = (
+        mode == "dense"
+        and backward_ir is None
+        and not dense_summary
+        and target.device_type == "cuda"
+        and len(transitions) == 1
+        and len(transitions[0].injections) == 1
+        and len(operator.algorithm.readouts) == 1
+    )
     shape = EstimationShape.of(
         fixed_sizes[state.head_role],
         feature_sizes,
         dense_summary,
         state_count=len(operator.algorithm.states),
         backward=backward_ir is not None,
+        chunked=chunked_eligible,
     )
     candidate_list: list[LoweredCandidate] = []
     estimates: dict[LoweredCandidate, CandidateEstimate] = {}
@@ -855,9 +904,12 @@ def compile_plan(
     tuning_identity = _digest(
         (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
     )
+    selected_estimate = estimates[candidate]
     workspace = WorkspacePolicy(
-        bytes_per_token=estimates[candidate].workspace_bytes_per_token,
+        bytes_per_token=selected_estimate.workspace_bytes_per_token,
         maximum_bytes=target.workspace_bytes,
+        aligned_bytes_per_token=selected_estimate.aligned_workspace_bytes_per_token,
+        alignment_tokens=selected_estimate.alignment_tokens,
     )
     backward_candidate = None
     backward_kernel_config = None

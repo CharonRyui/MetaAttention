@@ -17,6 +17,9 @@ from functools import lru_cache
 
 import torch
 
+# the chunk length the recurrence kernel and the published workspace bound share
+CHUNK_TOKENS = 64
+
 
 @lru_cache(maxsize=None)
 def _compile_boundary_pair(
@@ -198,7 +201,7 @@ def chunked_elementwise_dense(
     query: torch.Tensor,
     initial_state: torch.Tensor,
     output_dtype: torch.dtype,
-    chunk_tokens: int = 64,
+    chunk_tokens: int = CHUNK_TOKENS,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one diagonal recurrence through the chunked schedule.
 

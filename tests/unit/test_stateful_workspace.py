@@ -77,17 +77,26 @@ def test_factored_recurrence_charges_recorded_states_with_a_backward():
         workspace.required_bytes(32768)
 
 
-def test_summary_plan_charges_the_per_token_state_it_materializes():
-    """A plan that still materializes per-token summaries states their cost."""
+def test_diagonal_plan_bounds_aligned_workloads_by_chunk_states():
+    """A chunk-aligned dense workload pays the chunk States, not the token State.
+
+    The same plan still has to bound the per-token summary it falls back to when
+    a workload is not chunk aligned, which is what `bytes_per_token` covers.
+    """
     lowerer, workspace = _workspace(
         _compile(gla_attention, seqlen=2048, backward=False, size=64)
     )
     assert lowerer == "tilelang-elementwise"
-    # the diagonal summary, the injection, and the per-token State
     assert workspace.bytes_per_token == HEADS * (64 * 64 * 3) * 4
-    assert workspace.required_bytes(2048) < ENVELOPE
-    with pytest.raises(RuntimeError):
-        workspace.required_bytes(32768)
+    assert workspace.alignment_tokens == 64
+
+    chunk_state = HEADS * 64 * 64 * 4 // 64
+    assert workspace.aligned_bytes_per_token == chunk_state
+    assert workspace.required_bytes(2048) == 2048 * chunk_state
+    assert workspace.required_bytes(32768) == 32768 * chunk_state
+    assert workspace.required_bytes(2048) < workspace.required_bytes(2050)
+    # an unaligned workload keeps the per-token bound
+    assert workspace.required_bytes(2050) == 2050 * workspace.bytes_per_token
 
 
 def test_fused_scalar_plan_charges_nothing_and_is_accepted_at_long_sequences():
