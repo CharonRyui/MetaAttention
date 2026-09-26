@@ -145,3 +145,7 @@ Settled while wiring, and worth keeping when this resumes: the ``evaluate`` call
 
 The next probe, which splits the remaining error between gathering and kernel: run the operator, monkey-patch ``_stateful_chunked.execute_chunked_states`` to return ``None``, run it again, and compare -- both runs are the same Program, and the reference path is the oracle. ``examples/rebased_attention.py`` has no ``example_inputs`` helper, so the inputs come from the coverage test's own builder.
 
+**Correction to the note above: both localizing attempts were invalid, so the mismatch is not yet attributed.** The first ran on ``perf/structured-lowering``, where ``execute_chunked_states`` does not exist, so it never exercised the branch. The second monkey-patched ``execute_chunked_states`` *after* ``_compile`` had already selected the lowering, so both runs took the same path and the comparison returned 0.0 -- which is evidence of nothing. To localize properly, compile twice: one operator compiled with the branch active and one compiled with it disabled from the start (patch before ``_compile``, or add a compile-time flag to the gate), then compare, and separately check the reference path against FLA to see whether the Program is at fault independently of chunking.
+
+What is actually established about ``rebased`` on the branch: the gate passes, the kernels run, outputs come back, and they mismatch FLA on 88.1% of elements at rtol/atol 5e-2. The cause is open.
+
