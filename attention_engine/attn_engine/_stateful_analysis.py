@@ -288,6 +288,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         f"d_{state.name}_initial",
     )
     scalar_factorized = None
+    dense_scalar = None
     scalar_propagations = all(
         isinstance(node, Identity) or isinstance(node, AxisScale) and not node.roles
         for node in algorithm.transition.propagations
@@ -303,13 +304,19 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         readout.role == feature_roles[0] for readout in algorithm.readouts
     )
     if scalar_propagations and factorized_injections and same_orientation:
-        dense_scalar = None
-        if (
-            len(algorithm.transition.propagations) == 1
-            and len(algorithm.transition.injections) == 1
-            and len(algorithm.readouts) == 1
-        ):
+        if len(algorithm.transition.propagations) == 0:
+            propagation = (
+                DenseInputIR("__identity_propagation__", 0, 1, 2, None),
+                ScalarExpressionIR("__identity_propagation__", "identity"),
+            )
+        elif len(algorithm.transition.propagations) == 1:
             propagation_node = algorithm.transition.propagations[0]
+            propagation = _dense_scalar_binding(
+                propagation_node.factor, algorithm, feature_role=None
+            )
+        else:
+            propagation = None
+        if len(algorithm.transition.injections) == 1 and len(algorithm.readouts) == 1:
             injection = algorithm.transition.injections[0]
             left_factor = next(
                 factor
@@ -320,9 +327,6 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 factor
                 for factor in injection.factors
                 if factor.roles == (feature_roles[1],)
-            )
-            propagation = _dense_scalar_binding(
-                propagation_node.factor, algorithm, feature_role=None
             )
             left = _dense_scalar_binding(
                 left_factor.expression, algorithm, feature_role=feature_roles[0]
@@ -335,12 +339,8 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 algorithm,
                 feature_role=feature_roles[0],
             )
-            if all(
-                recipe is not None for recipe in (propagation, left, right, readout)
-            ):
-                dense_scalar = DenseScalarFactorizedIR(
-                    propagation, left, right, readout
-                )
+            if all(recipe is not None for recipe in (propagation, left, right, readout)):
+                dense_scalar = DenseScalarFactorizedIR(propagation, left, right, readout)
         scalar_factorized = ScalarFactorizedIR(
             len(algorithm.transition.injections),
             len(algorithm.readouts),

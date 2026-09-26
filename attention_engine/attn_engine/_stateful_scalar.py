@@ -29,12 +29,13 @@ def _compile_scalar_factorized_dense_raw(
     readout_scale: float,
     return_final_state: bool,
     threads: int,
+    identity_propagation: bool,
 ):
     import tilelang
     import tilelang.language as T
 
-    chunk_tokens = 32
-    block_columns = 32
+    chunk_tokens = 64
+    block_columns = 64
     chunk_count = tilelang.cdiv(sequence_length, chunk_tokens)
 
     @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
@@ -59,6 +60,8 @@ def _compile_scalar_factorized_dense_raw(
             ),
             final: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
         ):
+            if False:
+                _ = (propagation_dtype, left_dtype, right_dtype, readout_dtype, output_dtype)
             with T.Kernel(
                 sequence_count * heads,
                 T.ceildiv(columns, block_columns),
@@ -128,23 +131,28 @@ def _compile_scalar_factorized_dense_raw(
                             right_shared[token, column] = right_value * right_scale
                         else:
                             right_shared[token, column] = 0.0
-                    if T.get_thread_binding() == 0:
-                        running_log = T.alloc_local((1,), dtype="float32")
-                        running_log[0] = 0.0
-                        for token in T.Serial(chunk_tokens):
-                            logical_token = chunk_start + token
-                            if logical_token < sequence_length:
-                                propagation_value = (
-                                    propagation[sequence, head, logical_token]
-                                    * propagation_scale
-                                )
-                                if propagation_operation == "exp":
-                                    propagation_value = T.exp(propagation_value)
-                                if propagation_is_log_scale:
-                                    running_log[0] += propagation_value
-                                else:
-                                    running_log[0] += T.log(propagation_value)
-                            log_prefix[token] = running_log[0]
+                    if identity_propagation:
+                        if T.get_thread_binding() == 0:
+                            for token in T.Serial(chunk_tokens):
+                                log_prefix[token] = 0.0
+                    else:
+                        if T.get_thread_binding() == 0:
+                            running_log = T.alloc_local((1,), dtype="float32")
+                            running_log[0] = 0.0
+                            for token in T.Serial(chunk_tokens):
+                                logical_token = chunk_start + token
+                                if logical_token < sequence_length:
+                                    propagation_value = (
+                                        propagation[sequence, head, logical_token]
+                                        * propagation_scale
+                                    )
+                                    if propagation_operation == "exp":
+                                        propagation_value = T.exp(propagation_value)
+                                    if propagation_is_log_scale:
+                                        running_log[0] += propagation_value
+                                    else:
+                                        running_log[0] += T.log(propagation_value)
+                                log_prefix[token] = running_log[0]
                     T.sync_threads()
 
                     T.clear(output_fragment)
@@ -225,7 +233,6 @@ def _compile_scalar_factorized_dense_raw(
 
     return build_kernel()
 
-
 def tilelang_scalar_factorized_dense_raw(
     raw_inputs: dict[str, torch.Tensor],
     initial_state: torch.Tensor,
@@ -237,13 +244,25 @@ def tilelang_scalar_factorized_dense_raw(
     return_final_state: bool,
     threads: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
+    identity_propagation = recipe.propagation[0].name == "__identity_propagation__"
+    def bind(binding):
+        if binding[0].name == "__identity_propagation__":
+            return torch.ones(
+                sequence_count,
+                initial_state.shape[1],
+                sequence_length,
+                device=initial_state.device,
+                dtype=torch.float32,
+            )
+        return raw_inputs[binding[0].name]
+
     bindings = tuple(
-        raw_inputs[item.name]
+        bind(item)
         for item in (
-            recipe.propagation[0],
-            recipe.left_factor[0],
-            recipe.right_factor[0],
-            recipe.readout[0],
+            recipe.propagation,
+            recipe.left_factor,
+            recipe.right_factor,
+            recipe.readout,
         )
     )
     propagation, left, right, readout = bindings
@@ -285,6 +304,7 @@ def tilelang_scalar_factorized_dense_raw(
         expressions[3].scale,
         return_final_state,
         threads,
+        identity_propagation,
     )
     kernel(propagation, left, right, readout, initial_state, output, final)
     return output, final if return_final_state else None
