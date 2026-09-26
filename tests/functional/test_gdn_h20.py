@@ -94,15 +94,16 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
     )
     operator = gated_delta_rule(1, 2, 64, 128, 128, HQ=1)
     compiled = _compile_gdn(operator)
-    result = compiled(
-        query=query,
-        key=key,
-        value=value,
-        gate=gate,
-        beta=beta,
-        initial_state=StateTuple(("memory",), (initial,)),
-        return_final_state=True,
-    )
+    with torch.no_grad():
+        result = compiled(
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            initial_state=StateTuple(("memory",), (initial,)),
+            return_final_state=True,
+        )
     expected_output, expected_state = gated_delta_rule_reference(
         query,
         key,
@@ -123,7 +124,9 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
 
 
 def test_gdn_continuation_matches_full_invocation(gpu_device):
-    query, key, value, gate, beta = _bindings(gpu_device, length=128)
+    query, key, value, gate, beta = (
+        tensor.detach() for tensor in _bindings(gpu_device, length=128)
+    )
     operator = gated_delta_rule(1, 2, 128, 128, 128, HQ=1)
     compiled = _compile_gdn(operator)
     prefix_query = query[:, :, :64].contiguous()
@@ -372,3 +375,95 @@ def test_compositional_pressure_profile_all_empty(gpu_device):
     assert result.outputs["output"].shape == (0, 4, 128)
     assert result.final_state is not None
     assert torch.equal(result.final_state[0], initial)
+
+
+def test_gdn_factored_recurrence_matches_independent_reference(gpu_device):
+    """The factored recurrent kernel must reproduce the GDN reference exactly.
+
+    Compiled without a backward, the GDN profile lowers to the factored
+    recurrence: one kernel that keeps the State column in registers, replays the
+    authored gate and rank-one contraction per token, and contracts the readout.
+    """
+    query, key, value, gate, beta = (
+        tensor.detach() for tensor in _bindings(gpu_device, length=130)
+    )
+    initial = torch.randn(1, 2, 128, 128, device=gpu_device, dtype=torch.float32)
+    operator = gated_delta_rule(1, 2, 130, 128, 128, HQ=1)
+    compiled = _compile_gdn(operator, backward=False)
+    plan = compiled.operator._plans[compiled.specialization]
+    assert plan.plan.candidate.lowerer == "tilelang-factored-recurrence"
+    assert plan.rank_one_factored is not None
+    assert plan.plan.workspace.required_bytes(130) == 0
+
+    with torch.no_grad():
+        result = compiled(
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            initial_state=StateTuple(("memory",), (initial,)),
+            return_final_state=True,
+        )
+    expected_output, expected_state = gated_delta_rule_reference(
+        query,
+        key,
+        value,
+        gate,
+        beta,
+        initial_state=initial,
+        output_final_state=True,
+    )
+    assert result.final_state is not None
+    assert expected_state is not None
+    torch.testing.assert_close(
+        result.outputs["output"], expected_output, rtol=0.1, atol=0.1
+    )
+    torch.testing.assert_close(
+        result.final_state["memory"], expected_state, rtol=0.1, atol=0.1
+    )
+
+
+def test_gdn_factored_recurrence_continues_from_a_returned_state(gpu_device):
+    """A factored result must be usable as the next invocation's initial State."""
+    query, key, value, gate, beta = _bindings(gpu_device, length=128)
+    operator = gated_delta_rule(1, 2, 128, 128, 128, HQ=1)
+    compiled = _compile_gdn(operator, backward=False)
+    with torch.no_grad():
+        full = compiled(
+            query=query,
+            key=key,
+            value=value,
+            gate=gate,
+            beta=beta,
+            return_final_state=True,
+        )
+        prefix = compiled(
+            query=query[:, :, :64].contiguous(),
+            key=key[:, :, :64].contiguous(),
+            value=value[:, :, :64].contiguous(),
+            gate=gate[:, :, :64].contiguous(),
+            beta=beta[:, :, :64].contiguous(),
+            return_final_state=True,
+        )
+        assert prefix.final_state is not None
+        assert full.final_state is not None
+        suffix = compiled(
+            query=query[:, :, 64:].contiguous(),
+            key=key[:, :, 64:].contiguous(),
+            value=value[:, :, 64:].contiguous(),
+            gate=gate[:, :, 64:].contiguous(),
+            beta=beta[:, :, 64:].contiguous(),
+            initial_state=prefix.final_state,
+            return_final_state=True,
+        )
+    assert suffix.final_state is not None
+    torch.testing.assert_close(
+        torch.cat((prefix.outputs[0], suffix.outputs[0]), dim=2),
+        full.outputs[0],
+        rtol=0.1,
+        atol=0.1,
+    )
+    torch.testing.assert_close(
+        suffix.final_state[0], full.final_state[0], rtol=0.1, atol=0.1
+    )

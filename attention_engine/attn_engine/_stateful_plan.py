@@ -21,6 +21,7 @@ class PlanRepresentation(str, Enum):
     RANK_ONE_FACTORIZED = "rank-one-factorized"
     SHARED_STATE_CONTRACTION = "shared-state-contraction"
     SCALAR_FACTORIZED = "scalar-factorized"
+    FACTORED_RECURRENCE = "factored-recurrence"
     STATEFUL_REFERENCE = "stateful-reference"
 
 
@@ -70,6 +71,14 @@ PLAN_RULES = {
         (
             PlanRepresentation.RANK_ONE_FACTORIZED.value,
             PlanRepresentation.SHARED_STATE_CONTRACTION.value,
+        ),
+    ),
+    PlanRepresentation.FACTORED_RECURRENCE: PlanRule(
+        PlanRepresentation.FACTORED_RECURRENCE,
+        (
+            "contracting-first-feature-readout",
+            "disjoint-single-feature-injections",
+            "ordered-axis-scale-and-rank-one-propagations",
         ),
     ),
     PlanRepresentation.STATEFUL_REFERENCE: PlanRule(
@@ -177,6 +186,12 @@ LOWERERS = (
         (PlanRepresentation.SCALAR_FACTORIZED,),
         20,
         "scalar-factorized",
+    ),
+    CandidateLowerer(
+        "tilelang-factored-recurrence",
+        (PlanRepresentation.FACTORED_RECURRENCE,),
+        15,
+        "factored-recurrence",
     ),
     CandidateLowerer(
         "reference-stateful",
@@ -381,7 +396,8 @@ class TileLangExecutable:
     backward_ir: Any | None
     dense_summary: bool
     scalar_factorized: Any | None
-    workspace_allocator: WorkspaceAllocator
+    rank_one_factored: Any | None = None
+    workspace_allocator: WorkspaceAllocator | None = None
     composition: Composition | None = None
     backward_binding: Any | None = None
 
@@ -424,6 +440,13 @@ class TileLangExecutable:
             backward=self.backward_binding,
             config=self.plan.backward_kernel_config.values
             if self.plan.backward_kernel_config else (),
+        )
+
+    def factored_recurrence_dense(self, **kwargs):
+        from ._stateful_factored import factored_recurrence_dense
+
+        return factored_recurrence_dense(
+            threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
         )
 
     def scalar_factorized_dense_raw(self, raw_inputs, initial_state, **kwargs):
@@ -495,6 +518,7 @@ def compile_plan(
     backward_ir: Any | None,
     dense_summary: bool,
     scalar_factorized: Any | None,
+    rank_one_factored: Any | None,
     structural_features: Any,
     optimized: bool,
     autotune: bool,
@@ -512,6 +536,8 @@ def compile_plan(
         representations = (PlanRepresentation.GENERIC_DENSE_AFFINE, *rewrites)
         if optimized and scalar_factorized is not None:
             representations += (PlanRepresentation.SCALAR_FACTORIZED,)
+        if optimized and rank_one_factored is not None and mode == "dense":
+            representations += (PlanRepresentation.FACTORED_RECURRENCE,)
     mathematical_plans = tuple(
         MathematicalPlan(
             _digest((source_identity, representation.value)),
@@ -533,7 +559,10 @@ def compile_plan(
         for item in mathematical_plans
         if not active_rewrites.intersection(item.conflicts)
         for lowerer in LOWERERS
-        if not (backward_ir is not None and lowerer.runtime_family == "scalar-factorized")
+        if not (
+            backward_ir is not None
+            and lowerer.runtime_family in {"scalar-factorized", "factored-recurrence"}
+        )
         if item.representation is PlanRepresentation.GENERIC_DENSE_AFFINE
         or RUNTIME_FAMILY_ELIGIBILITY.get(lowerer.runtime_family, lambda _: (True, None))(operator.algorithm)[0]
         if (candidate := lowerer.lower(
@@ -571,8 +600,12 @@ def compile_plan(
             candidates,
         )
         provisional = TileLangExecutable(
-            provisional_plan, backward_ir, dense_summary, scalar_factorized,
-            WorkspaceAllocator()
+            provisional_plan,
+            backward_ir,
+            dense_summary,
+            scalar_factorized,
+            rank_one_factored=None,
+            workspace_allocator=WorkspaceAllocator(),
         )
         device = torch.device(target.device_type)
         cache = None
@@ -632,20 +665,12 @@ def compile_plan(
     tuning_identity = _digest(
         (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
     )
-    fixed_sizes = dict(compilation.role_sizes)
-    state_heads = fixed_sizes[operator.algorithm.states[0].head_role]
-    per_token_elements = 0
-    for spec in operator.algorithm.states:
-        sizes = [fixed_sizes[role] for role in spec.feature_roles]
-        if spec.rank == 2:
-            rows, columns = sizes
-            per_token_elements += rows * rows + columns * columns + rows * columns
-        else:
-            per_token_elements += sizes[0] * sizes[0] + sizes[0]
-    workspace = WorkspacePolicy(
-        bytes_per_token=state_heads * per_token_elements * 4,
-        maximum_bytes=target.workspace_bytes,
-    )
+    if candidate.lowerer == "tilelang-factored-recurrence":
+        # the kernel keeps every State column in registers and writes only the
+        # output, so no sequence-scaled workspace is required
+        workspace = WorkspacePolicy(bytes_per_token=0, maximum_bytes=target.workspace_bytes)
+    else:
+        workspace = _summary_workspace(operator, compilation, target)
     backward_candidate = None
     backward_kernel_config = None
     if backward_ir is not None and not requires_reference_lowering(operator.algorithm):
@@ -695,13 +720,36 @@ def compile_plan(
                 layer="backward",
             )
     return TileLangExecutable(
-        plan,
-        backward_ir,
-        dense_summary,
-        scalar_factorized,
-        WorkspaceAllocator(),
-        composition,
-        backward_binding,
+        plan=plan,
+        backward_ir=backward_ir,
+        dense_summary=dense_summary,
+        scalar_factorized=scalar_factorized,
+        rank_one_factored=(
+            rank_one_factored
+            if candidate.lowerer == "tilelang-factored-recurrence"
+            else None
+        ),
+        workspace_allocator=WorkspaceAllocator(),
+        composition=composition,
+        backward_binding=backward_binding,
+    )
+
+
+def _summary_workspace(operator: Any, compilation: Any, target: Any) -> WorkspacePolicy:
+    """Per-token workspace for the plans that materialize per-token summaries."""
+    fixed_sizes = dict(compilation.role_sizes)
+    state_heads = fixed_sizes[operator.algorithm.states[0].head_role]
+    per_token_elements = 0
+    for spec in operator.algorithm.states:
+        sizes = [fixed_sizes[role] for role in spec.feature_roles]
+        if spec.rank == 2:
+            rows, columns = sizes
+            per_token_elements += rows * rows + columns * columns + rows * columns
+        else:
+            per_token_elements += sizes[0] * sizes[0] + sizes[0]
+    return WorkspacePolicy(
+        bytes_per_token=state_heads * per_token_elements * 4,
+        maximum_bytes=target.workspace_bytes,
     )
 
 

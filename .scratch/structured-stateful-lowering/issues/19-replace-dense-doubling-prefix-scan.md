@@ -4,7 +4,7 @@
 
 **Blocked by:** 12/Add Rank One Factorized Plan; 17/Compose Optimized Forward and Backward.
 
-**Status:** in progress (19a delivered, 19b open)
+**Status:** in progress (19a and 19b-i delivered, 19b-ii open)
 
 Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64):
 
@@ -17,13 +17,23 @@ Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64):
 | `gdn` | rank-one | 81.6 ms | 81.6 ms | 169.5 ms | 169.5 ms |
 | `rwkv7` | rank-one | 81.6 ms | 81.6 ms | — | — |
 
+19b-i (delivered): a `factored-recurrence` Plan Representation and `tilelang-factored-recurrence` lowerer add `_stateful_factored.py`, one kernel that keeps every State column in registers, replays the authored whole-State or first-feature Axis Scale and first-feature Rank One operations per token, adds the injection outer products, and contracts the readout. Eligibility (`rank_one_factored_eligible`) requires one Transition, one contracting first-feature readout, disjoint single-feature injection factors, and at least one rank-one contraction, so the diagonal-only Programs keep the scalar and elementwise kernels that already fuse the same work into fewer, shorter kernels. The family is forward-only: with a compiled backward the plan stays on the previous path, exactly as `scalar-factorized` does.
+
+| family | T=2048 forward before | after 19b-i | launches | workspace |
+| --- | --- | --- | --- | --- |
+| `gdn` | 81.6 ms | 3.73 ms | 1 + 20 | 0 (was 384 KiB/token) |
+| `rwkv7` | 81.6 ms | 4.00 ms | 1 + 18 | 0 |
+| `gdn` T=8192 | rejected | 17.7 ms | 1 + 19 | 0 |
+
+Evidence: `test_gdn_factored_recurrence_matches_independent_reference` and `test_gdn_factored_recurrence_continues_from_a_returned_state` compare against `gated_delta_rule_reference` at T=130 with an initial State and a prefix/suffix continuation.
+
 19a (delivered): `_compile_elementwise_prefix` is now a streaming kernel. Every thread owns one State element and walks its segment accumulating `(A_t, B_t)` with `S_t = A_t S_0 + B_t`, so the cross-thread scan, its barriers, and the shared-memory chunk loop are gone; per-axis, per-token-scalar, and full elementwise factors all lower to the same accumulation. The kernel also composes in reverse (`reverse=True`), which removed the seven flipped token-sized copies the elementwise VJP used to make.
 
 Measured effect of 19a: the three backward scans fall from 7.5-8.5 ms to 1.0 ms, forward falls 2.4x, and the whole training step falls ~2x. Against Flash Linear Attention at T=2048 (`testing/benchmark_linear_attention.py`, both sides VALID against the FP32 oracle) `gla` moves 250x -> 11.9x -> 5.84x end-to-end and 366x -> 16.4x on graph replay across 20 and 19a. The remaining 5.84x is the per-token State materialization and the token-serial accumulation, which 21 and 19b remove.
 
 What remains for 19b, in the measured order of impact:
 
-1. **Rank-one States (gdn, rwkv7)**: `_tilelang_dense_affine_scan` still doubles over the token axis with four fused-matmul launches and six full-size temporaries per step (4*log2(T) launches, ~1.6 GiB per step at T=2048). The dense per-token factor representation is `O(T*H*R*R)` (1 GiB at R=128, T=2048), so the fix is a factored representation, not a faster composition of the same one.
+1. **Rank-one backward (19b-ii)**: the factored family has no VJP yet, so a Program compiled with `backward=True` keeps the doubling scan and the dense per-token factor matrices (`gdn` training is still 169 ms at T=2048). The backward needs the State adjoint recurrence in reverse over `(l, r, c)`, the per-token gradients `dL/dl`, `dL/dr`, `dL/dc`, the injection and readout operand gradients, and the initial-State gradient; the `grad_r`/`grad_readout` terms need the per-token State, so the kernel must either recompute it per chunk or carry the WY matrix described below.
 
    Design note for the implementation: within a chunk, a chain of rank-one updates `prod_s (I + c_s l_s r_s^T)` is `I + A W B^T` with `A = [l_1..l_n]`, `B = [r_1..r_n]` and an `n x n` coefficient matrix `W` from a triangular solve (the WY represention). That makes the chunk summary `O(n^2 R)` instead of `O(n R^2)`, the chunk scan cheap (`T/n` summaries), and the per-token epilogue a prefix of the same form. The same factors serve the VJP: the state adjoint recurrences in reverse over `(l, r, c)` plus the per-token gradients `dL/dl = ..., dL/dr = ..., dL/dc = l^T S r`, none of which need a `[T,H,R,R]` tensor.
 2. **Readout fusion (see 21)**: the elementwise family still materializes per-token States and then reads them back, which is why the VJP spends ~2 ms in token-sized torch passes and why GLA forward is 6x the scalar-factorized schedule. Fusing the contraction into the streaming kernel removes those passes entirely.

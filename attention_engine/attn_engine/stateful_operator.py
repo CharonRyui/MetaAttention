@@ -885,6 +885,7 @@ class StatefulOperator:
             ),
             dense_summary=needs_dense,
             scalar_factorized=self.algorithm._analysis.scalar_factorized,
+            rank_one_factored=self.algorithm._analysis.rank_one_factored,
             optimized=compilation.options.optimized,
             autotune=compilation.options.autotune,
             structural_features=self.algorithm._analysis.structural_features,
@@ -1586,6 +1587,13 @@ class StatefulOperator:
             shared_readouts,
         )
         family = getattr(executable, "runtime_family", "generic")
+        if (
+            getattr(executable, "rank_one_factored", None) is not None
+            and runtime.device.type == "cuda"
+        ):
+            return self._lower_factored_recurrence(
+                values, initial_state, runtime, return_final_state, executable
+            )
         identity_only = not self.algorithm.transition.propagations
         needs_dense_transform = _dense_summary_required(self.algorithm)
         if family == "axis-scale":
@@ -1836,6 +1844,75 @@ class StatefulOperator:
                 )[:, -1]
             final_state = StateTuple((state_spec.name,), (final,))
         return tuple(output_values), final_state
+
+    def _lower_factored_recurrence(
+        self,
+        values: Mapping[str, torch.Tensor],
+        initial_state: torch.Tensor,
+        runtime: _Runtime,
+        return_final_state: bool,
+        executable: Any,
+    ) -> tuple[tuple[torch.Tensor, ...], StateTuple | None]:
+        """Run an eligible Program through one factored recurrent kernel.
+
+        The kernel holds every State column in registers and replays the authored
+        operations per token, so no per-token State or factor matrix is written
+        and the readout is contracted in the kernel.
+        """
+        state_spec = self.algorithm.states[0]
+        first_role, _ = state_spec.feature_roles
+        heads = runtime.state_heads
+        token_count = runtime.token_count
+        rows, columns = runtime.feature_sizes
+        device = runtime.device
+        ones_row = torch.ones(token_count, heads, rows, 1, device=device)
+        ones_scalar = torch.ones(token_count, heads, 1, 1, device=device)
+        operation_codes: list[str] = []
+        left_factors: list[torch.Tensor] = []
+        right_factors: list[torch.Tensor] = []
+        coefficients: list[torch.Tensor] = []
+        for node in self.algorithm.transition.propagations:
+            if isinstance(node, AxisScale) and not node.roles:
+                operation_codes.append("scale")
+                left_factors.append(ones_row)
+                right_factors.append(ones_row)
+                coefficients.append(_evaluate(node.factor, values).float())
+            elif isinstance(node, AxisScale):
+                operation_codes.append("row-scale")
+                left_factors.append(_evaluate(node.factor, values).float())
+                right_factors.append(ones_row)
+                coefficients.append(ones_scalar)
+            else:
+                operation_codes.append("rank-one")
+                left_factors.append(_evaluate(node.left, values).float())
+                right_factors.append(_evaluate(node.right, values).float())
+                coefficients.append(_evaluate(node.coefficient, values).float())
+        injection_left: list[torch.Tensor] = []
+        injection_right: list[torch.Tensor] = []
+        for injection in self.algorithm.transition.injections:
+            row_factor, column_factor = injection.factors
+            if tuple(column_factor.roles) == (first_role,):
+                row_factor, column_factor = column_factor, row_factor
+            injection_left.append(_evaluate(row_factor.expression, values).float())
+            injection_right.append(_evaluate(column_factor.expression, values).float())
+        readout = self.algorithm.readouts[0]
+        assert isinstance(readout, StateContraction)
+        operand = _evaluate(readout.operand, values).float()
+        output, final = executable.factored_recurrence_dense(
+            operation_codes=tuple(operation_codes),
+            left_factors=left_factors,
+            right_factors=right_factors,
+            coefficients=coefficients,
+            injection_left=injection_left,
+            injection_right=injection_right,
+            readout=operand,
+            initial_state=initial_state,
+            output_dtype=readout.output_dtype,
+        )
+        final_state = (
+            StateTuple((state_spec.name,), (final,)) if return_final_state else None
+        )
+        return (output,), final_state
 
     def _specialization_key(
         self,

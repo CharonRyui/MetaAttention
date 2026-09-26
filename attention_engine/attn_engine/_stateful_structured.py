@@ -84,7 +84,17 @@ def shared_state_contraction_eligibility(algorithm: Any) -> Eligibility:
     return True, None
 
 
+def factored_recurrence_eligibility(algorithm: Any) -> Eligibility:
+    """Return whether the factored recurrent kernel can replay the Program."""
+    from ._stateful_analysis import rank_one_factored_eligible
+
+    if rank_one_factored_eligible(algorithm) is None:
+        return False, "not-a-factored-recurrence"
+    return True, None
+
+
 RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
+    "factored-recurrence": factored_recurrence_eligibility,
     "axis-scale": axis_scale_eligibility,
     "product-injection-gemm": product_injection_eligibility,
     "rank-one-factorized": rank_one_eligibility,

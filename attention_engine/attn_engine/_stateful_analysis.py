@@ -58,6 +58,27 @@ class ScalarFactorizedIR:
 
 
 @dataclass(frozen=True)
+class FactoredOperationIR:
+    """One authored Transition step the factored kernel replays per token."""
+
+    kind: str
+
+
+@dataclass(frozen=True)
+class RankOneFactoredIR:
+    """Structural proof that a State runs as one factored recurrent kernel.
+
+    ``operations`` is the authored order of whole-State or first-feature Axis
+    Scales and first-feature Rank One contractions, so the kernel can replay it
+    against a State column held in registers.
+    """
+
+    operations: tuple[FactoredOperationIR, ...]
+    injection_count: int
+    readout_role: Any
+
+
+@dataclass(frozen=True)
 class TypedExpression:
     expression: InputExpression
     dtype: torch.dtype
@@ -114,6 +135,7 @@ class Analysis:
     backward: BackwardIR
     expression_types: tuple[tuple[str, TypedExpression], ...]
     scalar_factorized: ScalarFactorizedIR | None
+    rank_one_factored: RankOneFactoredIR | None
     simplified: SimplifiedIR
     structural_features: StructuralFeatures
     canonical_identity: str
@@ -529,6 +551,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             len(primary_transition.propagations),
             dense_scalar,
         )
+    rank_one_factored = rank_one_factored_eligible(algorithm)
     canonical_identity = _canonical_identity(algorithm)
     simplified_expressions = tuple(
         (path, simplify_expression(typed.expression)) for path, typed in types
@@ -570,6 +593,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         backward,
         tuple(types),
         scalar_factorized,
+        rank_one_factored,
         simplified,
         structural_features,
         canonical_identity,
@@ -885,6 +909,60 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
         elif isinstance(expression, StateTerm):
             result.extend(_input_names(expression.operand))
     return tuple(result)
+
+
+def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | None:
+    """Prove a matrix State runs as one factored recurrent kernel.
+
+    The kernel holds one State column per thread in registers and replays the
+    authored operations per token, so the Program needs a single Transition, one
+    readout that contracts the first Feature, injections whose factors are
+    disjoint single-Feature outer products, and propagations that are whole-State
+    or first-Feature Axis Scales plus first-Feature Rank One contractions.
+    """
+    from .stateful_operator import AxisScale, RankOnePropagation, StateContraction
+
+    if len(algorithm.states) != 1 or algorithm.states[0].rank != 2:
+        return None
+    if len(algorithm.transitions) != 1:
+        return None
+    state = algorithm.states[0]
+    first_role, second_role = state.feature_roles
+    readouts = algorithm.readouts
+    if len(readouts) != 1 or not isinstance(readouts[0], StateContraction):
+        return None
+    if readouts[0].state != state.name or readouts[0].role != first_role:
+        return None
+    operations: list[FactoredOperationIR] = []
+    for node in algorithm.transitions[0].propagations:
+        if isinstance(node, AxisScale):
+            if node.roles and tuple(node.roles) != (first_role,):
+                return None
+            operations.append(
+                FactoredOperationIR("row-scale" if node.roles else "scale")
+            )
+        elif isinstance(node, RankOnePropagation):
+            if node.role != first_role:
+                return None
+            operations.append(FactoredOperationIR("rank-one"))
+        else:
+            return None
+    if not operations or not any(
+        operation.kind == "rank-one" for operation in operations
+    ):
+        # without a rank-one contraction the scalar and per-axis diagonal plans
+        # already fuse the same work into fewer, shorter kernels
+        return None
+    injections = algorithm.transitions[0].injections
+    if not injections:
+        return None
+    for injection in injections:
+        if len(injection.factors) != 2:
+            return None
+        roles = {tuple(factor.roles) for factor in injection.factors}
+        if roles != {(first_role,), (second_role,)}:
+            return None
+    return RankOneFactoredIR(tuple(operations), len(injections), first_role)
 
 
 def _dense_scalar_binding(
