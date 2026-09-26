@@ -23,3 +23,13 @@ Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64) agains
 - [ ] `StateTerm`, `Contract`, `Outer`, `Softmax`, and prior-State readouts are evaluated against chunk States in the epilogue, so the readout adds no full-sequence pass.
 - [ ] Every v2/v3 coverage family compiles and runs at T=4096 within the H20 envelope, and each is at most 3x the specialized plan for the same State shape.
 - [ ] CPU parity tests and the H20 coverage parity tests keep passing unchanged, and per-family H20 numbers are recorded as evidence.
+
+**Implementation map (surveyed, not yet built).** The union layout has exactly two consumers, both in `_stateful_reference.py`:
+
+- `feature_layout` (line 105) builds the ordered union of every Feature role over inputs and States and returns the axis map.
+- line 155 lays out *inputs* as token-major `[tokens, heads, *union features]`; line 260 passes the same axis map into `_scan_state`, which is where the per-token State is materialized in that union shape.
+
+So the first box is narrower than it looks: the input layout can stay union-based (inputs really are shared per Program), and what has to change is that `_scan_state` allocates and carries each State with its *own* `state.feature_roles` order and shape. The expression evaluator already keys everything by role (`axes[role]`), so the change is a substitution at the state-term sites -- `StateTerm`, `Contract`, `Outer`, `Softmax` -- from the union axis map to a per-State one, with both maps available where a State term and an Input term meet.
+
+Payoff, in the order it unblocks the rest of this ticket: a State no longer pays for Feature roles it does not use, the per-token State buffer shrinks to `[tokens, heads, *own roles]`, and that per-State shape is exactly what the chunk scan needs to take over from the reference lowering. Then the readout epilogue can be evaluated against chunk States, and the `_stateful_chunked.py` schedule already built for ticket 19 extends to multi-State Programs once each State carries its own carry buffer.
+
