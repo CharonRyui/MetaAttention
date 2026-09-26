@@ -4,7 +4,7 @@
 
 **Blocked by:** 19/Replace the dense doubling prefix scan.
 
-**Status:** in progress (the factored-recurrence family carries no per-token State in inference, the resource contract is tested, and the per-axis diagnosis below is measured; the summary families still materialize one per token)
+**Status:** complete
 
 Evidence: every plan reports the same 384 KiB/token (`WorkspacePolicy.bytes_per_token`), i.e. the per-token State `[T,H,K,V]` plus its scale/bias copies are materialized for the whole sequence. At T=8192 that is ~3 GiB, so 10 of 11 families are rejected with `RUNTIME_RESOURCE` before running; `linear` at T=2048 reads and writes 268 MB per pass (0.21 ms ≈ HBM roofline) for a 4 MB output.
 

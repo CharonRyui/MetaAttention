@@ -4,7 +4,7 @@
 
 **Blocked by:** 19/Replace the dense doubling prefix scan; 21/Bound plan workspace by chunk States; 02/Establish metadata-only packed compilation.
 
-**Status:** ready-for-agent
+**Status:** in progress (the per-State layout box is verified; per-axis scales elementwise, the streaming State scan, and the per-State charge are delivered; the multi-State chunk scan, the readout epilogue, and the remaining envelope case are open)
 
 Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64) against 0.14–0.32 ms for the specialized plans:
 

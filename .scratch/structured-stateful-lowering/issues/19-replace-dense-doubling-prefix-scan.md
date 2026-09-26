@@ -4,7 +4,7 @@
 
 **Blocked by:** 12/Add Rank One Factorized Plan; 17/Compose Optimized Forward and Backward.
 
-**Status:** in progress (19a, 19b-i, 19b-ii delivered; rank-one backward throughput and the diagonal-family fusion remain)
+**Status:** in progress (19a, 19b-i, 19b-ii and the chunked diagonal schedule are delivered; the 2x latency target, the packed form, and the rank-one chunk form remain)
 
 Baseline (`testing/benchmark_stateful_plans.py`, H20, BF16, B1 H8 K=V=64):
 
