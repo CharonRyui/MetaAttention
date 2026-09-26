@@ -139,4 +139,9 @@ The diagnosis is the same hazard this branch hit before, now confirmed on a seco
 
 The work was reverted rather than committed because the rank-1 path would otherwise be unreachable dead code -- nothing in the corpus routes a rank-1 State to this entry -- and a test cannot reach it until the symbol collision is fixed.
 
+**Multi-State wiring attempted: the gate passes, the numbers are wrong.** Branch ``feat/chunked-multistate`` carries it, unmerged. ``execute_reference`` now early-returns into ``execute_chunked_states``; for ``rebased`` the gate passes, the per-State gathering runs and the kernels return, so the plumbing works end to end. The values do not: the FLA-parity test reports 88.1% of elements mismatched, greatest absolute difference 4.10, so the error is semantic and sits in either the gathering or the kernel's convention. ``perf/structured-lowering`` keeps only the verified entry work and its test.
+
+Settled while wiring, and worth keeping when this resumes: the ``evaluate`` callback takes ``(expression, bound)`` because ``_injection_terms`` and ``_affine_summary`` call it that way; a whole-State ``AxisScale`` makes ``elementwise`` of shape ``[T,H,1,1]``, so the column gate has to be ``None`` rather than a slice of column 0; a rank-1 State promotes to one *column* (``[C,1]``) with its injection factor as the key, which is exactly how ``_injection_terms`` and ``_scan_state`` already present it, and the opposite of the orientation first written here; and a whole-State injection is declined because the kernels' key is separable.
+
+The next probe, which splits the remaining error between gathering and kernel: run the operator, monkey-patch ``_stateful_chunked.execute_chunked_states`` to return ``None``, run it again, and compare -- both runs are the same Program, and the reference path is the oracle. ``examples/rebased_attention.py`` has no ``example_inputs`` helper, so the inputs come from the coverage test's own builder.
 
