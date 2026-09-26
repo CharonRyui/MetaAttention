@@ -1,7 +1,7 @@
 """CPU expressibility and numeric checks for the FLA coverage Programs.
 
-Every factory in ``examples/fla_coverage.py`` must construct, type-check, compile,
-and execute; the Programs whose library operator is not directly callable here are
+Every Program the coverage table points at must construct, type-check, compile, and
+execute; the Programs whose library operator is not directly callable here are
 compared with independent token recurrences written from the mathematics.
 """
 
@@ -13,7 +13,27 @@ import pytest
 import torch
 
 from attn_engine import FeatureRole, HeadRole, Target
-from examples import fla_coverage as coverage
+from examples import fla_coverage
+from examples.based_attention import based_attention
+from examples.gated_slot_attention import gated_slot_attention
+from examples.hgrn import hgrn
+from examples.normalized_linear_attention import normalized_linear_attention
+from examples.rebased_attention import rebased_attention
+from examples.retention_attention import retention_attention, retention_decay
+from examples.rwkv6_attention import rwkv6_attention
+from examples.rwkv7_state import rwkv7_state
+
+# every Program the coverage table points at, by factory name
+FACTORIES = {
+    "based_attention": based_attention,
+    "gated_slot_attention": gated_slot_attention,
+    "hgrn": hgrn,
+    "normalized_linear_attention": normalized_linear_attention,
+    "rebased_attention": rebased_attention,
+    "retention_attention": retention_attention,
+    "rwkv6_attention": rwkv6_attention,
+    "rwkv7_state": rwkv7_state,
+}
 
 pytestmark = pytest.mark.unit
 
@@ -117,7 +137,7 @@ CASES = {
             "query": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
             "key": torch.randn(BATCH, HEADS, LENGTH, DIM, generator=generator),
             "value": torch.randn(BATCH, HEADS, LENGTH, DIM_VALUE, generator=generator),
-            "decay": coverage.retention_decay(HEADS)
+            "decay": retention_decay(HEADS)
             .expand(BATCH, HEADS, LENGTH)
             .contiguous(),
         },
@@ -178,7 +198,7 @@ CASES = {
 def test_coverage_factory_compiles_and_runs_on_cpu(name):
     case = CASES[name]
     output = _run(
-        coverage.FACTORIES[name],
+        FACTORIES[name],
         case["inputs"](_generator()),
         case["kwargs"],
         case.get("heads", HEADS),
@@ -190,7 +210,7 @@ def test_coverage_factory_compiles_and_runs_on_cpu(name):
 def test_rwkv6_attention_matches_prior_state_readout_recurrence():
     inputs = CASES["rwkv6_attention"]["inputs"](_generator())
     actual = _run(
-        coverage.rwkv6_attention,
+        rwkv6_attention,
         inputs,
         CASES["rwkv6_attention"]["kwargs"],
     )
@@ -221,7 +241,7 @@ def test_rwkv6_attention_matches_prior_state_readout_recurrence():
 def test_rebased_attention_matches_squared_attention_recurrence():
     inputs = CASES["rebased_attention"]["inputs"](_generator())
     actual = _run(
-        coverage.rebased_attention, inputs, CASES["rebased_attention"]["kwargs"]
+        rebased_attention, inputs, CASES["rebased_attention"]["kwargs"]
     )
     scale = DIM**-0.5
     numerator = torch.zeros(BATCH, HEADS, DIM * DIM, DIM_VALUE)
@@ -248,7 +268,7 @@ def test_rebased_attention_matches_squared_attention_recurrence():
 def test_based_attention_matches_second_order_taylor_recurrence():
     inputs = CASES["based_attention"]["inputs"](_generator())
     actual = _run(
-        coverage.based_attention, inputs, CASES["based_attention"]["kwargs"]
+        based_attention, inputs, CASES["based_attention"]["kwargs"]
     )
     scale = DIM**-0.5
     zero = torch.zeros(BATCH, HEADS, DIM_VALUE)
@@ -291,7 +311,7 @@ def test_based_attention_matches_second_order_taylor_recurrence():
 def test_gated_slot_attention_matches_two_state_softmax_recurrence():
     inputs = CASES["gated_slot_attention"]["inputs"](_generator())
     actual = _run(
-        coverage.gated_slot_attention,
+        gated_slot_attention,
         inputs,
         CASES["gated_slot_attention"]["kwargs"],
     )
@@ -322,7 +342,7 @@ def test_gated_slot_attention_matches_two_state_softmax_recurrence():
 
 def test_rwkv7_state_matches_dplr_recurrence():
     inputs = CASES["rwkv7_state"]["inputs"](_generator())
-    actual = _run(coverage.rwkv7_state, inputs, CASES["rwkv7_state"]["kwargs"])
+    actual = _run(rwkv7_state, inputs, CASES["rwkv7_state"]["kwargs"])
     memory = torch.zeros(BATCH, HEADS, DIM, DIM_VALUE)
     outputs = []
     for token in range(LENGTH):
@@ -348,13 +368,27 @@ def test_product_feature_roles_must_match_their_factor_sizes(name):
     from attn_engine import StatefulCompilationError
 
     case = CASES[name]
-    operator = coverage.FACTORIES[name](**case["kwargs"])
+    operator = FACTORIES[name](**case["kwargs"])
     sizes = _role_sizes(operator)
     product = next(role for role in sizes if "_x_" in role.name)
     sizes[product] = sizes[product] + 1
     with pytest.raises(StatefulCompilationError) as captured:
         operator.compile(role_sizes=sizes, target=Target(), mode="dense")
     assert captured.value.category in ("COMPILE_ROLE_SIZE", "RUNTIME_SHAPE")
+
+
+def test_every_coverage_program_pointer_resolves():
+    import importlib
+
+    programs = {
+        row[1] for row in fla_coverage.FLA_COVERAGE if row[1].startswith("examples/")
+    }
+    assert programs
+    for program in programs:
+        module_path, _, factory = program.partition(":")
+        assert module_path.endswith(".py") and factory, program
+        module = importlib.import_module(module_path[:-3].replace("/", "."))
+        assert callable(getattr(module, factory)), program
 
 
 def test_fla_coverage_table_covers_every_installed_fla_op_module():
@@ -368,7 +402,7 @@ def test_fla_coverage_table_covers_every_installed_fla_op_module():
     } - {"common", "utils"}
     covered = {
         entry[0].split(".")[2]
-        for entry in coverage.FLA_COVERAGE
+        for entry in fla_coverage.FLA_COVERAGE
         if len(entry[0].split(".")) > 2
     }
     assert not modules - covered, sorted(modules - covered)

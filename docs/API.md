@@ -193,9 +193,11 @@ and expression readouts. Gradients flow through the same lowering, so no eager
 token loop and no framework-derived backward is involved. Programs that stay
 within the v1 language keep their existing specialized TileLang plans.
 
-`examples/fla_coverage.py` authors every Flash Linear Attention operator that is
-a per-token linear recurrence in this language and records the coverage table;
-`tests/functional/test_fla_coverage.py` checks parity with the library operators.
+Each Flash Linear Attention operator that is a per-token linear recurrence has
+its Program in its own `examples/<family>.py` module, and
+`examples/fla_coverage.py` records the coverage table that points at those
+factories; `tests/functional/test_fla_coverage.py` checks parity with the library
+operators.
 
 The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
 outputs, FP32 State, canonical contiguous layouts, and Feature pairs in

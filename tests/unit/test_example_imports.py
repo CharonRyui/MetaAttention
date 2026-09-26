@@ -9,8 +9,11 @@ pytestmark = [pytest.mark.unit, pytest.mark.examples]
 
 
 EXAMPLE_FACTORIES = (
-    ("examples.gated_retention", "gated_retention"),
+    ("examples.based_attention", "based_attention"),
     ("examples.gated_delta_rule", "gated_delta_rule"),
+    ("examples.gated_retention", "gated_retention"),
+    ("examples.gated_slot_attention", "gated_slot_attention"),
+    ("examples.hgrn", "hgrn"),
     ("examples.linear_attention", "linear_attention"),
     ("examples.linear_attention", "simple_gla_attention"),
     ("examples.linear_attention", "gla_attention"),
@@ -22,10 +25,15 @@ EXAMPLE_FACTORIES = (
     ("examples.mha_decode", "softmax_attention_decode"),
     ("examples.mha_v2", "causal_softmax_attention"),
     ("examples.mla_decode", "mla_decode"),
+    ("examples.normalized_linear_attention", "normalized_linear_attention"),
+    ("examples.rebased_attention", "rebased_attention"),
     ("examples.reluattn", "relu_attention"),
     ("examples.reluattn_v2", "relu_attention"),
+    ("examples.retention_attention", "retention_attention"),
     ("examples.retention_parallel", "retention_parallel"),
     ("examples.retnet_recurrent", "retnet_recurrent"),
+    ("examples.rwkv6_attention", "rwkv6_attention"),
+    ("examples.rwkv7_state", "rwkv7_state"),
     ("examples.sigmoid_attn", "sigmoid_attention"),
     ("examples.sigmoid_attn_v2", "sigmoid_attention"),
     ("examples.sparse_gqa_decode", "sparse_gqa_decode"),

@@ -1,4 +1,4 @@
-"""FLA parity for Stateful Operator Programs authored in ``examples/fla_coverage.py``.
+"""FLA parity for the Stateful Operator Programs the coverage table lists.
 
 Each case compiles one DSL Program, runs it on GPU tensors, and compares against
 the Flash Linear Attention operator whose reference semantics the Program was
@@ -11,17 +11,13 @@ import pytest
 import torch
 
 from attn_engine import Target
-from examples.fla_coverage import (
-    EPS,
-    based_attention,
-    gated_slot_attention,
-    hgrn,
-    normalized_linear_attention,
-    rebased_attention,
-    retention_attention,
-    rwkv6_attention,
-)
-from examples.fla_coverage import retention_decay
+from examples.based_attention import based_attention
+from examples.gated_slot_attention import gated_slot_attention
+from examples.hgrn import hgrn
+from examples.normalized_linear_attention import EPS, normalized_linear_attention
+from examples.rebased_attention import rebased_attention
+from examples.retention_attention import retention_attention, retention_decay
+from examples.rwkv6_attention import rwkv6_attention
 
 pytestmark = [pytest.mark.functional, pytest.mark.gpu]
 

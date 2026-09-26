@@ -58,10 +58,11 @@ any arity, `Outer`, `Contract`, `Softmax`, and prior-State readouts.)
 
 ## Consequences
 
-- `examples/fla_coverage.py` expresses every per-token linear recurrence in
-  `fla.ops` and records the coverage table; `tests/functional/test_fla_coverage.py`
-  checks library parity for the operators whose reference semantics were
-  confirmed from source.
+- Every per-token linear recurrence in `fla.ops` is expressed by a Program in
+  `examples/`, and `examples/fla_coverage.py` records the coverage table that
+  points at those factories; `tests/functional/test_fla_coverage.py` checks
+  library parity for the operators whose reference semantics were confirmed from
+  source.
 - Softmax and sparse attention (`attn`, `forgetting_attn`, `nsa`) stay with
   `AttentionEngine`; a stateful linear-recurrence language is the wrong home for
   them, and that engine already implements their online forms.

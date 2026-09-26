@@ -57,10 +57,12 @@ implicit second transition; `prior=True` names the pre-transition State instead.
 
 ## Consequences
 
-- `examples/fla_coverage.py` now authors Based, Rebased, Gated Slot Attention, and
-  RWKV6, and the coverage table records them; `tests/functional/test_fla_coverage.py`
-  checks parity with `fused_chunk_based`, `parallel_rebased`, `chunk_gsa`, and
-  `chunk_rwkv6` on H20.
+- `examples/based_attention.py`, `examples/rebased_attention.py`,
+  `examples/gated_slot_attention.py`, and `examples/rwkv6_attention.py` author
+  Based, Rebased, Gated Slot Attention, and RWKV6; the coverage table in
+  `examples/fla_coverage.py` points at them, and
+  `tests/functional/test_fla_coverage.py` checks parity with `fused_chunk_based`,
+  `parallel_rebased`, `chunk_gsa`, and `chunk_rwkv6` on H20.
 - The RWKV6 entry was corrected rather than extended. The previous
   `rwkv6_recurrence` Program read a token shift and a removal term into the
   library's chunk kernel; `fla.ops.rwkv6.recurrent_naive` defines

@@ -12,9 +12,8 @@ The names match the corresponding FLA operators:
 * :func:`gla_attention` matches ``chunk_gla`` with a feature-wise gate;
 * :func:`lightning_attention` matches Lightning Attention's scalar gate schedule.
 
-FLA's normalized linear attention keeps an additional scalar denominator state;
-the first MetaAttention state schema models one matrix state, so that variant
-is intentionally exposed only through ``normalize=False`` semantics. Forgetting
+FLA's normalized linear attention keeps an additional denominator State, so it is
+a separate Program in :mod:`examples.normalized_linear_attention`. Forgetting
 attention is softmax attention with decay, not this matrix-state recurrence.
 """
 from __future__ import annotations
