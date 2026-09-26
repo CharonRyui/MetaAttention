@@ -18,7 +18,7 @@ from typing import (
 
 import torch
 
-SCHEMA_VERSION = "stateful-operator-ir/1"
+SCHEMA_VERSION = "stateful-operator-ir/2"
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
@@ -161,14 +161,44 @@ class InputExpression:
     def __radd__(self, other: InputExpression | float | int) -> Add:
         return Add(as_expression(other), self)
 
+    def __sub__(self, other: InputExpression | float | int) -> Add:
+        return Add(self, Negate(as_expression(other)))
+
+    def __rsub__(self, other: InputExpression | float | int) -> Add:
+        return Add(as_expression(other), Negate(self))
+
     def __mul__(self, other: InputExpression | float | int) -> Multiply:
         return Multiply(self, as_expression(other))
 
     def __rmul__(self, other: InputExpression | float | int) -> Multiply:
         return Multiply(as_expression(other), self)
 
+    def __truediv__(self, other: InputExpression | float | int) -> Divide:
+        return Divide(self, as_expression(other))
+
+    def __rtruediv__(self, other: InputExpression | float | int) -> Divide:
+        return Divide(as_expression(other), self)
+
     def __neg__(self) -> Negate:
         return Negate(self)
+
+    def exp(self) -> Exp:
+        return Exp(self)
+
+    def log(self) -> Log:
+        return Log(self)
+
+    def sigmoid(self) -> Sigmoid:
+        return Sigmoid(self)
+
+    def sqrt(self) -> Sqrt:
+        return Sqrt(self)
+
+    def reciprocal(self) -> Reciprocal:
+        return Reciprocal(self)
+
+    def clamp(self, minimum: float, maximum: float) -> Clamp:
+        return Clamp(self, minimum, maximum)
 
 
 @dataclass(frozen=True)
@@ -229,6 +259,103 @@ class Exp(InputExpression):
     operand: InputExpression
 
 
+@dataclass(frozen=True)
+class Divide(InputExpression):
+    """Quotient of two expressions; computed in FP32 like every reciprocal form."""
+
+    left: InputExpression
+    right: InputExpression
+
+
+@dataclass(frozen=True)
+class Log(InputExpression):
+    operand: InputExpression
+
+
+@dataclass(frozen=True)
+class Sigmoid(InputExpression):
+    operand: InputExpression
+
+
+@dataclass(frozen=True)
+class Sqrt(InputExpression):
+    operand: InputExpression
+
+
+@dataclass(frozen=True)
+class Reciprocal(InputExpression):
+    operand: InputExpression
+
+
+@dataclass(frozen=True, init=False)
+class Clamp(InputExpression):
+    """Finite two-sided clamp; the bounds are compile-time constants."""
+
+    operand: InputExpression
+    minimum: float
+    maximum: float
+
+    def __init__(
+        self, operand: InputExpression | float | int, minimum: float, maximum: float
+    ) -> None:
+        low, high = float(minimum), float(maximum)
+        if not (math.isfinite(low) and math.isfinite(high)) or low > high:
+            raise ValueError("Clamp bounds must be finite and ordered")
+        object.__setattr__(self, "operand", as_expression(operand))
+        object.__setattr__(self, "minimum", low)
+        object.__setattr__(self, "maximum", high)
+
+
+@dataclass(frozen=True, init=False)
+class Shift(InputExpression):
+    """Value of ``operand`` ``lag`` tokens earlier inside the same sequence.
+
+    Tokens whose lag crosses a sequence boundary read the typed zero of
+    ``operand``, matching the zero padding used by the gate/token-shift forms in
+    Flash Linear Attention.
+    """
+
+    operand: InputExpression
+    lag: int
+
+    def __init__(self, operand: InputExpression | float | int, lag: int) -> None:
+        steps = int(lag)
+        if isinstance(lag, bool) or steps < 1:
+            raise ValueError("Shift requires a positive integer lag")
+        object.__setattr__(self, "operand", as_expression(operand))
+        object.__setattr__(self, "lag", steps)
+
+
+@dataclass(frozen=True, init=False)
+class StateTerm(InputExpression):
+    """Contraction of one named State inside a readout expression.
+
+    ``role`` selects the contracted Feature role; the term carries the State's
+    other Feature role. ``role=None`` reads a rank-1 State itself without
+    contraction, which is how identity readouts such as HGRN's ``o = h`` are
+    expressed. Readouts observe post-transition State; Transitions are driven by
+    Inputs only, so a State Term never appears inside a Transition.
+    """
+
+    state: str
+    operand: InputExpression
+    role: FeatureRole | None
+
+    def __init__(
+        self,
+        state: str,
+        operand: InputExpression | float | int,
+        role: FeatureRole | None,
+    ) -> None:
+        if not isinstance(state, str) or not state:
+            raise TypeError("State Term requires a State name")
+        if role is not None and not isinstance(role, FeatureRole):
+            raise TypeError("State Term role must be a Feature role or None")
+        object.__setattr__(self, "state", state)
+        object.__setattr__(self, "operand", as_expression(operand))
+        object.__setattr__(self, "role", role)
+
+
 def as_expression(value: InputExpression | float | int) -> InputExpression:
     if isinstance(value, InputExpression):
         return value
@@ -265,31 +392,43 @@ class TensorInput:
 
 @dataclass(frozen=True, init=False)
 class StateSpec:
+    """One recurrent State: a matrix with two ordered Features, or a vector.
+
+    A rank-2 State carries two distinct ordered Feature roles; a rank-1 State
+    (``Batch, Head, Feature``) carries a single Feature role and is how scalar
+    accumulators such as a linear-attention denominator are declared.
+    """
+
     name: str
-    roles: tuple[_SingletonRole, HeadRole, FeatureRole, FeatureRole]
+    roles: tuple[_SingletonRole, HeadRole, FeatureRole, ...]
 
     def __init__(self, name: str, roles: TypingSequence[LogicalRole]) -> None:
         roles = tuple(roles)
         if (
-            len(roles) != 4
+            len(roles) not in (3, 4)
             or roles[0] != Batch
             or not isinstance(roles[1], HeadRole)
-            or not isinstance(roles[2], FeatureRole)
-            or not isinstance(roles[3], FeatureRole)
+            or not all(isinstance(role, FeatureRole) for role in roles[2:])
         ):
-            raise ValueError("matrix State roles are Batch, one Head, and two Features")
-        if roles[-2] == roles[-1]:
+            raise ValueError(
+                "State roles are Batch, one Head, and one or two Features"
+            )
+        if len(roles) == 4 and roles[2] == roles[3]:
             raise ValueError("State Feature roles must be distinct and ordered")
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "roles", roles)
+
+    @property
+    def rank(self) -> int:
+        return len(self.roles) - 2
 
     @property
     def head_role(self) -> HeadRole:
         return self.roles[1]
 
     @property
-    def feature_roles(self) -> tuple[FeatureRole, FeatureRole]:
-        return self.roles[2], self.roles[3]
+    def feature_roles(self) -> tuple[FeatureRole, ...]:
+        return tuple(self.roles[2:])
 
 
 @dataclass(frozen=True)
@@ -393,6 +532,36 @@ class StateContraction:
 
 
 @dataclass(frozen=True, init=False)
+class Readout:
+    """A named output produced by an arbitrary expression over States and Inputs.
+
+    The canonical single-role form is :class:`StateContraction`. ``Readout`` is
+    the general form used when an output combines several States, divides by a
+    denominator State, adds a non-State term, or reads a State without
+    contraction. Its expression may contain :class:`StateTerm` nodes, which
+    reference post-transition State values.
+    """
+
+    name: str
+    expression: InputExpression
+    output_dtype: torch.dtype
+
+    def __init__(
+        self,
+        name: str,
+        expression: InputExpression | float | int,
+        output_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
+        if not isinstance(name, str) or not name:
+            raise TypeError("Readout requires a name")
+        if output_dtype not in _SUPPORTED_DTYPES:
+            raise ValueError("Readout output supports only BF16 and FP32")
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "expression", as_expression(expression))
+        object.__setattr__(self, "output_dtype", output_dtype)
+
+
+@dataclass(frozen=True, init=False)
 class HeadMapping:
     mappings: tuple[tuple[HeadRole, HeadRole], ...]
 
@@ -444,24 +613,42 @@ class StateTransition:
 class AlgorithmIR:
     inputs: tuple[TensorInput, ...]
     states: tuple[StateSpec, ...]
-    transition: StateTransition
-    readouts: tuple[StateContraction, ...]
+    transitions: tuple[StateTransition, ...]
+    readouts: tuple[StateContraction | Readout, ...]
     head_mapping: HeadMapping
 
     def __init__(
         self,
         inputs: TypingSequence[TensorInput],
         states: TypingSequence[StateSpec],
-        transition: StateTransition,
-        readouts: TypingSequence[StateContraction],
+        transition: StateTransition | TypingSequence[StateTransition],
+        readouts: TypingSequence[StateContraction | Readout],
         head_mapping: HeadMapping,
     ) -> None:
+        transitions = (
+            (transition,) if isinstance(transition, StateTransition) else tuple(transition)
+        )
         object.__setattr__(self, "inputs", tuple(inputs))
         object.__setattr__(self, "states", tuple(states))
-        object.__setattr__(self, "transition", transition)
+        object.__setattr__(self, "transitions", transitions)
         object.__setattr__(self, "readouts", tuple(readouts))
         object.__setattr__(self, "head_mapping", head_mapping)
         self._validate()
+
+    @property
+    def transition(self) -> StateTransition:
+        """The single Transition; only valid for one-State programs."""
+        if len(self._transitions) != 1:
+            raise StatefulCompilationError(
+                "IR_SCHEMA",
+                "transitions",
+                {"expected": "single State program", "actual": len(self._transitions)},
+            )
+        return self._transitions[0]
+
+    @property
+    def _transitions(self) -> tuple[StateTransition, ...]:
+        return self.transitions
 
     def _validate(self) -> None:
         from ._stateful_ir_validation import (
@@ -473,6 +660,8 @@ class AlgorithmIR:
         validate_algorithm_structure(self)
         object.__setattr__(self, "_analysis", analyze_algorithm(self))
         validate_transition_structure(self)
+
+
 
     @property
     def _structural_identity(self) -> str:
@@ -510,7 +699,7 @@ class _Runtime:
     token_count: int
     uniform_length: int | None
     state_heads: int
-    feature_sizes: tuple[int, int]
+    feature_sizes: tuple[int, ...]
     offsets: torch.Tensor | None
 
 
@@ -586,7 +775,8 @@ class StatefulOperator:
         needs_dense = any(
             isinstance(node, RankOnePropagation)
             or isinstance(node, AxisScale) and len(node.roles) == 1
-            for node in self.algorithm.transition.propagations
+            for transition in self.algorithm.transitions
+            for node in transition.propagations
         )
         plan = compile_plan(
             mode=compilation.mode,
@@ -634,7 +824,11 @@ class StatefulOperator:
         from ._stateful_runtime_validation import validate_input_names
 
         validate_input_names({item.name for item in self.algorithm.inputs}, inputs)
-        runtime, role_sizes = self._validate_runtime(inputs, sequence_offsets)
+        runtime, role_sizes = self._validate_runtime(
+            inputs,
+            sequence_offsets,
+            dict(compiled.compilation.role_sizes),
+        )
         expected_packed = compiled.compilation.mode == "packed"
         if runtime.packed != expected_packed:
             raise StatefulCompilationError(
@@ -645,14 +839,18 @@ class StatefulOperator:
         self._validate_target(runtime.device, compiled.compilation.target)
         self._validate_aliases(inputs)
         self._validate_fixed_roles(role_sizes, compiled.compilation)
-        state = self._validate_state(
+        initial_states = self._validate_state(
             initial_state,
             runtime,
+            role_sizes,
             cache_default=not (runtime.token_count == 0 and return_final_state),
+        )
+        requires_grad_state = any(
+            tensor.requires_grad for tensor in initial_states.values()
         )
         if not compiled.compilation.options.backward and (
             torch.is_grad_enabled()
-            and (state.requires_grad or any(tensor.requires_grad for tensor in inputs.values()))
+            and (requires_grad_state or any(tensor.requires_grad for tensor in inputs.values()))
         ):
             raise StatefulCompilationError(
                 "RUNTIME_GRAD", "inputs", {"backward": "not compiled"}
@@ -665,6 +863,13 @@ class StatefulOperator:
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
         plan.workspace_allocator.acquire(runtime.device, workspace_size)
+        from ._stateful_reference import requires_reference_lowering
+
+        if requires_reference_lowering(self.algorithm):
+            return self._execute_reference(
+                runtime, role_sizes, inputs, initial_states, return_final_state
+            )
+        state = initial_states[self.algorithm.states[0].name]
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
             plan.runtime_family == "scalar-factorized"
@@ -749,14 +954,31 @@ class StatefulOperator:
                     "COMPILE_ROLE_SIZE", f"role_sizes.{role}", {"size": size}
                 )
         state = self.algorithm.states[0]
-        feature_sizes = tuple(role_sizes[role] for role in state.feature_roles)
-        if target.device_type == "cuda" and any(size not in (64, 128) for size in feature_sizes):
-            if os.environ.get("STATEFUL_OPERATOR_TEST_CPU") != "1":
-                raise StatefulCompilationError(
-                    "SPECIALIZATION",
-                    "role_sizes",
-                    {"feature_sizes": feature_sizes, "supported": [64, 128]},
-                )
+        head_roles = {spec.head_role for spec in self.algorithm.states}
+        if len(head_roles) != 1:
+            raise StatefulCompilationError(
+                "IR_SCHEMA",
+                "states",
+                {
+                    "expected": "States share one Head role",
+                    "actual": sorted(str(role) for role in head_roles),
+                },
+            )
+        for spec in self.algorithm.states:
+            feature_sizes = tuple(role_sizes[role] for role in spec.feature_roles)
+            if target.device_type == "cuda" and any(
+                size not in (64, 128) for size in feature_sizes
+            ):
+                if os.environ.get("STATEFUL_OPERATOR_TEST_CPU") != "1":
+                    raise StatefulCompilationError(
+                        "SPECIALIZATION",
+                        "role_sizes",
+                        {
+                            "state": spec.name,
+                            "feature_sizes": feature_sizes,
+                            "supported": [64, 128],
+                        },
+                    )
         state_heads = role_sizes[state.head_role]
         for source, mapped_target in self.algorithm.head_mapping.mappings:
             if mapped_target != state.head_role or state_heads % role_sizes[source]:
@@ -785,10 +1007,17 @@ class StatefulOperator:
         self,
         inputs: Mapping[str, torch.Tensor],
         offsets: torch.Tensor | None,
+        declared_roles: Mapping[LogicalRole, int] | None = None,
     ) -> tuple[_Runtime, dict[str, int]]:
         packed = offsets is not None
         device: torch.device | None = None
-        role_sizes: dict[LogicalRole, int] = {}
+        # Fixed Roles are validated against the compiled contract; a Role carried
+        # only by a State (never by an Input) must still resolve.
+        role_sizes: dict[LogicalRole, int] = {
+            role: size
+            for role, size in (declared_roles or {}).items()
+            if isinstance(role, (HeadRole, FeatureRole))
+        }
         token_count: int | None = None
         uniform_length: int | None = None
         for spec in self.algorithm.inputs:
@@ -908,14 +1137,21 @@ class StatefulOperator:
             raise StatefulCompilationError(
                 "RUNTIME_SHAPE", "states[0].roles", {"missing_role": error.args[0]}
             ) from error
-        if device.type == "cuda" and (
-            feature_sizes[0] not in (64, 128) or feature_sizes[1] not in (64, 128)
-        ):
-            raise StatefulCompilationError(
-                "SPECIALIZATION",
-                "states[0].roles",
-                {"feature_sizes": feature_sizes, "supported": [64, 128]},
-            )
+        for spec in self.algorithm.states:
+            try:
+                sizes = tuple(role_sizes[role] for role in spec.feature_roles)
+            except KeyError as error:
+                raise StatefulCompilationError(
+                    "RUNTIME_SHAPE",
+                    f"states.{spec.name}",
+                    {"missing_role": error.args[0]},
+                ) from error
+            if device.type == "cuda" and any(size not in (64, 128) for size in sizes):
+                raise StatefulCompilationError(
+                    "SPECIALIZATION",
+                    "states[0].roles",
+                    {"state": spec.name, "feature_sizes": sizes, "supported": [64, 128]},
+                )
         for source, target in self.algorithm.head_mapping.mappings:
             if target != state_spec.head_role or source not in role_sizes:
                 raise StatefulCompilationError(
@@ -933,7 +1169,7 @@ class StatefulOperator:
                 token_count,
                 uniform_length,
                 state_heads,
-                (feature_sizes[0], feature_sizes[1]),
+                tuple(feature_sizes),
                 offsets,
             ),
             role_sizes,
@@ -955,46 +1191,134 @@ class StatefulOperator:
         self,
         state: StateTuple | None,
         runtime: _Runtime,
+        role_sizes: Mapping[LogicalRole, int],
         *,
         cache_default: bool,
-    ) -> torch.Tensor:
-        spec = self.algorithm.states[0]
-        shape = (
-            runtime.sequence_count,
-            runtime.state_heads,
-            runtime.feature_sizes[0],
-            runtime.feature_sizes[1],
-        )
-        if state is None:
-            if not cache_default:
-                return torch.zeros(shape, device=runtime.device, dtype=torch.float32)
-            key = (runtime.device, *shape)
-            cached = self._zero_states.get(key)
-            if cached is None:
-                cached = torch.zeros(shape, device=runtime.device, dtype=torch.float32)
-                self._zero_states[key] = cached
-            return cached
-        if not isinstance(state, StateTuple) or state.names != (spec.name,):
-            raise StatefulCompilationError(
-                "RUNTIME_STATE", "initial_state", {"expected": [spec.name]}
-            )
-        tensor = state[0]
-        if (
-            tuple(tensor.shape) != shape
-            or tensor.dtype != torch.float32
-            or tensor.device != runtime.device
-            or not tensor.is_contiguous()
+    ) -> dict[str, torch.Tensor]:
+        """Validate initial State for every declared State and return them by name."""
+        expected = tuple(spec.name for spec in self.algorithm.states)
+        if state is not None and (
+            not isinstance(state, StateTuple) or state.names != expected
         ):
             raise StatefulCompilationError(
-                "RUNTIME_STATE",
-                f"initial_state.{spec.name}",
-                {
-                    "shape": shape,
-                    "dtype": "torch.float32",
-                    "device": str(runtime.device),
-                },
+                "RUNTIME_STATE", "initial_state", {"expected": list(expected)}
             )
-        return tensor
+        states: dict[str, torch.Tensor] = {}
+        for index, spec in enumerate(self.algorithm.states):
+            shape = (
+                runtime.sequence_count,
+                role_sizes[spec.head_role],
+                *(role_sizes[role] for role in spec.feature_roles),
+            )
+            if state is None:
+                states[spec.name] = self._zero_state(
+                    runtime, spec.name, shape, cache_default
+                )
+                continue
+            tensor = state[index]
+            if (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != torch.float32
+                or tensor.device != runtime.device
+                or not tensor.is_contiguous()
+            ):
+                raise StatefulCompilationError(
+                    "RUNTIME_STATE",
+                    f"initial_state.{spec.name}",
+                    {
+                        "shape": shape,
+                        "dtype": "torch.float32",
+                        "device": str(runtime.device),
+                    },
+                )
+            states[spec.name] = tensor
+        return states
+
+    def _zero_state(
+        self, runtime: _Runtime, name: str, shape: tuple[int, ...], cache_default: bool
+    ) -> torch.Tensor:
+        if not cache_default:
+            return torch.zeros(shape, device=runtime.device, dtype=torch.float32)
+        key = (runtime.device, name, shape)
+        cached = self._zero_states.get(key)
+        if cached is None:
+            cached = torch.zeros(shape, device=runtime.device, dtype=torch.float32)
+            self._zero_states[key] = cached
+        return cached
+
+    def _execute_reference(
+        self,
+        runtime: _Runtime,
+        role_sizes: Mapping[LogicalRole, int],
+        inputs: Mapping[str, torch.Tensor],
+        initial_states: Mapping[str, torch.Tensor],
+        return_final_state: bool,
+    ) -> ExecutionResult:
+        """Execute a schema-v2 Program through the reference lowering."""
+        from ._stateful_reference import execute_reference, normalize_inputs
+
+        algorithm = self.algorithm
+        heads = runtime.state_heads
+        if runtime.packed:
+            assert runtime.offsets is not None
+            lengths = runtime.offsets[1:] - runtime.offsets[:-1]
+            segment = torch.repeat_interleave(
+                torch.arange(runtime.sequence_count, device=runtime.device), lengths.long()
+            )
+        else:
+            assert runtime.uniform_length is not None
+            segment = torch.arange(
+                runtime.sequence_count, device=runtime.device
+            ).repeat_interleave(runtime.uniform_length)
+        values = normalize_inputs(
+            algorithm,
+            role_sizes,
+            inputs,
+            packed=runtime.packed,
+            sequence_count=runtime.sequence_count,
+            token_count=runtime.token_count,
+            uniform_length=runtime.uniform_length,
+            state_heads=heads,
+            device=runtime.device,
+        )
+        outputs, finals = execute_reference(
+            algorithm,
+            values=values,
+            initial_states=initial_states,
+            segment=segment,
+            role_sizes=role_sizes,
+            heads=heads,
+            token_count=runtime.token_count,
+            device=runtime.device,
+            return_final_state=return_final_state,
+        )
+        ordered: list[torch.Tensor] = []
+        for readout in algorithm.readouts:
+            tensor = outputs[readout.name]
+            if runtime.packed:
+                ordered.append(tensor)
+            else:
+                assert runtime.uniform_length is not None
+                ordered.append(
+                    tensor.reshape(
+                        runtime.sequence_count,
+                        runtime.uniform_length,
+                        heads,
+                        tensor.shape[-1],
+                    ).permute(0, 2, 1, 3)
+                )
+        final_state = None
+        if finals is not None:
+            final_state = StateTuple(
+                tuple(spec.name for spec in algorithm.states),
+                tuple(finals[spec.name] for spec in algorithm.states),
+            )
+        return ExecutionResult(
+            NamedOutputTuple(
+                tuple(readout.name for readout in algorithm.readouts), tuple(ordered)
+            ),
+            final_state,
+        )
 
     def _normalize_inputs(
         self,
@@ -1508,26 +1832,182 @@ def _segmented_elementwise_scan(
 
 
 def _evaluate(
-    expression: InputExpression, values: Mapping[str, torch.Tensor]
+    expression: InputExpression,
+    values: Mapping[str, torch.Tensor],
+    *,
+    states: Mapping[str, torch.Tensor] | None = None,
+    state_specs: Mapping[str, Any] | None = None,
+    feature_axes: Mapping[Any, int] | None = None,
+    segment: torch.Tensor | None = None,
+    squeeze_features: bool = False,
 ) -> torch.Tensor:
+    """Evaluate an Input Expression; State Terms need the State binding.
+
+    ``squeeze_features`` selects the readout value space, where an Input carries
+    only the Feature axes it actually declares, so an input term and a State Term
+    result can be combined arithmetically.
+    """
     if isinstance(expression, Input):
-        return values[expression.name]
+        bound = values[expression.name]
+        return _squeeze_singleton_features(bound) if squeeze_features else bound
     if isinstance(expression, Constant):
-        sample = next(iter(values.values()))
-        return torch.tensor(
-            expression.value, device=sample.device, dtype=expression.dtype
-        )
+        device = _expression_device(values, states)
+        return torch.full((), expression.value, device=device, dtype=expression.dtype)
     if isinstance(expression, Add):
-        return _evaluate(expression.left, values) + _evaluate(expression.right, values)
+        return _evaluate(
+            expression.left, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        ) + _evaluate(
+            expression.right, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        )
     if isinstance(expression, Multiply):
-        return _evaluate(expression.left, values) * _evaluate(expression.right, values)
+        return _evaluate(
+            expression.left, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        ) * _evaluate(
+            expression.right, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        )
+    if isinstance(expression, Divide):
+        return _evaluate(
+            expression.left, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        ) / _evaluate(
+            expression.right, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        )
     if isinstance(expression, Negate):
-        return -_evaluate(expression.operand, values)
-    if isinstance(expression, Exp):
-        return _evaluate(expression.operand, values).float().exp()
+        return -_evaluate(
+            expression.operand, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        )
+    if isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
+        operand = _evaluate(
+            expression.operand, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        ).float()
+        if isinstance(expression, Exp):
+            return operand.exp()
+        if isinstance(expression, Log):
+            return operand.log()
+        if isinstance(expression, Sigmoid):
+            return operand.sigmoid()
+        if isinstance(expression, Sqrt):
+            return operand.sqrt()
+        if isinstance(expression, Reciprocal):
+            return operand.reciprocal()
+        return operand.clamp(expression.minimum, expression.maximum)
+    if isinstance(expression, Shift):
+        if segment is None:
+            raise StatefulCompilationError(
+                "IR_TYPE", "expression.Shift", {"reason": "missing sequence segment"}
+            )
+        operand = _evaluate(
+            expression.operand, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        )
+        return _shift_within_segment(operand, expression.lag, segment)
+    if isinstance(expression, StateTerm):
+        if states is None or state_specs is None:
+            raise StatefulCompilationError(
+                "IR_TYPE", "expression.StateTerm", {"reason": "missing State binding"}
+            )
+        spec = state_specs[expression.state]
+        operand = _evaluate(
+            expression.operand, values, states=states, state_specs=state_specs,
+            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features
+        )
+        return _contract_state_term(operand, spec, expression.role, states[expression.state], feature_axes)
     raise StatefulCompilationError(
         "IR_TYPE", "expression", {"node": type(expression).__name__}
     )
+
+
+def _expression_device(
+    values: Mapping[str, torch.Tensor], states: Mapping[str, torch.Tensor] | None
+) -> torch.device:
+    for tensor in values.values():
+        return tensor.device
+    if states:
+        for tensor in states.values():
+            return tensor.device
+    raise StatefulCompilationError(
+        "IR_TYPE", "expression.Constant", {"reason": "no bound Tensor"}
+    )
+
+
+def _squeeze_singleton_features(value: torch.Tensor) -> torch.Tensor:
+    """Drop Feature axes that carry a single element (readout value space)."""
+    if value.ndim <= 2:
+        return value
+    kept = [axis for axis in range(2, value.ndim) if value.shape[axis] != 1]
+    order = [0, 1, *kept, *(axis for axis in range(2, value.ndim) if axis not in kept)]
+    return value.permute(*order).reshape(
+        value.shape[0], value.shape[1], *[value.shape[axis] for axis in kept]
+    )
+
+
+def _shift_within_segment(
+    operand: torch.Tensor, lag: int, segment: torch.Tensor
+) -> torch.Tensor:
+    """Shift a token-major tensor backwards, zero-filling sequence starts."""
+    token_count = operand.shape[0]
+    shifted = torch.zeros_like(operand)
+    if token_count <= lag:
+        return shifted
+    source = slice(0, token_count - lag)
+    destination = slice(lag, token_count)
+    same = segment[destination] == segment[source]
+    mask = same.view(-1, *([1] * (operand.ndim - 1)))
+    shifted[destination] = torch.where(mask, operand[source], torch.zeros_like(operand[source]))
+    return shifted
+
+
+def _contract_state_term(
+    operand: torch.Tensor,
+    state_spec: Any,
+    role: Any,
+    state_value: torch.Tensor,
+    feature_axes: Mapping[Any, int] | None,
+) -> torch.Tensor:
+    """Contract one State Feature role (or read a rank-1 State) from an operand."""
+    features = state_spec.feature_roles
+    if role is None:
+        if any(size != 1 for size in operand.shape[2:]):
+            raise StatefulCompilationError(
+                "IR_TYPE",
+                "expression.StateTerm",
+                {"identity_readout": "requires a State-free operand"},
+            )
+        scalars = operand.reshape(
+            *operand.shape[:2], *([1] * (state_value.ndim - 2))
+        ).float()
+        return state_value.float() * scalars
+    axes = feature_axes or {}
+    if operand.ndim < 4:
+        axis = operand.ndim - 1
+    else:
+        axis = axes.get(role)
+    if axis is None:
+        raise StatefulCompilationError(
+            "IR_TYPE", "expression.StateTerm", {"role": str(role)}
+        )
+    moved = operand.movedim(axis, 2)
+    if any(size != 1 for size in moved.shape[3:]):
+        raise StatefulCompilationError(
+            "IR_TYPE",
+            "expression.StateTerm",
+            {"operand_features": [str(feature) for feature in axes]},
+        )
+    reduced = moved.reshape(moved.shape[0], moved.shape[1], moved.shape[2]).float()
+    state_float = state_value.float()
+    if state_spec.rank == 1:
+        return torch.einsum("thf,thf->th", reduced, state_float).unsqueeze(-1)
+    if role == features[0]:
+        return torch.einsum("thf,thfv->thv", reduced, state_float)
+    return torch.einsum("thv,thfv->thf", reduced, state_float)
+
 
 
 def _feature_vector(

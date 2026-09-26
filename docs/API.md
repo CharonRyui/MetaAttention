@@ -148,6 +148,34 @@ propagation, Product Injection tuples, explicit Head Mapping, and single-role
 State Contractions. Compiler analysis, Mathematical Plans, Lowered Candidates,
 KernelConfig, context contracts, and caches are internal.
 
+Schema v2 keeps every v1 form and adds what the remaining Flash Linear
+Attention families need:
+
+- **Several independent States** with one Transition each; States share one Head
+  role and use at most two distinct Feature roles.
+- **Rank-1 States** (`Batch, Head, Feature`) for scalar accumulators such as a
+  linear-attention denominator.
+- **Expression readouts**: `Readout(name, expression, output_dtype)` where the
+  expression may combine `StateTerm` contractions, inputs, and arithmetic,
+  including `Divide` by a denominator State, `Clamp`, and a non-State additive
+  term. A `StateTerm` with `role=None` reads a rank-1 State without contraction.
+- **More Input Expressions**: `Divide`, `Log`, `Sigmoid`, `Sqrt`, `Reciprocal`,
+  `Clamp`, and `Shift(expr, lag)` for token shift. Transcendental and reciprocal
+  forms compute in FP32, as `Exp` already did.
+- **Independent States stay Scanable**: a Transition is driven by Inputs only,
+  so the per-token summary remains affine and the parallel scan still applies.
+
+Schema-v2 Programs execute through the reference lowering in
+`attention_engine/attn_engine/_stateful_reference.py`: the same parallel
+segmented scans the specialized lowerings use, with per-State affine summaries
+and expression readouts. Gradients flow through the same lowering, so no eager
+token loop and no framework-derived backward is involved. Programs that stay
+within the v1 language keep their existing specialized TileLang plans.
+
+`examples/fla_coverage.py` authors every Flash Linear Attention operator that is
+a per-token linear recurrence in this language and records the coverage table;
+`tests/functional/test_fla_coverage.py` checks parity with the library operators.
+
 The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
 outputs, FP32 State, canonical contiguous layouts, and Feature pairs in
 `{64,128} × {64,128}`. Invalid IR, unsupported composition, Target mismatch,

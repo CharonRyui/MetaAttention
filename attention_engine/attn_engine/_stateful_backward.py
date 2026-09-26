@@ -58,7 +58,15 @@ def backward_eligibility(backward_ir: Any, family: str) -> tuple[bool, str | Non
     steps = getattr(backward_ir, "reverse_steps", None)
     if steps is None:
         return False, "BackwardIR has no reverse_steps"
-    supported = {"axis_scale", "rank_one", "product_injection", "state_contraction", "head_reduce", "state_recurrence"}
+    supported = {
+        "axis_scale",
+        "rank_one",
+        "product_injection",
+        "state_contraction",
+        "readout",
+        "head_reduce",
+        "state_recurrence",
+    }
     unsupported = [step.operation for step in steps if step.operation not in supported]
     if unsupported:
         return False, f"unsupported BackwardIR operations: {tuple(unsupported)!r}"

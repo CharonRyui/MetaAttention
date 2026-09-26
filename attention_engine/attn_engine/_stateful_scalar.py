@@ -344,6 +344,10 @@ def _compile_scalar_factorized_forward(
             output: T.Tensor((token_count, heads, columns), dtype=output_dtype),
             final: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
         ):
+            if False:
+                # tilelang resolves annotations through the kernel's free
+                # variables, so names used only in a signature must be referenced.
+                _ = (token_count, input_dtype, output_dtype)
             with T.Kernel(
                 sequence_count * heads,
                 T.ceildiv(columns, block_columns),

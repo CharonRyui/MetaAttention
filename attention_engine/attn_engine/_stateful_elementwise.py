@@ -71,6 +71,10 @@ def _compile_elementwise_prefix(
             ),
             output_bias: T.Tensor((token_count, heads, rows, columns), dtype=dtype),
         ):
+            if False:
+                # tilelang resolves annotations through the kernel's free
+                # variables, so names used only in a signature must be referenced.
+                _ = (dtype, rows)
             with T.Kernel(heads, matrix_blocks, threads=block_tokens) as (
                 head,
                 matrix_block,

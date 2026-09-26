@@ -21,6 +21,7 @@ class PlanRepresentation(str, Enum):
     RANK_ONE_FACTORIZED = "rank-one-factorized"
     SHARED_STATE_CONTRACTION = "shared-state-contraction"
     SCALAR_FACTORIZED = "scalar-factorized"
+    STATEFUL_REFERENCE = "stateful-reference"
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,14 @@ PLAN_RULES = {
         (
             PlanRepresentation.RANK_ONE_FACTORIZED.value,
             PlanRepresentation.SHARED_STATE_CONTRACTION.value,
+        ),
+    ),
+    PlanRepresentation.STATEFUL_REFERENCE: PlanRule(
+        PlanRepresentation.STATEFUL_REFERENCE,
+        (
+            "independent-affine-states",
+            "post-transition-readout-expressions",
+            "authored-propagation-order",
         ),
     ),
 }
@@ -132,11 +141,12 @@ class CandidateLowerer:
         )
 
     def estimate(
-        self, plan: MathematicalPlan, feature_sizes: tuple[int, int]
+        self, plan: MathematicalPlan, feature_sizes: tuple[int, ...]
     ) -> CandidateEstimate:
-        rows, columns = feature_sizes
-        workspace = rows * columns * 4
-        return CandidateEstimate(True, self.static_cost, workspace)
+        elements = 1
+        for size in feature_sizes:
+            elements *= size
+        return CandidateEstimate(True, self.static_cost, elements * 4)
 
 
 LOWERERS = (
@@ -168,7 +178,32 @@ LOWERERS = (
         20,
         "scalar-factorized",
     ),
+    CandidateLowerer(
+        "reference-stateful",
+        (PlanRepresentation.STATEFUL_REFERENCE,),
+        200,
+        "stateful-reference",
+    ),
 )
+
+
+def backward_context_family(
+    algorithm: Any, candidate: LoweredCandidate, dense_summary: bool
+) -> str:
+    """Select the backward context that matches the forward runtime branch.
+
+    The forward pass picks its elementwise scan whenever the per-token summary is
+    a scalar pair rather than dense ``(left, right)`` factors, so the generated
+    backward must be bound to the same context or it would ask for values the
+    forward never saved.
+    """
+    family = runtime_family_for(candidate)
+    if family == "axis-scale":
+        return "dense" if dense_summary else "elementwise"
+    if family in {"generic", "product-injection-gemm", "shared-state-contraction"}:
+        identity_only = not algorithm.transitions[0].propagations
+        return "elementwise" if identity_only and not dense_summary else "dense"
+    return "dense"
 
 
 def runtime_family_for(candidate: LoweredCandidate) -> str:
@@ -467,10 +502,16 @@ def compile_plan(
     compilation: Any,
 ) -> TileLangExecutable:
     """Enumerate mathematical plans, then bind one stable executable candidate."""
-    rewrites = _structured_rewrites(structural_features) if optimized else ()
-    representations = (PlanRepresentation.GENERIC_DENSE_AFFINE, *rewrites)
-    if optimized and scalar_factorized is not None:
-        representations += (PlanRepresentation.SCALAR_FACTORIZED,)
+    from ._stateful_reference import requires_reference_lowering
+
+    if requires_reference_lowering(operator.algorithm):
+        representations = (PlanRepresentation.STATEFUL_REFERENCE,)
+        rewrites = ()
+    else:
+        rewrites = _structured_rewrites(structural_features) if optimized else ()
+        representations = (PlanRepresentation.GENERIC_DENSE_AFFINE, *rewrites)
+        if optimized and scalar_factorized is not None:
+            representations += (PlanRepresentation.SCALAR_FACTORIZED,)
     mathematical_plans = tuple(
         MathematicalPlan(
             _digest((source_identity, representation.value)),
@@ -564,10 +605,10 @@ def compile_plan(
     fixed_roles = tuple((str(role), size) for role, size in compilation.role_sizes)
     backward_binding = None
     backward_values: tuple[tuple[str, int], ...] = ()
-    if backward_ir is not None:
+    if backward_ir is not None and not requires_reference_lowering(operator.algorithm):
         from ._stateful_backward import bind_backward
 
-        family = "dense" if dense_summary or runtime_family_for(candidate) != "elementwise" else "elementwise"
+        family = backward_context_family(operator.algorithm, candidate, dense_summary)
         backward_values = (("threads", 128),) if family == "dense" else (("block_tokens", 128),)
         backward_binding = bind_backward(backward_ir, family, backward_values)
     context_values = (
@@ -591,15 +632,23 @@ def compile_plan(
     tuning_identity = _digest(
         (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
     )
-    state_heads = dict(compilation.role_sizes)[operator.algorithm.states[0].head_role]
-    rows, columns = feature_sizes
+    fixed_sizes = dict(compilation.role_sizes)
+    state_heads = fixed_sizes[operator.algorithm.states[0].head_role]
+    per_token_elements = 0
+    for spec in operator.algorithm.states:
+        sizes = [fixed_sizes[role] for role in spec.feature_roles]
+        if spec.rank == 2:
+            rows, columns = sizes
+            per_token_elements += rows * rows + columns * columns + rows * columns
+        else:
+            per_token_elements += sizes[0] * sizes[0] + sizes[0]
     workspace = WorkspacePolicy(
-        bytes_per_token=state_heads * (rows * rows + columns * columns + rows * columns) * 4,
+        bytes_per_token=state_heads * per_token_elements * 4,
         maximum_bytes=target.workspace_bytes,
     )
     backward_candidate = None
     backward_kernel_config = None
-    if backward_ir is not None:
+    if backward_ir is not None and not requires_reference_lowering(operator.algorithm):
         backward_candidate = LoweredCandidate(
             _digest((source_identity, "tilelang-generic-backward", "backward")),
             source_identity,

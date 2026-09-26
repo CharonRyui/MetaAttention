@@ -23,7 +23,9 @@ def axis_scale_eligibility(algorithm: Any) -> Eligibility:
     scalar scale are elementwise; a one-feature scale is represented by a
     diagonal transform, including for non-square State features.
     """
-    propagations = algorithm.transition.propagations
+    propagations = tuple(
+        node for transition in algorithm.transitions for node in transition.propagations
+    )
     if not propagations:
         return False, "no-axis-scale-propagation"
     if not all(type(node).__name__ == "AxisScale" for node in propagations):
@@ -33,10 +35,16 @@ def axis_scale_eligibility(algorithm: Any) -> Eligibility:
 
 def product_injection_eligibility(algorithm: Any) -> Eligibility:
     """Return whether injections have explicit role-compatible GEMM factors."""
-    injections = algorithm.transition.injections
+    injections = tuple(
+        injection
+        for transition in algorithm.transitions
+        for injection in transition.injections
+    )
     if not injections:
         return False, "no-product-injection"
-    features = set(algorithm.states[0].feature_roles)
+    features = {
+        role for state in algorithm.states for role in state.feature_roles
+    }
     for index, injection in enumerate(injections):
         roles = [tuple(factor.roles) for factor in injection.factors]
         if any(set(item) - features for item in roles):
@@ -51,7 +59,9 @@ def product_injection_eligibility(algorithm: Any) -> Eligibility:
 
 def rank_one_eligibility(algorithm: Any) -> Eligibility:
     """Return whether ordered RankOne propagations can be factorized."""
-    propagations = algorithm.transition.propagations
+    propagations = tuple(
+        node for transition in algorithm.transitions for node in transition.propagations
+    )
     if not propagations or not any(type(node).__name__ == "RankOnePropagation" for node in propagations):
         return False, "no-rank-one-propagation"
     if not all(type(node).__name__ in {"RankOnePropagation", "AxisScale"} for node in propagations):
@@ -61,7 +71,11 @@ def rank_one_eligibility(algorithm: Any) -> Eligibility:
 
 def shared_state_contraction_eligibility(algorithm: Any) -> Eligibility:
     """Return whether at least two independent readouts share one State."""
-    readouts = algorithm.readouts
+    from .stateful_operator import StateContraction
+
+    readouts = [readout for readout in algorithm.readouts if isinstance(readout, StateContraction)]
+    if len(readouts) != len(algorithm.readouts):
+        return False, "readout-expressions-are-not-state-contractions"
     if len(readouts) < 2:
         return False, "fewer-than-two-readouts"
     states = {readout.state for readout in readouts}

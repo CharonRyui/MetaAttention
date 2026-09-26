@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
+import math
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -70,6 +71,7 @@ class AffineSummaryIR:
     state: str
     transform: str = "dense"
     additive: str = "state"
+    states: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,6 +88,7 @@ class BackwardIR:
     reverse_steps: tuple[VJPStep, ...]
     input_gradients: tuple[str, ...]
     initial_state_gradient: str
+    state_cotangents: tuple[tuple[str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -121,18 +124,33 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     from .stateful_operator import (
         Add,
         AxisScale,
+        Clamp,
         Constant,
+        Divide,
         Exp,
+        FeatureRole,
         Identity,
         Input,
+        Log,
         Multiply,
         Negate,
         RankOnePropagation,
+        Reciprocal,
+        Shift,
+        Sigmoid,
+        Sqrt,
+        StateContraction,
+        StateTerm,
         StatefulCompilationError,
         _canonical_identity,
     )
 
     input_types = {item.name: (item.dtype, item.roles) for item in algorithm.inputs}
+    states = {state.name: state for state in algorithm.states}
+    transitions = {transition.state: transition for transition in algorithm.transitions}
+    ordered = tuple(
+        (state, transitions[state.name]) for state in algorithm.states
+    )
     state = algorithm.states[0]
     feature_roles = state.feature_roles
     types: list[tuple[str, TypedExpression]] = []
@@ -152,7 +170,40 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             )
         elif isinstance(expression, Constant):
             typed = TypedExpression(expression, expression.dtype, ())
-        elif isinstance(expression, (Add, Multiply)):
+        elif isinstance(expression, StateTerm):
+            spec = states.get(expression.state)
+            if spec is None:
+                raise StatefulCompilationError(
+                    "IR_TYPE", path, {"unknown_state": expression.state}
+                )
+            operand = type_expression(expression.operand, f"{path}.operand")
+            feature = tuple(role for role in operand.roles if role in spec.feature_roles)
+            if expression.role is None:
+                if spec.rank != 1 or feature:
+                    raise StatefulCompilationError(
+                        "IR_TYPE",
+                        path,
+                        {"identity_readout": "requires a rank-1 State and a State-free operand"},
+                    )
+                produced = (*spec.feature_roles,)
+            else:
+                if feature != (expression.role,):
+                    raise StatefulCompilationError(
+                        "IR_TYPE",
+                        path,
+                        {
+                            "expected_feature": str(expression.role),
+                            "operand_features": _role_names(feature),
+                        },
+                    )
+                produced = tuple(
+                    role for role in spec.feature_roles if role != expression.role
+                )
+            kept_heads = tuple(
+                role for role in operand.roles if not isinstance(role, FeatureRole)
+            )
+            typed = TypedExpression(expression, torch.float32, (*kept_heads, *produced))
+        elif isinstance(expression, (Add, Multiply, Divide)):
             left = type_expression(expression.left, f"{path}.left")
             right = type_expression(expression.right, f"{path}.right")
             if not _broadcastable(left.roles, right.roles, algorithm):
@@ -164,15 +215,20 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                         "right_roles": _role_names(right.roles),
                     },
                 )
+            dtype = (
+                torch.float32
+                if isinstance(expression, Divide)
+                else _promote(left.dtype, right.dtype)
+            )
             typed = TypedExpression(
                 expression,
-                _promote(left.dtype, right.dtype),
+                dtype,
                 _broadcast_roles(left.roles, right.roles, algorithm),
             )
-        elif isinstance(expression, Negate):
+        elif isinstance(expression, (Negate, Shift)):
             operand = type_expression(expression.operand, f"{path}.operand")
             typed = TypedExpression(expression, operand.dtype, operand.roles)
-        elif isinstance(expression, Exp):
+        elif isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
             operand = type_expression(expression.operand, f"{path}.operand")
             typed = TypedExpression(expression, torch.float32, operand.roles)
         else:
@@ -183,141 +239,172 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         return typed
 
     reverse: list[VJPStep] = []
-    for index, node in enumerate(algorithm.transition.propagations):
-        path = f"transition.propagations[{index}]"
-        if isinstance(node, Identity):
-            continue
-        if isinstance(node, AxisScale):
-            typed = type_expression(node.factor, f"{path}.factor")
-            expected = tuple(role for role in typed.roles if role in feature_roles)
-            if set(expected) != set(node.roles):
-                raise StatefulCompilationError(
-                    "IR_TYPE",
-                    f"{path}.roles",
-                    {
-                        "factor_features": _role_names(expected),
-                        "declared": _role_names(node.roles),
-                    },
+    for state_index, (state_spec, transition) in enumerate(ordered):
+        base = "transition" if len(ordered) == 1 else f"transitions[{state_index}]"
+        for index, node in enumerate(transition.propagations):
+            path = f"{base}.propagations[{index}]"
+            if isinstance(node, Identity):
+                continue
+            if isinstance(node, AxisScale):
+                typed = type_expression(node.factor, f"{path}.factor")
+                expected = tuple(
+                    role for role in typed.roles if role in state_spec.feature_roles
                 )
-            reverse.append(VJPStep(path, "axis_scale", _input_names(node.factor)))
-        elif isinstance(node, RankOnePropagation):
-            left = type_expression(node.left, f"{path}.left")
-            right = type_expression(node.right, f"{path}.right")
-            coefficient = type_expression(node.coefficient, f"{path}.coefficient")
-            for name, typed in (("left", left), ("right", right)):
-                if tuple(role for role in typed.roles if role in feature_roles) != (
-                    node.role,
-                ):
+                if set(expected) != set(node.roles):
                     raise StatefulCompilationError(
                         "IR_TYPE",
-                        f"{path}.{name}",
-                        {"expected_feature": str(node.role)},
+                        f"{path}.roles",
+                        {
+                            "factor_features": _role_names(expected),
+                            "declared": _role_names(node.roles),
+                        },
                     )
-            if any(role in feature_roles for role in coefficient.roles):
-                raise StatefulCompilationError(
-                    "IR_TYPE", f"{path}.coefficient", {"expected": "feature scalar"}
+                reverse.append(VJPStep(path, "axis_scale", _input_names(node.factor)))
+            elif isinstance(node, RankOnePropagation):
+                left = type_expression(node.left, f"{path}.left")
+                right = type_expression(node.right, f"{path}.right")
+                coefficient = type_expression(node.coefficient, f"{path}.coefficient")
+                for name, typed in (("left", left), ("right", right)):
+                    if tuple(
+                        role
+                        for role in typed.roles
+                        if role in state_spec.feature_roles
+                    ) != (node.role,):
+                        raise StatefulCompilationError(
+                            "IR_TYPE",
+                            f"{path}.{name}",
+                            {"expected_feature": str(node.role)},
+                        )
+                if any(role in state_spec.feature_roles for role in coefficient.roles):
+                    raise StatefulCompilationError(
+                        "IR_TYPE", f"{path}.coefficient", {"expected": "feature scalar"}
+                    )
+                reverse.append(
+                    VJPStep(
+                        path,
+                        "rank_one",
+                        _input_names(node.left, node.right, node.coefficient),
+                    )
                 )
+            else:
+                raise StatefulCompilationError(
+                    "RECURRENT", path, {"node": type(node).__name__}
+                )
+
+        for index, injection in enumerate(transition.injections):
+            path = f"{base}.injections[{index}]"
+            for factor_index, factor in enumerate(injection.factors):
+                typed = type_expression(
+                    factor.expression, f"{path}.factors[{factor_index}].expression"
+                )
+                actual = tuple(
+                    role for role in typed.roles if role in state_spec.feature_roles
+                )
+                if set(actual) != set(factor.roles):
+                    raise StatefulCompilationError(
+                        "IR_TYPE",
+                        f"{path}.factors[{factor_index}].roles",
+                        {
+                            "expression_features": _role_names(actual),
+                            "declared": _role_names(factor.roles),
+                        },
+                    )
             reverse.append(
                 VJPStep(
                     path,
-                    "rank_one",
-                    _input_names(node.left, node.right, node.coefficient),
+                    "product_injection",
+                    tuple(
+                        name
+                        for factor in injection.factors
+                        for name in _input_names(factor.expression)
+                    ),
                 )
             )
-        else:
-            raise StatefulCompilationError(
-                "RECURRENT", path, {"node": type(node).__name__}
-            )
-
-    for index, injection in enumerate(algorithm.transition.injections):
-        path = f"transition.injections[{index}]"
-        for factor_index, factor in enumerate(injection.factors):
-            typed = type_expression(
-                factor.expression, f"{path}.factors[{factor_index}].expression"
-            )
-            actual = tuple(role for role in typed.roles if role in feature_roles)
-            if set(actual) != set(factor.roles):
-                raise StatefulCompilationError(
-                    "IR_TYPE",
-                    f"{path}.factors[{factor_index}].roles",
-                    {
-                        "expression_features": _role_names(actual),
-                        "declared": _role_names(factor.roles),
-                    },
-                )
-        reverse.append(
-            VJPStep(
-                path,
-                "product_injection",
-                tuple(
-                    name
-                    for factor in injection.factors
-                    for name in _input_names(factor.expression)
-                ),
-            )
-        )
 
     for index, readout in enumerate(algorithm.readouts):
         path = f"readouts[{index}]"
-        operand = type_expression(readout.operand, f"{path}.operand")
-        actual = tuple(role for role in operand.roles if role in feature_roles)
-        if actual != (readout.role,):
-            raise StatefulCompilationError(
-                "IR_TYPE", f"{path}.operand", {"expected_feature": str(readout.role)}
+        if isinstance(readout, StateContraction):
+            operand = type_expression(readout.operand, f"{path}.operand")
+            actual = tuple(
+                role for role in operand.roles if role in state.feature_roles
             )
-        reverse.append(
-            VJPStep(path, "state_contraction", _input_names(readout.operand))
-        )
+            if actual != (readout.role,):
+                raise StatefulCompilationError(
+                    "IR_TYPE", f"{path}.operand", {"expected_feature": str(readout.role)}
+                )
+            reverse.append(
+                VJPStep(path, "state_contraction", _input_names(readout.operand))
+            )
+        else:
+            type_expression(readout.expression, f"{path}.expression")
+            reverse.append(
+                VJPStep(path, "readout", _input_names(readout.expression))
+            )
 
     reverse.extend(
         VJPStep(f"head_mapping[{index}]", "head_reduce", (str(source),))
         for index, (source, _) in enumerate(algorithm.head_mapping.mappings)
     )
-    reverse.append(
-        VJPStep(
-            "transition.state",
-            "state_recurrence",
-            (state.name, f"d_{state.name}_final"),
+    for state_index, (state_spec, _) in enumerate(reversed(ordered)):
+        base = "transition" if len(ordered) == 1 else f"transitions[{len(ordered) - 1 - state_index}]"
+        reverse.append(
+            VJPStep(
+                f"{base}.state",
+                "state_recurrence",
+                (state_spec.name, f"d_{state_spec.name}_final"),
+            )
         )
-    )
     backward = BackwardIR(
         tuple(readout.name for readout in algorithm.readouts),
         f"d_{state.name}_final",
         tuple(reversed(reverse)),
         tuple(item.name for item in algorithm.inputs if item.differentiable),
         f"d_{state.name}_initial",
+        tuple(
+            (state_spec.name, f"d_{state_spec.name}_final", f"d_{state_spec.name}_initial")
+            for state_spec, _ in ordered
+        ),
     )
     scalar_factorized = None
     dense_scalar = None
-    scalar_propagations = all(
-        isinstance(node, Identity) or isinstance(node, AxisScale) and not node.roles
-        for node in algorithm.transition.propagations
+    primary_transition = algorithm.transitions[0]
+    v1_shape = (
+        len(algorithm.states) == 1
+        and algorithm.states[0].rank == 2
+        and all(isinstance(readout, StateContraction) for readout in algorithm.readouts)
     )
-    factorized_injections = bool(algorithm.transition.injections) and all(
+    scalar_propagations = v1_shape and all(
+        isinstance(node, Identity) or isinstance(node, AxisScale) and not node.roles
+        for node in primary_transition.propagations
+    )
+    factorized_injections = v1_shape and bool(primary_transition.injections) and all(
         len(injection.factors) == 2
         and {role for factor in injection.factors for role in factor.roles}
         == set(feature_roles)
         and all(len(factor.roles) == 1 for factor in injection.factors)
-        for injection in algorithm.transition.injections
+        for injection in primary_transition.injections
     )
-    same_orientation = bool(algorithm.readouts) and all(
+    same_orientation = v1_shape and bool(algorithm.readouts) and all(
         readout.role == feature_roles[0] for readout in algorithm.readouts
     )
     if scalar_propagations and factorized_injections and same_orientation:
-        if len(algorithm.transition.propagations) == 0:
+        if len(primary_transition.propagations) == 0:
             propagation = (
                 DenseInputIR("__identity_propagation__", 0, 1, 2, None),
                 ScalarExpressionIR("__identity_propagation__", "identity"),
             )
-        elif len(algorithm.transition.propagations) == 1:
-            propagation_node = algorithm.transition.propagations[0]
+        elif len(primary_transition.propagations) == 1:
+            propagation_node = primary_transition.propagations[0]
             propagation = _dense_scalar_binding(
                 propagation_node.factor, algorithm, feature_role=None
             )
         else:
             propagation = None
-        if len(algorithm.transition.injections) == 1 and len(algorithm.readouts) == 1:
-            injection = algorithm.transition.injections[0]
+        if (
+            len(primary_transition.injections) == 1
+            and len(algorithm.readouts) == 1
+        ):
+            injection = primary_transition.injections[0]
             left_factor = next(
                 factor
                 for factor in injection.factors
@@ -342,9 +429,9 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             if all(recipe is not None for recipe in (propagation, left, right, readout)):
                 dense_scalar = DenseScalarFactorizedIR(propagation, left, right, readout)
         scalar_factorized = ScalarFactorizedIR(
-            len(algorithm.transition.injections),
+            len(primary_transition.injections),
             len(algorithm.readouts),
-            len(algorithm.transition.propagations),
+            len(primary_transition.propagations),
             dense_scalar,
         )
     canonical_identity = _canonical_identity(algorithm)
@@ -362,19 +449,29 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         else ()
     )
     simplified = SimplifiedIR(simplified_identity, simplified_rewrites)
+    all_propagations = tuple(
+        node for transition in algorithm.transitions for node in transition.propagations
+    )
+    readout_states: set[str] = set()
+    for readout in algorithm.readouts:
+        if isinstance(readout, StateContraction):
+            readout_states.add(readout.state)
+        else:
+            readout_states.update(
+                term.state for _, term in _all_state_terms(readout.expression)
+            )
     structural_features = StructuralFeatures(
-        axis_scale=any(isinstance(node, AxisScale) for node in algorithm.transition.propagations),
-        product_injection=bool(algorithm.transition.injections),
+        axis_scale=any(isinstance(node, AxisScale) for node in all_propagations),
+        product_injection=any(transition.injections for transition in algorithm.transitions),
         rank_one=any(
-            isinstance(node, RankOnePropagation)
-            for node in algorithm.transition.propagations
+            isinstance(node, RankOnePropagation) for node in all_propagations
         ),
         shared_state_contraction=len(algorithm.readouts) > 1
-        and len({readout.state for readout in algorithm.readouts}) == 1,
+        and len(readout_states) == 1,
     )
     return Analysis(
         ExecutionClass.SCANABLE,
-        AffineSummaryIR(state.name),
+        AffineSummaryIR(state.name, "dense", "state", tuple(s.name for s in algorithm.states)),
         backward,
         tuple(types),
         scalar_factorized,
@@ -390,9 +487,30 @@ def _promote(left: torch.dtype, right: torch.dtype) -> torch.dtype:
 
 def simplify_expression(expression):
     """Apply representation-safe identities without reassociating arithmetic."""
-    from .stateful_operator import Add, Constant, Exp, Input, Multiply, Negate
+    from .stateful_operator import (
+        Add,
+        Clamp,
+        Constant,
+        Divide,
+        Exp,
+        Input,
+        Log,
+        Multiply,
+        Negate,
+        Reciprocal,
+        Shift,
+        Sigmoid,
+        Sqrt,
+        StateTerm,
+    )
 
-    if isinstance(expression, (Input, Constant)):
+    if isinstance(expression, (Input, Constant, StateTerm)):
+        if isinstance(expression, StateTerm):
+            return StateTerm(
+                expression.state,
+                simplify_expression(expression.operand),
+                expression.role,
+            )
         return expression
     if isinstance(expression, Negate):
         operand = simplify_expression(expression.operand)
@@ -404,7 +522,24 @@ def simplify_expression(expression):
         if isinstance(operand, Constant) and operand.value == 0:
             return Constant(1.0, operand.dtype)
         return Exp(operand)
-    if isinstance(expression, (Add, Multiply)):
+    if isinstance(expression, (Log, Sigmoid, Sqrt, Reciprocal)):
+        operand = simplify_expression(expression.operand)
+        if isinstance(operand, Constant):
+            folded = _fold_unary(expression, operand)
+            if folded is not None:
+                return folded
+        return type(expression)(operand)
+    if isinstance(expression, Clamp):
+        operand = simplify_expression(expression.operand)
+        if isinstance(operand, Constant):
+            return Constant(
+                min(max(operand.value, expression.minimum), expression.maximum),
+                operand.dtype,
+            )
+        return Clamp(operand, expression.minimum, expression.maximum)
+    if isinstance(expression, Shift):
+        return Shift(simplify_expression(expression.operand), expression.lag)
+    if isinstance(expression, (Add, Multiply, Divide)):
         left = simplify_expression(expression.left)
         right = simplify_expression(expression.right)
         if isinstance(expression, Add):
@@ -413,6 +548,10 @@ def simplify_expression(expression):
             if _is_constant(right, 0):
                 return left
             return Add(left, right)
+        if isinstance(expression, Divide):
+            if _is_constant(right, 1):
+                return left
+            return Divide(left, right)
         if _is_constant(left, 1):
             return right
         if _is_constant(right, 1):
@@ -421,47 +560,126 @@ def simplify_expression(expression):
     raise TypeError(f"unsupported expression: {type(expression).__name__}")
 
 
+def _fold_unary(expression, constant):
+    """Fold a transcendental or reciprocal of a non-negative literal Constant."""
+    from .stateful_operator import Constant, Log, Reciprocal, Sigmoid, Sqrt
+
+    value = constant.value
+    if isinstance(expression, (Log, Sqrt, Reciprocal)) and value <= 0:
+        return None
+    try:
+        if isinstance(expression, Log):
+            folded = math.log(value)
+        elif isinstance(expression, Sigmoid):
+            folded = 1.0 / (1.0 + math.exp(-value))
+        elif isinstance(expression, Sqrt):
+            folded = math.sqrt(value)
+        else:
+            folded = 1.0 / value
+    except (OverflowError, ValueError, ZeroDivisionError):
+        return None
+    if not math.isfinite(folded):
+        return None
+    return Constant(folded, constant.dtype)
+
+
+def _all_state_terms(expression):
+    """Yield ``(path, StateTerm)`` for every State reference in an expression."""
+    from .stateful_operator import (
+        Add,
+        Clamp,
+        Constant,
+        Divide,
+        Exp,
+        Input,
+        Log,
+        Multiply,
+        Negate,
+        Reciprocal,
+        Shift,
+        Sigmoid,
+        Sqrt,
+        StateTerm,
+    )
+
+    if isinstance(expression, StateTerm):
+        yield "state", expression
+        yield from _all_state_terms(expression.operand)
+        return
+    if isinstance(expression, (Input, Constant)):
+        return
+    if isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift)):
+        yield from _all_state_terms(expression.operand)
+        return
+    if isinstance(expression, (Add, Multiply, Divide)):
+        yield from _all_state_terms(expression.left)
+        yield from _all_state_terms(expression.right)
+        return
+    return
+
+
+
 
 
 
 
 def _simplified_identity_payload(algorithm):
     """Build a canonical identity payload without recursively validating a new IR."""
-    from .stateful_operator import AxisScale, ProductFactor, RankOnePropagation
+    from .stateful_operator import (
+        AxisScale,
+        ProductFactor,
+        RankOnePropagation,
+        Readout,
+        StateContraction,
+    )
 
-    propagations = tuple(
-        replace(node, factor=simplify_expression(node.factor))
-        if isinstance(node, AxisScale)
-        else replace(
-            node,
-            left=simplify_expression(node.left),
-            right=simplify_expression(node.right),
-            coefficient=simplify_expression(node.coefficient),
+    def simplify_transition(transition):
+        propagations = tuple(
+            replace(node, factor=simplify_expression(node.factor))
+            if isinstance(node, AxisScale)
+            else replace(
+                node,
+                left=simplify_expression(node.left),
+                right=simplify_expression(node.right),
+                coefficient=simplify_expression(node.coefficient),
+            )
+            if isinstance(node, RankOnePropagation)
+            else node
+            for node in transition.propagations
         )
-        if isinstance(node, RankOnePropagation)
-        else node
-        for node in algorithm.transition.propagations
-    )
-    injections = tuple(
-        replace(
-            injection,
-            factors=tuple(
-                ProductFactor(simplify_expression(factor.expression), factor.roles)
-                for factor in injection.factors
-            ),
+        injections = tuple(
+            replace(
+                injection,
+                factors=tuple(
+                    ProductFactor(simplify_expression(factor.expression), factor.roles)
+                    for factor in injection.factors
+                ),
+            )
+            for injection in transition.injections
         )
-        for injection in algorithm.transition.injections
-    )
-    transition = replace(
-        algorithm.transition,
-        propagations=propagations,
-        injections=injections,
+        return replace(
+            transition, propagations=propagations, injections=injections
+        )
+
+    transitions = tuple(
+        simplify_transition(transition) for transition in algorithm.transitions
     )
     readouts = tuple(
         replace(readout, operand=simplify_expression(readout.operand))
+        if isinstance(readout, StateContraction)
+        else replace(readout, expression=simplify_expression(readout.expression))
+        if isinstance(readout, Readout)
+        else readout
         for readout in algorithm.readouts
     )
-    return algorithm.inputs, algorithm.states, transition, readouts, algorithm.head_mapping
+    return (
+        algorithm.inputs,
+        algorithm.states,
+        transitions,
+        readouts,
+        algorithm.head_mapping,
+    )
+
 
 
 
@@ -521,15 +739,31 @@ def _role_names(roles: tuple[Any, ...]) -> list[str]:
 
 
 def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
-    from .stateful_operator import Add, Exp, Input, Multiply, Negate
+    from .stateful_operator import (
+        Add,
+        Clamp,
+        Divide,
+        Exp,
+        Input,
+        Log,
+        Multiply,
+        Negate,
+        Reciprocal,
+        Shift,
+        Sigmoid,
+        Sqrt,
+        StateTerm,
+    )
 
     result: list[str] = []
     for expression in expressions:
         if isinstance(expression, Input):
             result.append(expression.name)
-        elif isinstance(expression, (Add, Multiply)):
+        elif isinstance(expression, (Add, Multiply, Divide)):
             result.extend(_input_names(expression.left, expression.right))
-        elif isinstance(expression, (Negate, Exp)):
+        elif isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift)):
+            result.extend(_input_names(expression.operand))
+        elif isinstance(expression, StateTerm):
             result.extend(_input_names(expression.operand))
     return tuple(result)
 
