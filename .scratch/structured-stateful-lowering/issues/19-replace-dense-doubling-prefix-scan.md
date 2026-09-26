@@ -83,3 +83,17 @@ So `gla` moves from 6.2x to 4.05x of the scalar group: better, and not yet the 2
 
 Correctness: `tests/functional/test_chunked_elementwise.py` covers a row-decay Program at a chunk-aligned length (chunk-boundary tokens 63/64/127 and the final State), a two-axis Program through the same carry, and the scalar family's unchanged selection. Final-State error against the FP32 recurrence is 4.8e-6.
 
+**Latency progress at T=2048, measured, band = 0.304-0.312 ms (`linear` 0.304, `simple-gla` 0.312, `retnet` 0.315):**
+
+| family | start of this work | now | vs band | kernel time |
+| --- | --- | --- | --- | --- |
+| `gla` | 1.870 | **0.567 ms** | 1.9x | 0.232 ms |
+| `mamba2` | - | **0.608 ms** | 2.0x | 0.242 ms |
+| `gdn` | 4.568 | 4.568 ms | 15x | - |
+| `rwkv7` | 4.987 | 4.987 ms | 16x | - |
+| `rebased` (2 States, rank-1 denominator) | rejected | 3.306 ms | - | ~2.7 ms |
+
+`gla`'s kernel time is now 0.232 ms against FLA's 0.236 ms on the same shape, so the remaining 0.335 ms is prologue: the per-token decay factors are computed in torch (an `exp` over `[1,8,2048,64]` plus its fp32 cast), which fusion into the kernel would remove. Three changes got there: the chunk-parallel boundary walk, keeping the per-axis factors separate instead of their outer product (268 MB for a 64x64 State at T=2048, 1 GiB for `rebased`'s 256x64), and trying the chunked schedule before assembling an injection the chunked path never reads.
+
+`gdn` and `rwkv7` are untouched because their rank-one Transitions go through `factored_recurrence_dense`, which replays an interpreted operation list per token while holding the State column in registers: about 500x off FLOP-bound, so it needs the chunked WY form (chunk transition `I + L W R^T` via a triangular substitution, intra-chunk masked attention, matmul state update) rather than tuning.
+
