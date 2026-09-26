@@ -1733,6 +1733,22 @@ class StatefulOperator:
             )
             return tuple(output_values), final_state
 
+        if elementwise is not None and family == "axis-scale":
+            # tried before the injection is assembled: the chunked schedule takes
+            # the injection's own per-axis factors, so materializing the
+            # tokens*heads*rows*columns product first (268 MB for a 64x64 State at
+            # T=2048) is pure waste on this path
+            chunked = self._lower_chunked_elementwise(
+                values, initial_state, elementwise, second_factor, runtime, executable
+            )
+            if chunked is not None:
+                output, chunked_final = chunked
+                final_state = (
+                    StateTuple((state_spec.name,), (chunked_final,))
+                    if return_final_state
+                    else None
+                )
+                return (output,), final_state
         if executable.runtime_family == "product-injection-gemm":
             injection = product_injection_terms(
                 self.algorithm.transition.injections,
@@ -1760,18 +1776,6 @@ class StatefulOperator:
                 token_count, heads, left_size, right_size, device=device
             )
         segment_i32 = segment.to(torch.int32)
-        if elementwise is not None and family == "axis-scale":
-            chunked = self._lower_chunked_elementwise(
-                values, initial_state, injection, elementwise, second_factor, runtime, executable
-            )
-            if chunked is not None:
-                output, chunked_final = chunked
-                final_state = (
-                    StateTuple((state_spec.name,), (chunked_final,))
-                    if return_final_state
-                    else None
-                )
-                return (output,), final_state
         if elementwise is not None:
             # the summary factors are derived from the token-major input views,
             # so they are not always contiguous; materializing them here is the
@@ -1878,7 +1882,6 @@ class StatefulOperator:
         self,
         values: Mapping[str, torch.Tensor],
         initial_state: torch.Tensor,
-        injection: torch.Tensor,
         elementwise: torch.Tensor,
         second_factor: torch.Tensor | None,
         runtime: _Runtime,
