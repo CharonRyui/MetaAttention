@@ -163,8 +163,8 @@ def test_two_axis_gla_packed_isolates_sequences_and_empty_runs(gpu_device):
     assert torch.equal(result.final_state["memory"][3], initial[3])
 
 
-def test_two_axis_backward_compilation_keeps_the_dense_summary(gpu_device):
-    """A compiled backward owns dense factors, so the pair path must not engage."""
+def test_two_axis_gradients_match_the_token_recurrence(gpu_device):
+    """The paired VJP contracts each factor along the axis the other spans."""
     heads, dim, length = 2, 64, 33
     bindings = _bindings(gpu_device, (length,), heads, dim)
     dense = {
@@ -176,7 +176,7 @@ def test_two_axis_backward_compilation_keeps_the_dense_summary(gpu_device):
     ).requires_grad_()
     operator = dual_gate_gla_attention(1, heads, length, dim, dim)
     compiled = _compile(operator, heads, dim, backward=True)
-    assert compiled.operator._plans[compiled.specialization].dense_summary is True
+    assert compiled.operator._plans[compiled.specialization].dense_summary is False
 
     result = compiled(
         **dense,

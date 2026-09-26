@@ -872,11 +872,7 @@ class StatefulOperator:
 
         state = self.algorithm.states[0]
         role_sizes = dict(compilation.role_sizes)
-        # a two-axis elementwise pair has no compiler-derived VJP yet, so a
-        # compilation that asks for a backward keeps the dense summary factors
-        needs_dense = _dense_summary_required(self.algorithm) or (
-            compilation.options.backward and _two_axis_scale_required(self.algorithm)
-        )
+        needs_dense = _dense_summary_required(self.algorithm)
         plan = compile_plan(
             mode=compilation.mode,
             source_identity=self.algorithm._analysis.simplified.identity,
@@ -2041,17 +2037,6 @@ def _dense_summary_required(algorithm: AlgorithmIR) -> bool:
             if isinstance(node, RankOnePropagation):
                 return True
     return False
-
-
-def _two_axis_scale_required(algorithm: AlgorithmIR) -> bool:
-    """Whether the Transition scales both State Features in one elementwise pair."""
-    scaled_roles: set[Any] = set()
-    for transition in algorithm.transitions:
-        for node in transition.propagations:
-            if isinstance(node, AxisScale) and len(node.roles) == 1:
-                scaled_roles.add(node.roles[0])
-    features = set(algorithm.states[0].feature_roles)
-    return len(scaled_roles & features) > 1
 
 
 def _verify_product_roles(

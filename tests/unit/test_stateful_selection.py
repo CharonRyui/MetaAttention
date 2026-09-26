@@ -134,13 +134,9 @@ def test_optimization_disabled_selects_generic_execution_only():
 
 def test_two_scaled_axes_lower_without_a_dense_summary():
     """Both axes scaled is still diagonal: one factor per axis, not a summary pair."""
-    from attn_engine.stateful_operator import (
-        _dense_summary_required,
-        _two_axis_scale_required,
-    )
+    from attn_engine.stateful_operator import _dense_summary_required
 
     operator = dual_gate_gla_attention(1, HEADS, 32, 64, 64)
-    assert _two_axis_scale_required(operator.algorithm) is True
     assert _dense_summary_required(operator.algorithm) is False
     compiled = operator.compile(
         role_sizes=_sizes(operator, 64, 64),
@@ -152,7 +148,8 @@ def test_two_scaled_axes_lower_without_a_dense_summary():
     assert executable.dense_summary is False
     assert executable.plan.candidate.lowerer == "tilelang-elementwise"
 
-    # a compilation that asks for a backward keeps the dense factors its VJP owns
+    # a compilation that asks for a backward uses the same pair, whose VJP
+    # contracts each factor along the axis the other spans
     backward_compiled = operator.compile(
         role_sizes=_sizes(operator, 64, 64),
         target=Target(),
@@ -162,5 +159,5 @@ def test_two_scaled_axes_lower_without_a_dense_summary():
     )
     assert (
         backward_compiled.operator._plans[backward_compiled.specialization].dense_summary
-        is True
+        is False
     )

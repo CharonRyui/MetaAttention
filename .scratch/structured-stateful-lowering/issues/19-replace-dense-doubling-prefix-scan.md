@@ -54,6 +54,6 @@ What remains for 19b, in the measured order of impact:
 
 - [x] The elementwise prefix composes in one launch with no cross-thread scan, for per-axis and scalar factors, in dense and packed modes.
 - [ ] One chunked path serves dense and diagonal summaries with chunk-level parallelism.
-- [ ] The doubling scan is deleted or retained only as a CPU reference; no CUDA path reaches it.
-- [ ] Authored propagation order, segmentation, `initial_state`/final-State semantics, packed mode, and gradient parity are unchanged against the current implementation, checked by the existing H20 suites.
+- [x] The doubling scan is deleted or retained only as a CPU reference; no CUDA path reaches it. (`_segmented_affine_scan` and `_segmented_elementwise_scan` are called only from the `else` branches of the two `runtime.device.type == "cuda"` tests in `_lower_parallel_scan`; every CUDA path goes through `executable.prefix`.)
+- [x] Authored propagation order, segmentation, `initial_state`/final-State semantics, packed mode, and gradient parity are unchanged against the current implementation, checked by the existing H20 suites. (`test_gdn_h20.py`, `test_fla_coverage.py`, `test_linear_attention_examples.py`, and `test_two_axis_elementwise.py`: 25 pass, including the packed and gradient cases.)
 - [ ] `gdn`, `rwkv7`, `gla`, and `mamba2` land within 2x of the scalar-factorized group at T=2048 with one launch per pass.

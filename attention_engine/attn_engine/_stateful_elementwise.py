@@ -287,33 +287,43 @@ class _TileLangElementwisePrefix(torch.autograd.Function):
         else:
             states = output_scale * initial + output_bias
         ctx.backward_binding = backward
-        ctx.save_for_backward(scale, second, segment, output_scale, output_bias, initial_state)
+        ctx.save_for_backward(
+            scale, second, segment, output_scale, output_second, output_bias, initial_state
+        )
         return states
 
     @staticmethod
     def backward(ctx, grad_states):
-        scale, second, segment, output_scale, output_bias, initial_state = (
-            ctx.saved_tensors
-        )
-        if second is not None:
-            raise RuntimeError(
-                "a two-axis elementwise prefix has no compiler-derived VJP yet"
-            )
+        (
+            scale,
+            second,
+            segment,
+            output_scale,
+            output_second,
+            output_bias,
+            initial_state,
+        ) = ctx.saved_tensors
+        # the second factor slot is published as None when the Program scales one
+        # axis, so the declared elementwise context is complete either way
         context = {
             "transition.scale": scale,
+            "transition.second": second,
+            "transition.output_second": output_second,
             "transition.segment": segment,
             "transition.output_scale": output_scale,
             "transition.output_bias": output_bias,
             "transition.initial_state": initial_state,
         }
-        # the binding differentiates (scale, bias, segment, initial_state); the
-        # second factor slot takes no gradient in its absence
-        scale_gradient, bias_gradient, segment_gradient, state_gradient = (
-            ctx.backward_binding(context, grad_states)
-        )
+        (
+            scale_gradient,
+            second_gradient,
+            bias_gradient,
+            segment_gradient,
+            state_gradient,
+        ) = ctx.backward_binding(context, grad_states)
         return (
             scale_gradient,
-            None,
+            second_gradient,
             bias_gradient,
             segment_gradient,
             state_gradient,

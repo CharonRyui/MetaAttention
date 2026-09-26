@@ -20,6 +20,10 @@ _DENSE_CONTEXT: tuple[ContextEntry, ...] = (
 )
 _ELEMENTWISE_CONTEXT: tuple[ContextEntry, ...] = (
     ("transition.scale", "runtime", ("head", "row", "column"), "[tokens,heads,scale_rows,scale_columns]"),
+    # the pair slots hold the second State axis factor, or None when the Program
+    # scales one axis only
+    ("transition.second", "runtime", ("head", "row", "column"), "[tokens,heads,1,columns]"),
+    ("transition.output_second", "runtime", ("token", "head", "row", "column"), "[tokens,heads,1,columns]"),
     ("transition.segment", "int32", ("token",), "[tokens]"),
     ("transition.output_scale", "runtime", ("token", "head", "row", "column"), "[tokens,heads,scale_rows,scale_columns]"),
     ("transition.output_bias", "runtime", ("token", "head", "row", "column"), "[tokens,heads,rows,columns]"),
@@ -216,8 +220,18 @@ def _elementwise_vjp(
     from ._stateful_elementwise import _tilelang_segmented_elementwise_scan
 
     scale = context["transition.scale"]
+    # None when the Program scales one axis; a pair otherwise
+    second = context["transition.second"]
+    output_second = context["transition.output_second"]
+    if second is not None:
+        # one factor per State axis: the per-element factor and its cumulative
+        # product are composed from the pair before the reverse walks
+        row_factor, column_factor = scale, second
+        scale = row_factor * column_factor
     segment = context["transition.segment"]
     output_scale = context["transition.output_scale"]
+    if output_second is not None:
+        output_scale = output_scale * output_second
     output_bias = context["transition.output_bias"]
     initial_state = context["transition.initial_state"]
     grad_states = torch.zeros_like(output_bias) if grad_states is None else grad_states
@@ -250,13 +264,23 @@ def _elementwise_vjp(
     same_segment = (segment[1:] == segment[:-1]).view(-1, 1, 1, 1)
     previous_scale[1:] = torch.where(same_segment, output_scale[:-1], previous_scale[1:])
     previous_bias[1:] = torch.where(same_segment, output_bias[:-1], previous_bias[1:])
-    scale_gradient = _sum_to_shape(
-        adjoint_scale * previous_scale + adjoint_bias * previous_bias, scale.shape
-    )
+    elementwise_gradient = adjoint_scale * previous_scale + adjoint_bias * previous_bias
+    if second is None:
+        scale_gradient = _sum_to_shape(elementwise_gradient, scale.shape)
+        second_gradient = None
+    else:
+        # the per-element gradient is w.r.t. the product, so each factor's
+        # gradient contracts the other along the axis it spans
+        second_gradient = _sum_to_shape(
+            elementwise_gradient * row_factor, column_factor.shape
+        )
+        scale_gradient = _sum_to_shape(
+            elementwise_gradient * column_factor, row_factor.shape
+        )
     state_gradient = torch.zeros_like(initial_state)
     if segment.numel():
         state_gradient.index_add_(0, segment.long(), grad_states * output_scale)
-    return scale_gradient, adjoint_bias, None, state_gradient
+    return scale_gradient, second_gradient, adjoint_bias, None, state_gradient
 
 
 def _factored_vjp(
