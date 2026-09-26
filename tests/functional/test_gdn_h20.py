@@ -540,3 +540,67 @@ def test_gdn_factored_recurrence_supports_non_square_state(gpu_device):
     torch.testing.assert_close(
         result.final_state["memory"], expected_state, rtol=0.1, atol=0.1
     )
+
+
+def test_gdn_factored_recurrence_gradients_match_independent_reference(gpu_device):
+    """The factored reverse walk must match the FP64 oracle's gradients.
+
+    Covers the rank-one adjoint, the per-token factor gradients, the injection
+    gradients, the readout operand, and the initial State.
+    """
+    query, key, value, gate, beta = _bindings(gpu_device, length=130)
+    initial = torch.randn(
+        1, 2, 128, 128, device=gpu_device, dtype=torch.float32, requires_grad=True
+    )
+    operator = gated_delta_rule(1, 2, 130, 128, 128, HQ=1)
+    compiled = _compile_gdn(operator)
+    assert (
+        compiled.operator._plans[compiled.specialization].plan.candidate.lowerer
+        == "tilelang-factored-recurrence"
+    )
+
+    result = compiled(
+        query=query,
+        key=key,
+        value=value,
+        gate=gate,
+        beta=beta,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    assert result.final_state is not None
+
+    actual_inputs = (query, key, value, gate, beta, initial)
+    reference_inputs = tuple(
+        tensor.detach().clone().requires_grad_(True) for tensor in actual_inputs
+    )
+    expected_output, expected_state = gated_delta_rule_reference(
+        reference_inputs[0],
+        reference_inputs[1],
+        reference_inputs[2],
+        reference_inputs[3],
+        reference_inputs[4],
+        initial_state=reference_inputs[5],
+        output_final_state=True,
+    )
+    assert expected_state is not None
+
+    actual_loss = result.outputs["output"].float().square().mean()
+    actual_loss = actual_loss + result.final_state["memory"].square().mean()
+    expected_loss = expected_output.float().square().mean()
+    expected_loss = expected_loss + expected_state.square().mean()
+    actual_gradients = torch.autograd.grad(actual_loss, actual_inputs)
+    expected_gradients = torch.autograd.grad(expected_loss, reference_inputs)
+
+    for name, actual_gradient, expected_gradient in zip(
+        ("query", "key", "value", "gate", "beta", "initial_state"),
+        actual_gradients,
+        expected_gradients,
+        strict=True,
+    ):
+        scale = expected_gradient.abs().max().item()
+        assert scale > 0.0, name
+        torch.testing.assert_close(
+            actual_gradient, expected_gradient, rtol=0.08, atol=0.08 * scale + 1e-6
+        )
+

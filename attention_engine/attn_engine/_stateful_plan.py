@@ -213,6 +213,8 @@ def backward_context_family(
     forward never saved.
     """
     family = runtime_family_for(candidate)
+    if family == "factored-recurrence":
+        return "factored"
     if family == "axis-scale":
         return "dense" if dense_summary else "elementwise"
     if family in {"generic", "product-injection-gemm", "shared-state-contraction"}:
@@ -445,8 +447,15 @@ class TileLangExecutable:
     def factored_recurrence_dense(self, **kwargs):
         from ._stateful_factored import factored_recurrence_dense
 
+        if kwargs.get("initial_state") is not None:
+            self._validate_gradient_dispatch(
+                kwargs["initial_state"], *kwargs.get("left_factors", ())
+            )
         return factored_recurrence_dense(
-            threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
+            backward=self.backward_binding,
+            config=self.plan.kernel_config.values,
+            threads=dict(self.plan.kernel_config.values).get("threads", 128),
+            **kwargs,
         )
 
     def scalar_factorized_dense_raw(self, raw_inputs, initial_state, **kwargs):
@@ -559,10 +568,7 @@ def compile_plan(
         for item in mathematical_plans
         if not active_rewrites.intersection(item.conflicts)
         for lowerer in LOWERERS
-        if not (
-            backward_ir is not None
-            and lowerer.runtime_family in {"scalar-factorized", "factored-recurrence"}
-        )
+        if not (backward_ir is not None and lowerer.runtime_family == "scalar-factorized")
         if item.representation is PlanRepresentation.GENERIC_DENSE_AFFINE
         or RUNTIME_FAMILY_ELIGIBILITY.get(lowerer.runtime_family, lambda _: (True, None))(operator.algorithm)[0]
         if (candidate := lowerer.lower(
@@ -642,7 +648,11 @@ def compile_plan(
         from ._stateful_backward import bind_backward
 
         family = backward_context_family(operator.algorithm, candidate, dense_summary)
-        backward_values = (("threads", 128),) if family == "dense" else (("block_tokens", 128),)
+        backward_values = (
+            (("threads", 128),)
+            if family in {"dense", "factored"}
+            else (("block_tokens", 128),)
+        )
         backward_binding = bind_backward(backward_ir, family, backward_values)
     context_values = (
         tuple(ContextValue(*value) for value in backward_binding.context_values)
@@ -666,9 +676,17 @@ def compile_plan(
         (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
     )
     if candidate.lowerer == "tilelang-factored-recurrence":
-        # the kernel keeps every State column in registers and writes only the
-        # output, so no sequence-scaled workspace is required
-        workspace = WorkspacePolicy(bytes_per_token=0, maximum_bytes=target.workspace_bytes)
+        # inference writes only the output; a compiled backward records the
+        # per-token State so the reverse walk never inverts the recurrence
+        fixed_sizes = dict(compilation.role_sizes)
+        state_heads = fixed_sizes[operator.algorithm.states[0].head_role]
+        rows, columns = (
+            fixed_sizes[role] for role in operator.algorithm.states[0].feature_roles
+        )
+        per_token = state_heads * rows * columns * 2 if backward_ir is not None else 0
+        workspace = WorkspacePolicy(
+            bytes_per_token=per_token, maximum_bytes=target.workspace_bytes
+        )
     else:
         workspace = _summary_workspace(operator, compilation, target)
     backward_candidate = None

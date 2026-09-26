@@ -27,6 +27,20 @@ _ELEMENTWISE_CONTEXT: tuple[ContextEntry, ...] = (
 )
 
 
+_FACTORED_CONTEXT: tuple[ContextEntry, ...] = (
+    ("factored.opcode", "int32", ("operation",), "[operations]"),
+    ("factored.left", "runtime", ("operation", "token", "head", "row"), "[operations,tokens,heads,rows,1]"),
+    ("factored.right", "runtime", ("operation", "token", "head", "row"), "[operations,tokens,heads,rows,1]"),
+    ("factored.coefficient", "runtime", ("operation", "token", "head"), "[operations,tokens,heads,1,1]"),
+    ("factored.injection_left", "runtime", ("injection", "token", "head", "row"), "[injections,tokens,heads,rows,1]"),
+    ("factored.injection_right", "runtime", ("injection", "token", "head", "column"), "[injections,tokens,heads,1,columns]"),
+    ("factored.readout", "runtime", ("token", "head", "row"), "[tokens,heads,rows,1]"),
+    ("factored.recorded", "bfloat16", ("sequence", "head", "token", "row", "column"), "[sequences,heads,tokens,rows,columns]"),
+    ("factored.initial_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
+    ("factored.final_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
+)
+
+
 def _config_values(
     config: tuple[tuple[str, int], ...] | int,
     family: str | None = None,
@@ -51,7 +65,7 @@ def backward_eligibility(backward_ir: Any, family: str) -> tuple[bool, str | Non
     current summary kernels consume every canonical VJP operation and reject a
     future operation until its executable is implemented.
     """
-    if family not in {"dense", "elementwise"}:
+    if family not in {"dense", "elementwise", "factored"}:
         return False, f"unsupported backward runtime family: {family}"
     if backward_ir is None:
         return False, "missing BackwardIR"
@@ -99,6 +113,8 @@ class BackwardBinding:
             return _dense_vjp(saved_context, grad_states, self.config)
         if self.family == "elementwise":
             return _elementwise_vjp(saved_context, grad_states, self.config)
+        if self.family == "factored":
+            return _factored_vjp(saved_context, grad_states, self.config)
         raise RuntimeError(f"unknown backward runtime family: {self.family}")
 
 
@@ -109,8 +125,14 @@ def default_backward(family: str, config: tuple[tuple[str, int], ...] | int = ()
         reverse_steps = ()
 
     return BackwardBinding(
-        _DirectBackwardIR(), family, _config_values(config, family),
-        _DENSE_CONTEXT if family == "dense" else _ELEMENTWISE_CONTEXT,
+        _DirectBackwardIR(),
+        family,
+        _config_values(config, family),
+        {
+            "dense": _DENSE_CONTEXT,
+            "elementwise": _ELEMENTWISE_CONTEXT,
+            "factored": _FACTORED_CONTEXT,
+        }[family],
     )
 def bind_backward(
     backward_ir: Any,
@@ -125,6 +147,9 @@ def bind_backward(
     if family == "dense":
         _config(values, "threads", 128)
         context_values = _DENSE_CONTEXT
+    elif family == "factored":
+        _config(values, "threads", 128)
+        context_values = _FACTORED_CONTEXT
     else:
         _config(values, "block_tokens", 128)
         context_values = _ELEMENTWISE_CONTEXT
@@ -232,6 +257,37 @@ def _elementwise_vjp(
     if segment.numel():
         state_gradient.index_add_(0, segment.long(), grad_states * output_scale)
     return scale_gradient, adjoint_bias, None, state_gradient
+
+
+def _factored_vjp(
+    context: Mapping[str, torch.Tensor],
+    grads: tuple[torch.Tensor | None, torch.Tensor | None],
+    config: tuple[tuple[str, int], ...],
+) -> tuple[torch.Tensor | None, ...]:
+    """Reverse walk for the factored recurrence over the recorded token States."""
+    from ._stateful_factored import factored_recurrence_backward
+
+    grad_output, grad_final = grads
+    final_state = context["factored.final_state"]
+    if grad_output is not None:
+        grad_output = grad_output.float()
+    if grad_final is None:
+        grad_final = torch.zeros_like(final_state)
+    return factored_recurrence_backward(
+        operation_codes=context["factored.operation_codes"],
+        opcode=context["factored.opcode"],
+        left_factors=context["factored.left"],
+        right_factors=context["factored.right"],
+        coefficients=context["factored.coefficient"],
+        injection_left=context["factored.injection_left"],
+        injection_right=context["factored.injection_right"],
+        readout=context["factored.readout"],
+        recorded=context["factored.recorded"],
+        initial_state=context["factored.initial_state"],
+        grad_output=grad_output,
+        grad_final=grad_final,
+        threads=_config(config, "threads", 128),
+    )
 
 
 def _sum_to_shape(value: torch.Tensor, shape: torch.Size) -> torch.Tensor:
