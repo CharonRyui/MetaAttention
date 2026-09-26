@@ -121,6 +121,9 @@ def _compile_elementwise_prefix(
                 accumulated_scale = T.alloc_local((1,), dtype="float32")
                 accumulated_second = T.alloc_local((1,), dtype="float32")
                 accumulated_bias = T.alloc_local((1,), dtype="float32")
+                row_term = T.alloc_local((1,), dtype="float32")
+                column_term = T.alloc_local((1,), dtype="float32")
+                element_factor = T.alloc_local((1,), dtype="float32")
                 current_segment = T.alloc_local((1,), dtype="int32")
                 if index < matrix_size:
                     row = index // columns
@@ -156,30 +159,20 @@ def _compile_elementwise_prefix(
                             accumulated_second[0] = 1.0
                             accumulated_bias[0] = 0.0
                             current_segment[0] = segment[token]
+                        row_term[0] = scale[token, head, scale_row, scale_column]
                         if paired:
-                            accumulated_scale[0] = (
-                                accumulated_scale[0]
-                                * scale[token, head, scale_row, scale_column]
-                            )
+                            column_term[0] = second[token, head, 0, column]
                             accumulated_second[0] = (
-                                accumulated_second[0] * second[token, head, 0, column]
+                                accumulated_second[0] * column_term[0]
                             )
-                            accumulated_bias[0] = (
-                                scale[token, head, scale_row, scale_column]
-                                * second[token, head, 0, column]
-                                * accumulated_bias[0]
-                                + bias[token, head, row, column]
-                            )
+                            element_factor[0] = row_term[0] * column_term[0]
                         else:
-                            accumulated_bias[0] = (
-                                scale[token, head, scale_row, scale_column]
-                                * accumulated_bias[0]
-                                + bias[token, head, row, column]
-                            )
-                            accumulated_scale[0] = (
-                                scale[token, head, scale_row, scale_column]
-                                * accumulated_scale[0]
-                            )
+                            element_factor[0] = row_term[0]
+                        accumulated_bias[0] = (
+                            element_factor[0] * accumulated_bias[0]
+                            + bias[token, head, row, column]
+                        )
+                        accumulated_scale[0] = row_term[0] * accumulated_scale[0]
                         output_bias[token, head, row, column] = accumulated_bias[0]
                         if write_scale[0]:
                             output_scale[

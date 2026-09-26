@@ -1761,6 +1761,10 @@ class StatefulOperator:
             )
         segment_i32 = segment.to(torch.int32)
         if elementwise is not None:
+            # the summary factors are derived from the token-major input views,
+            # so they are not always contiguous; materializing them here is the
+            # pre-existing seam this lowering declares (see the ticket note on
+            # spec section "Implementation Decisions")
             scale = elementwise.contiguous()
             second_operand = (
                 second_factor.contiguous() if second_factor is not None else None

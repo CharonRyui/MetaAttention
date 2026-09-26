@@ -350,8 +350,9 @@ def backward_context_family(
     if family == "axis-scale":
         return "dense" if dense_summary else "elementwise"
     if family in {"generic", "product-injection-gemm", "shared-state-contraction"}:
-        identity_only = not algorithm.transitions[0].propagations
-        return "elementwise" if identity_only and not dense_summary else "dense"
+        # the forward composes a dense summary pair only when it was asked for
+        # one, so the backward must read the elementwise context otherwise
+        return "dense" if dense_summary else "elementwise"
     return "dense"
 
 

@@ -175,15 +175,18 @@ def _axis_scale_summary(
             else:
                 rows_factor = rows_factor * factor
         elif node.roles[0] == state_spec.feature_roles[0]:
-            if single is not None and rows_factor is None and columns_factor is None:
-                single = None
             rows_factor = factor if rows_factor is None else rows_factor * factor
-        elif node.roles[0] == state_spec.feature_roles[1]:
-            if single is not None and rows_factor is None and columns_factor is None:
+            if single is not None:
+                # a whole-State scale already accumulated folds into this axis
+                rows_factor = single * rows_factor
                 single = None
+        elif node.roles[0] == state_spec.feature_roles[1]:
             columns_factor = (
                 factor if columns_factor is None else columns_factor * factor
             )
+            if single is not None:
+                columns_factor = single * columns_factor
+                single = None
         else:
             raise ValueError("AxisScale role is not a State Feature role")
     if rows_factor is not None and columns_factor is not None:
