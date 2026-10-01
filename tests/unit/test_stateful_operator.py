@@ -96,26 +96,6 @@ def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
     assert len(operator._plans) == 1
 
 
-def test_vector_propagation_fits_tiny_workspace_envelope():
-    from attn_engine import Target
-    from examples.linear_attention import gla_attention
-
-    operator = gla_attention(1, 1, 8, 2, 3)
-    compiled = operator.compile(
-        role_sizes={
-            role: 1 if isinstance(role, HeadRole) else 2
-            for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
-            for role in spec.roles
-            if isinstance(role, (HeadRole, FeatureRole))
-        },
-        target=Target(workspace_bytes=1),
-        mode="dense",
-    )
-    plan = compiled.operator._plans[compiled.specialization].plan
-    assert plan.candidate.lowerer == "tilelang-vector-propagation"
-    assert plan.workspace.bytes_per_token == 0
-
-
 def test_backward_compilation_publishes_compiler_owned_backward_candidate():
     operator = StatefulOperator(_accumulator_ir())
     compiled = _compile(operator, backward=True)
@@ -125,18 +105,28 @@ def test_backward_compilation_publishes_compiler_owned_backward_candidate():
     assert executable.plan.backward_candidate is not None
     assert executable.plan.backward_candidate.direction == "backward"
     assert executable.plan.backward_kernel_config is not None
-    assert executable.plan.context_contract.required == executable.plan.context_contract.produced
+    assert (
+        executable.plan.context_contract.required
+        == executable.plan.context_contract.produced
+    )
 
 
 def test_context_contract_rejects_dtype_role_and_shape_mismatches():
     from attn_engine._stateful_plan import ContextContract, ContextValue
 
     produced = ContextValue(
-        "inputs.query", "torch.float32", ("batch", "heads", "sequence", "key"), "runtime"
+        "inputs.query",
+        "torch.float32",
+        ("batch", "heads", "sequence", "key"),
+        "runtime",
     )
     mismatches = (
-        ContextValue(produced.name, "torch.bfloat16", produced.roles, produced.shape_rule),
-        ContextValue(produced.name, produced.dtype, ("batch", "sequence"), produced.shape_rule),
+        ContextValue(
+            produced.name, "torch.bfloat16", produced.roles, produced.shape_rule
+        ),
+        ContextValue(
+            produced.name, produced.dtype, ("batch", "sequence"), produced.shape_rule
+        ),
         ContextValue(produced.name, produced.dtype, produced.roles, "token-major"),
     )
 
@@ -152,9 +142,11 @@ def test_context_contract_identity_separates_backward_behavior():
     forward_plan = operator._plans[forward.specialization].plan
     backward_plan = operator._plans[backward.specialization].plan
 
-    assert forward_plan.context_contract.identity != backward_plan.context_contract.identity
+    assert (
+        forward_plan.context_contract.identity
+        != backward_plan.context_contract.identity
+    )
     assert forward_plan.binary_identity != backward_plan.binary_identity
-
 
 
 def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallback():
@@ -189,7 +181,6 @@ def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallbac
     assert select_candidate((generic,), {generic: estimates[generic]}) is generic
 
 
-
 def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
     from attn_engine._stateful_plan import WORKLOAD_POLICY, normalized_geometric_mean
 
@@ -199,9 +190,7 @@ def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
         "empty-containing",
     }
     assert len(WORKLOAD_POLICY.points("dense")) >= 2
-    scores = normalized_geometric_mean(
-        {"first": (1.0, 4.0), "second": (2.0, 2.0)}
-    )
+    scores = normalized_geometric_mean({"first": (1.0, 4.0), "second": (2.0, 2.0)})
     assert scores["first"] == pytest.approx(2**0.5)
     assert scores["second"] == pytest.approx(2**0.5)
 
@@ -281,19 +270,25 @@ def test_candidate_tuning_removes_failed_specialized_candidate_and_keeps_generic
     from attn_engine._stateful_tuning import WorkloadPoint, tune_candidates
 
     generic = LoweredCandidate("generic", "plan-g", "tilelang-generic", "forward")
-    specialized = LoweredCandidate("specialized", "plan-s", "tilelang-elementwise", "forward")
+    specialized = LoweredCandidate(
+        "specialized", "plan-s", "tilelang-elementwise", "forward"
+    )
 
     def factory(candidate, config, workload):
         def invoke():
             if candidate is specialized:
                 raise RuntimeError("specialized probe failed")
+
         return invoke
 
     result = tune_candidates(
         (generic, specialized),
         {generic: ((("threads", 128),),), specialized: ((("block_tokens", 128),),)},
-        (WorkloadPoint(1, 2),), factory, autotune=True,
-        timer=lambda invoke: (invoke() or 2.0), generic_candidate=generic,
+        (WorkloadPoint(1, 2),),
+        factory,
+        autotune=True,
+        timer=lambda invoke: invoke() or 2.0,
+        generic_candidate=generic,
         static_costs={generic: 100, specialized: 1},
     )
     assert result.winner is generic
@@ -312,8 +307,13 @@ def test_candidate_tuning_disabled_uses_static_default_without_factory():
         return lambda: None
 
     result = tune_candidates(
-        (generic,), {generic: ((("threads", 128),),)}, (WorkloadPoint(1, 1),),
-        factory, autotune=False, generic_candidate=generic, static_costs={generic: 1},
+        (generic,),
+        {generic: ((("threads", 128),),)},
+        (WorkloadPoint(1, 1),),
+        factory,
+        autotune=False,
+        generic_candidate=generic,
+        static_costs={generic: 1},
     )
     assert result.winner is generic
     assert calls == []
@@ -357,9 +357,13 @@ def _reference(inputs, initial=None):
 def test_generic_scalar_propagation_matches_reference_gradients(cotangent):
     inputs = _inputs(length=5, requires_grad=True)
     initial = torch.randn(1, 1, 2, 3, requires_grad=True)
-    compiled = _compile(StatefulOperator(_accumulator_ir()), optimized=False, backward=True)
+    compiled = _compile(
+        StatefulOperator(_accumulator_ir()), optimized=False, backward=True
+    )
     result = compiled(
-        **inputs, initial_state=StateTuple(("memory",), (initial,)), return_final_state=True
+        **inputs,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
     )
     expected_output, expected_state = _reference(inputs, initial)
     torch.testing.assert_close(result.outputs[0], expected_output)
@@ -373,8 +377,12 @@ def test_generic_scalar_propagation_matches_reference_gradients(cotangent):
         actual_loss = actual_loss + result.final_state[0].square().sum()
         expected_loss = expected_loss + expected_state.square().sum()
     differentiable = (*inputs.values(), initial)
-    actual_gradients = torch.autograd.grad(actual_loss, differentiable, allow_unused=True)
-    expected_gradients = torch.autograd.grad(expected_loss, differentiable, allow_unused=True)
+    actual_gradients = torch.autograd.grad(
+        actual_loss, differentiable, allow_unused=True
+    )
+    expected_gradients = torch.autograd.grad(
+        expected_loss, differentiable, allow_unused=True
+    )
     for actual, expected in zip(actual_gradients, expected_gradients, strict=True):
         if expected is None:
             assert actual is None
@@ -567,8 +575,14 @@ def test_simplified_identity_ignores_removed_expression_identities():
         head_mapping=original.head_mapping,
     )
 
-    assert original._analysis.canonical_identity != rewritten._analysis.canonical_identity
-    assert original._analysis.simplified.identity == rewritten._analysis.simplified.identity
+    assert (
+        original._analysis.canonical_identity != rewritten._analysis.canonical_identity
+    )
+    assert (
+        original._analysis.simplified.identity
+        == rewritten._analysis.simplified.identity
+    )
+
 
 def test_analysis_derives_scanable_affine_summary_and_backward_ir():
     analysis = _accumulator_ir()._analysis
@@ -611,7 +625,9 @@ def test_structured_plans_and_kernel_config_have_separate_identities():
         "axis-scale",
         "product-injection-gemm",
     )
-    assert structured_plan.mathematical_plan.identity != structured_plan.candidate.identity
+    assert (
+        structured_plan.mathematical_plan.identity != structured_plan.candidate.identity
+    )
     assert structured_plan.candidate.identity != structured_plan.kernel_config.identity
 
 
@@ -690,12 +706,7 @@ def test_shared_readouts_and_rank_one_are_model_independent_planner_features():
     }
     assert "rank-one-factorized" in rewrites
     assert "shared-state-contraction" in rewrites
-    # the estimate may prefer any of the specialized representations for this
-    # shape; what matters is that the planner recognizes them and never falls
-    # back to the generic baseline
-    assert plan.mathematical_plan.representation == "product-injection-gemm"
     assert plan.mathematical_plan.representation != "generic-dense-affine"
-
 
 
 def test_analysis_maps_expression_head_roles_to_state_heads():

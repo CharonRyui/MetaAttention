@@ -147,6 +147,10 @@ class EstimationShape:
     backward: bool = False
     chunked: bool = False
     chunked_states: bool = False
+    chunked_states_workspace: int = 0
+    chunked_states_chunk_bytes: int = 0
+    factored_workspace: int = 0
+    factored_chunk_bytes: int = 0
 
     @classmethod
     def of(
@@ -160,6 +164,10 @@ class EstimationShape:
         backward: bool = False,
         chunked: bool = False,
         chunked_states: bool = False,
+        chunked_states_workspace: int = 0,
+        chunked_states_chunk_bytes: int = 0,
+        factored_workspace: int = 0,
+        factored_chunk_bytes: int = 0,
     ) -> "EstimationShape":
         """Price a rank-2 State by both Features and a rank-1 State by its one."""
         rows = feature_sizes[0]
@@ -174,6 +182,10 @@ class EstimationShape:
             backward=backward,
             chunked=chunked,
             chunked_states=chunked_states,
+            chunked_states_workspace=chunked_states_workspace,
+            chunked_states_chunk_bytes=chunked_states_chunk_bytes,
+            factored_workspace=factored_workspace,
+            factored_chunk_bytes=factored_chunk_bytes,
         )
 
     @property
@@ -206,6 +218,7 @@ class CandidateEstimate:
     flops_per_token: int
     launches: int
     workspace_bytes_per_token: int
+    workspace_bytes_per_chunk: int = 0
     aligned_workspace_bytes_per_token: int | None = None
     alignment_tokens: int = 0
     reason: str | None = None
@@ -243,7 +256,9 @@ class CandidateLowerer:
             return None
         if (
             maximum_workspace_bytes is not None
-            and estimate.workspace_bytes_per_token > maximum_workspace_bytes
+            and estimate.workspace_bytes_per_token
+            + 2 * estimate.workspace_bytes_per_chunk
+            > maximum_workspace_bytes
         ):
             return None
         return LoweredCandidate(
@@ -271,14 +286,21 @@ class CandidateLowerer:
         summary = shape.summary_elements
         dense = shape.rows * shape.rows + shape.columns * shape.columns + state
         from ._stateful_chunked import CHUNK_TOKENS
+
         if representation is PlanRepresentation.VECTOR_PROPAGATION:
-            # State columns stay in registers; only the output is written.
+            # Aligned inference uses diagonal chunk carries; other workloads
+            # keep State columns in registers. Charge factors conservatively.
             return CandidateEstimate(
                 True,
                 heads * (shape.rows + 2 * shape.columns) * 4,
                 3 * heads * state,
                 1,
                 0,
+                aligned_workspace_bytes_per_token=heads
+                * (4 * shape.rows + 3 * shape.columns)
+                * 4,
+                alignment_tokens=CHUNK_TOKENS,
+                workspace_bytes_per_chunk=3 * heads * state * 4,
             )
         if representation is PlanRepresentation.SCALAR_FACTORIZED:
             # one fused kernel that moves the factors and the output only
@@ -290,30 +312,33 @@ class CandidateLowerer:
                 0,
             )
         if representation is PlanRepresentation.FACTORED_RECURRENCE:
-            # inference writes only the output; a compiled backward records the
-            # per-token State so the reverse walk never inverts the recurrence
+            # Inference keeps affine chunk summaries and carries; backward
+            # retains the original recorded-State reverse walk.
             return CandidateEstimate(
                 True,
                 heads * (shape.rows + 2 * shape.columns) * 4,
                 4 * heads * state,
-                1,
-                heads * state * 2 if shape.backward else 0,
+                1 if shape.backward else 3,
+                heads * state * 2 if shape.backward else shape.factored_workspace,
+                workspace_bytes_per_chunk=0
+                if shape.backward
+                else shape.factored_chunk_bytes,
             )
         if representation in _SUMMARY_REPRESENTATIONS:
             arithmetic = 2 * heads * state * (2 if shape.dense_summary else 1)
             if representation is PlanRepresentation.AXIS_SCALE and shape.chunked:
-                # the chunked schedule keeps only the chunk-level running pair, so
-                # a chunk-aligned workload needs no per-token buffer at all
+                # Chunk replay keeps three boundary buffers, not token States.
                 return CandidateEstimate(
                     True,
                     heads * (3 * state + shape.columns) * 4,
                     arithmetic,
-                    2,
+                    3,
                     heads * (summary + 2 * state) * 4,
                     aligned_workspace_bytes_per_token=max(
-                        1, heads * state * 4 // CHUNK_TOKENS
+                        1, heads * (4 * shape.rows + 3 * shape.columns) * 4
                     ),
                     alignment_tokens=CHUNK_TOKENS,
+                    workspace_bytes_per_chunk=3 * heads * state * 4,
                 )
             return CandidateEstimate(
                 True,
@@ -338,20 +363,15 @@ class CandidateLowerer:
             # elementwise factor per axis, so it materializes the factor, the
             # injection, and the per-token State rather than dense matrices
             if shape.chunked_states:
-                # the multi-State chunked schedule keeps only the chunk-boundary
-                # carries, summed over the States, instead of a per-token State
-                from ._stateful_chunked import CHUNK_TOKENS
-
+                # The dense schedule supports tails and keeps boundary carries,
+                # factors and contracted terms, never a token State history.
                 return CandidateEstimate(
                     True,
                     heads * (3 * states + shape.columns) * 4,
                     3 * heads * states,
-                    2,
-                    heads * 3 * states * 4,
-                    aligned_workspace_bytes_per_token=max(
-                        1, heads * states * 4 // CHUNK_TOKENS
-                    ),
-                    alignment_tokens=CHUNK_TOKENS,
+                    3 * shape.state_count,
+                    shape.chunked_states_workspace,
+                    workspace_bytes_per_chunk=shape.chunked_states_chunk_bytes,
                 )
             return CandidateEstimate(
                 True,
@@ -436,10 +456,15 @@ def backward_context_family(
 
 def runtime_family_for(candidate: LoweredCandidate) -> str:
     return next(
-        lowerer.runtime_family for lowerer in LOWERERS if lowerer.name == candidate.lowerer
+        lowerer.runtime_family
+        for lowerer in LOWERERS
+        if lowerer.name == candidate.lowerer
     )
 
-def kernel_configurations(candidate: LoweredCandidate) -> tuple[tuple[tuple[str, int], ...], ...]:
+
+def kernel_configurations(
+    candidate: LoweredCandidate,
+) -> tuple[tuple[tuple[str, int], ...], ...]:
     if candidate.lowerer == "tilelang-elementwise":
         return tuple((("block_tokens", size),) for size in (128, 64, 256))
     return tuple((("threads", size),) for size in (128, 256))
@@ -477,7 +502,9 @@ class ContextContract:
         return _digest(asdict(self))
 
     def validate(self) -> None:
-        available = {value.name: value for value in (*self.produced, *self.recomputable)}
+        available = {
+            value.name: value for value in (*self.produced, *self.recomputable)
+        }
         if len(available) != len(self.produced) + len(self.recomputable):
             raise ValueError("duplicate context value name")
         for required in self.required:
@@ -493,14 +520,25 @@ class WorkspacePolicy:
     ``alignment_tokens`` and the compilation can reach the chunked schedule;
     every other workload is bounded by ``bytes_per_token``, which covers the
     per-token fallback the same plan will take.
+
+    Dense chunk scratch is charged per sequence and ceiling-divided chunk,
+    including a final-State allowance; it does not require token alignment.
     """
 
     bytes_per_token: int
     maximum_bytes: int
     aligned_bytes_per_token: int | None = None
     alignment_tokens: int = 0
+    bytes_per_chunk: int = 0
+    chunk_tokens: int = 64
 
-    def required_bytes(self, token_count: int) -> int:
+    def required_bytes(
+        self,
+        token_count: int,
+        *,
+        sequence_count: int = 1,
+        sequence_length: int | None = None,
+    ) -> int:
         per_token = self.bytes_per_token
         if (
             self.aligned_bytes_per_token is not None
@@ -509,26 +547,20 @@ class WorkspacePolicy:
         ):
             per_token = self.aligned_bytes_per_token
         required = token_count * per_token
+        if (
+            self.bytes_per_chunk
+            and token_count
+            and (
+                self.aligned_bytes_per_token is None
+                or per_token == self.aligned_bytes_per_token
+            )
+        ):
+            length = sequence_length if sequence_length is not None else token_count
+            chunks = (length + self.chunk_tokens - 1) // self.chunk_tokens
+            required += sequence_count * (chunks + 1) * self.bytes_per_chunk
         if required > self.maximum_bytes:
             raise RuntimeError("runtime workload exceeds compiled resource envelope")
         return required
-
-
-class WorkspaceAllocator:
-    """Compiler-owned per-device workspace cache for dynamic workloads."""
-
-    def __init__(self) -> None:
-        self._buffers: dict[tuple[torch.device, int], torch.Tensor] = {}
-
-    def acquire(self, device: torch.device, size: int) -> torch.Tensor | None:
-        if size == 0:
-            return None
-        key = (device, size)
-        buffer = self._buffers.get(key)
-        if buffer is None:
-            buffer = torch.empty(size, dtype=torch.uint8, device=device)
-            self._buffers[key] = buffer
-        return buffer
 
 
 @dataclass(frozen=True)
@@ -539,8 +571,13 @@ class Composition:
 
     def validate(self) -> None:
         self.context_contract.validate()
-        if self.backward_candidate is not None and self.backward_candidate.direction != "backward":
-            raise ValueError("composition backward candidate must lower backward direction")
+        if (
+            self.backward_candidate is not None
+            and self.backward_candidate.direction != "backward"
+        ):
+            raise ValueError(
+                "composition backward candidate must lower backward direction"
+            )
 
 
 @dataclass(frozen=True)
@@ -586,10 +623,13 @@ def normalized_geometric_mean(
     if len(widths) != 1 or not widths or next(iter(widths)) == 0:
         raise ValueError("candidate measurements must cover one common workload policy")
     width = next(iter(widths))
-    best = tuple(min(values[index] for values in measurements.values()) for index in range(width))
+    best = tuple(
+        min(values[index] for values in measurements.values()) for index in range(width)
+    )
     return {
         candidate: math.exp(
-            sum(math.log(value / best[index]) for index, value in enumerate(values)) / width
+            sum(math.log(value / best[index]) for index, value in enumerate(values))
+            / width
         )
         for candidate, values in measurements.items()
     }
@@ -630,7 +670,6 @@ class TileLangExecutable:
     dense_summary: bool
     scalar_factorized: Any | None
     rank_one_factored: Any | None = None
-    workspace_allocator: WorkspaceAllocator | None = None
     composition: Composition | None = None
     backward_binding: Any | None = None
 
@@ -643,7 +682,9 @@ class TileLangExecutable:
         )
 
     def _validate_gradient_dispatch(self, *tensors: torch.Tensor) -> None:
-        if not torch.is_grad_enabled() or not any(tensor.requires_grad for tensor in tensors):
+        if not torch.is_grad_enabled() or not any(
+            tensor.requires_grad for tensor in tensors
+        ):
             return
         if (
             self.backward_ir is None
@@ -652,7 +693,9 @@ class TileLangExecutable:
             or self.composition is None
             or self.composition.backward_candidate != self.plan.backward_candidate
         ):
-            raise RuntimeError("gradient execution has no compiler-selected backward candidate")
+            raise RuntimeError(
+                "gradient execution has no compiler-selected backward candidate"
+            )
 
     def prefix(self, transform, bias, segment, initial_state, second=None):
         transform_inputs = transform if isinstance(transform, tuple) else (transform,)
@@ -663,18 +706,27 @@ class TileLangExecutable:
             from ._stateful_affine import tilelang_dense_affine_prefix
 
             return tilelang_dense_affine_prefix(
-                transform[0], transform[1], bias, segment, initial_state,
+                transform[0],
+                transform[1],
+                bias,
+                segment,
+                initial_state,
                 backward=self.backward_binding,
                 config=self.plan.backward_kernel_config.values
-                if self.plan.backward_kernel_config else (),
+                if self.plan.backward_kernel_config
+                else (),
             )
         from ._stateful_elementwise import tilelang_elementwise_prefix
 
         return tilelang_elementwise_prefix(
-            transform, bias, segment, initial_state,
+            transform,
+            bias,
+            segment,
+            initial_state,
             backward=self.backward_binding,
             config=self.plan.backward_kernel_config.values
-            if self.plan.backward_kernel_config else (),
+            if self.plan.backward_kernel_config
+            else (),
             second=second,
         )
 
@@ -710,8 +762,11 @@ class TileLangExecutable:
         if self.scalar_factorized is None or self.scalar_factorized.dense is None:
             raise ValueError("plan has no raw dense scalar lowering")
         return tilelang_scalar_factorized_dense_raw(
-            raw_inputs, initial_state, self.scalar_factorized.dense,
-            threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
+            raw_inputs,
+            initial_state,
+            self.scalar_factorized.dense,
+            threads=dict(self.plan.kernel_config.values).get("threads", 128),
+            **kwargs,
         )
 
     def scalar_factorized_dense(self, *args, **kwargs):
@@ -720,7 +775,9 @@ class TileLangExecutable:
         if self.scalar_factorized is None:
             raise ValueError("plan is not scalar-factorized")
         return tilelang_scalar_factorized_dense(
-            *args, threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
+            *args,
+            threads=dict(self.plan.kernel_config.values).get("threads", 128),
+            **kwargs,
         )
 
     def scalar_factorized_packed(self, *args, **kwargs):
@@ -729,18 +786,23 @@ class TileLangExecutable:
         if self.scalar_factorized is None:
             raise ValueError("plan is not scalar-factorized")
         return tilelang_scalar_factorized_forward(
-            *args, threads=dict(self.plan.kernel_config.values).get("threads", 128), **kwargs
+            *args,
+            threads=dict(self.plan.kernel_config.values).get("threads", 128),
+            **kwargs,
         )
 
 
 def publish_successful_artifact(identity: str, payload: Any, *, layer: str) -> Path:
     """Atomically publish one successful compiler artifact under its layer identity."""
-    root = Path(
-        os.environ.get(
-            "STATEFUL_OPERATOR_CACHE_DIR",
-            Path.home() / ".cache" / "meta-attention" / "stateful-operator",
+    root = (
+        Path(
+            os.environ.get(
+                "STATEFUL_OPERATOR_CACHE_DIR",
+                Path.home() / ".cache" / "meta-attention" / "stateful-operator",
+            )
         )
-    ) / layer
+        / layer
+    )
     root.mkdir(parents=True, exist_ok=True)
     destination = root / f"{identity}.json"
     lock_path = root / f"{identity}.lock"
@@ -758,10 +820,6 @@ def publish_successful_artifact(identity: str, payload: Any, *, layer: str) -> P
         finally:
             Path(temporary).unlink(missing_ok=True)
     return destination
-
-
-
-
 
 
 def compile_plan(
@@ -808,6 +866,7 @@ def compile_plan(
         for representation in representations
     )
     from ._stateful_structured import RUNTIME_FAMILY_ELIGIBILITY
+
     active_rewrites = {item.value for item in rewrites}
     fixed_sizes = dict(compilation.role_sizes)
     state = operator.algorithm.states[0]
@@ -821,7 +880,7 @@ def compile_plan(
         and len(transitions[0].injections) == 1
         and len(operator.algorithm.readouts) == 1
     )
-    from ._stateful_chunked import chunked_states_eligible
+    from ._stateful_chunked import chunked_states_eligible, chunked_states_workspace
 
     chunked_states = (
         mode == "dense"
@@ -829,6 +888,33 @@ def compile_plan(
         and target.device_type == "cuda"
         and chunked_states_eligible(operator.algorithm)
     )
+    state_workspace, state_chunk_bytes = (
+        chunked_states_workspace(
+            operator.algorithm, fixed_sizes, fixed_sizes[state.head_role]
+        )
+        if chunked_states
+        else (0, 0)
+    )
+    factored_token_bytes = factored_chunk_bytes = 0
+    if rank_one_factored is not None and mode == "dense" and backward_ir is None:
+        heads = fixed_sizes[state.head_role]
+        rows, columns = feature_sizes
+        operation_count = len(rank_one_factored.operations)
+        injection_count = rank_one_factored.injection_count
+        readout_count = len(rank_one_factored.readout_roles)
+        factored_token_bytes = (
+            4
+            * heads
+            * (
+                operation_count * (2 * rows + columns + 1)
+                + injection_count * (rows + columns)
+                + readout_count * (rows + 2 * columns)
+                + 4
+                * (operation_count + injection_count + readout_count)
+                * (rows + columns)
+            )
+        )
+        factored_chunk_bytes = 4 * heads * (rows * rows + 2 * rows * columns + columns)
     state_total = 0
     for spec in operator.algorithm.states:
         sizes = [fixed_sizes[role] for role in spec.feature_roles]
@@ -842,6 +928,10 @@ def compile_plan(
         backward=backward_ir is not None,
         chunked=chunked_eligible,
         chunked_states=chunked_states,
+        chunked_states_workspace=state_workspace,
+        chunked_states_chunk_bytes=state_chunk_bytes,
+        factored_workspace=factored_token_bytes,
+        factored_chunk_bytes=factored_chunk_bytes,
     )
     candidate_list: list[LoweredCandidate] = []
     estimates: dict[LoweredCandidate, CandidateEstimate] = {}
@@ -850,7 +940,9 @@ def compile_plan(
             continue
         for lowerer in LOWERERS:
             if lowerer.runtime_family == "vector-propagation" and (
-                mode != "dense" or backward_ir is not None or target.device_type != "cuda"
+                mode != "dense"
+                or backward_ir is not None
+                or target.device_type != "cuda"
             ):
                 continue
             if lowerer.runtime_family == "scalar-factorized" and (
@@ -863,6 +955,19 @@ def compile_plan(
                 # the plan is only its fused kernel: a compiled backward has no
                 # binding for it, and anything else falls through to the summary
                 # path this candidate would mis-price
+                continue
+            if (
+                lowerer.runtime_family == "factored-recurrence"
+                and backward_ir is not None
+                and (
+                    rank_one_factored is None
+                    or len(rank_one_factored.readout_roles) != 1
+                    or any(
+                        operation.kind == "column-scale"
+                        for operation in rank_one_factored.operations
+                    )
+                )
+            ):
                 continue
             if (
                 item.representation is not PlanRepresentation.GENERIC_DENSE_AFFINE
@@ -883,7 +988,9 @@ def compile_plan(
         from .stateful_operator import StatefulCompilationError
 
         raise StatefulCompilationError(
-            "COMPILE_RESOURCE", "target.workspace_bytes", {"reason": "no feasible lowered candidate"}
+            "COMPILE_RESOURCE",
+            "target.workspace_bytes",
+            {"reason": "no feasible lowered candidate"},
         )
     candidate_estimates = tuple(
         sorted(
@@ -911,7 +1018,9 @@ def compile_plan(
             mode,
             feature_sizes,
             ContextContract((), (), ()),
-            WorkspacePolicy(feature_sizes[0] * feature_sizes[1] * 4, target.workspace_bytes),
+            WorkspacePolicy(
+                feature_sizes[0] * feature_sizes[1] * 4, target.workspace_bytes
+            ),
             mathematical_plans,
             candidates,
             candidate_estimates=candidate_estimates,
@@ -922,15 +1031,20 @@ def compile_plan(
             dense_summary,
             scalar_factorized,
             rank_one_factored=None,
-            workspace_allocator=WorkspaceAllocator(),
         )
         device = torch.device(target.device_type)
         cache = None
         cache_root = os.environ.get("STATEFUL_OPERATOR_CACHE_DIR")
         if cache_root:
-            cache = MeasurementCache(str(Path(cache_root) / "tuning" / "measurements.json"))
-        factory = invocation_factory(operator, compilation, provisional, mathematical_plans, device)
-        generic = next(item for item in candidates if item.lowerer == "tilelang-generic")
+            cache = MeasurementCache(
+                str(Path(cache_root) / "tuning" / "measurements.json")
+            )
+        factory = invocation_factory(
+            operator, compilation, provisional, mathematical_plans, device
+        )
+        generic = next(
+            item for item in candidates if item.lowerer == "tilelang-generic"
+        )
         tuning_result = tune_candidates(
             candidates,
             {item: kernel_configurations(item) for item in candidates},
@@ -945,7 +1059,9 @@ def compile_plan(
         )
         candidate = tuning_result.winner
         selected_plan = next(
-            item for item in mathematical_plans if item.identity == candidate.plan_identity
+            item
+            for item in mathematical_plans
+            if item.identity == candidate.plan_identity
         )
         values = tuning_result.winner_config
     kernel_config = KernelConfig(_digest((candidate.identity, values)), values)
@@ -966,7 +1082,8 @@ def compile_plan(
         backward_binding = bind_backward(backward_ir, family, backward_values)
     context_values = (
         tuple(ContextValue(*value) for value in backward_binding.context_values)
-        if backward_binding is not None else ()
+        if backward_binding is not None
+        else ()
     )
     context_contract = ContextContract(context_values, context_values, ())
     context_contract.validate()
@@ -983,7 +1100,14 @@ def compile_plan(
         )
     )
     tuning_identity = _digest(
-        (source_identity, fixed_roles, environment, toolchain, WORKLOAD_POLICY.version, mode)
+        (
+            source_identity,
+            fixed_roles,
+            environment,
+            toolchain,
+            WORKLOAD_POLICY.version,
+            mode,
+        )
     )
     selected_estimate = estimates[candidate]
     workspace = WorkspacePolicy(
@@ -991,6 +1115,7 @@ def compile_plan(
         maximum_bytes=target.workspace_bytes,
         aligned_bytes_per_token=selected_estimate.aligned_workspace_bytes_per_token,
         alignment_tokens=selected_estimate.alignment_tokens,
+        bytes_per_chunk=selected_estimate.workspace_bytes_per_chunk,
     )
     backward_candidate = None
     backward_kernel_config = None
@@ -1051,7 +1176,6 @@ def compile_plan(
             if candidate.lowerer == "tilelang-factored-recurrence"
             else None
         ),
-        workspace_allocator=WorkspaceAllocator(),
         composition=composition,
         backward_binding=backward_binding,
     )
@@ -1073,7 +1197,12 @@ def _structured_rewrites(features: Any) -> tuple[PlanRepresentation, ...]:
 
 
 def _target_fingerprint(target: Any) -> tuple[Any, ...]:
-    return (target.device_type, target.product_family, target.capability, target.workspace_bytes)
+    return (
+        target.device_type,
+        target.product_family,
+        target.capability,
+        target.workspace_bytes,
+    )
 
 
 def _toolchain_fingerprint() -> tuple[str, ...]:
@@ -1154,7 +1283,6 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()
-
 
 
 def is_parallel_plan(plan: Any) -> bool:

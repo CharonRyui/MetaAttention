@@ -1,12 +1,11 @@
-"""Factored recurrent lowering for matrices States with rank-one transitions.
+"""Ordered low-rank recurrence lowering.
 
-A matrix State whose per-token transition is a chain of whole-State or
-first-feature Axis Scales and first-feature Rank One contractions is applied by
-one kernel that keeps the State column in registers and replays the authored
-operations per token. Nothing per token is written to global memory, so the
-plan's memory is the State plus the output, and the doubling prefix scan and its
-per-token factor matrices disappear.
+Dense inference composes FP32 affine summaries per chunk, scans incoming State
+carries and replays independent chunks with all authored readouts. The original
+single-readout recurrent kernel and recorded-State reverse walk remain the
+compiled gradient path. Neither path reorders noncommuting propagations.
 """
+
 from __future__ import annotations
 
 from functools import lru_cache
@@ -14,7 +13,7 @@ from functools import lru_cache
 import torch
 
 
-_OPERATION_CODES = {"scale": 0, "row-scale": 1, "rank-one": 2}
+_OPERATION_CODES = {"scale": 0, "row-scale": 1, "column-scale": 3, "rank-one": 2}
 
 
 def _code_names(codes: tuple[int, ...]) -> tuple[str, ...]:
@@ -118,7 +117,9 @@ def _compile_factored_dense(
                                 )
                         elif opcode[index] == 1:
                             for row in T.serial(rows):
-                                state[row] = state[row] * left[index, token, head, row, 0]
+                                state[row] = (
+                                    state[row] * left[index, token, head, row, 0]
+                                )
                         else:
                             dot[0] = 0.0
                             for row in T.serial(rows):
@@ -143,14 +144,17 @@ def _compile_factored_dense(
                         accumulated[0] = 0.0
                         for row in T.serial(rows):
                             accumulated[0] = (
-                                accumulated[0] + readout[token, head, row, 0] * state[row]
+                                accumulated[0]
+                                + readout[token, head, row, 0] * state[row]
                             )
                         output[sequence, head, token, column] = accumulated[0]
                         if record_states:
                             # the reverse walk needs the per-token State; storing it
                             # is exact, while inverting the recurrence is not
                             for row in T.serial(rows):
-                                recorded[sequence, head, token, row, column] = state[row]
+                                recorded[sequence, head, token, row, column] = state[
+                                    row
+                                ]
                 if column < columns:
                     for row in T.serial(rows):
                         final[sequence, head, row, column] = state[row]
@@ -242,6 +246,34 @@ def _run_factored_forward(
         recorded,
     )
     return output, final, recorded
+
+
+def factored_recurrence_chunked(
+    *,
+    operation_codes: tuple[str, ...],
+    left_factors: list[torch.Tensor],
+    right_factors: list[torch.Tensor],
+    coefficients: list[torch.Tensor],
+    injection_left: list[torch.Tensor],
+    injection_right: list[torch.Tensor],
+    readouts: list[torch.Tensor],
+    initial_state: torch.Tensor,
+    output_dtypes: tuple[torch.dtype, ...],
+) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
+    """Execute ordered affine summaries, FP32 chunk carries and parallel replay."""
+    from ._stateful_lowrank_kernels import execute
+
+    return execute(
+        operation_codes=operation_codes,
+        left_factors=left_factors,
+        right_factors=right_factors,
+        coefficients=coefficients,
+        injection_left=injection_left,
+        injection_right=injection_right,
+        readouts=readouts,
+        initial_state=initial_state,
+        output_dtypes=output_dtypes,
+    )
 
 
 @lru_cache(maxsize=None)
@@ -350,9 +382,7 @@ def _compile_factored_backward(
                             sequence, head, token, row, column
                         ]
                         if token == 0:
-                            previous[row, column] = initial[
-                                sequence, head, row, column
-                            ]
+                            previous[row, column] = initial[sequence, head, row, column]
                         else:
                             previous[row, column] = recorded[
                                 sequence, head, token - 1, row, column
@@ -368,7 +398,8 @@ def _compile_factored_backward(
                     # readout: out_t = q_t . s_t
                     for row, column in T.Parallel(rows, columns):
                         adjoint[row, column] = (
-                            adjoint[row, column] + column_factor[column] * second_row[row]
+                            adjoint[row, column]
+                            + column_factor[column] * second_row[row]
                         )
                     for row in T.Parallel(rows):
                         local[0] = 0.0
@@ -382,9 +413,7 @@ def _compile_factored_backward(
                     # additive injections have no State dependence
                     for index in T.Serial(injection_count):
                         for row in T.Parallel(rows):
-                            factor_row[row] = injection_left[
-                                index, token, head, row, 0
-                            ]
+                            factor_row[row] = injection_left[index, token, head, row, 0]
                         for column in T.Parallel(columns):
                             second_column[column] = injection_right[
                                 index, token, head, 0, column
@@ -404,9 +433,9 @@ def _compile_factored_backward(
                                 local[0] = (
                                     local[0] + adjoint[row, column] * factor_row[row]
                                 )
-                            grad_injection_right[
-                                index, token, head, 0, column
-                            ] = local[0]
+                            grad_injection_right[index, token, head, 0, column] = local[
+                                0
+                            ]
                         T.sync_threads()
 
                     # authored operations invert in reverse order, each replaying
@@ -419,17 +448,13 @@ def _compile_factored_backward(
                         for earlier in T.Serial(operation_count):
                             if earlier < operation:
                                 for row in T.Parallel(rows):
-                                    factor_row[row] = left[
-                                        earlier, token, head, row, 0
-                                    ]
+                                    factor_row[row] = left[earlier, token, head, row, 0]
                                 for row in T.Parallel(rows):
                                     second_row[row] = right[
                                         earlier, token, head, row, 0
                                     ]
                                 if T.get_thread_binding() == 0:
-                                    scalars[0] = coefficient[
-                                        earlier, token, head, 0, 0
-                                    ]
+                                    scalars[0] = coefficient[earlier, token, head, 0, 0]
                                 T.sync_threads()
                                 for row, column in T.Parallel(rows, columns):
                                     state[row, column] = (
@@ -461,9 +486,7 @@ def _compile_factored_backward(
                             factor_row[row] = left[operation, token, head, row, 0]
                         if opcode[operation] == 2:
                             for row in T.Parallel(rows):
-                                second_row[row] = right[
-                                    operation, token, head, row, 0
-                                ]
+                                second_row[row] = right[operation, token, head, row, 0]
                         if T.get_thread_binding() == 0:
                             scalars[0] = coefficient[operation, token, head, 0, 0]
                         T.sync_threads()
@@ -472,15 +495,15 @@ def _compile_factored_backward(
                                 local[0] = 0.0
                                 for row in T.serial(rows):
                                     local[0] = (
-                                        local[0]
-                                        + second_row[row] * state[row, column]
+                                        local[0] + second_row[row] * state[row, column]
                                     )
                                 column_factor[column] = local[0]
                             for column in T.Parallel(columns):
                                 local[0] = 0.0
                                 for row in T.serial(rows):
                                     local[0] = (
-                                        local[0] + factor_row[row] * adjoint[row, column]
+                                        local[0]
+                                        + factor_row[row] * adjoint[row, column]
                                     )
                                 second_column[column] = local[0]
                             T.sync_threads()
@@ -517,9 +540,7 @@ def _compile_factored_backward(
                             T.sync_threads()
                             for row, column in T.Parallel(rows, columns):
                                 adjoint[row, column] = adjoint[row, column] + (
-                                    scalars[0]
-                                    * second_row[row]
-                                    * second_column[column]
+                                    scalars[0] * second_row[row] * second_column[column]
                                 )
                             T.sync_threads()
                         elif opcode[operation] == 1:
@@ -551,12 +572,12 @@ def _compile_factored_backward(
                                 local[0] = 0.0
                                 for row in T.serial(rows):
                                     local[0] = local[0] + row_scratch[row]
-                                grad_coefficient[operation, token, head, 0, 0] = local[0]
+                                grad_coefficient[operation, token, head, 0, 0] = local[
+                                    0
+                                ]
                             T.sync_threads()
                             for row, column in T.Parallel(rows, columns):
-                                adjoint[row, column] = (
-                                    adjoint[row, column] * scalars[0]
-                                )
+                                adjoint[row, column] = adjoint[row, column] * scalars[0]
                             T.sync_threads()
 
                 for row, column in T.Parallel(rows, columns):

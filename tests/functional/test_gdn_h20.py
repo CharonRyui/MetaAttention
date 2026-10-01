@@ -47,7 +47,9 @@ def _compile_pressure(operator, *, packed):
         if role == operator.algorithm.states[0].head_role:
             sizes[role] = 4
         elif role in operator.algorithm.states[0].feature_roles:
-            sizes[role] = 64 if role == operator.algorithm.states[0].feature_roles[0] else 128
+            sizes[role] = (
+                64 if role == operator.algorithm.states[0].feature_roles[0] else 128
+            )
         else:
             sizes[role] = 2
     return operator.compile(
@@ -56,6 +58,7 @@ def _compile_pressure(operator, *, packed):
         mode="packed" if packed else "dense",
         backward=True,
     )
+
 
 def _bindings(device: torch.device, *, length: int = 64):
     batch, query_heads, state_heads, dim = 1, 1, 2, 128
@@ -378,12 +381,7 @@ def test_compositional_pressure_profile_all_empty(gpu_device):
 
 
 def test_gdn_factored_recurrence_matches_independent_reference(gpu_device):
-    """The factored recurrent kernel must reproduce the GDN reference exactly.
-
-    Compiled without a backward, the GDN profile lowers to the factored
-    recurrence: one kernel that keeps the State column in registers, replays the
-    authored gate and rank-one contraction per token, and contracts the readout.
-    """
+    """FP32 affine carries and chunk replay reproduce the GDN recurrence."""
     query, key, value, gate, beta = (
         tensor.detach() for tensor in _bindings(gpu_device, length=130)
     )
@@ -393,7 +391,6 @@ def test_gdn_factored_recurrence_matches_independent_reference(gpu_device):
     plan = compiled.operator._plans[compiled.specialization]
     assert plan.plan.candidate.lowerer == "tilelang-factored-recurrence"
     assert plan.rank_one_factored is not None
-    assert plan.plan.workspace.required_bytes(130) == 0
 
     with torch.no_grad():
         result = compiled(
@@ -482,13 +479,25 @@ def test_gdn_factored_recurrence_supports_non_square_state(gpu_device):
     )
     key = torch.nn.functional.normalize(
         torch.randn(
-            1, 1, length, rows, device=gpu_device, dtype=torch.bfloat16, generator=generator
+            1,
+            1,
+            length,
+            rows,
+            device=gpu_device,
+            dtype=torch.bfloat16,
+            generator=generator,
         ),
         p=2,
         dim=-1,
     )
     value = torch.randn(
-        1, heads, length, columns, device=gpu_device, dtype=torch.bfloat16, generator=generator
+        1,
+        heads,
+        length,
+        columns,
+        device=gpu_device,
+        dtype=torch.bfloat16,
+        generator=generator,
     )
     gate = -torch.rand(1, heads, length, device=gpu_device, generator=generator)
     beta = torch.rand(1, heads, length, device=gpu_device, generator=generator)
@@ -604,3 +613,89 @@ def test_gdn_factored_recurrence_gradients_match_independent_reference(gpu_devic
             actual_gradient, expected_gradient, rtol=0.08, atol=0.08 * scale + 1e-6
         )
 
+
+@pytest.mark.parametrize("rank_first", [False, True])
+def test_ordered_lowrank_chunks_preserve_order_and_continuation(gpu_device, rank_first):
+    """Noncommuting row decay and rank-one updates retain authored order."""
+    from dataclasses import replace
+    from attn_engine import AlgorithmIR, StatefulOperator
+    from testing.benchmark_stateful_plans import CASES, inputs_for, role_sizes_for
+
+    case = replace(
+        next(case for case in CASES if case.name == "pressure"), batch=2, heads=2
+    )
+    length = 67
+    operator = case.factory(**case.kwargs(length))
+    transition = operator.algorithm.transition
+    if rank_first:
+        row, rank, column = transition.propagations
+        transition = replace(transition, propagations=(rank, row, column))
+        operator = StatefulOperator(
+            AlgorithmIR(
+                inputs=operator.algorithm.inputs,
+                states=operator.algorithm.states,
+                transition=transition,
+                readouts=operator.algorithm.readouts,
+                head_mapping=operator.algorithm.head_mapping,
+            )
+        )
+    sizes = role_sizes_for(operator, case, length)
+    compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense")
+    bindings = inputs_for(operator, case, length, gpu_device)
+    initial = torch.randn(2, 2, 64, 64, device=gpu_device) * 0.1
+    state = initial.clone()
+    expected = {"output": [], "auxiliary": []}
+    for token in range(length):
+        left = bindings["left"][:, :, token].float()
+        right = bindings["right"][:, :, token].float()
+        coefficient = bindings["coefficient"][:, :, token, None, None]
+        row_decay = bindings["left_gate"][:, :, token].exp().unsqueeze(-1)
+        if not rank_first:
+            state = state * row_decay
+        state = state + coefficient * left.unsqueeze(-1) * (
+            state * right.unsqueeze(-1)
+        ).sum(-2, keepdim=True)
+        if rank_first:
+            state = state * row_decay
+        state = state * bindings["right_gate"][:, :, token].exp().unsqueeze(-2)
+        value = bindings["value"][:, :, token].float()
+        state = state + left.unsqueeze(-1) * value.unsqueeze(-2)
+        state = state + right.unsqueeze(-1) * (value * coefficient[..., 0]).unsqueeze(
+            -2
+        )
+        for name, query in (("output", "query"), ("auxiliary", "auxiliary_query")):
+            expected[name].append(
+                (state * bindings[query][:, :, token].float().unsqueeze(-1)).sum(-2)
+            )
+    result = compiled(
+        **bindings,
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    prefix = compiled(
+        **{name: tensor[:, :, :65].contiguous() for name, tensor in bindings.items()},
+        initial_state=StateTuple(("memory",), (initial,)),
+        return_final_state=True,
+    )
+    suffix = compiled(
+        **{name: tensor[:, :, 65:].contiguous() for name, tensor in bindings.items()},
+        initial_state=prefix.final_state,
+        return_final_state=True,
+    )
+    for name, reference in expected.items():
+        reference = torch.stack(reference, 2)
+        torch.testing.assert_close(
+            result.outputs[name].float(), reference, rtol=0.02, atol=0.02
+        )
+        torch.testing.assert_close(
+            torch.cat((prefix.outputs[name], suffix.outputs[name]), 2).float(),
+            reference,
+            rtol=0.02,
+            atol=0.02,
+        )
+    torch.testing.assert_close(
+        result.final_state["memory"], state, rtol=0.002, atol=0.002
+    )
+    torch.testing.assert_close(
+        suffix.final_state["memory"], state, rtol=0.002, atol=0.002
+    )

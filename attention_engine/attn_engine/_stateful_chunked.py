@@ -1,289 +1,18 @@
-"""Chunked execution for diagonal State recurrences.
+"""Dense diagonal-State lowering with FP32 chunk carries and typed readouts.
 
-A diagonal Transition (whole-State, first-Feature or second-Feature Axis Scale
-factors) needs no dense summary. This module runs such a Program through three
-kernels: one that computes each chunk's own affine pair, one that composes those
-pairs into the running pair at every chunk end, and one that replays each chunk
-independently with the State column in registers and the readout contracted in
-place. Log-gate exponentiation and unit column factors can be selected as
-compile-time kernel modes, avoiding materialized per-token factor tensors.
-Splitting the pair walk per chunk is what keeps the serial depth at one chunk
-instead of the whole sequence. Nothing token-sized reaches global memory except
-the output.
+Identity recurrence uses chunk GEMMs, synthesizing Product Features in tiles.
+Other diagonal transitions keep State in distributed registers for one chunk;
+dependent readouts consume contracted vectors, never per-token matrix States.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
 from typing import Any, Mapping
 
 import torch
 
 # the chunk length the recurrence kernel and the published workspace bound share
 CHUNK_TOKENS = 64
-
-
-@lru_cache(maxsize=None)
-def _compile_chunk_pairs(
-    sequence_count: int,
-    sequence_length: int,
-    heads: int,
-    rows: int,
-    columns: int,
-    chunk_tokens: int,
-    threads: int,
-    device_index: int,
-    log_gate_rows: bool,
-    unit_gate_columns: bool,
-    scalar_gate: bool,
-):
-    """Write each chunk's own affine pair, one block per (sequence, head, chunk).
-
-    A running pair is the composition of the per-chunk pairs, so walking whole
-    sequences here is wasted serial depth: every element spent ``sequence_length``
-    dependent steps to reach the same answer that a single chunk's walk plus a
-    short composition gives. Chunks are independent, so they go on the grid.
-    """
-    import tilelang
-    import tilelang.language as T
-
-    chunk_count = tilelang.cdiv(sequence_length, chunk_tokens)
-    matrix_size = rows * columns
-    matrix_blocks = tilelang.cdiv(matrix_size, threads)
-
-    @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-    def build_kernel():
-        @T.prim_func
-        def chunk_pair_kernel(
-            gate_rows: T.Tensor((sequence_length, heads, 1 if scalar_gate else rows), "float32"),
-            gate_columns: T.Tensor((sequence_length, heads, columns), "float32"),
-            key: T.Tensor((sequence_length, heads, rows), "float32"),
-            value: T.Tensor((sequence_length, heads, columns), "float32"),
-            local_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-            local_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-        ):
-            if False:
-                _ = (
-                    chunk_count,
-                    matrix_blocks,
-                    rows,
-                    columns,
-                    threads,
-                    log_gate_rows,
-                    unit_gate_columns,
-                    scalar_gate,
-                )
-            with T.Kernel(
-                sequence_count * heads, chunk_count, matrix_blocks, threads=threads
-            ) as (sequence_head, chunk, matrix_block):
-                sequence = sequence_head // heads
-                head = sequence_head % heads
-                index = matrix_block * threads + T.get_thread_binding()
-                scale = T.alloc_local((1,), dtype="float32")
-                bias = T.alloc_local((1,), dtype="float32")
-                if index < matrix_size:
-                    row = index // columns
-                    column = index % columns
-                    scale[0] = 1.0
-                    bias[0] = 0.0
-                    for step in T.serial(chunk_tokens):
-                        token = chunk * chunk_tokens + step
-                        if token < sequence_length:
-                            # factors are token-major with batch-major flattening
-                            flat = sequence * sequence_length + token
-                            if log_gate_rows:
-                                row_gate = T.exp(gate_rows[flat, head, 0 if scalar_gate else row])
-                            else:
-                                row_gate = gate_rows[flat, head, 0 if scalar_gate else row]
-                            column_gate = (
-                                1.0
-                                if unit_gate_columns
-                                else gate_columns[flat, head, column]
-                            )
-                            bias[0] = (
-                                row_gate * column_gate * bias[0]
-                                + key[flat, head, row] * value[flat, head, column]
-                            )
-                            scale[0] = row_gate * column_gate * scale[0]
-                    local_scale[chunk, head, row, column] = scale[0]
-                    local_bias[chunk, head, row, column] = bias[0]
-
-        return chunk_pair_kernel
-
-    return build_kernel()
-
-
-@lru_cache(maxsize=None)
-def _compile_chunk_scan(
-    sequence_count: int,
-    heads: int,
-    rows: int,
-    columns: int,
-    chunk_count: int,
-    threads: int,
-    device_index: int,
-):
-    """Compose the per-chunk pairs into the running pair at every chunk end."""
-    import tilelang
-    import tilelang.language as T
-
-    matrix_size = rows * columns
-    matrix_blocks = tilelang.cdiv(matrix_size, threads)
-
-    @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-    def build_kernel():
-        @T.prim_func
-        def chunk_scan_kernel(
-            local_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-            local_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-            carry_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-            carry_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-        ):
-            if False:
-                _ = (matrix_blocks, rows, columns, threads)
-            with T.Kernel(sequence_count * heads, matrix_blocks, threads=threads) as (
-                sequence_head,
-                matrix_block,
-            ):
-                head = sequence_head % heads
-                index = matrix_block * threads + T.get_thread_binding()
-                scale = T.alloc_local((1,), dtype="float32")
-                bias = T.alloc_local((1,), dtype="float32")
-                if index < matrix_size:
-                    row = index // columns
-                    column = index % columns
-                    scale[0] = 1.0
-                    bias[0] = 0.0
-                    for chunk in T.serial(chunk_count):
-                        bias[0] = (
-                            local_scale[chunk, head, row, column] * bias[0]
-                            + local_bias[chunk, head, row, column]
-                        )
-                        scale[0] = local_scale[chunk, head, row, column] * scale[0]
-                        carry_scale[chunk, head, row, column] = scale[0]
-                        carry_bias[chunk, head, row, column] = bias[0]
-
-        return chunk_scan_kernel
-
-    return build_kernel()
-
-
-@lru_cache(maxsize=None)
-def _compile_chunk_recurrence(
-    sequence_count: int,
-    sequence_length: int,
-    heads: int,
-    rows: int,
-    columns: int,
-    output_dtype: torch.dtype,
-    chunk_tokens: int,
-    thread_columns: int,
-    device_index: int,
-    log_gate_rows: bool,
-    unit_gate_columns: bool,
-    scalar_gate: bool,
-):
-    """Replay one chunk per block, State in registers, readout in place.
-
-    The grid gives every (sequence, head, chunk, column slice) its own block, so
-    the block count scales with the chunk count instead of with heads alone.
-    """
-    import tilelang
-    import tilelang.language as T
-
-    chunk_count = tilelang.cdiv(sequence_length, chunk_tokens)
-    block_columns = min(columns, thread_columns)
-    column_blocks = tilelang.cdiv(columns, block_columns)
-
-    @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
-    def build_kernel():
-        @T.prim_func
-        def chunk_recurrence_kernel(
-            carry_scale: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-            carry_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
-            gate_rows: T.Tensor((sequence_length, heads, 1 if scalar_gate else rows), "float32"),
-            gate_columns: T.Tensor((sequence_length, heads, columns), "float32"),
-            key: T.Tensor((sequence_length, heads, rows), "float32"),
-            value: T.Tensor((sequence_length, heads, columns), "float32"),
-            query: T.Tensor((sequence_length, heads, rows), "float32"),
-            initial: T.Tensor((sequence_count, heads, rows, columns), "float32"),
-            output: T.Tensor(
-                (sequence_count, heads, sequence_length, columns), dtype=output_dtype
-            ),
-            final: T.Tensor((sequence_count, heads, rows, columns), "float32"),
-        ):
-            if False:
-                _ = (
-                    output_dtype, chunk_count, column_blocks, rows, columns,
-                    log_gate_rows, unit_gate_columns, scalar_gate,
-                )
-            with T.Kernel(
-                sequence_count * heads, chunk_count, column_blocks, threads=block_columns
-            ) as (sequence_head, chunk, column_block):
-                sequence = sequence_head // heads
-                head = sequence_head % heads
-                column = column_block * block_columns + T.get_thread_binding()
-                state = T.alloc_local((rows,), dtype="float32")
-                accumulated = T.alloc_local((1,), dtype="float32")
-                start = chunk * chunk_tokens
-                if log_gate_rows:
-                    gate_shared = T.alloc_shared(
-                        (chunk_tokens, 1 if scalar_gate else rows), dtype="float32"
-                    )
-                    for step, row in T.Parallel(chunk_tokens, 1 if scalar_gate else rows):
-                        if start + step < sequence_length:
-                            gate_shared[step, row] = T.exp(
-                                gate_rows[
-                                    sequence * sequence_length + start + step,
-                                    head,
-                                    0 if scalar_gate else row,
-                                ]
-                            )
-                    T.sync_threads()
-                if column < columns:
-                    for row in T.serial(rows):
-                        if chunk == 0:
-                            state[row] = initial[sequence, head, row, column]
-                        else:
-                            state[row] = (
-                                carry_scale[chunk - 1, head, row, column]
-                                * initial[sequence, head, row, column]
-                                + carry_bias[chunk - 1, head, row, column]
-                            )
-                for token_in_chunk in T.Serial(chunk_tokens):
-                    token = start + token_in_chunk
-                    if token < sequence_length:
-                        flat = sequence * sequence_length + token
-                        if column < columns:
-                            for row in T.serial(rows):
-                                row_gate = (
-                                    gate_shared[token_in_chunk, 0 if scalar_gate else row]
-                                    if log_gate_rows
-                                    else gate_rows[flat, head, 0 if scalar_gate else row]
-                                )
-                                column_gate = (
-                                    1.0
-                                    if unit_gate_columns
-                                    else gate_columns[flat, head, column]
-                                )
-                                state[row] = (
-                                    row_gate * column_gate * state[row]
-                                    + key[flat, head, row] * value[flat, head, column]
-                                )
-                            accumulated[0] = 0.0
-                            for row in T.serial(rows):
-                                accumulated[0] = (
-                                    accumulated[0] + query[flat, head, row] * state[row]
-                                )
-                            output[sequence, head, token, column] = accumulated[0]
-                    if chunk == chunk_count - 1 and token == sequence_length - 1:
-                        # the last chunk owns the final State of the sequence
-                        for row in T.serial(rows):
-                            final[sequence, head, row, column] = state[row]
-
-        return chunk_recurrence_kernel
-
-    return build_kernel()
 
 
 def _chunked_state(
@@ -300,124 +29,43 @@ def _chunked_state(
     unit_gate_columns: bool = False,
     scalar_gate: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run one diagonal recurrence through the chunked schedule.
+    """Run a diagonal recurrence through distributed chunk replay."""
+    from ._stateful_diagonal_kernels import prepare_state, read_state
 
-    Every per-token tensor is token-major and contiguous. ``gate_columns`` may be
-    omitted for a whole-State decay or one that scales the rows alone, in which
-    case the column factor is one. The readout contracts the rows and writes the
-    columns, so ``query`` spans the rows. A rank-1 State is passed as one column
-    per token and promotes to a single column of the rows axis, where its
-    injection factor is the key and ``value`` is the constant one.
-    """
+    if chunk_tokens != CHUNK_TOKENS:
+        raise ValueError("diagonal recurrence uses 64-token chunks")
     promoted = initial_state.dim() == 3
-    if promoted:
-        # [sequences, heads, columns] is a single column per token: the State's
-        # one Feature lands on the rows, where a first-Feature readout contracts
-        # it, and the injection factor becomes the key. This matches the promoted
-        # matrix view the reference lowering already uses for rank-1 States.
-        initial_state = initial_state.unsqueeze(-1)
-    rows, columns = initial_state.shape[2], initial_state.shape[3]
-    sequence_count, heads = initial_state.shape[0], initial_state.shape[1]
-    token_count = value.shape[0] if value is not None else key.shape[0]
+    initial = initial_state.unsqueeze(-1) if promoted else initial_state
+    batch, heads, rows, columns = initial.shape
+    tokens = key.shape[0]
+    length = tokens // batch
+    if tokens != batch * length:
+        raise ValueError("dense tokens must divide evenly between sequences")
     if value is None:
-        assert columns == 1, "a rank-1 State is one column per token"
         value = torch.ones(
-            token_count, heads, 1, device=key.device, dtype=key.dtype
+            tokens, heads, columns, device=key.device, dtype=torch.float32
         )
-    if token_count % chunk_tokens and sequence_count > 1:
-        raise ValueError("chunked recurrence needs chunk-aligned dense sequences")
-    device = initial_state.device
-    rows_gate = gate_rows.reshape(token_count, heads, -1)
-    if scalar_gate:
-        if rows_gate.shape[-1] != 1:
-            raise ValueError("scalar chunked gate must have one feature")
-    elif rows_gate.shape[-1] == 1 and rows > 1:
-        # a whole-State decay applies to every row
-        rows_gate = rows_gate.expand(token_count, heads, rows)
-    rows_gate = rows_gate.float().contiguous()
-    key = key.reshape(token_count, heads, -1).float().contiguous()
-    value = value.reshape(token_count, heads, -1).float().contiguous()
-    query = query.reshape(token_count, heads, -1).float().contiguous()
-    columns_gate = (
-        None
-        if unit_gate_columns
-        else (
-            torch.ones(token_count, heads, columns, device=device, dtype=torch.float32)
-            if gate_columns is None
-            else gate_columns.reshape(token_count, heads, columns).float().contiguous()
-        )
+    rows_gate = gate_rows.reshape(tokens, heads, -1).float()
+    if log_gate_rows:
+        rows_gate = rows_gate.exp()
+    rows_gate = rows_gate.expand(tokens, heads, rows)
+    columns_gate = None if unit_gate_columns else gate_columns
+    carry, final, factors = prepare_state(
+        rows_gate=rows_gate,
+        columns_gate=columns_gate,
+        key=key,
+        value=value,
+        initial=initial,
+        sequence_length=length,
+        return_final_state=True,
     )
-    chunk_count = (token_count + chunk_tokens - 1) // chunk_tokens
-    device_index = device.index
-    if device_index is None:
-        device_index = torch.cuda.current_device()
-    pairs = _compile_chunk_pairs(
-        sequence_count,
-        token_count,
-        heads,
-        rows,
-        columns,
-        chunk_tokens,
-        128,
-        device_index,
-        log_gate_rows,
-        unit_gate_columns,
-        scalar_gate,
+    output = read_state(carry, factors, query, sequence_length=length)
+    output = (
+        output.reshape(batch, length, heads, columns)
+        .permute(0, 2, 1, 3)
+        .to(output_dtype)
     )
-    local_scale = torch.empty(
-        chunk_count, heads, rows, columns, device=device, dtype=torch.float32
-    )
-    local_bias = torch.empty_like(local_scale)
-    pairs(
-        rows_gate,
-        columns_gate,
-        key.contiguous(),
-        value.contiguous(),
-        local_scale,
-        local_bias,
-    )
-    scan = _compile_chunk_scan(
-        sequence_count, heads, rows, columns, chunk_count, 128, device_index
-    )
-    carry_scale = torch.empty_like(local_scale)
-    carry_bias = torch.empty_like(local_scale)
-    scan(local_scale, local_bias, carry_scale, carry_bias)
-    kernel = _compile_chunk_recurrence(
-        sequence_count,
-        token_count,
-        heads,
-        rows,
-        columns,
-        output_dtype,
-        chunk_tokens,
-        64,
-        device_index,
-        log_gate_rows,
-        unit_gate_columns,
-        scalar_gate,
-    )
-    output = torch.empty(
-        sequence_count, heads, token_count, columns, device=device, dtype=output_dtype
-    )
-    final = torch.empty(
-        sequence_count, heads, rows, columns, device=device, dtype=torch.float32
-    )
-    kernel(
-        carry_scale,
-        carry_bias,
-        rows_gate,
-        columns_gate,
-        key,
-        value,
-        query,
-        initial_state.contiguous(),
-        output,
-        final,
-    )
-    if promoted:
-        # a rank-1 State keeps its declared rank
-        final = final.squeeze(-1)
-    return output, final
+    return output, final.squeeze(-1) if promoted else final
 
 
 def chunked_elementwise_dense(
@@ -467,45 +115,39 @@ def chunked_elementwise_dense(
 
 
 def _contracted_terms(expression: Any) -> list[Any] | None:
-    """Collect the State Terms a readout expression carries, or ``None``."""
-    from .stateful_operator import Add, Constant, Divide, Multiply, StateTerm
+    """Collect nested State Terms; reject unimplemented expression nodes."""
+    from .stateful_operator import (
+        Add,
+        Clamp,
+        Constant,
+        Contract,
+        Divide,
+        Exp,
+        Input,
+        Log,
+        Multiply,
+        Negate,
+        Outer,
+        Reciprocal,
+        Sigmoid,
+        Softmax,
+        Sqrt,
+        StateTerm,
+    )
 
     if isinstance(expression, StateTerm):
-        return [expression]
-    if isinstance(expression, Constant):
+        dependencies = _contracted_terms(expression.operand)
+        return None if dependencies is None else dependencies + [expression]
+    if isinstance(expression, (Input, Constant)):
         return []
-    if isinstance(expression, (Add, Multiply, Divide)):
+    if isinstance(expression, (Add, Multiply, Divide, Outer, Contract)):
         left = _contracted_terms(expression.left)
         right = _contracted_terms(expression.right)
         return None if left is None or right is None else left + right
-    return None
-
-
-def _compose_readout(
-    expression: Any, contracted: Mapping[str, torch.Tensor]
-) -> torch.Tensor | None:
-    """Evaluate a readout whose State Terms the kernels already contracted.
-
-    ``None`` means the expression carries a node this epilogue cannot evaluate
-    over contracted outputs, which keeps the Program on the reference lowering.
-    """
-    from .stateful_operator import Add, Constant, Divide, Multiply, StateTerm
-
-    if isinstance(expression, StateTerm):
-        return contracted.get(expression.state)
-    if isinstance(expression, Constant):
-        device = next(iter(contracted.values())).device
-        return torch.full((), expression.value, device=device, dtype=expression.dtype)
-    if isinstance(expression, (Add, Multiply, Divide)):
-        left = _compose_readout(expression.left, contracted)
-        right = _compose_readout(expression.right, contracted)
-        if left is None or right is None:
-            return None
-        if isinstance(expression, Add):
-            return left + right
-        if isinstance(expression, Multiply):
-            return left * right
-        return left / right
+    if isinstance(
+        expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Softmax)
+    ):
+        return _contracted_terms(expression.operand)
     return None
 
 
@@ -535,10 +177,14 @@ def _axis_factors(
 
     def per_token(expression: Any, size: int | None) -> torch.Tensor | None:
         factor = evaluate(expression, values).float()
+        if factor.numel() == 1:
+            return factor.reshape(1, 1, 1).expand(token_count, heads, size or 1)
         if size is None:
             broadcast = factor.reshape(token_count, heads, -1)
             return broadcast if broadcast.shape[-1] == 1 else None
-        return _role_vector(factor, token_count, heads).reshape(token_count, heads, size)
+        return _role_vector(factor, token_count, heads).reshape(
+            token_count, heads, size
+        )
 
     rows = torch.ones(token_count, heads, left_size, device=device)
     columns = (
@@ -558,8 +204,6 @@ def _axis_factors(
             if scale is None:
                 return None
             rows = rows * scale
-            if columns is not None:
-                columns = columns * scale
             continue
         if roles[0] == view.feature_roles[0]:
             row_factor = per_token(node.factor, left_size)
@@ -578,33 +222,100 @@ def _axis_factors(
     return rows, columns
 
 
-def chunked_states_eligible(algorithm: Any) -> bool:
-    """Whether ``execute_chunked_states`` can express this Program's algebra.
+def _readout_expression(readout: Any) -> Any:
+    from .stateful_operator import StateContraction, StateTerm
 
-    Static, from the IR alone. The runtime gate additionally requires a CUDA
-    device, a chunk-aligned uniform length, and no autograd, so a Program that
-    passes here can still fall back to the reference lowering.
-    """
-    from .stateful_operator import AxisScale, StateContraction, StateTerm
+    return (
+        StateTerm(readout.state, readout.operand, readout.role)
+        if isinstance(readout, StateContraction)
+        else readout.expression
+    )
 
-    from ._stateful_reference import _matrix_view
 
-    terms_by_state: dict[str, int] = {state.name: 0 for state in algorithm.states}
-    for readout in algorithm.readouts:
-        expression = (
-            StateTerm(readout.state, readout.operand, readout.role)
-            if isinstance(readout, StateContraction)
-            else readout.expression
+def _expression_features(expression: Any, algorithm: Any) -> tuple[Any, ...] | None:
+    """Prove the squeezed value carries at most one Feature axis."""
+    from .stateful_operator import (
+        Constant,
+        Contract,
+        FeatureRole,
+        Input,
+        Outer,
+        StateTerm,
+    )
+
+    if isinstance(expression, Constant):
+        return ()
+    if isinstance(expression, Input):
+        spec = next(
+            (item for item in algorithm.inputs if item.name == expression.name), None
         )
-        terms = _contracted_terms(expression)
+        if spec is None:
+            return None
+        roles = tuple(role for role in spec.roles if isinstance(role, FeatureRole))
+        return roles if len(roles) <= 1 else None
+    if isinstance(expression, StateTerm):
+        spec = next(
+            (item for item in algorithm.states if item.name == expression.state), None
+        )
+        if spec is None:
+            return None
+        operand = _expression_features(expression.operand, algorithm)
+        if expression.role is None:
+            return spec.feature_roles if operand == () and spec.rank == 1 else None
+        if operand != (expression.role,):
+            return None
+        return tuple(role for role in spec.feature_roles if role != expression.role)
+    if hasattr(expression, "left"):
+        left = _expression_features(expression.left, algorithm)
+        right = _expression_features(expression.right, algorithm)
+        if left is None or right is None:
+            return None
+        if isinstance(expression, Outer):
+            return (
+                (expression.role,)
+                if left == (expression.role.left,) and right == (expression.role.right,)
+                else None
+            )
+        if isinstance(expression, Contract):
+            return (
+                ()
+                if left in ((), (expression.role,))
+                and right in ((), (expression.role,))
+                else None
+            )
+        # The reference readout value space also aligns its single surviving
+        # Feature positionally (including an extent-one authored unit Feature).
+        return left or right
+    if hasattr(expression, "operand"):
+        return _expression_features(expression.operand, algorithm)
+    return None
+
+
+def chunked_states_eligible(algorithm: Any, *, packed: bool = False) -> bool:
+    """Static proof for dense diagonal recurrence with dependent readout passes."""
+    from .stateful_operator import AxisScale, Identity
+
+    if packed:
+        return False
+    specs = {state.name: state for state in algorithm.states}
+    modes: dict[str, set[bool]] = {name: set() for name in specs}
+    for readout in algorithm.readouts:
+        terms = _contracted_terms(_readout_expression(readout))
         if terms is None:
             return False
+        if _expression_features(_readout_expression(readout), algorithm) is None:
+            return False
         for term in terms:
-            if term.prior or term.role is None or term.state not in terms_by_state:
+            state = specs.get(term.state)
+            if state is None:
                 return False
-            terms_by_state[term.state] += 1
-    # the kernels write one output per State, so each State may be read once
-    if any(count != 1 for count in terms_by_state.values()):
+            if term.role is None:
+                if state.rank != 1:
+                    return False
+            elif term.role != state.feature_roles[0]:
+                return False
+            modes[state.name].add(term.role is None)
+    if any(len(mode) > 1 for mode in modes.values()):
         return False
     for state in algorithm.states:
         transition = next(
@@ -612,17 +323,81 @@ def chunked_states_eligible(algorithm: Any) -> bool:
         )
         if transition is None or len(transition.injections) != 1:
             return False
-        if any(not isinstance(node, AxisScale) for node in transition.propagations):
-            return False
-        view = _matrix_view(state)
-        first_role = view.feature_roles[0]
+        for node in transition.propagations:
+            if not isinstance(node, (AxisScale, Identity)):
+                return False
+            if isinstance(node, AxisScale):
+                if _contracted_terms(node.factor) != []:
+                    return False
+                features = _expression_features(node.factor, algorithm)
+                if features is None or (features and features != tuple(node.roles)):
+                    return False
+                if any(role not in state.feature_roles for role in node.roles):
+                    return False
+                if len(node.roles) > 1 and features:
+                    return False
+        seen: set[Any] = set()
+        scalar_count = 0
         for factor in transition.injections[0].factors:
             roles = tuple(factor.roles)
-            if len(roles) > 1:
+            scalar_count += not roles
+            if scalar_count > 1:
                 return False
-            if roles and roles[0] not in (first_role, view.feature_roles[-1]):
+            if len(roles) > 1 or any(
+                role not in state.feature_roles or role in seen for role in roles
+            ):
                 return False
+            if _contracted_terms(factor.expression) != []:
+                return False
+            features = _expression_features(factor.expression, algorithm)
+            if features is None or (features and features != roles):
+                return False
+            seen.update(roles)
+        if seen != set(state.feature_roles):
+            return False
     return True
+
+
+def chunked_states_workspace(
+    algorithm: Any, role_sizes: Mapping[Any, int], heads: int
+) -> tuple[int, int]:
+    """Conservative ``(bytes/token, bytes/chunk/sequence)`` scratch bound.
+
+    Charge B*T times the first and B*(ceil(T/64)+1) times the second, including
+    final States. Covers factor evaluation, contracted FP32 outputs and authored
+    arithmetic. Identity Product Features are synthesized inside GEMM tiles.
+    """
+    from .stateful_operator import Identity, ProductFeatureRole
+
+    per_token = 0
+    per_chunk = 0
+    for state in algorithm.states:
+        dims = [role_sizes[role] for role in state.feature_roles]
+        elements = dims[0] * (dims[1] if len(dims) == 2 else 1)
+        transition = next(
+            item for item in algorithm.transitions if item.state == state.name
+        )
+        identity = all(isinstance(node, Identity) for node in transition.propagations)
+        per_chunk += 4 * heads * elements * (2 if identity else 3)
+        factor_dims = [
+            role_sizes[role.left] + role_sizes[role.right]
+            if identity and isinstance(role, ProductFeatureRole)
+            else role_sizes[role]
+            for role in state.feature_roles
+        ]
+        per_token += 32 * heads * sum(factor_dims)
+    for readout in algorithm.readouts:
+        for term in _contracted_terms(_readout_expression(readout)) or ():
+            state = next(
+                state for state in algorithm.states if state.name == term.state
+            )
+            output = (
+                role_sizes[state.feature_roles[-1]]
+                if state.rank == 2 or term.role is None
+                else 1
+            )
+            per_token += 64 * heads * output
+    return per_token, per_chunk
 
 
 def execute_chunked_states(
@@ -636,143 +411,200 @@ def execute_chunked_states(
     token_count: int,
     device: torch.device,
     return_final_state: bool,
+    sequence_length: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None] | None:
-    """Run a multi-State Program through the chunked schedule, or decline.
-
-    Declining (``None``) leaves the caller on the reference lowering. This path
-    takes a Program whose States all have diagonal Transitions with one separable
-    injection, and whose readout is arithmetic over State Terms that each contract
-    their State's first Feature. That last condition is the kernels' orientation:
-    they contract the rows and write the columns, so a term contracting the second
-    Feature, or reducing the whole State (``role=None``, as HGRN's identity readout
-    does), needs an output these kernels do not produce.
-
-    The States stay in global memory only as chunk-boundary carries, which is the
-    point: the reference lowering materializes one State per token per State.
-    """
-    if device.type != "cuda" or token_count % CHUNK_TOKENS:
+    """Dense inference with boundary carries, GEMMs and dependent readout passes."""
+    if device.type != "cuda" or sequence_length is None or sequence_length <= 0:
         return None
     if any(
         tensor.requires_grad for tensor in (*values.values(), *initial_states.values())
     ):
         return None
-    from .stateful_operator import AxisScale, StateContraction, StateTerm, _evaluate
-
-    from ._stateful_reference import _matrix_view, _role_vector
-
-    def evaluate(
-        expression: Any, bound: Mapping[str, torch.Tensor]
-    ) -> torch.Tensor:
-        return _evaluate(expression, bound, feature_axes=None, segment=segment)
-
     if not chunked_states_eligible(algorithm):
         return None
-    terms_by_state: dict[str, list[Any]] = {
-        state.name: [] for state in algorithm.states
-    }
-    expressions: list[tuple[str, Any]] = []
-    for readout in algorithm.readouts:
-        expression = (
-            StateTerm(readout.state, readout.operand, readout.role)
-            if isinstance(readout, StateContraction)
-            else readout.expression
-        )
-        terms = _contracted_terms(expression)
-        assert terms is not None
-        for term in terms:
-            terms_by_state[term.state].append(term)
-        expressions.append((readout.name, expression))
-    gate_rows: list[torch.Tensor] = []
-    gate_columns: list[torch.Tensor | None] = []
-    keys: list[torch.Tensor] = []
-    values_per_state: list[torch.Tensor] = []
-    queries: list[torch.Tensor] = []
-    initials: list[torch.Tensor] = []
-    for state in algorithm.states:
-        view = _matrix_view(state)
-        transition = next(
-            item for item in algorithm.transitions if item.state == state.name
-        )
-        if len(transition.injections) != 1:
-            return None
-        if any(not isinstance(node, AxisScale) for node in transition.propagations):
-            return None
-        first_role = view.feature_roles[0]
-        left_size = role_sizes[first_role]
-        right_size = 1 if state.rank == 1 else role_sizes[view.feature_roles[1]]
-        factors = _axis_factors(
-            transition.propagations,
-            view=view,
-            evaluate=evaluate,
-            values=values,
-            token_count=token_count,
-            heads=heads,
-            left_size=left_size,
-            right_size=right_size,
-            device=device,
-        )
-        if factors is None:
-            return None
-        row_factor, column_factor = factors
-        term = terms_by_state[state.name][0]
-        if term.role != first_role:
-            return None
-        # take the injection's own factors rather than slicing the assembled
-        # matrix: slicing bias[..., 0] also carries the other factor's first
-        # element, which is a per-token scalar that then rides along in the key
-        key = None
-        column = None
-        for factor in transition.injections[0].factors:
-            factor_value = evaluate(factor.expression, values).float()
-            roles = tuple(factor.roles)
-            if len(roles) == 1 and roles[0] == first_role:
-                key = _role_vector(factor_value, token_count, heads)
-            elif roles and roles[0] == view.feature_roles[-1]:
-                column = _role_vector(factor_value, token_count, heads)
-            elif not roles:
-                # a factor without Feature roles adds the same value to every row
-                column = factor_value.reshape(token_count, heads, -1)
-            else:
-                return None
-        if key is None:
-            return None
-        if column is None:
-            column = torch.ones(token_count, heads, 1, device=device)
-        # a whole-State scale is one factor over both axes, so only the row gate
-        # carries it; the kernels expand an extent-one row gate themselves
-        gate_rows.append(row_factor)
-        gate_columns.append(column_factor)
-        keys.append(key)
-        values_per_state.append(column)
-        queries.append(
-            _role_vector(evaluate(term.operand, values), token_count, heads)
-        )
-        initials.append(initial_states[state.name])
-    outputs, finals = chunked_elementwise_dense(
-        gate_rows=tuple(gate_rows),
-        gate_columns=tuple(gate_columns),
-        key=tuple(keys),
-        value=tuple(values_per_state),
-        query=tuple(queries),
-        initial_state=tuple(initials),
-        output_dtype=algorithm.readouts[0].output_dtype,
+    from .stateful_operator import (
+        Add,
+        Clamp,
+        Contract,
+        Divide,
+        Exp,
+        Identity,
+        Log,
+        Multiply,
+        Negate,
+        Outer,
+        Reciprocal,
+        Sigmoid,
+        Softmax,
+        Sqrt,
+        StateTerm,
+        _evaluate,
     )
-    # the kernels write [sequence, head, token, column]; the space the reference
-    # lowering's caller consumes is token before head, since its readouts come back
-    # from the token-major internal layout
-    outputs = tuple(output.permute(0, 2, 1, 3) for output in outputs)
-    contracted = {
-        state.name: output for state, output in zip(algorithm.states, outputs)
+    from ._stateful_reference import _matrix_view
+    from ._stateful_diagonal_kernels import prepare_state, read_state
+
+    specs = {state.name: state for state in algorithm.states}
+    transitions = {transition.state: transition for transition in algorithm.transitions}
+    identity_read = {
+        term.state
+        for readout in algorithm.readouts
+        for term in (_contracted_terms(_readout_expression(readout)) or ())
+        if term.role is None
     }
-    result: dict[str, torch.Tensor] = {}
-    for name, expression in expressions:
-        composed = _compose_readout(expression, contracted)
-        if composed is None:
-            return None
-        readout = next(item for item in algorithm.readouts if item.name == name)
-        result[name] = composed.to(readout.output_dtype)
-    if not return_final_state:
-        return result, None
-    return result, {
-        state.name: final for state, final in zip(algorithm.states, finals)
+    prepared: dict[str, Any] = {}
+    final_states: dict[str, torch.Tensor] = {}
+    term_values: dict[Any, torch.Tensor] = {}
+    input_values: dict[Any, torch.Tensor] = {}
+
+    def vector(value: torch.Tensor, size: int) -> torch.Tensor:
+        if value.numel() == 1:
+            return value.reshape(1, 1, 1).expand(token_count, heads, size)
+        return value.reshape(token_count, heads, -1).expand(token_count, heads, size)
+
+    def input_expression(expression: Any) -> torch.Tensor:
+        if expression not in input_values:
+            result = _evaluate(
+                expression, values, segment=segment, squeeze_features=True
+            )
+            input_values[expression] = (
+                result.unsqueeze(-1) if result.ndim == 2 else result
+            )
+        return input_values[expression]
+
+    def row_expression(expression: Any, size: int, lazy: bool) -> Any:
+        if lazy and isinstance(expression, Outer):
+            return (
+                input_expression(expression.left).reshape(token_count, heads, -1),
+                input_expression(expression.right).reshape(token_count, heads, -1),
+            )
+        return vector(input_expression(expression), size)
+
+    def prepare(name: str):
+        if name in prepared:
+            return prepared[name]
+        state = specs[name]
+        transition = transitions[name]
+        rows = role_sizes[state.feature_roles[0]]
+        columns = 1 if state.rank == 1 else role_sizes[state.feature_roles[1]]
+        identity = all(isinstance(node, Identity) for node in transition.propagations)
+        if identity:
+            row_gate, column_gate = None, None
+        else:
+            row_gate, column_gate = _axis_factors(
+                transition.propagations,
+                view=_matrix_view(state),
+                evaluate=lambda expr, _: input_expression(expr),
+                values=values,
+                token_count=token_count,
+                heads=heads,
+                left_size=rows,
+                right_size=columns,
+                device=device,
+            )
+        key = None
+        value = None
+        scalar = None
+        for factor in transition.injections[0].factors:
+            if not factor.roles:
+                scalar = input_expression(factor.expression)
+            elif factor.roles[0] == state.feature_roles[0]:
+                key = row_expression(
+                    factor.expression, rows, identity and name not in identity_read
+                )
+            else:
+                value = vector(input_expression(factor.expression), columns)
+        if value is None:
+            value = torch.ones(
+                token_count, heads, columns, device=device, dtype=torch.float32
+            )
+        if scalar is not None:
+            value = value * vector(scalar, 1)
+        initial = initial_states[name]
+        if state.rank == 1:
+            if name in identity_read:
+                initial = initial.unsqueeze(-2)
+                value, key = key, value
+                row_gate, column_gate = None, row_gate
+            else:
+                initial = initial.unsqueeze(-1)
+        carry, final, factors = prepare_state(
+            rows_gate=row_gate,
+            columns_gate=column_gate,
+            key=key,
+            value=value,
+            initial=initial,
+            sequence_length=sequence_length,
+            return_final_state=return_final_state,
+            identity=identity,
+        )
+        if state.rank == 1:
+            final = final.squeeze(-2 if name in identity_read else -1)
+        final_states[name] = final
+        prepared[name] = carry, factors, identity
+        return prepared[name]
+
+    def evaluate(expression: Any) -> torch.Tensor:
+        if _contracted_terms(expression) == []:
+            return input_expression(expression)
+        if isinstance(expression, StateTerm):
+            if expression not in term_values:
+                carry, factors, identity = prepare(expression.state)
+                size = carry.shape[2]
+                if expression.role is None:
+                    query = vector(evaluate(expression.operand), 1)
+                elif (
+                    identity
+                    and isinstance(expression.operand, Outer)
+                    and not _contracted_terms(expression.operand)
+                ):
+                    query = row_expression(expression.operand, size, True)
+                else:
+                    query = vector(evaluate(expression.operand), size)
+                term_values[expression] = read_state(
+                    carry,
+                    factors,
+                    query,
+                    sequence_length=sequence_length,
+                    prior=expression.prior,
+                    identity=identity,
+                )
+            return term_values[expression]
+        if isinstance(expression, (Add, Multiply, Divide, Contract, Outer)):
+            left, right = evaluate(expression.left), evaluate(expression.right)
+            if isinstance(expression, Add):
+                return left + right
+            if isinstance(expression, Multiply):
+                return left * right
+            if isinstance(expression, Divide):
+                return left / right
+            if isinstance(expression, Contract):
+                return (left.float() * right.float()).sum(-1, keepdim=True)
+            return (left.float().unsqueeze(-1) * right.float().unsqueeze(-2)).flatten(2)
+        operand = evaluate(expression.operand).float()
+        if isinstance(expression, Negate):
+            return -operand
+        if isinstance(expression, Exp):
+            return operand.exp()
+        if isinstance(expression, Log):
+            return operand.log()
+        if isinstance(expression, Sigmoid):
+            return operand.sigmoid()
+        if isinstance(expression, Sqrt):
+            return operand.sqrt()
+        if isinstance(expression, Reciprocal):
+            return operand.reciprocal()
+        if isinstance(expression, Clamp):
+            return operand.clamp(expression.minimum, expression.maximum)
+        if isinstance(expression, Softmax):
+            return operand.softmax(-1)
+        raise AssertionError("eligibility admitted an unsupported readout")
+
+    outputs = {
+        readout.name: evaluate(_readout_expression(readout)).to(readout.output_dtype)
+        for readout in algorithm.readouts
     }
+    if return_final_state:
+        for state in algorithm.states:
+            prepare(state.name)
+        return outputs, final_states
+    return outputs, None

@@ -255,6 +255,7 @@ def execute_reference(
     token_count: int,
     device: torch.device,
     return_final_state: bool,
+    sequence_length: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
     """Run one invocation of a v2 Program through the reference lowering."""
     from ._stateful_chunked import execute_chunked_states
@@ -269,11 +270,12 @@ def execute_reference(
         token_count=token_count,
         device=device,
         return_final_state=return_final_state,
+        sequence_length=sequence_length,
     )
     if chunked is not None:
-        # the chunked schedule keeps each State in registers and stores only the
-        # chunk-boundary carries, where the per-token path below materializes one
-        # State per token per State
+        # Dense inference keeps only boundary States and contracted vectors;
+        # the fallback below materializes per-token States for packed, gradients
+        # or unsupported compositions.
         return chunked
     order, axes = feature_layout(algorithm)
     state_values: dict[str, torch.Tensor] = {}
@@ -349,8 +351,7 @@ def _scan_state(
     # only a rank-one contraction composes a non-diagonal update; a single-feature
     # Axis Scale stays one elementwise factor per axis, as the v1 families do
     dense = any(
-        type(node).__name__ == "RankOnePropagation"
-        for node in transition.propagations
+        type(node).__name__ == "RankOnePropagation" for node in transition.propagations
     )
     evaluate = lambda expression, bound: _evaluate(  # noqa: E731
         expression, bound, feature_axes=None, segment=segment
@@ -558,7 +559,8 @@ def _affine_summary(
                     )
                 else:
                     left = (
-                        torch.diag_embed(_role_vector(factor, token_count, heads)) @ left
+                        torch.diag_embed(_role_vector(factor, token_count, heads))
+                        @ left
                     )
             elif node.roles[0] == view.feature_roles[1]:
                 if right is None:
@@ -632,9 +634,7 @@ def _prior_state(
         return prior
     prior[0] = initial[segment[0].long()]
     if states.shape[0] > 1:
-        same = (segment[1:] == segment[:-1]).view(
-            -1, *([1] * (states.ndim - 1))
-        )
+        same = (segment[1:] == segment[:-1]).view(-1, *([1] * (states.ndim - 1)))
         prior[1:] = torch.where(same, states[:-1], initial[segment[1:].long()])
     return prior
 

@@ -226,7 +226,9 @@ class InputExpression:
     ) -> Outer:
         return Outer(self, other, role)
 
-    def contract(self, other: InputExpression | float | int, role: FeatureRole) -> Contract:
+    def contract(
+        self, other: InputExpression | float | int, role: FeatureRole
+    ) -> Contract:
         return Contract(self, other, role)
 
     def softmax(self, role: FeatureRole) -> Softmax:
@@ -510,9 +512,7 @@ class StateSpec:
             or not isinstance(roles[1], HeadRole)
             or not all(isinstance(role, FeatureRole) for role in roles[2:])
         ):
-            raise ValueError(
-                "State roles are Batch, one Head, and one or two Features"
-            )
+            raise ValueError("State roles are Batch, one Head, and one or two Features")
         if len(roles) == 4 and roles[2] == roles[3]:
             raise ValueError("State Feature roles must be distinct and ordered")
         object.__setattr__(self, "name", name)
@@ -726,7 +726,9 @@ class AlgorithmIR:
         head_mapping: HeadMapping,
     ) -> None:
         transitions = (
-            (transition,) if isinstance(transition, StateTransition) else tuple(transition)
+            (transition,)
+            if isinstance(transition, StateTransition)
+            else tuple(transition)
         )
         object.__setattr__(self, "inputs", tuple(inputs))
         object.__setattr__(self, "states", tuple(states))
@@ -760,8 +762,6 @@ class AlgorithmIR:
         validate_algorithm_structure(self)
         object.__setattr__(self, "_analysis", analyze_algorithm(self))
         validate_transition_structure(self)
-
-
 
     @property
     def _structural_identity(self) -> str:
@@ -946,19 +946,25 @@ class StatefulOperator:
         )
         if not compiled.compilation.options.backward and (
             torch.is_grad_enabled()
-            and (requires_grad_state or any(tensor.requires_grad for tensor in inputs.values()))
+            and (
+                requires_grad_state
+                or any(tensor.requires_grad for tensor in inputs.values())
+            )
         ):
             raise StatefulCompilationError(
                 "RUNTIME_GRAD", "inputs", {"backward": "not compiled"}
             )
         plan = self._plans[compiled.specialization]
         try:
-            workspace_size = plan.plan.workspace.required_bytes(runtime.token_count)
+            plan.plan.workspace.required_bytes(
+                runtime.token_count,
+                sequence_count=runtime.sequence_count,
+                sequence_length=runtime.uniform_length,
+            )
         except RuntimeError as error:
             raise StatefulCompilationError(
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
-        plan.workspace_allocator.acquire(runtime.device, workspace_size)
         from ._stateful_reference import requires_reference_lowering
 
         if requires_reference_lowering(self.algorithm):
@@ -967,14 +973,6 @@ class StatefulOperator:
             )
         state = initial_states[self.algorithm.states[0].name]
         scalar_profile = getattr(plan, "scalar_factorized", None)
-        scalar_chunkable = (
-            runtime.sequence_count == 1
-            and runtime.uniform_length is not None
-            and runtime.uniform_length % 64 == 0
-            and scalar_profile is not None
-            and scalar_profile.dense is not None
-            and scalar_profile.dense.propagation[1].is_log_scale
-        )
         raw_dense = (
             plan.runtime_family == "scalar-factorized"
             and runtime.device.type == "cuda"
@@ -986,42 +984,14 @@ class StatefulOperator:
         )
         if raw_dense:
             assert runtime.uniform_length is not None
-            if scalar_chunkable:
-                values = self._normalize_inputs(inputs, runtime, role_sizes)
-                state_spec = self.algorithm.states[0]
-                propagation = self.algorithm.transition.propagations[0]
-                injection = self.algorithm.transition.injections[0]
-                factors = {
-                    factor.roles[0]: _evaluate(factor.expression, values)
-                    for factor in injection.factors
-                }
-                readout = _feature_vector(
-                    _evaluate(self.algorithm.readouts[0].operand, values),
-                    self.algorithm.readouts[0].role,
-                    state_spec,
-                )
-                outputs, finals = plan.chunked_elementwise_dense(
-                    gate_rows=(_token_major(_evaluate(propagation.factor.operand, values), runtime),),
-                    gate_columns=(None,),
-                    key=(_token_major(factors[state_spec.feature_roles[0]], runtime),),
-                    value=(_token_major(factors[state_spec.feature_roles[1]], runtime),),
-                    query=(_token_major(readout, runtime),),
-                    initial_state=(state,),
-                    output_dtype=self.algorithm.readouts[0].output_dtype,
-                    log_gate_rows=(True,),
-                    unit_gate_columns=(True,),
-                    scalar_gate=(True,),
-                )
-                output, fused_final = outputs[0], finals[0]
-            else:
-                output, fused_final = plan.scalar_factorized_dense_raw(
-                    inputs,
-                    state,
-                    sequence_count=runtime.sequence_count,
-                    sequence_length=runtime.uniform_length,
-                    output_dtype=self.algorithm.readouts[0].output_dtype,
-                    return_final_state=return_final_state,
-                )
+            output, fused_final = plan.scalar_factorized_dense_raw(
+                inputs,
+                state,
+                sequence_count=runtime.sequence_count,
+                sequence_length=runtime.uniform_length,
+                output_dtype=self.algorithm.readouts[0].output_dtype,
+                return_final_state=return_final_state,
+            )
             outputs = (output,)
             final_state = (
                 StateTuple((self.algorithm.states[0].name,), (fused_final,))
@@ -1039,7 +1009,6 @@ class StatefulOperator:
             ),
             final_state,
         )
-
 
     def _validate_compilation(
         self,
@@ -1067,7 +1036,9 @@ class StatefulOperator:
             if isinstance(role, (HeadRole, FeatureRole))
         )
         actual = set(role_sizes)
-        invalid = [role for role in actual if not isinstance(role, (HeadRole, FeatureRole))]
+        invalid = [
+            role for role in actual if not isinstance(role, (HeadRole, FeatureRole))
+        ]
         if invalid:
             raise StatefulCompilationError(
                 "COMPILE_ROLE_SIZE", "role_sizes", {"runtime_roles": invalid}
@@ -1078,7 +1049,10 @@ class StatefulOperator:
             raise StatefulCompilationError(
                 "COMPILE_ROLE_SIZE",
                 "role_sizes",
-                {"missing": sorted(map(str, missing)), "unknown": sorted(map(str, unknown))},
+                {
+                    "missing": sorted(map(str, missing)),
+                    "unknown": sorted(map(str, unknown)),
+                },
             )
         for role, size in role_sizes.items():
             if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
@@ -1296,7 +1270,11 @@ class StatefulOperator:
                 raise StatefulCompilationError(
                     "SPECIALIZATION",
                     "states[0].roles",
-                    {"state": spec.name, "feature_sizes": sizes, "supported": [64, 128]},
+                    {
+                        "state": spec.name,
+                        "feature_sizes": sizes,
+                        "supported": [64, 128],
+                    },
                 )
         _verify_product_roles(role_sizes, "inputs")
         for source, target in self.algorithm.head_mapping.mappings:
@@ -1410,7 +1388,8 @@ class StatefulOperator:
             assert runtime.offsets is not None
             lengths = runtime.offsets[1:] - runtime.offsets[:-1]
             segment = torch.repeat_interleave(
-                torch.arange(runtime.sequence_count, device=runtime.device), lengths.long()
+                torch.arange(runtime.sequence_count, device=runtime.device),
+                lengths.long(),
             )
         else:
             assert runtime.uniform_length is not None
@@ -1438,6 +1417,7 @@ class StatefulOperator:
             token_count=runtime.token_count,
             device=runtime.device,
             return_final_state=return_final_state,
+            sequence_length=(runtime.uniform_length if not runtime.packed else None),
         )
         ordered: list[torch.Tensor] = []
         for readout in algorithm.readouts:
@@ -1622,6 +1602,7 @@ class StatefulOperator:
             rank_one_summary,
             shared_readouts,
         )
+
         family = getattr(executable, "runtime_family", "generic")
         if (
             getattr(executable, "rank_one_factored", None) is not None
@@ -1670,14 +1651,20 @@ class StatefulOperator:
             identity_left = identity_right = None
         else:
             if needs_dense_transform or family in {
-                "generic", "product-injection-gemm", "shared-state-contraction"
+                "generic",
+                "product-injection-gemm",
+                "shared-state-contraction",
             }:
-                identity_left = torch.eye(left_size, device=device).expand(
-                    token_count, heads, left_size, left_size
-                ).contiguous()
-                identity_right = torch.eye(right_size, device=device).expand(
-                    token_count, heads, right_size, right_size
-                ).contiguous()
+                identity_left = (
+                    torch.eye(left_size, device=device)
+                    .expand(token_count, heads, left_size, left_size)
+                    .contiguous()
+                )
+                identity_right = (
+                    torch.eye(right_size, device=device)
+                    .expand(token_count, heads, right_size, right_size)
+                    .contiguous()
+                )
                 left: torch.Tensor | None = identity_left
                 right: torch.Tensor | None = identity_right
             else:
@@ -1685,7 +1672,8 @@ class StatefulOperator:
                 left = right = None
             elementwise: torch.Tensor | None = (
                 torch.ones(token_count, heads, 1, 1, device=device)
-                if identity_only else None
+                if identity_only
+                else None
             )
             for node in self.algorithm.transition.propagations:
                 if isinstance(node, Identity):
@@ -1697,7 +1685,9 @@ class StatefulOperator:
                             assert left is not None
                             left = factor * left
                         else:
-                            elementwise = factor if elementwise is None else elementwise * factor
+                            elementwise = (
+                                factor if elementwise is None else elementwise * factor
+                            )
                     elif node.roles[0] == state_spec.feature_roles[0]:
                         assert left is not None
                         left = torch.diag_embed(factor[..., :, 0]) @ left
@@ -1705,19 +1695,28 @@ class StatefulOperator:
                         assert right is not None
                         right = right @ torch.diag_embed(factor[..., 0, :])
                 elif isinstance(node, RankOnePropagation):
-                    left_vector = _feature_vector(_evaluate(node.left, values), node.role, state_spec)
-                    right_vector = _feature_vector(_evaluate(node.right, values), node.role, state_spec)
-                    coefficient = _evaluate(node.coefficient, values).float()[..., :1, :1]
+                    left_vector = _feature_vector(
+                        _evaluate(node.left, values), node.role, state_spec
+                    )
+                    right_vector = _feature_vector(
+                        _evaluate(node.right, values), node.role, state_spec
+                    )
+                    coefficient = _evaluate(node.coefficient, values).float()[
+                        ..., :1, :1
+                    ]
                     assert identity_left is not None and identity_right is not None
                     assert left is not None and right is not None
                     if node.role == state_spec.feature_roles[0]:
-                        update = identity_left + coefficient * left_vector.unsqueeze(-1) * right_vector.unsqueeze(-2)
+                        update = identity_left + coefficient * left_vector.unsqueeze(
+                            -1
+                        ) * right_vector.unsqueeze(-2)
                         left = update @ left
                     else:
-                        update = identity_right + coefficient * right_vector.unsqueeze(-1) * left_vector.unsqueeze(-2)
+                        update = identity_right + coefficient * right_vector.unsqueeze(
+                            -1
+                        ) * left_vector.unsqueeze(-2)
                         right = right @ update
         scalar_profile = getattr(executable, "scalar_factorized", None)
-
 
         can_fuse_scalar = (
             executable.runtime_family == "scalar-factorized"
@@ -1983,7 +1982,9 @@ class StatefulOperator:
             initial_state=initial_state,
             output_dtype=readout.output_dtype,
         )
-        final_state = StateTuple((state_spec.name,), (final,)) if return_final_state else None
+        final_state = (
+            StateTuple((state_spec.name,), (final,)) if return_final_state else None
+        )
         return (output,), final_state
 
     def _lower_chunked_elementwise(
@@ -2059,66 +2060,91 @@ class StatefulOperator:
         return_final_state: bool,
         executable: Any,
     ) -> tuple[tuple[torch.Tensor, ...], StateTuple | None]:
-        """Run an eligible Program through one factored recurrent kernel.
+        """Lower inference through chunks; retain the compiled backward path."""
+        from ._stateful_factored import factored_recurrence_chunked
 
-        The kernel holds every State column in registers and replays the authored
-        operations per token, so no per-token State or factor matrix is written
-        and the readout is contracted in the kernel.
-        """
         state_spec = self.algorithm.states[0]
-        first_role, _ = state_spec.feature_roles
-        heads = runtime.state_heads
-        token_count = runtime.token_count
-        rows, columns = runtime.feature_sizes
-        device = runtime.device
-        ones_row = torch.ones(token_count, heads, rows, 1, device=device)
-        ones_scalar = torch.ones(token_count, heads, 1, 1, device=device)
-        operation_codes: list[str] = []
-        left_factors: list[torch.Tensor] = []
-        right_factors: list[torch.Tensor] = []
-        coefficients: list[torch.Tensor] = []
+        first_role, second_role = state_spec.feature_roles
+        backward_path = executable.backward_binding is not None
+        if backward_path:
+            token_count, heads = runtime.token_count, runtime.state_heads
+            rows, _ = runtime.feature_sizes
+            ones_row = torch.ones(token_count, heads, rows, 1, device=runtime.device)
+            ones_scalar = torch.ones(token_count, heads, 1, 1, device=runtime.device)
+        codes: list[str] = []
+        left: list[torch.Tensor | None] = []
+        right: list[torch.Tensor | None] = []
+        coefficient: list[torch.Tensor | None] = []
         for node in self.algorithm.transition.propagations:
-            if isinstance(node, AxisScale) and not node.roles:
-                operation_codes.append("scale")
-                left_factors.append(ones_row)
-                right_factors.append(ones_row)
-                coefficients.append(_evaluate(node.factor, values).float())
-            elif isinstance(node, AxisScale):
-                operation_codes.append("row-scale")
-                left_factors.append(_evaluate(node.factor, values).float())
-                right_factors.append(ones_row)
-                coefficients.append(ones_scalar)
+            if isinstance(node, AxisScale):
+                if not node.roles:
+                    codes.append("scale")
+                    left.append(None)
+                    right.append(None)
+                    coefficient.append(_evaluate(node.factor, values).float())
+                elif tuple(node.roles) == (first_role,):
+                    codes.append("row-scale")
+                    left.append(_evaluate(node.factor, values).float())
+                    right.append(None)
+                    coefficient.append(None)
+                else:
+                    codes.append("column-scale")
+                    left.append(_evaluate(node.factor, values).float())
+                    right.append(None)
+                    coefficient.append(None)
             else:
-                operation_codes.append("rank-one")
-                left_factors.append(_evaluate(node.left, values).float())
-                right_factors.append(_evaluate(node.right, values).float())
-                coefficients.append(_evaluate(node.coefficient, values).float())
+                codes.append("rank-one")
+                left.append(_evaluate(node.left, values).float())
+                right.append(_evaluate(node.right, values).float())
+                coefficient.append(_evaluate(node.coefficient, values).float())
         injection_left: list[torch.Tensor] = []
         injection_right: list[torch.Tensor] = []
         for injection in self.algorithm.transition.injections:
-            row_factor, column_factor = injection.factors
-            if tuple(column_factor.roles) == (first_role,):
-                row_factor, column_factor = column_factor, row_factor
-            injection_left.append(_evaluate(row_factor.expression, values).float())
-            injection_right.append(_evaluate(column_factor.expression, values).float())
-        readout = self.algorithm.readouts[0]
-        assert isinstance(readout, StateContraction)
-        operand = _evaluate(readout.operand, values).float()
-        output, final = executable.factored_recurrence_dense(
-            operation_codes=tuple(operation_codes),
-            left_factors=left_factors,
-            right_factors=right_factors,
-            coefficients=coefficients,
-            injection_left=injection_left,
-            injection_right=injection_right,
-            readout=operand,
-            initial_state=initial_state,
-            output_dtype=readout.output_dtype,
-        )
+            first, second = injection.factors
+            if tuple(first.roles) == (second_role,):
+                first, second = second, first
+            injection_left.append(_evaluate(first.expression, values).float())
+            injection_right.append(_evaluate(second.expression, values).float())
+        readouts: list[torch.Tensor] = []
+        dtypes: list[torch.dtype] = []
+        for readout in self.algorithm.readouts:
+            assert isinstance(readout, StateContraction)
+            readouts.append(_evaluate(readout.operand, values).float())
+            dtypes.append(readout.output_dtype)
+        if backward_path:
+            dense_left = [item if item is not None else ones_row for item in left]
+            dense_right = [item if item is not None else ones_row for item in right]
+            dense_coeff = [
+                item if item is not None else ones_scalar for item in coefficient
+            ]
+            output, final = executable.factored_recurrence_dense(
+                operation_codes=tuple(codes),
+                left_factors=dense_left,
+                right_factors=dense_right,
+                coefficients=dense_coeff,
+                injection_left=injection_left,
+                injection_right=injection_right,
+                readout=readouts[0],
+                initial_state=initial_state,
+                output_dtype=dtypes[0],
+            )
+            outputs = (output,)
+        else:
+            outputs, final = factored_recurrence_chunked(
+                operation_codes=tuple(codes),
+                left_factors=left,
+                right_factors=right,
+                coefficients=coefficient,
+                injection_left=injection_left,
+                injection_right=injection_right,
+                readouts=readouts,
+                initial_state=initial_state,
+                output_dtypes=tuple(dtypes),
+            )
         final_state = (
             StateTuple((state_spec.name,), (final,)) if return_final_state else None
         )
-        return (output,), final_state
+        return outputs, final_state
 
     def _specialization_key(
         self,
@@ -2242,9 +2268,7 @@ def _dense_summary_required(algorithm: AlgorithmIR) -> bool:
     return False
 
 
-def _verify_product_roles(
-    role_sizes: Mapping[LogicalRole, int], path: str
-) -> None:
+def _verify_product_roles(role_sizes: Mapping[LogicalRole, int], path: str) -> None:
     """Every Product Feature role axis must equal the product of its factors."""
     for role, size in role_sizes.items():
         if not isinstance(role, ProductFeatureRole):
@@ -2297,44 +2321,84 @@ def _evaluate(
         return torch.full((), expression.value, device=device, dtype=expression.dtype)
     if isinstance(expression, Add):
         return _evaluate(
-            expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.left,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         ) + _evaluate(
-            expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.right,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
     if isinstance(expression, Multiply):
         return _evaluate(
-            expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.left,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         ) * _evaluate(
-            expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.right,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
     if isinstance(expression, Divide):
         return _evaluate(
-            expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.left,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         ) / _evaluate(
-            expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.right,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
     if isinstance(expression, Negate):
         return -_evaluate(
-            expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.operand,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
     if isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
         operand = _evaluate(
-            expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.operand,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         ).float()
         if isinstance(expression, Exp):
@@ -2354,8 +2418,13 @@ def _evaluate(
                 "IR_TYPE", "expression.Shift", {"reason": "missing sequence segment"}
             )
         operand = _evaluate(
-            expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.operand,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
         return _shift_within_segment(operand, expression.lag, segment)
@@ -2366,15 +2435,22 @@ def _evaluate(
             )
         spec = state_specs[expression.state]
         operand = _evaluate(
-            expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=squeeze_features,
+            expression.operand,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
         binding = states
         if expression.prior:
             if prior_states is None:
                 raise StatefulCompilationError(
-                    "IR_TYPE", "expression.StateTerm", {"prior": "no prior State binding"}
+                    "IR_TYPE",
+                    "expression.StateTerm",
+                    {"prior": "no prior State binding"},
                 )
             binding = prior_states
         return _contract_state_term(
@@ -2382,26 +2458,46 @@ def _evaluate(
         )
     if isinstance(expression, Outer):
         left = _evaluate(
-            expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            expression.left,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=True,
             prior_states=prior_states,
         )
         right = _evaluate(
-            expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            expression.right,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=True,
             prior_states=prior_states,
         )
         expanded = left.float().unsqueeze(-1) * right.float().unsqueeze(-2)
         return expanded.reshape(*left.shape[:2], left.shape[-1] * right.shape[-1])
     if isinstance(expression, Contract):
         left = _evaluate(
-            expression.left, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            expression.left,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=True,
             prior_states=prior_states,
         )
         right = _evaluate(
-            expression.right, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            expression.right,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=True,
             prior_states=prior_states,
         )
         # keep one singleton axis so the result broadcasts against a
@@ -2409,8 +2505,13 @@ def _evaluate(
         return (left.float() * right.float()).sum(dim=-1, keepdim=True)
     if isinstance(expression, Softmax):
         operand = _evaluate(
-            expression.operand, values, states=states, state_specs=state_specs,
-            feature_axes=feature_axes, segment=segment, squeeze_features=True,
+            expression.operand,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=True,
             prior_states=prior_states,
         )
         return torch.softmax(operand.float(), dim=-1)
@@ -2455,7 +2556,9 @@ def _shift_within_segment(
     destination = slice(lag, token_count)
     same = segment[destination] == segment[source]
     mask = same.view(-1, *([1] * (operand.ndim - 1)))
-    shifted[destination] = torch.where(mask, operand[source], torch.zeros_like(operand[source]))
+    shifted[destination] = torch.where(
+        mask, operand[source], torch.zeros_like(operand[source])
+    )
     return shifted
 
 
@@ -2502,7 +2605,6 @@ def _contract_state_term(
     if role == features[0]:
         return torch.einsum("thf,thfv->thv", reduced, state_float)
     return torch.einsum("thv,thfv->thf", reduced, state_float)
-
 
 
 def _feature_vector(
@@ -2553,7 +2655,9 @@ def _compile_factory_profile(
         role_sizes={
             roles["query_heads"]: query_heads,
             roles["key_heads"]: key_heads if key_heads is not None else state_heads,
-            roles["value_heads"]: value_heads if value_heads is not None else state_heads,
+            roles["value_heads"]: value_heads
+            if value_heads is not None
+            else state_heads,
             roles["state_heads"]: state_heads,
             roles["key_dim"]: key_size,
             roles["value_dim"]: value_size,

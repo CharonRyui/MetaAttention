@@ -1,10 +1,9 @@
-"""The chunked diagonal schedule: boundary carry, chunk blocks, fused readout.
+"""Dense diagonal schedule: chunk carries, distributed replay and typed readouts.
 
-A chunk-aligned dense run of a diagonal Program takes the chunked path: one
-kernel writes the running affine pair where each chunk ends, and one replays
-each (sequence, head, chunk, column block) independently with the State column
-in registers and the readout contracted in place. The per-token suite uses
-unaligned lengths, so this file is what covers the path.
+Aligned and tail lengths keep only FP32 chunk-boundary States. Replay contracts
+distributed State tiles in parallel; identity transitions use chunk GEMMs.
+The independent recurrences cover nonzero initial State, batched continuation,
+rank-1 identity, prior readout, whole-State decay and dependent Softmax readout.
 """
 
 from __future__ import annotations
@@ -41,13 +40,24 @@ def test_chunked_path_matches_the_token_recurrence(gpu_device):
     """A row-decay Program on a chunk-aligned length matches the FP32 oracle.
 
     Covers the boundary carry, the chunk blocks that read it, the fused readout,
-    and the final State the last chunk writes.
+    and the FP32 final State the carry pass writes.
     """
     generator = torch.Generator(device=gpu_device).manual_seed(3)
-    query = torch.randn(1, HEADS, LENGTH, DIM, device=gpu_device, dtype=torch.bfloat16, generator=generator)
+    query = torch.randn(
+        1,
+        HEADS,
+        LENGTH,
+        DIM,
+        device=gpu_device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    gate = -torch.rand(1, HEADS, LENGTH, DIM, device=gpu_device, generator=generator) * 0.05
+    gate = (
+        -torch.rand(1, HEADS, LENGTH, DIM, device=gpu_device, generator=generator)
+        * 0.05
+    )
     initial = 0.1 * torch.randn(1, HEADS, DIM, DIM, device=gpu_device)
     operator = gla_attention(1, HEADS, LENGTH, DIM, DIM)
     compiled = _compile(operator, HEADS, DIM)
@@ -94,16 +104,32 @@ def test_chunked_path_matches_the_token_recurrence(gpu_device):
 def test_chunked_path_handles_both_scaled_axes(gpu_device):
     """A pair of axis factors runs through the same chunked carry."""
     generator = torch.Generator(device=gpu_device).manual_seed(5)
-    query = torch.randn(1, HEADS, LENGTH, DIM, device=gpu_device, dtype=torch.bfloat16, generator=generator)
+    query = torch.randn(
+        1,
+        HEADS,
+        LENGTH,
+        DIM,
+        device=gpu_device,
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
     key = torch.randn_like(query)
     value = torch.randn_like(query)
-    key_gate = -torch.rand(1, HEADS, LENGTH, DIM, device=gpu_device, generator=generator) * 0.05
-    value_gate = -torch.rand(1, HEADS, LENGTH, DIM, device=gpu_device, generator=generator) * 0.05
+    key_gate = (
+        -torch.rand(1, HEADS, LENGTH, DIM, device=gpu_device, generator=generator)
+        * 0.05
+    )
+    value_gate = (
+        -torch.rand(1, HEADS, LENGTH, DIM, device=gpu_device, generator=generator)
+        * 0.05
+    )
     operator = dual_gate_gla_attention(1, HEADS, LENGTH, DIM, DIM)
     compiled = _compile(operator, HEADS, DIM)
 
     with torch.no_grad():
-        result = compiled(query=query, key=key, value=value, key_gate=key_gate, value_gate=value_gate)
+        result = compiled(
+            query=query, key=key, value=value, key_gate=key_gate, value_gate=value_gate
+        )
 
     state = torch.zeros(HEADS, DIM, DIM, device=gpu_device)
     outputs = []
@@ -111,7 +137,9 @@ def test_chunked_path_handles_both_scaled_axes(gpu_device):
         state = state * (
             key_gate[0, :, token].float().exp().unsqueeze(-1)
             * value_gate[0, :, token].float().exp().unsqueeze(-2)
-        ) + torch.einsum("hk,hv->hkv", key[0, :, token].float(), value[0, :, token].float())
+        ) + torch.einsum(
+            "hk,hv->hkv", key[0, :, token].float(), value[0, :, token].float()
+        )
         outputs.append(
             torch.einsum("hk,hkv->hv", query[0, :, token].float() * DIM**-0.5, state)
         )
@@ -137,7 +165,7 @@ def test_chunked_entry_runs_a_rank_one_state_beside_a_dense_one():
     """
     import torch
 
-    from attention_engine.attn_engine._stateful_chunked import chunked_elementwise_dense
+    from attn_engine._stateful_chunked import chunked_elementwise_dense
 
     torch.manual_seed(0)
     device = torch.device("cuda")
@@ -163,7 +191,9 @@ def test_chunked_entry_runs_a_rank_one_state_beside_a_dense_one():
     )
     assert len(outputs) == 2 and len(finals) == 2
     assert outputs[0].shape == (sequences, heads, tokens, columns)
-    assert outputs[1].shape == (sequences, heads, tokens, 1), "a rank-1 State is one column"
+    assert outputs[1].shape == (sequences, heads, tokens, 1), (
+        "a rank-1 State is one column"
+    )
     assert finals[1].shape == (sequences, heads, columns)
 
     state = initial.clone()
@@ -173,13 +203,191 @@ def test_chunked_entry_runs_a_rank_one_state_beside_a_dense_one():
     for token in range(tokens):
         injection = key[token].unsqueeze(-1) * value[token].unsqueeze(-2)
         state = gate[token].unsqueeze(0).unsqueeze(-1) * state + injection.unsqueeze(0)
-        rank_state = rank_gate[token].unsqueeze(0) * rank_state + rank_key[token].unsqueeze(0)
+        rank_state = rank_gate[token].unsqueeze(0) * rank_state + rank_key[
+            token
+        ].unsqueeze(0)
         # a first-Feature readout contracts the rows: out[g] = sum_f q[f] S[f, g]
         expected[:, :, token] = torch.einsum("shfg,hf->shg", state, query[token])
-        expected_rank[:, :, token] = (
-            rank_state * rank_query[token].unsqueeze(0)
-        ).sum(-1, keepdim=True)
+        expected_rank[:, :, token] = (rank_state * rank_query[token].unsqueeze(0)).sum(
+            -1, keepdim=True
+        )
     torch.testing.assert_close(outputs[0].float(), expected, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(outputs[1].float(), expected_rank, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(finals[0], state, atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(finals[1], rank_state, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.parametrize("kind", ["identity", "prior", "dependency", "whole"])
+def test_diagonal_typed_readout_tail_and_continuation(gpu_device, kind):
+    """Nonzero batched carry, a tail and dependent/prior/rank-1 readouts."""
+    from attn_engine import (
+        AlgorithmIR,
+        AxisScale,
+        Batch,
+        Constant,
+        FeatureRole,
+        HeadMapping,
+        HeadRole,
+        Input,
+        ProductFactor,
+        ProductInjection,
+        Readout,
+        Sequence,
+        Softmax,
+        StateSpec,
+        StateTerm,
+        StateTransition,
+        TensorInput,
+    )
+    from attn_engine._stateful_chunked import execute_chunked_states
+
+    batch, heads, length, rows, columns = 2, 2, 67, 3, 5
+    row, col = FeatureRole("r"), FeatureRole("c")
+    head = HeadRole("h")
+    generator = torch.Generator(device=gpu_device).manual_seed(31)
+    key = (
+        torch.randn(batch, length, heads, rows, device=gpu_device, generator=generator)
+        * 0.1
+    )
+    value = (
+        torch.randn(
+            batch, length, heads, columns, device=gpu_device, generator=generator
+        )
+        * 0.1
+    )
+    query = torch.randn_like(key)
+    gate = torch.full((batch, length, heads, rows), 0.8, device=gpu_device)
+    inputs = (
+        TensorInput("k", (Batch, Sequence, head, row), torch.float32),
+        TensorInput("v", (Batch, Sequence, head, col), torch.float32),
+        TensorInput("q", (Batch, Sequence, head, row), torch.float32),
+        TensorInput("g", (Batch, Sequence, head, row), torch.float32),
+    )
+    propagations = (
+        (AxisScale(Constant(0.8)),)
+        if kind == "whole"
+        else (AxisScale(Input("g"), (row,)),)
+    )
+    matrix = StateSpec("matrix", (Batch, head, row, col))
+    matrix_transition = StateTransition(
+        "matrix",
+        propagations=propagations,
+        injections=(
+            ProductInjection(
+                (
+                    ProductFactor(Input("k"), (row,)),
+                    ProductFactor(Input("v"), (col,)),
+                )
+            ),
+        ),
+    )
+    initial = {
+        "matrix": torch.randn(batch, heads, rows, columns, device=gpu_device) * 0.1
+    }
+    states, transitions = [matrix], [matrix_transition]
+    if kind == "identity":
+        states = [StateSpec("vector", (Batch, head, col))]
+        transitions = [
+            StateTransition(
+                "vector",
+                injections=(ProductInjection((ProductFactor(Input("v"), (col,)),)),),
+            )
+        ]
+        initial = {
+            "vector": torch.randn(batch, heads, columns, device=gpu_device) * 0.1
+        }
+        expression = StateTerm("vector", Constant(1.0), None)
+    elif kind == "prior":
+        expression = (
+            StateTerm("matrix", Input("q"), row, prior=True) + Input("v") * 0.25
+        )
+    elif kind == "whole":
+        expression = StateTerm("matrix", Input("q"), row)
+    else:
+        states.append(StateSpec("second", (Batch, head, col, row)))
+        transitions.append(
+            StateTransition(
+                "second",
+                injections=(
+                    ProductInjection(
+                        (
+                            ProductFactor(Input("v"), (col,)),
+                            ProductFactor(Input("k"), (row,)),
+                        )
+                    ),
+                ),
+            )
+        )
+        initial["second"] = (
+            torch.randn(batch, heads, columns, rows, device=gpu_device) * 0.1
+        )
+        expression = StateTerm(
+            "second", Softmax(StateTerm("matrix", Input("q"), row), col), col
+        )
+    algorithm = AlgorithmIR(
+        inputs=inputs,
+        states=tuple(states),
+        transition=tuple(transitions),
+        readouts=(Readout("out", expression, torch.float32),),
+        head_mapping=HeadMapping({head: head}),
+    )
+
+    def run(start, end, carry):
+        count = end - start
+        values = {
+            name: tensor[:, start:end].reshape(batch * count, heads, -1)
+            for name, tensor in {"k": key, "v": value, "q": query, "g": gate}.items()
+        }
+        result = execute_chunked_states(
+            algorithm,
+            values=values,
+            initial_states=carry,
+            segment=torch.arange(batch, device=gpu_device).repeat_interleave(count),
+            role_sizes={row: rows, col: columns},
+            heads=heads,
+            token_count=batch * count,
+            device=torch.device(gpu_device),
+            return_final_state=True,
+            sequence_length=count,
+        )
+        assert result is not None
+        output, final = result
+        return output["out"].reshape(batch, count, heads, -1), final
+
+    with torch.no_grad():
+        actual, final = run(0, length, initial)
+        first, middle = run(0, 65, initial)
+        second, continued = run(65, length, middle)
+    oracle = {name: tensor.clone() for name, tensor in initial.items()}
+    expected = []
+    for t in range(length):
+        if kind == "identity":
+            oracle["vector"] += value[:, t]
+            expected.append(oracle["vector"].clone())
+        else:
+            prior = torch.einsum("bhr,bhrc->bhc", query[:, t], oracle["matrix"])
+            oracle["matrix"] = oracle["matrix"] * gate[:, t].unsqueeze(-1) + key[
+                :, t
+            ].unsqueeze(-1) * value[:, t].unsqueeze(-2)
+            if kind == "prior":
+                expected.append(prior + value[:, t] * 0.25)
+            elif kind == "whole":
+                expected.append(
+                    torch.einsum("bhr,bhrc->bhc", query[:, t], oracle["matrix"])
+                )
+            else:
+                oracle["second"] += value[:, t].unsqueeze(-1) * key[:, t].unsqueeze(-2)
+                weights = torch.einsum(
+                    "bhr,bhrc->bhc", query[:, t], oracle["matrix"]
+                ).softmax(-1)
+                expected.append(
+                    torch.einsum("bhc,bhcr->bhr", weights, oracle["second"])
+                )
+    torch.testing.assert_close(actual, torch.stack(expected, 1), atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(
+        torch.cat((first, second), 1), actual, atol=2e-5, rtol=2e-4
+    )
+    for name in oracle:
+        assert final[name].dtype == torch.float32
+        torch.testing.assert_close(final[name], oracle[name], atol=2e-5, rtol=2e-4)
+        torch.testing.assert_close(continued[name], oracle[name], atol=2e-5, rtol=2e-4)

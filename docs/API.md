@@ -186,12 +186,15 @@ families need (`docs/adr/0003-product-features-and-prior-state-readouts.md`):
   role its expression does not carry; the value broadcasts along that axis, so a
   constant `+1` Injection expresses a token count.
 
-Schema-v2 Programs execute through the reference lowering in
-`attention_engine/attn_engine/_stateful_reference.py`: the same parallel
-segmented scans the specialized lowerings use, with per-State affine summaries
-and expression readouts. Gradients flow through the same lowering, so no eager
-token loop and no framework-derived backward is involved. Programs that stay
-within the v1 language keep their existing specialized TileLang plans.
+Schema-v2 Programs enter the reference lowering in
+`attention_engine/attn_engine/_stateful_reference.py`. Dense inference whose
+typed transitions are diagonal, with disjoint injection factors and supported
+expression readouts, uses FP32 chunk summaries, boundary carries and independent
+64-token replay. Identity propagation uses tiled GEMMs; Product Feature operands
+are synthesized inside tiles rather than stored as token-sized outer products.
+Prior-State terms and readout dependencies retain their authored semantics.
+Packed and gradient execution retain the segmented affine scan. Programs within
+the v1 language retain typed specialized TileLang plans.
 
 Each Flash Linear Attention operator that is a per-token linear recurrence has
 its Program in its own `examples/<family>.py` module, and
@@ -206,26 +209,61 @@ invalid packed offsets, unsupported specialization, resource failure, and
 codegen failure surface as structured `StatefulCompilationError` values. The
 complete contract is in `docs/stateful-operator-ir-spec.md`.
 
-### Scalar propagation inference schedule
+### Structural inference schedules
 
-The scalar-factorized candidate uses the chunked diagonal pair/scan/replay
-schedule for dense, single-sequence inference with one scalar `Exp` propagation,
-one rank-one injection and one readout, when the sequence length is a multiple
-of 64 and the existing raw dense recipe applies. Dispatch follows typed IR,
-not an example/model name. The kernels consume the original log-gate, keep it
-as one scalar per token/head, and apply propagation before injection/readout.
-Identity propagation, multiple sequences, unaligned lengths, packed inputs and
-gradient execution retain their existing paths. Nonzero initial State and the
-returned final State remain valid for continuation.
+Identity and scalar propagation use the existing fused scalar-factorized dense
+kernel. A previously measured aligned scalar chunk schedule improved CUDA Graph
+replay but regressed public-call latency; scalar inference now consistently uses
+the raw dense kernel rather than that multi-launch schedule.
 
-On an idle H20, BF16 `B=1,H=8,T=2048,K=V=64`, the same public callable measured
-0.380 ms end-to-end / 0.176 ms CUDA Graph replay for the chunked schedule versus
-0.296 ms / 0.228 ms for the original raw dense schedule (10 warmups, median of
-50 repetitions). Kernel replay improves about 22%, but end-to-end latency
-regresses about 28%; the multi-launch schedule is not an across-the-board speedup.
-Both schedules pass an independent FP32 token recurrence. Stock FLA on the
-benchmark's clamped scalar log-gates fails that oracle, so its timings are not
-reported as a valid speedup comparison.
+Diagonal multi-State inference supports batches, nonaligned tails, nonzero
+initial States, FP32 final States and continuation. Readout expressions consume
+contracted FP32 terms without materializing per-token matrix States. Unsupported
+typed structures retain the generic lowering; selection does not inspect model
+or example names.
+
+Ordered first-axis Rank-One propagations with row, column or whole-State scales
+use affine chunk summaries `S_out = P @ S_in @ diag(d) + b`, an FP32 boundary
+carry pass and independent chunk replay. Operation order is preserved inside
+each chunk; replay reads the incoming carry, not the outgoing summary. Multiple
+injections and independent first-axis contractions share the same replay.
+No inverse gate or BF16 State approximation is used in inference. Existing
+single-readout backward execution retains its recorded-State reverse walk;
+unsupported gradient compositions retain the generic lowering.
+
+The workspace envelope charges token factors and expression outputs separately
+from chunk carries: `B*T*bytes_per_token + B*(ceil(T/64)+1)*bytes_per_chunk`.
+The extra chunk allowance covers final States. The runtime checks this bound
+before launching; it no longer allocates an unused duplicate reservation buffer.
+
+`testing/benchmark_stateful_plans.py --families based,rebased,rwkv6,gsa,hgrn,gdn,rwkv7,pressure --seqlen 512 2048 --fla --json /tmp/plans.json`
+reports the selected lowerer, public-call timing, CUDA Graph replay, launches and
+workspace. Stock FLA is timed as a performance baseline only; its outputs are
+not a correctness oracle.
+
+Measured on an idle H20, BF16, `B=1,H=8,T=2048,K=V=64`, five warmups and
+median of twenty CUDA-event samples around the public callable with final State:
+
+| Structure/example | Before end-to-end ms | After end-to-end ms | After Graph ms | FLA Graph ms |
+| --- | ---: | ---: | ---: | ---: |
+| Based (`K=16`) | 11.384 | 1.931 | 0.816 | 0.468 |
+| ReBased (`K=16`) | 2.814 | 1.084 | 0.609 | 0.078 |
+| Normalized linear | 0.766 | 0.874 | 0.203 | 0.068 |
+| RWKV6 | 2.796 | 0.908 | 0.365 | 0.131 |
+| GSA (`slots=16`) | 2.119 | 0.988 | 0.312 | 0.142 |
+| HGRN (`H=1`) | 0.570 | 0.519 | 0.060 | 0.065 |
+| GDN | 4.661 | 1.074 | 0.604 | 0.190 |
+| RWKV7 State | 4.968 | 1.031 | 0.601 | 0.351 |
+| Ordered composition pressure | 82.628 | 1.372 | 0.924 | unavailable |
+
+Before Based and pressure needed an explicit 8 GiB workspace envelope; every
+after case runs with the default 1 GiB envelope. Before pressure's auxiliary
+output failed the independent FP32 tolerance; after output and auxiliary pass.
+Normalized linear end-to-end latency regresses despite faster Graph replay.
+FLA remains faster for most cases; its timing is not a correctness claim.
+After results pass an independent FP32 token recurrence for outputs and every
+final State at lengths 65, 512 and 2048 with nonzero initial States, plus batched
+continuation split across nonaligned chunks.
 
 ## Legacy Customized Linear Attention API
 

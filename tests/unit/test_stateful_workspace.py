@@ -53,15 +53,15 @@ def _workspace(compiled):
     return plan.plan.candidate.lowerer, plan.plan.workspace
 
 
-def test_factored_recurrence_charges_nothing_without_a_backward():
-    """Inference keeps only the output and the final State."""
+def test_factored_inference_accepts_chunks_but_rejects_excessive_scratch():
+    """Chunk summaries avoid token-State storage but remain envelope-bounded."""
     lowerer, workspace = _workspace(
         _compile(gated_delta_rule, seqlen=2048, backward=False)
     )
     assert lowerer == "tilelang-factored-recurrence"
-    assert workspace.bytes_per_token == 0
-    # so a long sequence is accepted where the summary plans are not
-    assert workspace.required_bytes(32768) == 0
+    assert 0 < workspace.required_bytes(2048) < ENVELOPE
+    with pytest.raises(RuntimeError, match="resource envelope"):
+        workspace.required_bytes(32768)
 
 
 def test_factored_recurrence_charges_recorded_states_with_a_backward():
@@ -77,16 +77,15 @@ def test_factored_recurrence_charges_recorded_states_with_a_backward():
         workspace.required_bytes(32768)
 
 
-def test_vector_plan_uses_no_token_state_workspace():
-    """The vector kernel keeps each State column in registers."""
+def test_vector_plan_bounds_chunk_scratch_and_long_unaligned_sequences():
+    """Aligned chunk execution is bounded without a token State history."""
     lowerer, workspace = _workspace(
         _compile(gla_attention, seqlen=2048, backward=False, size=64)
     )
     assert lowerer == "tilelang-vector-propagation"
-    assert workspace.bytes_per_token == 0
-    assert workspace.alignment_tokens == 0
-    assert workspace.required_bytes(2048) == 0
-    assert workspace.required_bytes(32768) == 0
+    assert 0 < workspace.required_bytes(2048) < ENVELOPE
+    assert workspace.required_bytes(32768) < ENVELOPE
+    assert workspace.required_bytes(32769) == 0
 
 
 def test_fused_scalar_plan_charges_nothing_and_is_accepted_at_long_sequences():
@@ -97,3 +96,24 @@ def test_fused_scalar_plan_charges_nothing_and_is_accepted_at_long_sequences():
     assert lowerer == "tilelang-scalar-factorized"
     assert workspace.bytes_per_token == 0
     assert workspace.required_bytes(32768) == 0
+
+
+def test_chunk_workspace_counts_tail_and_batch_before_rejecting():
+    from attn_engine._stateful_plan import WorkspacePolicy
+
+    workspace = WorkspacePolicy(
+        bytes_per_token=2, maximum_bytes=500, bytes_per_chunk=100
+    )
+    # Two sequences of 32 tokens: each needs a carry and final-State allowance.
+    with pytest.raises(RuntimeError, match="resource envelope"):
+        workspace.required_bytes(64, sequence_count=2, sequence_length=32)
+    # One sequence uses fewer boundaries for the same token count.
+    assert workspace.required_bytes(64, sequence_length=64) == 328
+    # A tail adds a chunk, but the exact envelope edge is still accepted.
+    workspace = WorkspacePolicy(
+        bytes_per_token=2, maximum_bytes=430, bytes_per_chunk=100
+    )
+    assert workspace.required_bytes(65, sequence_length=65) == 430
+    with pytest.raises(RuntimeError, match="resource envelope"):
+        workspace.required_bytes(66, sequence_length=66)
+    assert workspace.required_bytes(0, sequence_count=2, sequence_length=0) == 0

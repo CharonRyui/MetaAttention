@@ -66,16 +66,15 @@ class FactoredOperationIR:
 
 @dataclass(frozen=True)
 class RankOneFactoredIR:
-    """Structural proof that a State runs as one factored recurrent kernel.
+    """Structural proof for one ordered matrix-State recurrence.
 
-    ``operations`` is the authored order of whole-State or first-feature Axis
-    Scales and first-feature Rank One contractions, so the kernel can replay it
-    against a State column held in registers.
+    ``operations`` preserves authored order and ``readout_roles`` records every
+    independent contraction fused by the inference chunk schedule.
     """
 
     operations: tuple[FactoredOperationIR, ...]
     injection_count: int
-    readout_role: Any
+    readout_roles: tuple[Any, ...]
 
 
 @dataclass(frozen=True)
@@ -120,8 +119,6 @@ class SimplifiedIR:
     rewrites: tuple[str, ...]
 
 
-
-
 @dataclass(frozen=True)
 class StructuralFeatures:
     axis_scale: bool
@@ -129,6 +126,8 @@ class StructuralFeatures:
     product_injection: bool
     rank_one: bool
     shared_state_contraction: bool
+
+
 @dataclass(frozen=True)
 class Analysis:
     execution_class: ExecutionClass
@@ -174,9 +173,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     input_types = {item.name: (item.dtype, item.roles) for item in algorithm.inputs}
     states = {state.name: state for state in algorithm.states}
     transitions = {transition.state: transition for transition in algorithm.transitions}
-    ordered = tuple(
-        (state, transitions[state.name]) for state in algorithm.states
-    )
+    ordered = tuple((state, transitions[state.name]) for state in algorithm.states)
     known_features = {
         role
         for spec in (*algorithm.inputs, *algorithm.states)
@@ -206,9 +203,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                         "operand_features": _role_names(features),
                     },
                 )
-        heads = tuple(
-            role for role in left.roles if not isinstance(role, FeatureRole)
-        )
+        heads = tuple(role for role in left.roles if not isinstance(role, FeatureRole))
         typed = TypedExpression(expression, torch.float32, (*heads, expression.role))
         types.append((path, typed))
         return typed
@@ -249,9 +244,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                         "operand_features": _role_names(features),
                     },
                 )
-        heads = tuple(
-            role for role in left.roles if not isinstance(role, FeatureRole)
-        )
+        heads = tuple(role for role in left.roles if not isinstance(role, FeatureRole))
         typed = TypedExpression(expression, torch.float32, heads)
         types.append((path, typed))
         return typed
@@ -278,13 +271,17 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                     "IR_TYPE", path, {"unknown_state": expression.state}
                 )
             operand = type_expression(expression.operand, f"{path}.operand")
-            feature = tuple(role for role in operand.roles if role in spec.feature_roles)
+            feature = tuple(
+                role for role in operand.roles if role in spec.feature_roles
+            )
             if expression.role is None:
                 if spec.rank != 1 or feature:
                     raise StatefulCompilationError(
                         "IR_TYPE",
                         path,
-                        {"identity_readout": "requires a rank-1 State and a State-free operand"},
+                        {
+                            "identity_readout": "requires a rank-1 State and a State-free operand"
+                        },
                     )
                 produced = (*spec.feature_roles,)
             else:
@@ -381,9 +378,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 coefficient = type_expression(node.coefficient, f"{path}.coefficient")
                 for name, typed in (("left", left), ("right", right)):
                     if tuple(
-                        role
-                        for role in typed.roles
-                        if role in state_spec.feature_roles
+                        role for role in typed.roles if role in state_spec.feature_roles
                     ) != (node.role,):
                         raise StatefulCompilationError(
                             "IR_TYPE",
@@ -448,23 +443,27 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             )
             if actual != (readout.role,):
                 raise StatefulCompilationError(
-                    "IR_TYPE", f"{path}.operand", {"expected_feature": str(readout.role)}
+                    "IR_TYPE",
+                    f"{path}.operand",
+                    {"expected_feature": str(readout.role)},
                 )
             reverse.append(
                 VJPStep(path, "state_contraction", _input_names(readout.operand))
             )
         else:
             type_expression(readout.expression, f"{path}.expression")
-            reverse.append(
-                VJPStep(path, "readout", _input_names(readout.expression))
-            )
+            reverse.append(VJPStep(path, "readout", _input_names(readout.expression)))
 
     reverse.extend(
         VJPStep(f"head_mapping[{index}]", "head_reduce", (str(source),))
         for index, (source, _) in enumerate(algorithm.head_mapping.mappings)
     )
     for state_index, (state_spec, _) in enumerate(reversed(ordered)):
-        base = "transition" if len(ordered) == 1 else f"transitions[{len(ordered) - 1 - state_index}]"
+        base = (
+            "transition"
+            if len(ordered) == 1
+            else f"transitions[{len(ordered) - 1 - state_index}]"
+        )
         reverse.append(
             VJPStep(
                 f"{base}.state",
@@ -479,7 +478,11 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         tuple(item.name for item in algorithm.inputs if item.differentiable),
         f"d_{state.name}_initial",
         tuple(
-            (state_spec.name, f"d_{state_spec.name}_final", f"d_{state_spec.name}_initial")
+            (
+                state_spec.name,
+                f"d_{state_spec.name}_final",
+                f"d_{state_spec.name}_initial",
+            )
             for state_spec, _ in ordered
         ),
     )
@@ -495,15 +498,21 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         isinstance(node, Identity) or isinstance(node, AxisScale) and not node.roles
         for node in primary_transition.propagations
     )
-    factorized_injections = v1_shape and bool(primary_transition.injections) and all(
-        len(injection.factors) == 2
-        and {role for factor in injection.factors for role in factor.roles}
-        == set(feature_roles)
-        and all(len(factor.roles) == 1 for factor in injection.factors)
-        for injection in primary_transition.injections
+    factorized_injections = (
+        v1_shape
+        and bool(primary_transition.injections)
+        and all(
+            len(injection.factors) == 2
+            and {role for factor in injection.factors for role in factor.roles}
+            == set(feature_roles)
+            and all(len(factor.roles) == 1 for factor in injection.factors)
+            for injection in primary_transition.injections
+        )
     )
-    same_orientation = v1_shape and bool(algorithm.readouts) and all(
-        readout.role == feature_roles[0] for readout in algorithm.readouts
+    same_orientation = (
+        v1_shape
+        and bool(algorithm.readouts)
+        and all(readout.role == feature_roles[0] for readout in algorithm.readouts)
     )
     if scalar_propagations and factorized_injections and same_orientation:
         if len(primary_transition.propagations) == 0:
@@ -518,10 +527,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             )
         else:
             propagation = None
-        if (
-            len(primary_transition.injections) == 1
-            and len(algorithm.readouts) == 1
-        ):
+        if len(primary_transition.injections) == 1 and len(algorithm.readouts) == 1:
             injection = primary_transition.injections[0]
             left_factor = next(
                 factor
@@ -544,8 +550,12 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 algorithm,
                 feature_role=feature_roles[0],
             )
-            if all(recipe is not None for recipe in (propagation, left, right, readout)):
-                dense_scalar = DenseScalarFactorizedIR(propagation, left, right, readout)
+            if all(
+                recipe is not None for recipe in (propagation, left, right, readout)
+            ):
+                dense_scalar = DenseScalarFactorizedIR(
+                    propagation, left, right, readout
+                )
         scalar_factorized = ScalarFactorizedIR(
             len(primary_transition.injections),
             len(algorithm.readouts),
@@ -563,8 +573,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     )
     simplified_rewrites = (
         ("safe-zero-one",)
-        if _canonical_identity(simplified_expressions)
-        != original_expression_identity
+        if _canonical_identity(simplified_expressions) != original_expression_identity
         else ()
     )
     simplified = SimplifiedIR(simplified_identity, simplified_rewrites)
@@ -581,10 +590,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             )
     propagation_factor = (
         primary_transition.propagations[0].factor
-        if (
-            v1_shape
-            and len(primary_transition.propagations) == 1
-        )
+        if (v1_shape and len(primary_transition.propagations) == 1)
         else None
     )
     vector_propagation = (
@@ -602,16 +608,18 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     structural_features = StructuralFeatures(
         axis_scale=any(isinstance(node, AxisScale) for node in all_propagations),
         vector_propagation=vector_propagation,
-        product_injection=any(transition.injections for transition in algorithm.transitions),
-        rank_one=any(
-            isinstance(node, RankOnePropagation) for node in all_propagations
+        product_injection=any(
+            transition.injections for transition in algorithm.transitions
         ),
+        rank_one=any(isinstance(node, RankOnePropagation) for node in all_propagations),
         shared_state_contraction=len(algorithm.readouts) > 1
         and len(readout_states) == 1,
     )
     return Analysis(
         ExecutionClass.SCANABLE,
-        AffineSummaryIR(state.name, "dense", "state", tuple(s.name for s in algorithm.states)),
+        AffineSummaryIR(
+            state.name, "dense", "state", tuple(s.name for s in algorithm.states)
+        ),
         backward,
         tuple(types),
         scalar_factorized,
@@ -770,7 +778,9 @@ def _all_state_terms(expression):
         return
     if isinstance(expression, (Input, Constant)):
         return
-    if isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)):
+    if isinstance(
+        expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)
+    ):
         yield from _all_state_terms(expression.operand)
         return
     if isinstance(expression, (Add, Multiply, Divide, Outer, Contract)):
@@ -778,11 +788,6 @@ def _all_state_terms(expression):
         yield from _all_state_terms(expression.right)
         return
     return
-
-
-
-
-
 
 
 def _simplified_identity_payload(algorithm):
@@ -819,9 +824,7 @@ def _simplified_identity_payload(algorithm):
             )
             for injection in transition.injections
         )
-        return replace(
-            transition, propagations=propagations, injections=injections
-        )
+        return replace(transition, propagations=propagations, injections=injections)
 
     transitions = tuple(
         simplify_transition(transition) for transition in algorithm.transitions
@@ -843,14 +846,10 @@ def _simplified_identity_payload(algorithm):
     )
 
 
-
-
-
 def _is_constant(expression, value: float) -> bool:
     from .stateful_operator import Constant
 
     return isinstance(expression, Constant) and expression.value == value
-
 
 
 def _broadcastable(
@@ -926,7 +925,10 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
             result.append(expression.name)
         elif isinstance(expression, (Add, Multiply, Divide, Outer, Contract)):
             result.extend(_input_names(expression.left, expression.right))
-        elif isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)):
+        elif isinstance(
+            expression,
+            (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax),
+        ):
             result.extend(_input_names(expression.operand))
         elif isinstance(expression, StateTerm):
             result.extend(_input_names(expression.operand))
@@ -934,13 +936,11 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
 
 
 def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | None:
-    """Prove a matrix State runs as one factored recurrent kernel.
+    """Prove an ordered matrix recurrence is factorizable.
 
-    The kernel holds one State column per thread in registers and replays the
-    authored operations per token, so the Program needs a single Transition, one
-    readout that contracts the first Feature, injections whose factors are
-    disjoint single-Feature outer products, and propagations that are whole-State
-    or first-Feature Axis Scales plus first-Feature Rank One contractions.
+    The proof preserves authored operation order. Scale operations may target
+    either feature axis; injections and readouts remain independent terms over
+    the same State.
     """
     from .stateful_operator import AxisScale, RankOnePropagation, StateContraction
 
@@ -951,18 +951,28 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     state = algorithm.states[0]
     first_role, second_role = state.feature_roles
     readouts = algorithm.readouts
-    if len(readouts) != 1 or not isinstance(readouts[0], StateContraction):
+    if not readouts or not all(
+        isinstance(readout, StateContraction) for readout in readouts
+    ):
         return None
-    if readouts[0].state != state.name or readouts[0].role != first_role:
+    if any(readout.state != state.name for readout in readouts):
+        return None
+    readout_roles = tuple(readout.role for readout in readouts)
+    if any(role != first_role for role in readout_roles):
         return None
     operations: list[FactoredOperationIR] = []
     for node in algorithm.transitions[0].propagations:
         if isinstance(node, AxisScale):
-            if node.roles and tuple(node.roles) != (first_role,):
+            if node.roles and not set(node.roles).issubset({first_role, second_role}):
                 return None
-            operations.append(
-                FactoredOperationIR("row-scale" if node.roles else "scale")
+            if len(node.roles) > 1:
+                return None
+            kind = (
+                "scale"
+                if not node.roles
+                else ("row-scale" if node.roles[0] == first_role else "column-scale")
             )
+            operations.append(FactoredOperationIR(kind))
         elif isinstance(node, RankOnePropagation):
             if node.role != first_role:
                 return None
@@ -972,8 +982,6 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     if not operations or not any(
         operation.kind == "rank-one" for operation in operations
     ):
-        # without a rank-one contraction the scalar and per-axis diagonal plans
-        # already fuse the same work into fewer, shorter kernels
         return None
     injections = algorithm.transitions[0].injections
     if not injections:
@@ -984,7 +992,7 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         roles = {tuple(factor.roles) for factor in injection.factors}
         if roles != {(first_role,), (second_role,)}:
             return None
-    return RankOneFactoredIR(tuple(operations), len(injections), first_role)
+    return RankOneFactoredIR(tuple(operations), len(injections), readout_roles)
 
 
 def _dense_scalar_binding(
