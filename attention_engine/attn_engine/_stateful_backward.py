@@ -32,14 +32,13 @@ _ELEMENTWISE_CONTEXT: tuple[ContextEntry, ...] = (
 
 
 _FACTORED_CONTEXT: tuple[ContextEntry, ...] = (
-    ("factored.opcode", "int32", ("operation",), "[operations]"),
     ("factored.left", "runtime", ("operation", "token", "head", "row"), "[operations,tokens,heads,rows,1]"),
     ("factored.right", "runtime", ("operation", "token", "head", "row"), "[operations,tokens,heads,rows,1]"),
     ("factored.coefficient", "runtime", ("operation", "token", "head"), "[operations,tokens,heads,1,1]"),
     ("factored.injection_left", "runtime", ("injection", "token", "head", "row"), "[injections,tokens,heads,rows,1]"),
     ("factored.injection_right", "runtime", ("injection", "token", "head", "column"), "[injections,tokens,heads,1,columns]"),
     ("factored.readout", "runtime", ("token", "head", "row"), "[tokens,heads,rows,1]"),
-    ("factored.recorded", "bfloat16", ("sequence", "head", "token", "row", "column"), "[sequences,heads,tokens,rows,columns]"),
+    ("factored.recorded", "float32", ("sequence", "head", "chunk", "row", "column"), "[sequences,heads,chunks,rows,columns]"),
     ("factored.initial_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
     ("factored.final_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
 )
@@ -288,7 +287,7 @@ def _factored_vjp(
     grads: tuple[torch.Tensor | None, torch.Tensor | None],
     config: tuple[tuple[str, int], ...],
 ) -> tuple[torch.Tensor | None, ...]:
-    """Reverse walk for the factored recurrence over the recorded token States."""
+    """Reverse chunk replay from FP32 entry checkpoints, without inversion."""
     from ._stateful_factored import factored_recurrence_backward
 
     grad_output, grad_final = grads
@@ -299,7 +298,6 @@ def _factored_vjp(
         grad_final = torch.zeros_like(final_state)
     return factored_recurrence_backward(
         operation_codes=context["factored.operation_codes"],
-        opcode=context["factored.opcode"],
         left_factors=context["factored.left"],
         right_factors=context["factored.right"],
         coefficients=context["factored.coefficient"],

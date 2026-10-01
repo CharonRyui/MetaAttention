@@ -13,6 +13,10 @@ def _compile_scalar_factorized_dense_raw(
     heads: int,
     rows: int,
     columns: int,
+    propagation_heads: int,
+    left_heads: int,
+    right_heads: int,
+    readout_heads: int,
     propagation_dtype: torch.dtype,
     left_dtype: torch.dtype,
     right_dtype: torch.dtype,
@@ -23,6 +27,9 @@ def _compile_scalar_factorized_dense_raw(
     right_operation: str,
     readout_operation: str,
     propagation_is_log_scale: bool,
+    left_is_log_scale: bool,
+    right_is_log_scale: bool,
+    readout_is_log_scale: bool,
     propagation_scale: float,
     left_scale: float,
     right_scale: float,
@@ -37,22 +44,25 @@ def _compile_scalar_factorized_dense_raw(
     chunk_tokens = 64
     block_columns = 64
     chunk_count = tilelang.cdiv(sequence_length, chunk_tokens)
+    propagation_shape = (
+        (sequence_count, heads, rows, columns)
+        if identity_propagation
+        else (sequence_count, propagation_heads, sequence_length)
+    )
 
     @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
     def build_kernel():
         @T.prim_func
         def kernel(
-            propagation: T.Tensor(
-                (sequence_count, heads, sequence_length), dtype=propagation_dtype
-            ),
+            propagation: T.Tensor(propagation_shape, dtype=propagation_dtype),
             left: T.Tensor(
-                (sequence_count, heads, sequence_length, rows), dtype=left_dtype
+                (sequence_count, left_heads, sequence_length, rows), dtype=left_dtype
             ),
             right: T.Tensor(
-                (sequence_count, heads, sequence_length, columns), dtype=right_dtype
+                (sequence_count, right_heads, sequence_length, columns), dtype=right_dtype
             ),
             readout: T.Tensor(
-                (sequence_count, heads, sequence_length, rows), dtype=readout_dtype
+                (sequence_count, readout_heads, sequence_length, rows), dtype=readout_dtype
             ),
             initial: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
             output: T.Tensor(
@@ -62,6 +72,7 @@ def _compile_scalar_factorized_dense_raw(
         ):
             if False:
                 _ = (propagation_dtype, left_dtype, right_dtype, readout_dtype, output_dtype)
+                _ = propagation_shape
             with T.Kernel(
                 sequence_count * heads,
                 T.ceildiv(columns, block_columns),
@@ -69,6 +80,10 @@ def _compile_scalar_factorized_dense_raw(
             ) as (sequence_head, column_block):
                 sequence = sequence_head // heads
                 head = sequence_head % heads
+                propagation_head = head // (heads // propagation_heads)
+                left_head = head // (heads // left_heads)
+                right_head = head // (heads // right_heads)
+                readout_head = head // (heads // readout_heads)
                 column_start = column_block * block_columns
                 state = T.alloc_shared((rows, block_columns), dtype="float32")
                 readout_shared = T.alloc_shared((chunk_tokens, rows), dtype="float32")
@@ -80,7 +95,10 @@ def _compile_scalar_factorized_dense_raw(
                 scores_shared = T.alloc_shared(
                     (chunk_tokens, chunk_tokens), dtype="float32"
                 )
-                log_prefix = T.alloc_shared((chunk_tokens,), dtype="float32")
+                gates = T.alloc_shared((chunk_tokens,), dtype="float32")
+                prefix = T.alloc_shared((chunk_tokens,), dtype="float32")
+                suffix = T.alloc_shared((chunk_tokens,), dtype="float32")
+                running_weight = T.alloc_fragment((chunk_tokens,), dtype="float32")
                 scores = T.alloc_fragment((chunk_tokens, chunk_tokens), dtype="float32")
                 output_fragment = T.alloc_fragment(
                     (chunk_tokens, block_columns), dtype="float32"
@@ -103,14 +121,25 @@ def _compile_scalar_factorized_dense_raw(
                     for token, row in T.Parallel(chunk_tokens, rows):
                         logical_token = chunk_start + token
                         if logical_token < sequence_length:
-                            readout_value = readout[sequence, head, logical_token, row]
-                            left_value = left[sequence, head, logical_token, row]
+                            readout_value = T.cast(
+                                readout[sequence, readout_head, logical_token, row],
+                                "float32",
+                            )
+                            left_value = T.cast(
+                                left[sequence, left_head, logical_token, row], "float32"
+                            )
                             if readout_operation == "exp":
                                 readout_value = T.exp(readout_value)
                             if left_operation == "exp":
                                 left_value = T.exp(left_value)
-                            readout_shared[token, row] = readout_value * readout_scale
-                            left_shared[token, row] = left_value * left_scale
+                            readout_value = readout_value * readout_scale
+                            left_value = left_value * left_scale
+                            if readout_is_log_scale:
+                                readout_value = T.exp(readout_value)
+                            if left_is_log_scale:
+                                left_value = T.exp(left_value)
+                            readout_shared[token, row] = readout_value
+                            left_shared[token, row] = left_value
                         else:
                             readout_shared[token, row] = 0.0
                             left_shared[token, row] = 0.0
@@ -120,39 +149,79 @@ def _compile_scalar_factorized_dense_raw(
                             logical_token < sequence_length
                             and column_start + column < columns
                         ):
-                            right_value = right[
-                                sequence,
-                                head,
-                                logical_token,
-                                column_start + column,
-                            ]
+                            right_value = T.cast(
+                                right[
+                                    sequence,
+                                    right_head,
+                                    logical_token,
+                                    column_start + column,
+                                ],
+                                "float32",
+                            )
                             if right_operation == "exp":
                                 right_value = T.exp(right_value)
-                            right_shared[token, column] = right_value * right_scale
+                            right_value = right_value * right_scale
+                            if right_is_log_scale:
+                                right_value = T.exp(right_value)
+                            right_shared[token, column] = right_value
                         else:
                             right_shared[token, column] = 0.0
-                    if identity_propagation:
-                        if T.get_thread_binding() == 0:
-                            for token in T.Serial(chunk_tokens):
-                                log_prefix[token] = 0.0
-                    else:
-                        if T.get_thread_binding() == 0:
-                            running_log = T.alloc_local((1,), dtype="float32")
-                            running_log[0] = 0.0
-                            for token in T.Serial(chunk_tokens):
+                    if not identity_propagation:
+                        if propagation_is_log_scale:
+                            if T.get_thread_binding() == 0:
+                                running_log = T.alloc_local((1,), dtype="float32")
+                                running_log[0] = 0.0
+                                for token in T.Serial(chunk_tokens):
+                                    logical_token = chunk_start + token
+                                    if logical_token < sequence_length:
+                                        propagation_value = T.cast(
+                                            propagation[
+                                                sequence, propagation_head, logical_token
+                                            ],
+                                            "float32",
+                                        )
+                                        if propagation_operation == "exp":
+                                            propagation_value = T.exp(propagation_value)
+                                        running_log[0] += (
+                                            propagation_value * propagation_scale
+                                        )
+                                    prefix[token] = running_log[0]
+                        else:
+                            for token in T.Parallel(chunk_tokens):
                                 logical_token = chunk_start + token
-                                if logical_token < sequence_length:
-                                    propagation_value = (
-                                        propagation[sequence, head, logical_token]
-                                        * propagation_scale
+                                if logical_token >= sequence_length:
+                                    gates[token] = 1.0
+                                else:
+                                    propagation_value = T.cast(
+                                        propagation[
+                                            sequence, propagation_head, logical_token
+                                        ],
+                                        "float32",
                                     )
                                     if propagation_operation == "exp":
                                         propagation_value = T.exp(propagation_value)
-                                    if propagation_is_log_scale:
-                                        running_log[0] += propagation_value
-                                    else:
-                                        running_log[0] += T.log(propagation_value)
-                                log_prefix[token] = running_log[0]
+                                    gates[token] = propagation_value * propagation_scale
+                            T.sync_threads()
+                            if T.get_thread_binding() == 0:
+                                running = T.alloc_local((1,), dtype="float32")
+                                running[0] = 1.0
+                                for token in T.Serial(chunk_tokens):
+                                    running[0] *= gates[token]
+                                    prefix[token] = running[0]
+                                running[0] = 1.0
+                                for reverse_token in T.Serial(chunk_tokens):
+                                    token = chunk_tokens - reverse_token - 1
+                                    suffix[token] = running[0]
+                                    running[0] *= gates[token]
+                            T.fill(running_weight, 1.0)
+                            for reverse_source in T.Serial(chunk_tokens):
+                                source = chunk_tokens - reverse_source - 1
+                                for token in T.Parallel(chunk_tokens):
+                                    scores_shared[token, source] = T.if_then_else(
+                                        source <= token, running_weight[token], 0.0
+                                    )
+                                    if source <= token:
+                                        running_weight[token] *= gates[source]
                     T.sync_threads()
 
                     T.clear(output_fragment)
@@ -162,8 +231,12 @@ def _compile_scalar_factorized_dense_raw(
                         output_fragment,
                         policy=T.GemmWarpPolicy.FullRow,
                     )
-                    for token, column in T.Parallel(chunk_tokens, block_columns):
-                        output_fragment[token, column] *= T.exp(log_prefix[token])
+                    if not identity_propagation:
+                        for token, column in T.Parallel(chunk_tokens, block_columns):
+                            if propagation_is_log_scale:
+                                output_fragment[token, column] *= T.exp(prefix[token])
+                            else:
+                                output_fragment[token, column] *= prefix[token]
 
                     T.clear(scores)
                     T.gemm(
@@ -174,12 +247,19 @@ def _compile_scalar_factorized_dense_raw(
                         policy=T.GemmWarpPolicy.FullRow,
                     )
                     for token, source in T.Parallel(chunk_tokens, chunk_tokens):
-                        scores[token, source] = T.if_then_else(
-                            source <= token,
-                            scores[token, source]
-                            * T.exp(log_prefix[token] - log_prefix[source]),
-                            0.0,
-                        )
+                        if identity_propagation:
+                            scores[token, source] = T.if_then_else(
+                                source <= token, scores[token, source], 0.0
+                            )
+                        elif propagation_is_log_scale:
+                            scores[token, source] = T.if_then_else(
+                                source <= token,
+                                scores[token, source]
+                                * T.exp(prefix[token] - prefix[source]),
+                                0.0,
+                            )
+                        else:
+                            scores[token, source] *= scores_shared[token, source]
                     T.copy(scores, scores_shared)
                     T.gemm(
                         scores_shared,
@@ -201,13 +281,17 @@ def _compile_scalar_factorized_dense_raw(
                                 column_start + column,
                             ] = output_fragment[token, column]
 
-                    end_log = log_prefix[
-                        T.min(chunk_tokens - 1, sequence_length - chunk_start - 1)
-                    ]
                     for token, row in T.Parallel(chunk_tokens, rows):
-                        weighted_left[token, row] = left_shared[token, row] * T.exp(
-                            end_log - log_prefix[token]
-                        )
+                        if identity_propagation:
+                            weighted_left[token, row] = left_shared[token, row]
+                        elif propagation_is_log_scale:
+                            weighted_left[token, row] = left_shared[token, row] * T.exp(
+                                prefix[chunk_tokens - 1] - prefix[token]
+                            )
+                        else:
+                            weighted_left[token, row] = (
+                                left_shared[token, row] * suffix[token]
+                            )
                     T.clear(update_fragment)
                     T.gemm(
                         weighted_left,
@@ -217,10 +301,18 @@ def _compile_scalar_factorized_dense_raw(
                         policy=T.GemmWarpPolicy.FullCol,
                     )
                     for row, column in T.Parallel(rows, block_columns):
-                        state[row, column] = (
-                            T.exp(end_log) * state[row, column]
-                            + update_fragment[row, column]
-                        )
+                        if identity_propagation:
+                            state[row, column] += update_fragment[row, column]
+                        elif propagation_is_log_scale:
+                            state[row, column] = (
+                                T.exp(prefix[chunk_tokens - 1]) * state[row, column]
+                                + update_fragment[row, column]
+                            )
+                        else:
+                            state[row, column] = (
+                                prefix[chunk_tokens - 1] * state[row, column]
+                                + update_fragment[row, column]
+                            )
                     T.sync_threads()
                 if return_final_state:
                     for row, column in T.Parallel(rows, block_columns):
@@ -246,14 +338,10 @@ def tilelang_scalar_factorized_dense_raw(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     identity_propagation = recipe.propagation[0].name == "__identity_propagation__"
     def bind(binding):
+        # Both kernels erase identity propagation loads at compile time. Reuse
+        # a live FP32 pointer rather than launching a dense tensor of ones.
         if binding[0].name == "__identity_propagation__":
-            return torch.ones(
-                sequence_count,
-                initial_state.shape[1],
-                sequence_length,
-                device=initial_state.device,
-                dtype=torch.float32,
-            )
+            return initial_state
         return raw_inputs[binding[0].name]
 
     bindings = tuple(
@@ -282,12 +370,36 @@ def tilelang_scalar_factorized_dense_raw(
         recipe.right_factor[1],
         recipe.readout[1],
     )
+    # Scheduling depends only on this invocation's dimensions. The mathematical
+    # plan remains valid when B/T change for a later continuation call.
+    if sequence_length >= 128 and sequence_count * heads < 32:
+        from ._stateful_scalar_kernels import scalar_chunked_dense_raw
+
+        scalar_chunked_dense_raw(
+            propagation,
+            left,
+            right,
+            readout,
+            initial_state,
+            output,
+            final,
+            expressions,
+            sequence_length=sequence_length,
+            identity_propagation=identity_propagation,
+            return_final_state=return_final_state,
+            threads=threads,
+        )
+        return output, final if return_final_state else None
     kernel = _compile_scalar_factorized_dense_raw(
         sequence_count,
         sequence_length,
         heads,
         rows,
         columns,
+        heads if identity_propagation else propagation.shape[1],
+        left.shape[1],
+        right.shape[1],
+        readout.shape[1],
         propagation.dtype,
         left.dtype,
         right.dtype,
@@ -298,6 +410,9 @@ def tilelang_scalar_factorized_dense_raw(
         expressions[2].operation,
         expressions[3].operation,
         expressions[0].is_log_scale,
+        expressions[1].is_log_scale,
+        expressions[2].is_log_scale,
+        expressions[3].is_log_scale,
         expressions[0].scale,
         expressions[1].scale,
         expressions[2].scale,

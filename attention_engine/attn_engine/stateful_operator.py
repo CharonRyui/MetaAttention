@@ -1961,9 +1961,8 @@ class StatefulOperator:
         first_role, second_role = state_spec.feature_roles
         transition = self.algorithm.transition
         gate_expression = transition.propagations[0].factor
-        if runtime.sequence_count == 1 and runtime.uniform_length % 64 == 0:
-            # Chunk carries and State-column replay avoid the long per-token
-            # vector walk at aligned single-sequence inference lengths.
+        if runtime.uniform_length >= 64:
+            # Independent chunk replay also handles batches and nonaligned tails.
             chunked = self._lower_chunked_elementwise(
                 values,
                 initial_state,
@@ -2022,15 +2021,14 @@ class StatefulOperator:
         """Run a diagonal recurrence through the chunked schedule.
 
         The kernels need one injection factor pair, one first-Feature readout,
-        chunk-aligned dense sequences, and no gradient. Anything else keeps the
-        per-token summary path.
+        dense sequences, and no gradient. Tails use identity propagation and
+        zero injections outside the logical sequence.
         """
         if (
             runtime.device.type != "cuda"
             or runtime.packed
             or runtime.uniform_length is None
-            or runtime.uniform_length != runtime.token_count
-            or runtime.uniform_length % 64
+            or runtime.uniform_length * runtime.sequence_count != runtime.token_count
             or len(self.algorithm.transition.injections) != 1
             or len(self.algorithm.readouts) != 1
             or any(tensor.requires_grad for tensor in values.values())
@@ -2132,24 +2130,46 @@ class StatefulOperator:
             assert isinstance(readout, StateContraction)
             readouts.append(_evaluate(readout.operand, values).float())
             dtypes.append(readout.output_dtype)
+        if runtime.packed:
+            assert runtime.offsets is not None
+            from ._stateful_packed import execute_lowrank_packed
+
+            outputs, final = execute_lowrank_packed(
+                operation_codes=tuple(codes),
+                left_factors=left,
+                right_factors=right,
+                coefficients=coefficient,
+                injection_left=injection_left,
+                injection_right=injection_right,
+                readouts=readouts,
+                initial_state=initial_state,
+                sequence_offsets=runtime.offsets,
+                output_dtypes=tuple(dtypes),
+                return_final_state=return_final_state,
+            )
+            final_state = (
+                StateTuple((state_spec.name,), (final,))
+                if return_final_state
+                else None
+            )
+            return outputs, final_state
         if backward_path:
             dense_left = [item if item is not None else ones_row for item in left]
             dense_right = [item if item is not None else ones_row for item in right]
             dense_coeff = [
                 item if item is not None else ones_scalar for item in coefficient
             ]
-            output, final = executable.factored_recurrence_dense(
+            outputs, final = executable.factored_recurrence_dense(
                 operation_codes=tuple(codes),
                 left_factors=dense_left,
                 right_factors=dense_right,
                 coefficients=dense_coeff,
                 injection_left=injection_left,
                 injection_right=injection_right,
-                readout=readouts[0],
+                readouts=readouts,
                 initial_state=initial_state,
-                output_dtype=dtypes[0],
+                output_dtypes=tuple(dtypes),
             )
-            outputs = (output,)
         else:
             outputs, final = factored_recurrence_chunked(
                 operation_codes=tuple(codes),

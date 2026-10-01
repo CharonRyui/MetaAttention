@@ -428,9 +428,6 @@ def tune_candidates(
                             len(workloads), normalized_configs)
     if cached is not None:
         return cached
-    generic = next((item for item in candidates if _is_generic(item, generic_candidate)), None)
-    if generic is None:
-        raise ValueError("candidate set must include the generic dense baseline")
     costs: dict[str, int] = {}
     for candidate in candidates:
         identity = _candidate_id(candidate)
@@ -443,12 +440,11 @@ def tune_candidates(
             if provided is None:
                 provided = static_costs.get(identity)
         costs[identity] = int(provided if provided is not None else getattr(candidate, "static_cost", 0))
-    # The caller may provide a larger feasible set; selection still measures only
-    # the strongest three plus the generic baseline, with deterministic ties.
+    # Measure the strongest feasible candidates; no representation is privileged.
     ranked = sorted(candidates, key=lambda item: (costs[_candidate_id(item)], _candidate_id(item)))
     measured_candidates = tuple(
         next(candidate for candidate in candidates if _candidate_id(candidate) == identity)
-        for identity in dict.fromkeys(_candidate_id(item) for item in (*ranked[:3], generic))
+        for identity in dict.fromkeys(_candidate_id(item) for item in ranked[:3])
     )
     failures: list[TuningFailure] = []
     records_by_candidate: dict[str, tuple[float, ...]] = {}
@@ -490,11 +486,6 @@ def tune_candidates(
             chosen = min(successful, key=lambda item: (_geomean(item[1]), item[0]))
             records_by_candidate[identity] = chosen[1]
             compile_by_candidate[identity] = chosen[2]
-        elif _is_generic(candidate, generic_candidate):
-            raise GenericBaselineError(tuple(item for item in failures if item.candidate == identity))
-
-    if _candidate_id(generic) not in records_by_candidate:
-        raise GenericBaselineError(tuple(item for item in failures if item.candidate == _candidate_id(generic)))
     if not records_by_candidate:
         raise GenericBaselineError(tuple(failures))
     best_per_workload = tuple(min(values[index] for values in records_by_candidate.values()) for index in range(len(workloads)))

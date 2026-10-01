@@ -78,24 +78,24 @@ def test_factored_recurrence_charges_recorded_states_with_a_backward():
 
 
 def test_vector_plan_bounds_chunk_scratch_and_long_unaligned_sequences():
-    """Aligned chunk execution is bounded without a token State history."""
+    """Aligned and unaligned lengths both charge bounded chunk scratch."""
     lowerer, workspace = _workspace(
         _compile(gla_attention, seqlen=2048, backward=False, size=64)
     )
     assert lowerer == "tilelang-vector-propagation"
     assert 0 < workspace.required_bytes(2048) < ENVELOPE
-    assert workspace.required_bytes(32768) < ENVELOPE
-    assert workspace.required_bytes(32769) == 0
+    assert 0 < workspace.required_bytes(32768) < ENVELOPE
+    assert 0 < workspace.required_bytes(32769) < ENVELOPE
 
 
-def test_fused_scalar_plan_charges_nothing_and_is_accepted_at_long_sequences():
-    """The fused scalar kernel moves only its factors, so it has no cliff."""
+def test_fused_scalar_plan_charges_chunk_scratch_at_long_sequences():
+    """The scalar schedule charges its bounded chunk carries and tail."""
     lowerer, workspace = _workspace(
         _compile(simple_gla_attention, seqlen=2048, backward=False, size=64)
     )
     assert lowerer == "tilelang-scalar-factorized"
     assert workspace.bytes_per_token == 0
-    assert workspace.required_bytes(32768) == 0
+    assert 0 < workspace.required_bytes(32768) < ENVELOPE
 
 
 def test_chunk_workspace_counts_tail_and_batch_before_rejecting():

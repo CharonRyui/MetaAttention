@@ -315,6 +315,24 @@ def execute(
     iv = stack_or_bind(injection_right, columns)
     query = stack_or_bind(readouts, rows)
 
+    from ._stateful_wy_kernels import eligible, execute as execute_wy
+
+    if eligible(tuple(operation_codes), len(injection_left), rows, columns):
+        return execute_wy(
+            codes=codes,
+            left=left,
+            right=right,
+            coefficient=coefficient,
+            injection_left=ik,
+            injection_right=iv,
+            query=query,
+            injection_count=len(injection_left),
+            readout_count=len(readouts),
+            initial_state=initial_state,
+            length=length,
+            output_dtypes=output_dtypes,
+        )
+
     transform = torch.empty(
         batch * heads, chunks, rows, rows, device=device, dtype=torch.float32
     )

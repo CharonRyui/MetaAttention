@@ -145,7 +145,7 @@ _SUMMARY_REPRESENTATIONS = frozenset(
 
 @dataclass(frozen=True)
 class EstimationShape:
-    """The Feature sizes and Program structure a candidate is priced for."""
+    """The feature sizes and live program structure priced for a candidate."""
 
     heads: int
     rows: int
@@ -153,6 +153,8 @@ class EstimationShape:
     dense_summary: bool
     state_count: int = 1
     state_total_elements: int = 0
+    dense_total_elements: int = 0
+    live_state_elements: int = 0
     backward: bool = False
     chunked: bool = False
     chunked_states: bool = False
@@ -170,6 +172,8 @@ class EstimationShape:
         *,
         state_count: int = 1,
         state_total_elements: int = 0,
+        dense_total_elements: int = 0,
+        live_state_elements: int = 0,
         backward: bool = False,
         chunked: bool = False,
         chunked_states: bool = False,
@@ -178,23 +182,14 @@ class EstimationShape:
         factored_workspace: int = 0,
         factored_chunk_bytes: int = 0,
     ) -> "EstimationShape":
-        """Price a rank-2 State by both Features and a rank-1 State by its one."""
         rows = feature_sizes[0]
         columns = feature_sizes[1] if len(feature_sizes) > 1 else 1
+        total = state_total_elements or state_count * rows * columns
         return cls(
-            heads=heads,
-            rows=rows,
-            columns=columns,
-            dense_summary=dense_summary,
-            state_count=state_count,
-            state_total_elements=state_total_elements or state_count * rows * columns,
-            backward=backward,
-            chunked=chunked,
-            chunked_states=chunked_states,
-            chunked_states_workspace=chunked_states_workspace,
-            chunked_states_chunk_bytes=chunked_states_chunk_bytes,
-            factored_workspace=factored_workspace,
-            factored_chunk_bytes=factored_chunk_bytes,
+            heads, rows, columns, dense_summary, state_count, total,
+            dense_total_elements or total, live_state_elements or total,
+            backward, chunked, chunked_states, chunked_states_workspace,
+            chunked_states_chunk_bytes, factored_workspace, factored_chunk_bytes,
         )
 
     @property
@@ -203,13 +198,8 @@ class EstimationShape:
 
     @property
     def summary_elements(self) -> int:
-        """Per-token summary size: one elementwise tensor, or a dense pair."""
         if self.dense_summary:
-            return (
-                self.rows * self.rows
-                + self.columns * self.columns
-                + self.state_elements
-            )
+            return self.rows * self.rows + self.columns * self.columns + self.state_elements
         return self.state_elements
 
 
@@ -291,34 +281,30 @@ class CandidateLowerer:
         """
         representation = PlanRepresentation(plan.representation)
         heads = shape.heads
-        state = shape.state_elements
+        state = shape.live_state_elements
         summary = shape.summary_elements
-        dense = shape.rows * shape.rows + shape.columns * shape.columns + state
+        dense = shape.dense_total_elements
         from ._stateful_chunked import CHUNK_TOKENS
 
         if representation is PlanRepresentation.VECTOR_PROPAGATION:
-            # Aligned inference uses diagonal chunk carries; other workloads
-            # keep State columns in registers. Charge factors conservatively.
             return CandidateEstimate(
                 True,
                 heads * (shape.rows + 2 * shape.columns) * 4,
                 3 * heads * state,
                 1,
                 0,
-                aligned_workspace_bytes_per_token=heads
-                * (4 * shape.rows + 3 * shape.columns)
-                * 4,
-                alignment_tokens=CHUNK_TOKENS,
                 workspace_bytes_per_chunk=3 * heads * state * 4,
             )
         if representation is PlanRepresentation.SCALAR_FACTORIZED:
-            # one fused kernel that moves the factors and the output only
             return CandidateEstimate(
                 True,
                 heads * (shape.rows + 2 * shape.columns + 1) * 4,
                 3 * heads * state,
-                1,
+                3,
                 0,
+                workspace_bytes_per_chunk=heads
+                * (2 * shape.rows * shape.columns + 1)
+                * 4,
             )
         if representation is PlanRepresentation.FACTORED_RECURRENCE:
             # Inference keeps affine chunk summaries and carries; backward
@@ -336,17 +322,13 @@ class CandidateLowerer:
         if representation in _SUMMARY_REPRESENTATIONS:
             arithmetic = 2 * heads * state * (2 if shape.dense_summary else 1)
             if representation is PlanRepresentation.AXIS_SCALE and shape.chunked:
-                # Chunk replay keeps three boundary buffers, not token States.
+                # Chunk replay keeps boundary buffers for every batch/sequence.
                 return CandidateEstimate(
                     True,
                     heads * (3 * state + shape.columns) * 4,
                     arithmetic,
                     3,
                     heads * (summary + 2 * state) * 4,
-                    aligned_workspace_bytes_per_token=max(
-                        1, heads * (4 * shape.rows + 3 * shape.columns) * 4
-                    ),
-                    alignment_tokens=CHUNK_TOKENS,
                     workspace_bytes_per_chunk=3 * heads * state * 4,
                 )
             return CandidateEstimate(
@@ -357,11 +339,14 @@ class CandidateLowerer:
                 heads * (summary + 2 * state) * 4,
             )
         if representation is PlanRepresentation.PRODUCT_FEATURE_CHUNKED:
+            # The chunked ProductFeature schedule keeps boundary carries and
+            # contracted outputs; it does not materialize the generic dense
+            # summary matrices charged by the reference executor.
             return CandidateEstimate(
                 True,
                 heads * (3 * shape.state_total_elements + shape.columns) * 4,
                 3 * heads * shape.state_total_elements,
-                3 * shape.state_count,
+                3,
                 shape.chunked_states_workspace,
                 workspace_bytes_per_chunk=shape.chunked_states_chunk_bytes,
             )
@@ -497,14 +482,13 @@ def select_candidate(
     candidates: tuple[LoweredCandidate, ...],
     estimates: Mapping[Any, CandidateEstimate],
 ) -> LoweredCandidate:
-    """Select by the shape-aware estimate with a deterministic identity tie-break."""
+    """Select by shape-aware estimate with a deterministic identity tie-break."""
     if not candidates:
         raise ValueError("no feasible lowered candidates")
     return min(
         candidates,
         key=lambda item: (estimates[item].cost, item.lowerer, item.identity),
     )
-
 
 @dataclass(frozen=True)
 class ContextValue:
@@ -877,19 +861,25 @@ def compile_plan(
         and target.device_type == "cuda"
         and product_feature_chunked_eligibility(operator.algorithm)[0]
     )
-    if product_feature_chunked:
-        representations = (PlanRepresentation.PRODUCT_FEATURE_CHUNKED,)
-        rewrites = ()
-    elif requires_reference_lowering(operator.algorithm):
-        representations = (PlanRepresentation.STATEFUL_REFERENCE,)
-        rewrites = ()
-    else:
-        rewrites = _structured_rewrites(structural_features) if optimized else ()
-        representations = (PlanRepresentation.GENERIC_DENSE_AFFINE, *rewrites)
+    reference_required = requires_reference_lowering(operator.algorithm)
+    rewrites = _structured_rewrites(structural_features) if optimized else ()
+    representations: list[PlanRepresentation] = []
+    if not reference_required:
+        representations.append(PlanRepresentation.GENERIC_DENSE_AFFINE)
+        representations.extend(rewrites)
         if optimized and scalar_factorized is not None:
-            representations += (PlanRepresentation.SCALAR_FACTORIZED,)
+            representations.append(PlanRepresentation.SCALAR_FACTORIZED)
         if optimized and rank_one_factored is not None and mode == "dense":
-            representations += (PlanRepresentation.FACTORED_RECURRENCE,)
+            representations.append(PlanRepresentation.FACTORED_RECURRENCE)
+    if product_feature_chunked:
+        representations.append(PlanRepresentation.PRODUCT_FEATURE_CHUNKED)
+    if reference_required:
+        representations.append(PlanRepresentation.STATEFUL_REFERENCE)
+    if not representations:
+        representations.append(PlanRepresentation.GENERIC_DENSE_AFFINE)
+    representations = list(dict.fromkeys(representations))
+    if reference_required:
+        rewrites = ()
     mathematical_plans = tuple(
         MathematicalPlan(
             _digest((source_identity, representation.value)),
@@ -906,7 +896,7 @@ def compile_plan(
     )
     from ._stateful_structured import RUNTIME_FAMILY_ELIGIBILITY
 
-    active_rewrites = {item.value for item in rewrites}
+    active_rewrites: set[str] = set()
     fixed_sizes = dict(compilation.role_sizes)
     state = operator.algorithm.states[0]
     transitions = operator.algorithm.transitions
@@ -964,19 +954,23 @@ def compile_plan(
         dense_summary,
         state_count=len(operator.algorithm.states),
         state_total_elements=state_total,
+        dense_total_elements=sum(
+            fixed_sizes[spec.feature_roles[0]] ** 2
+            + (fixed_sizes[spec.feature_roles[1]] ** 2 if len(spec.feature_roles) > 1 else 0)
+            + (state_total // max(1, len(operator.algorithm.states)))
+            for spec in operator.algorithm.states
+        ),
+        live_state_elements=state_total,
         backward=backward_ir is not None,
         chunked=chunked_eligible,
         chunked_states=chunked_states,
         chunked_states_workspace=state_workspace,
-        chunked_states_chunk_bytes=state_chunk_bytes,
         factored_workspace=factored_token_bytes,
         factored_chunk_bytes=factored_chunk_bytes,
     )
     candidate_list: list[LoweredCandidate] = []
     estimates: dict[LoweredCandidate, CandidateEstimate] = {}
     for item in mathematical_plans:
-        if active_rewrites.intersection(item.conflicts):
-            continue
         for lowerer in LOWERERS:
             if lowerer.runtime_family == "vector-propagation" and (
                 mode != "dense"
@@ -1000,11 +994,8 @@ def compile_plan(
                 and backward_ir is not None
                 and (
                     rank_one_factored is None
-                    or len(rank_one_factored.readout_roles) != 1
-                    or any(
-                        operation.kind == "column-scale"
-                        for operation in rank_one_factored.operations
-                    )
+                    or any(operation.kind not in {"column-scale", "row-scale", "scale", "rank-one"}
+                           for operation in rank_one_factored.operations)
                 )
             ):
                 continue
@@ -1069,7 +1060,7 @@ def compile_plan(
             backward_ir,
             dense_summary,
             scalar_factorized,
-            rank_one_factored=None,
+            rank_one_factored=rank_one_factored,
         )
         device = torch.device(target.device_type)
         cache = None
@@ -1081,9 +1072,6 @@ def compile_plan(
         factory = invocation_factory(
             operator, compilation, provisional, mathematical_plans, device
         )
-        generic = next(
-            item for item in candidates if item.lowerer == "tilelang-generic"
-        )
         tuning_result = tune_candidates(
             candidates,
             {item: kernel_configurations(item) for item in candidates},
@@ -1093,7 +1081,6 @@ def compile_plan(
             mode=mode,
             environment=_target_fingerprint(target),
             cache=cache,
-            generic_candidate=generic,
             static_costs={item: int(estimates[item].cost) for item in candidates},
         )
         candidate = tuning_result.winner

@@ -1,13 +1,11 @@
 """Structural performance diagnostics for the Stateful Operator plans.
 
-This is the measurement half of the plan work: it reports, per family, which
-Lowered Candidate the compiler selected, how much workspace that candidate needs,
-how many kernels it launches, and how its kernel and wall time scale with the
-sequence length. Kernel numbers print as ``n/a`` when a launch happens through a
-cached foreign runtime that the profiler cannot attribute; wall time is always
-measured. CUDA Graph replay and optional FLA timings use the same prepared
-inputs. FLA is a performance baseline only; this diagnostic does not use its
-outputs as a correctness oracle.
+This diagnostic reports structural plans and warmed measurements under explicit
+output-only, final-State, or two-call continuation contracts. CPU wall time
+includes synchronization; public-call CUDA events and Graph replay are separate
+metrics. Native-layout timings exclude preparation, whose cost is also reported.
+FLA is only a performance baseline: invalid outputs do not suppress timing ratios.
+Meta correctness is checked against an independent authored-order token recurrence.
 
 Usage::
 
@@ -21,6 +19,7 @@ import argparse
 import json
 import statistics
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -199,6 +198,173 @@ def inputs_for(operator, case: Case, seqlen: int, device: torch.device) -> dict:
     return values
 
 
+CONTRACTS = ("output-only", "final-state", "continuation")
+
+
+def _token_oracle(operator, inputs, sizes, *, initial_state=None):
+    """CPU FP32 recurrence, independent of lowering/scan/rewrite implementation.
+
+    Expressions carry named Feature axes; every propagation is applied in authored
+    order, followed by injections. This also preserves prior-State readouts.
+    """
+    from attn_engine import stateful_operator as ir
+
+    algorithm = operator.algorithm
+    batch = next(value.shape[0] for value in inputs.values())
+    length = next(inputs[spec.name].shape[spec.roles.index(Sequence)]
+                  for spec in algorithm.inputs if Sequence in spec.roles)
+    heads = sizes[algorithm.states[0].head_role]
+    states = {
+        spec.name: (torch.zeros(batch, heads, *(sizes[r] for r in spec.feature_roles))
+                    if initial_state is None else initial_state[spec.name].cpu().float().clone())
+        for spec in algorithm.states
+    }
+    specs = {spec.name: spec for spec in algorithm.states}
+    bound = {name: value.detach().cpu().float() for name, value in inputs.items()}
+
+    def align(value, roles, target):
+        ordered = tuple(role for role in target if role in roles)
+        value = value.permute(0, 1, *(2 + roles.index(role) for role in ordered))
+        return value.reshape(*value.shape[:2], *(value.shape[2 + ordered.index(role)]
+                             if role in ordered else 1 for role in target))
+
+    def evaluate(node, token, prior):
+        if isinstance(node, ir.Input):
+            spec = next(spec for spec in algorithm.inputs if spec.name == node.name)
+            value = bound[node.name]
+            roles = list(spec.roles)
+            if Sequence in roles:
+                value = value.select(roles.index(Sequence), token)
+                roles.remove(Sequence)
+            features = tuple(r for r in roles if isinstance(r, FeatureRole))
+            head = next((r for r in roles if isinstance(r, HeadRole)), None)
+            leading = Batch if Batch in roles else One
+            value = value.permute(roles.index(leading),
+                                  *([roles.index(head)] if head else []),
+                                  *(roles.index(r) for r in features))
+            if head is None:
+                value = value.unsqueeze(1)
+            if heads % value.shape[1]:
+                raise ValueError("oracle HeadMapping is not an integral replication")
+            return value.repeat_interleave(heads // value.shape[1], dim=1), features
+        if isinstance(node, ir.Constant):
+            return torch.tensor(node.value, dtype=torch.float32).reshape(1, 1), ()
+        if isinstance(node, ir.Shift):
+            if token < node.lag:
+                value, roles = evaluate(node.operand, 0, prior)
+                return torch.zeros_like(value), roles
+            return evaluate(node.operand, token - node.lag, prior)
+        if isinstance(node, ir.StateTerm):
+            value, roles = evaluate(node.operand, token, prior)
+            spec = specs[node.state]
+            state = (prior if node.prior else states)[node.state]
+            product = state * align(value, roles, spec.feature_roles)
+            if node.role is None:
+                result, remaining = product, spec.feature_roles
+            else:
+                axis = spec.feature_roles.index(node.role)
+                result = product.sum(2 + axis)
+                remaining = tuple(r for r in spec.feature_roles if r != node.role)
+            # Readouts treat singleton Feature axes as scalars (e.g. Based z0).
+            for axis in reversed(range(len(remaining))):
+                if result.shape[2 + axis] == 1:
+                    result = result.squeeze(2 + axis)
+                    remaining = remaining[:axis] + remaining[axis + 1:]
+            return result, remaining
+        if isinstance(node, (ir.Add, ir.Multiply, ir.Divide, ir.Outer, ir.Contract)):
+            left, lr = evaluate(node.left, token, prior)
+            right, rr = evaluate(node.right, token, prior)
+            roles = tuple(dict.fromkeys((*lr, *rr)))
+            if isinstance(node, ir.Outer):
+                return (left.unsqueeze(-1) * right.unsqueeze(-2)).flatten(2), (node.role,)
+            left, right = align(left, lr, roles), align(right, rr, roles)
+            if isinstance(node, ir.Contract):
+                return (left * right).sum(2 + roles.index(node.role)), tuple(r for r in roles if r != node.role)
+            value = left + right if isinstance(node, ir.Add) else left * right if isinstance(node, ir.Multiply) else left / right
+            return value, roles
+        value, roles = evaluate(node.operand, token, prior)
+        if isinstance(node, ir.Softmax):
+            return value.softmax(2 + roles.index(node.role)), roles
+        if isinstance(node, ir.Clamp):
+            return value.clamp(node.minimum, node.maximum), roles
+        unary = {ir.Negate: torch.neg, ir.Exp: torch.exp, ir.Log: torch.log,
+                 ir.Sigmoid: torch.sigmoid, ir.Sqrt: torch.sqrt,
+                 ir.Reciprocal: torch.reciprocal}
+        return unary[type(node)](value), roles
+
+    outputs = {readout.name: [] for readout in algorithm.readouts}
+    for token in range(length):
+        prior = dict(states)
+        for transition in algorithm.transitions:
+            spec = specs[transition.state]
+            state = states[spec.name]
+            for propagation in transition.propagations:
+                if isinstance(propagation, ir.AxisScale):
+                    factor, roles = evaluate(propagation.factor, token, prior)
+                    state = state * align(factor, roles, spec.feature_roles)
+                elif isinstance(propagation, ir.RankOnePropagation):
+                    left, lr = evaluate(propagation.left, token, prior)
+                    right, rr = evaluate(propagation.right, token, prior)
+                    coefficient, cr = evaluate(propagation.coefficient, token, prior)
+                    axis = 2 + spec.feature_roles.index(propagation.role)
+                    contraction = (state * align(right, rr, spec.feature_roles)).sum(axis, keepdim=True)
+                    state = state + align(coefficient, cr, spec.feature_roles) * align(left, lr, spec.feature_roles) * contraction
+                else:
+                    raise TypeError(f"unsupported oracle propagation {type(propagation).__name__}")
+            for injection in transition.injections:
+                product = torch.ones(1, 1, *([1] * spec.rank))
+                for factor in injection.factors:
+                    value, roles = evaluate(factor.expression, token, prior)
+                    product = product * align(value, roles, spec.feature_roles)
+                state = state + product
+            states[spec.name] = state
+        for readout in algorithm.readouts:
+            expression = (ir.StateTerm(readout.state, readout.operand, readout.role)
+                          if isinstance(readout, ir.StateContraction) else readout.expression)
+            value, roles = evaluate(expression, token, prior)
+            if not roles:
+                value = value.unsqueeze(-1)
+            outputs[readout.name].append(value)
+    return {name: torch.stack(values, dim=2) for name, values in outputs.items()}, states
+
+
+def _correctness(outputs, states, expected, expected_states, contract):
+    errors = {}
+    valid = True
+    pairs = [(f"output:{name}", outputs.get(name), value) for name, value in expected.items()]
+    if contract != "output-only":
+        pairs.extend((f"state:{name}", None if states is None else states.get(name), value)
+                     for name, value in expected_states.items())
+    tolerances = {}
+    for name, actual, reference in pairs:
+        if actual is None or actual.shape != reference.shape:
+            errors[name] = "missing or wrong shape"
+            valid = False
+            continue
+        actual = actual.detach().cpu().float()
+        errors[name] = (actual - reference).abs().max().item()
+        # Same numerical contract as the linear recurrence functional oracle.
+        # FP32 carry States are checked more tightly than BF16 readouts.
+        rtol, atol = (0.01, 0.02) if name.startswith("state:") else (0.02, 0.05)
+        tolerances[name] = {"rtol": rtol, "atol": atol}
+        valid = valid and torch.allclose(actual, reference, rtol=rtol, atol=atol)
+    return {"status": "VALID" if valid else "INVALID", "max_abs_errors": errors,
+            "oracle": "independent authored-order FP32 CPU token recurrence", "tolerances": tolerances}
+
+
+def _cpu_wall_time(call, warmup, repetitions):
+    for _ in range(warmup):
+        call()
+    samples = []
+    for _ in range(repetitions):
+        torch.cuda.synchronize()
+        start = time.perf_counter()
+        call()
+        torch.cuda.synchronize()
+        samples.append((time.perf_counter() - start) * 1000)
+    return statistics.median(samples)
+
+
 def _median_time(call, warmup: int, repetitions: int) -> float:
     for _ in range(warmup):
         call()
@@ -225,78 +391,108 @@ def _graph_time(call, warmup: int, repetitions: int) -> float:
     return _median_time(graph.replay, warmup, repetitions)
 
 
+@dataclass(frozen=True)
+class FLABaseline:
+    prepare: object
+    invoke: object
+    state_names: tuple[str, ...]
+    state_contract: bool = True
+    note: str = ""
+    preprocessing: str = "native-layout transpose/contiguous; timed in public call"
+
+    def split(self, result):
+        output, state = (result[0], result[1]) if isinstance(result, (tuple, list)) else (result, None)
+        if state is None:
+            return {"output": output}, None
+        values = (state,) if len(self.state_names) == 1 else tuple(state)
+        return {"output": output}, dict(zip(self.state_names, values))
+
+
 def _fla_call(case: Case, inputs: dict):
-    """Prepare a performance-only library baseline outside timed invocation."""
-    if case.name == "hgrn":
+    """Describe preparation and invocation separately; neither is silently free."""
+    name = case.name
+    if name in ("pressure", "mamba2"):
+        return None
+    if name == "hgrn":
         from fla.ops.hgrn import chunk_hgrn
 
-        return lambda: chunk_hgrn(inputs["value"].squeeze(1), inputs["gate"].squeeze(1))
-    if case.name in ("pressure", "mamba2"):
+        def invoke_hgrn(args, initial, final):
+            output, state = chunk_hgrn(*args, initial_state=initial, output_final_state=final)
+            return output.unsqueeze(1), None if state is None else state.unsqueeze(1)
+
+        return FLABaseline(
+            lambda values: (values["value"].squeeze(1), values["gate"].squeeze(1)),
+            invoke_hgrn, ("hidden",), preprocessing="squeeze views; timed in public call",
+        )
+
+    def prepare(values):
+        native = {key: value.transpose(1, 2).contiguous() for key, value in values.items()}
+        if name == "retnet":
+            native["gate"] = native["gate"].log()
+        if name == "rwkv6":
+            native["bonus"] = values["bonus"][0, :, 0].float().contiguous()
+        if name == "rwkv7":
+            beta = native["beta"].unsqueeze(-1)
+            native["injected"] = (native["value"] * beta).to(native["value"].dtype)
+            native["left"] = (-native["key"] * beta).to(native["key"].dtype)
+        return native
+
+    state_contract = name not in ("normalized-linear", "based", "rebased")
+    state_names = ("key_slot", "slot_value") if name == "gsa" else ("memory",)
+    note = "" if state_contract else "FLA does not expose all equivalent recurrent States"
+    if name in ("linear", "normalized-linear"):
+        from fla.ops.linear_attn import chunk_linear_attn as function
+    elif name in ("simple-gla", "retention", "retnet"):
+        from fla.ops.simple_gla import chunk_simple_gla as function
+    elif name == "gla":
+        from fla.ops.gla import chunk_gla as function
+    elif name == "based":
+        from fla.ops.based import fused_chunk_based as function
+    elif name == "rebased":
+        from fla.ops.rebased import parallel_rebased as function
+    elif name == "rwkv6":
+        from fla.ops.rwkv6 import chunk_rwkv6 as function
+    elif name == "gsa":
+        from fla.ops.gsa import chunk_gsa as function
+    elif name == "gdn":
+        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as function
+    elif name == "rwkv7":
+        from fla.ops.generalized_delta_rule.dplr import chunk_dplr_delta_rule as function
+    else:
         return None
-    q, k, v = (inputs[name] for name in ("query", "key", "value"))
-    if case.name in ("linear", "normalized-linear"):
-        from fla.ops.linear_attn import chunk_linear_attn
 
-        return lambda: chunk_linear_attn(
-            q, k, v, normalize=case.name == "normalized-linear", head_first=True
-        )
-    if case.name in ("simple-gla", "retention", "retnet"):
-        from fla.ops.simple_gla import chunk_simple_gla
+    def invoke(values, initial, final):
+        q, k, v = (values[key] for key in ("query", "key", "value"))
+        kwargs = {"head_first": False}
+        if state_contract or name == "normalized-linear":
+            kwargs.update(initial_state=initial, output_final_state=final)
+        if name in ("linear", "normalized-linear"):
+            result = function(q, k, v, normalize=name == "normalized-linear", **kwargs)
+        elif name in ("simple-gla", "retention", "retnet"):
+            result = function(q, k, v, values.get("gate", values.get("decay")), **kwargs)
+        elif name == "gla":
+            result = function(q, k, v, values["gate"], **kwargs)
+        elif name in ("based", "rebased"):
+            result = function(q, k, v, **kwargs)
+        elif name == "rwkv6":
+            result = function(q, k, v, values["decay"], values["bonus"], **kwargs)
+        elif name == "gsa":
+            result = function(q, k, v, values["slot"], values["gate"], **kwargs)
+        elif name == "gdn":
+            result = function(q, k, v, values["gate"], values["beta"], use_qk_l2norm_in_kernel=False, **kwargs)
+        else:
+            result = function(q, k, values["injected"], values["left"], values["removal"], values["decay"], scale=1.0, **kwargs)
+        output, state = (result[0], result[1]) if isinstance(result, (tuple, list)) else (result, None)
+        return output.transpose(1, 2), state
 
-        gate = inputs.get("gate", inputs.get("decay"))
-        if case.name == "retnet":
-            gate = gate.log()
-        return lambda: chunk_simple_gla(q, k, v, gate, head_first=True)
-    if case.name == "gla":
-        from fla.ops.gla import chunk_gla
-
-        return lambda: chunk_gla(q, k, v, inputs["gate"], head_first=True)
-    if case.name == "based":
-        from fla.ops.based import fused_chunk_based
-
-        return lambda: fused_chunk_based(q, k, v, head_first=True)
-    if case.name == "rebased":
-        from fla.ops.rebased import parallel_rebased
-
-        return lambda: parallel_rebased(q, k, v, head_first=True)
-    if case.name == "rwkv6":
-        from fla.ops.rwkv6 import chunk_rwkv6
-
-        bonus = inputs["bonus"][0, :, 0].float().contiguous()
-        return lambda: chunk_rwkv6(q, k, v, inputs["decay"], bonus, head_first=True)
-    if case.name == "gsa":
-        from fla.ops.gsa import chunk_gsa
-
-        return lambda: chunk_gsa(
-            q, k, v, inputs["slot"], inputs["gate"], head_first=True
-        )
-    if case.name == "gdn":
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule
-
-        args = tuple(
-            inputs[name].transpose(1, 2).contiguous()
-            for name in ("query", "key", "value", "gate", "beta")
-        )
-        return lambda: chunk_gated_delta_rule(
-            *args, head_first=False, use_qk_l2norm_in_kernel=False
-        )
-    if case.name == "rwkv7":
-        from fla.ops.generalized_delta_rule.dplr import chunk_dplr_delta_rule
-
-        beta = inputs["beta"].unsqueeze(-1)
-        injected = (v * beta).to(v.dtype)
-        left = (-k * beta).to(k.dtype)
-        return lambda: chunk_dplr_delta_rule(
-            q,
-            k,
-            injected,
-            left,
-            inputs["removal"],
-            inputs["decay"],
-            scale=1.0,
-            head_first=True,
-        )
-    return None
+    preprocessing = "transpose/contiguous"
+    if name == "rwkv7":
+        preprocessing += "; beta multiplication and BF16 casts (algebra differs from authored propagation order)"
+    elif name == "rwkv6":
+        preprocessing += "; FP32 bonus materialization"
+    elif name == "retnet":
+        preprocessing += "; gate log"
+    return FLABaseline(prepare, invoke, state_names, state_contract, note, preprocessing)
 
 
 def _kernel_profile(call, attempts: int = 2) -> tuple[float, int, int]:
@@ -313,95 +509,203 @@ def _kernel_profile(call, attempts: int = 2) -> tuple[float, int, int]:
         with profile(activities=[ProfilerActivity.CUDA]) as profiler:
             call()
             torch.cuda.synchronize()
-        events = [
-            event
-            for event in profiler.key_averages()
-            if event.self_device_time_total > 0
-        ]
+        events = [event for event in profiler.events()
+                  if event.device_type == torch.autograd.DeviceType.CUDA]
         if events or attempt == attempts - 1:
             break
-    kernel_ms = sum(event.self_device_time_total for event in events) / 1000.0
-    launches = sum(event.count for event in events)
+    kernel_ms = sum(event.device_time_total for event in events) / 1000.0
+    launches = len(events)
     tilelang = sum(
-        event.count for event in events if event.key in ("kernel_kernel", "kernel")
+        1 for event in events if event.name in ("kernel_kernel", "kernel")
     )
     return kernel_ms, tilelang, launches - tilelang
 
 
+def _split_inputs(operator, inputs, split):
+    parts = [{}, {}]
+    for spec in operator.algorithm.inputs:
+        value = inputs[spec.name]
+        if Sequence in spec.roles:
+            axis = spec.roles.index(Sequence)
+            parts[0][spec.name] = value.narrow(axis, 0, split).contiguous()
+            parts[1][spec.name] = value.narrow(axis, split, value.shape[axis] - split).contiguous()
+        else:
+            parts[0][spec.name] = parts[1][spec.name] = value
+    return parts
+
+
+def _meta_call(compiled, parts, contract):
+    def run():
+        prefix = compiled(**parts[0], return_final_state=contract != "output-only")
+        result = prefix
+        if contract == "continuation":
+            result = compiled(**parts[1], initial_state=prefix.final_state, return_final_state=True)
+        outputs = {name: result.outputs[name] for name in result.outputs.names}
+        if contract == "continuation":
+            outputs = {name: torch.cat((prefix.outputs[name], output), dim=2)
+                       for name, output in outputs.items()}
+        states = None if result.final_state is None else {name: result.final_state[name] for name in result.final_state.names}
+        return outputs, states
+    return run
+
+
+def _baseline_call(adapter, parts, contract, *, prepared=False):
+    def run():
+        first = parts[0] if prepared else adapter.prepare(parts[0])
+        result = adapter.invoke(first, None, contract != "output-only")
+        outputs, states = adapter.split(result)
+        if contract == "continuation":
+            second = parts[1] if prepared else adapter.prepare(parts[1])
+            initial = result[1]
+            if initial is None:
+                raise RuntimeError("FLA did not return a continuation State")
+            if adapter.state_names == ("hidden",):
+                initial = initial.squeeze(1)
+            suffix, states = adapter.split(adapter.invoke(second, initial, True))
+            outputs = {name: torch.cat((outputs[name], output), dim=2)
+                       for name, output in suffix.items()}
+        return outputs, states
+    return run
+
+
+def _measure_call(call, warmup, repetitions, timing="both"):
+    # First invocation and warming precede every timed/profiler/memory interval.
+    call()
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize()
+    record = {
+        "cpu_wall_ms": _cpu_wall_time(call, 0, repetitions),
+        "public_cuda_event_ms": _median_time(call, 0, repetitions),
+        "compilation_timed": False,
+        "memory_scope": "PyTorch CUDA allocator, warmed single invocation; includes returned outputs/States",
+    }
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    result = call()
+    torch.cuda.synchronize()
+    record["peak_allocated_bytes"] = torch.cuda.max_memory_allocated()
+    record["peak_incremental_bytes"] = record["peak_allocated_bytes"] - before
+    record["peak_reserved_bytes"] = torch.cuda.max_memory_reserved()
+    del result
+    try:
+        kernel_ms, kernels, others = _kernel_profile(call)
+        record.update(kernel_ms=kernel_ms or None, kernel_launches=kernels if kernel_ms else None,
+                      other_launches=others if kernel_ms else None,
+                      total_launches=kernels + others if kernel_ms else None)
+    except RuntimeError as error:
+        record.update(kernel_ms=None, kernel_launches=None, other_launches=None,
+                      total_launches=None, profiler_error=str(error))
+    record["launch_source"] = "CUPTI CUDA activity events (kernels and device copies); unavailable when foreign launches are not captured"
+    if timing in ("graph", "both"):
+        try:
+            record["graph_ms"] = _graph_time(call, 0, repetitions)
+        except RuntimeError as error:
+            record["graph_error"] = str(error)
+    return record
+
+
+def _ratios(meta, baseline):
+    # Correctness is deliberately not a gate: FLA is only a speed baseline.
+    return {name: baseline[name] / meta[name]
+            for name in ("cpu_wall_ms", "public_cuda_event_ms", "graph_ms")
+            if name in meta and name in baseline and meta[name] > 0}
+
+
 def measure(
-    case: Case,
-    seqlen: int,
-    device: torch.device,
-    warmup: int,
-    repetitions: int,
-    *,
-    fla: bool = False,
+    case: Case, seqlen: int, device: torch.device, warmup: int, repetitions: int,
+    *, fla: bool = False, contract: str = "final-state", timing: str = "both",
 ) -> dict:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        raise RuntimeError("CUDA is required")
+    if contract not in CONTRACTS:
+        raise ValueError(f"unknown contract: {contract}")
+    if seqlen < (2 if contract == "continuation" else 1) or warmup < 0 or repetitions < 1:
+        raise ValueError("positive sequence/repetitions and nonnegative warmup required; continuation needs >=2 tokens")
     operator = case.factory(**case.kwargs(seqlen))
     sizes = role_sizes_for(operator, case, seqlen)
-    record: dict = {"family": case.name, "seqlen": seqlen, "heads": case.heads}
+    record = {"family": case.name, "seqlen": seqlen, "heads": case.heads,
+              "batch": case.batch, "dim": case.dim, "dim_value": case.dim_value,
+              "contract": contract, "continuation_split": seqlen // 2 if contract == "continuation" else None,
+              "device": torch.cuda.get_device_name(device), "torch_version": torch.__version__,
+              "timing_units": "milliseconds", "ratio_direction": "FLA / Meta (>1 means Meta faster)",
+              "input_layout": "B,H,T,features; preparation inside public-call intervals",
+              "initial_state": "zero; continuation suffix receives actual prefix final-State"}
+    record["contract_scope"] = (
+        "one public call; output only" if contract == "output-only" else
+        "one public call; all declared final States" if contract == "final-state" else
+        "prefix + suffix public calls; actual prefix State passed to suffix; output concatenation timed"
+    )
     try:
-        compiled = operator.compile(
-            role_sizes=sizes, target=Target(), mode="dense", optimized=True
-        )
+        compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense", optimized=True)
     except StatefulCompilationError as error:
-        record["status"] = "COMPILE_REJECTED"
-        record["error"] = f"{error.category} at {error.path}"
+        record.update(status="COMPILE_REJECTED", error=f"{error.category} at {error.path}")
         return record
     plan = compiled.operator._plans[compiled.specialization]
-    record["lowerer"] = plan.plan.candidate.lowerer
-    record["representation"] = plan.plan.mathematical_plan.representation.value
-    record["rewrites"] = list(plan.plan.mathematical_plan.rewrites)
+    record.update(lowerer=plan.plan.candidate.lowerer,
+                  representation=plan.plan.mathematical_plan.representation.value,
+                  rewrites=list(plan.plan.mathematical_plan.rewrites))
     workspace = plan.plan.workspace
-    record["workspace_bytes_per_token"] = workspace.bytes_per_token
-    record["workspace_bytes_per_chunk"] = workspace.bytes_per_chunk
-    record["workspace_limit_bytes"] = workspace.maximum_bytes
+    record.update(workspace_bytes_per_token=workspace.bytes_per_token,
+                  workspace_bytes_per_chunk=workspace.bytes_per_chunk,
+                  workspace_limit_bytes=workspace.maximum_bytes)
     inputs = inputs_for(operator, case, seqlen, device)
-    call = lambda: compiled(**inputs, return_final_state=True)  # noqa: E731
+    parts = _split_inputs(operator, inputs, seqlen // 2) if contract == "continuation" else [inputs]
+    call = _meta_call(compiled, parts, contract)
     try:
-        record["workspace_bytes"] = workspace.required_bytes(
-            case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen
-        )
-    except RuntimeError as error:
-        record["status"] = "RUNTIME_RESOURCE"
-        record["error"] = str(error)
+        record["workspace_bytes"] = workspace.required_bytes(case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen)
+        actual, states = call()
+    except (StatefulCompilationError, RuntimeError) as error:
+        record.update(status="RUNTIME_REJECTED", error=str(error))
+        return record
+    expected, expected_states = _token_oracle(operator, inputs, sizes)
+    record["meta_correctness"] = _correctness(actual, states, expected, expected_states, contract)
+    del actual, states
+    record.update(_measure_call(call, warmup, repetitions, timing))
+    record["status"] = "OK" if record["meta_correctness"]["status"] == "VALID" else "META_INVALID"
+    record["meta_native_layout"] = {"layout": "public authored layout", "preparation_cpu_wall_ms": 0.0,
+                                    "preparation_cuda_event_ms": 0.0,
+                                    "note": "no separate native-layout public interface; internal normalization remains timed"}
+    if not fla:
         return record
     try:
-        call()
-    except StatefulCompilationError as error:
-        record["status"] = "RUNTIME_REJECTED"
-        record["error"] = f"{error.category} at {error.path}"
-        return record
-    record["status"] = "OK"
-    record["wall_ms"] = _median_time(call, warmup, repetitions)
-    try:
-        record["graph_ms"] = _graph_time(call, warmup, repetitions)
-    except RuntimeError as error:
-        record["graph_error"] = str(error)
-    if fla:
-        try:
-            baseline = _fla_call(case, inputs)
-            if baseline is None:
-                record["fla_note"] = "no mathematically identical library baseline"
-            else:
-                record["fla_wall_ms"] = _median_time(baseline, warmup, repetitions)
-                try:
-                    record["fla_graph_ms"] = _graph_time(baseline, warmup, repetitions)
-                except RuntimeError as error:
-                    record["fla_graph_error"] = str(error)
-        except (ImportError, RuntimeError, TypeError) as error:
-            record["fla_error"] = str(error)
-    kernel_ms, kernel_launches, other_launches = _kernel_profile(call)
-    if kernel_ms == 0.0 and record["wall_ms"] > 0.0:
-        # the profiler can miss launches made through a foreign runtime
-        record["kernel_ms"] = None
-        record["kernel_launches"] = None
-        record["other_launches"] = None
-    else:
-        record["kernel_ms"] = kernel_ms
-        record["kernel_launches"] = kernel_launches
-        record["other_launches"] = other_launches
+        adapter = _fla_call(case, inputs)
+        if adapter is None:
+            record["fla_note"] = "no library adapter for this authored Program"
+            return record
+        equivalent = contract == "output-only" or adapter.state_contract
+        record.update(fla_contract_comparable=equivalent, fla_preprocessing=adapter.preprocessing,
+                      fla_preprocessing_timed=True, fla_note=adapter.note)
+        # Unsupported state adapters still supply an explicitly non-comparable
+        # output-only speed diagnostic; never fabricate equivalent States.
+        baseline_contract = contract if equivalent else "output-only"
+        baseline_parts = parts if equivalent else [inputs]
+        baseline = _baseline_call(adapter, baseline_parts, baseline_contract)
+        actual, states = baseline()
+        record["fla_correctness"] = _correctness(actual, states, expected, expected_states, baseline_contract)
+        del actual, states
+        record["fla"] = _measure_call(baseline, warmup, repetitions, timing)
+        record["fla"]["contract"] = baseline_contract
+        if equivalent:
+            record["speedup"] = _ratios(record, record["fla"])
+        prepare = lambda: [adapter.prepare(part) for part in baseline_parts]
+        record["fla_native_layout"] = {
+            "preparation_cpu_wall_ms": _cpu_wall_time(prepare, warmup, repetitions),
+            "preparation_cuda_event_ms": _median_time(prepare, warmup, repetitions),
+            "preprocessing_timed": False,
+            "layout": "B,T,H,features (HGRN: B,T,D)",
+        }
+        prepared = prepare()
+        native = _baseline_call(adapter, prepared, baseline_contract, prepared=True)
+        record["fla_native_layout"].update(_measure_call(native, warmup, repetitions, timing))
+    except (ImportError, RuntimeError, TypeError, ValueError, AssertionError) as error:
+        record["fla_error"] = str(error)
     return record
+
+
+def _print_record(record):
+    """Print the entire measurement contract, including unsupported diagnostics."""
+    print(json.dumps(record, sort_keys=True), flush=True)
 
 
 def main() -> None:
@@ -412,10 +716,12 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--json", type=Path, help="write the records as JSON")
+    parser.add_argument("--contract", choices=(*CONTRACTS, "all"), default="final-state")
+    parser.add_argument("--timing", choices=("e2e", "graph", "both"), default="both")
     parser.add_argument(
         "--fla",
         action="store_true",
-        help="time stock FLA without checking its correctness",
+        help="time FLA as a performance baseline and report independent oracle diagnostics",
     )
     args = parser.parse_args()
     torch.set_num_threads(1)
@@ -423,6 +729,14 @@ def main() -> None:
         raise SystemExit("CUDA is required")
     device = torch.device("cuda")
     wanted = set(args.families.split(",")) if args.families else None
+    known = {case.name for case in CASES}
+    if wanted is not None and not wanted <= known:
+        parser.error(f"unknown families: {sorted(wanted - known)}")
+    contracts = CONTRACTS if args.contract == "all" else (args.contract,)
+    if args.warmup < 0 or args.repetitions < 1 or any(length < (2 if "continuation" in contracts else 1) for length in args.seqlen):
+        parser.error("positive lengths/repetitions and nonnegative warmup required; continuation needs >=2 tokens")
+    if args.heads is not None and args.heads < 1:
+        parser.error("heads must be positive")
     records = []
     for seqlen in args.seqlen:
         for case in CASES:
@@ -431,38 +745,18 @@ def main() -> None:
             case = (
                 Case(**{**case.__dict__, "heads": args.heads}) if args.heads else case
             )
-            torch.manual_seed(42)
-            record = measure(
-                case, seqlen, device, args.warmup, args.repetitions, fla=args.fla
-            )
-            records.append(record)
-            if record["status"] != "OK":
-                print(
-                    f"{record['family']:16s} T={seqlen:6d} {record['status']:17s} "
-                    f"{record.get('lowerer', '-'):24s} {record.get('error', '')}",
-                    flush=True,
+            for contract in contracts:
+                torch.manual_seed(42)
+                record = measure(
+                    case, seqlen, device, args.warmup, args.repetitions,
+                    fla=args.fla, contract=contract, timing=args.timing,
                 )
-                continue
-            kernel = record["kernel_ms"]
-            launches = record["kernel_launches"]
-            others = record["other_launches"]
-            kernel_text = "n/a" if kernel is None else f"{kernel:9.3f}"
-            launch_text = "n/a" if launches is None else f"{launches:3d}+{others:3d}"
-            graph_text = f"{record['graph_ms']:.3f}" if "graph_ms" in record else "n/a"
-            fla_text = (
-                f"{record['fla_wall_ms']:.3f}" if "fla_wall_ms" in record else "n/a"
-            )
-            print(
-                f"{record['family']:16s} T={seqlen:6d} {record['lowerer']:24s} "
-                f"wall={record['wall_ms']:9.3f} ms kernel={kernel_text} ms "
-                f"graph={graph_text} ms FLA-wall={fla_text} ms "
-                f"launches={launch_text} "
-                f"workspace={record['workspace_bytes'] / 2**20:8.1f} MiB "
-                f"({record['workspace_bytes_per_token'] / 2**10:.1f} KiB/token)",
-                flush=True,
-            )
+                records.append(record)
+                _print_record(record)
     if args.json is not None:
         args.json.write_text(json.dumps(records, indent=2))
+    if any(record["status"] != "OK" for record in records):
+        raise SystemExit("Meta measurement failed; see records (FLA diagnostics do not determine this status)")
 
 
 if __name__ == "__main__":

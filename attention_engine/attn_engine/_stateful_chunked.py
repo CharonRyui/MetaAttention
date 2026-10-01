@@ -186,12 +186,8 @@ def _axis_factors(
             token_count, heads, size
         )
 
-    rows = torch.ones(token_count, heads, left_size, device=device)
-    columns = (
-        None
-        if right_size == 1
-        else torch.ones(token_count, heads, right_size, device=device)
-    )
+    rows = None
+    columns = None
     for node in propagations:
         if isinstance(node, Identity):
             continue
@@ -203,20 +199,20 @@ def _axis_factors(
             scale = per_token(node.factor, None)
             if scale is None:
                 return None
-            rows = rows * scale
+            rows = scale if rows is None else rows * scale
             continue
         if roles[0] == view.feature_roles[0]:
             row_factor = per_token(node.factor, left_size)
             if row_factor is None:
                 return None
-            rows = rows * row_factor
+            rows = row_factor if rows is None else rows * row_factor
         elif roles[0] == view.feature_roles[-1]:
-            if columns is None:
+            if right_size == 1:
                 continue
             column_factor = per_token(node.factor, right_size)
             if column_factor is None:
                 return None
-            columns = columns * column_factor
+            columns = column_factor if columns is None else columns * column_factor
         else:
             return None
     return rows, columns
@@ -456,6 +452,7 @@ def execute_chunked_states(
     term_values: dict[Any, torch.Tensor] = {}
     input_values: dict[Any, torch.Tensor] = {}
     broadcast_values: dict[int, torch.Tensor] = {}
+    product_scores: dict[Any, torch.Tensor] = {}
 
     def vector(value: torch.Tensor, size: int) -> torch.Tensor:
         if value.numel() == 1:
@@ -582,6 +579,7 @@ def execute_chunked_states(
                     sequence_length=sequence_length,
                     prior=expression.prior,
                     identity=identity,
+                    product_scores=product_scores,
                 )
             return term_values[expression]
         if isinstance(expression, (Add, Multiply, Divide, Contract, Outer)):

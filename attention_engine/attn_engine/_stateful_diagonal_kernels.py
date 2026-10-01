@@ -1,7 +1,7 @@
 """Dense diagonal recurrence kernels; only chunk-boundary States reach memory.
 
-Identity propagation uses chunk GEMMs. General diagonal propagation replays a
-64-token chunk with a distributed FP32 State tile and a parallel row reduction.
+Identity propagation uses chunk GEMMs. General diagonal propagation uses
+inverse-free parallel forward products and weighted block GEMM contractions.
 All tensor layouts are token-major; sequence length is a static dense contract.
 """
 
@@ -64,45 +64,6 @@ def _identity_pairs(
         (r[:, None] < ROWS) & (c[None, :] < COLS),
     )
 
-
-@triton.jit
-def _diagonal_pairs(
-    GR,
-    GC,
-    K,
-    V,
-    Scale,
-    Bias,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    UNIT_ROWS: tl.constexpr,
-    UNIT_COLS: tl.constexpr,
-):
-    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    x = block * 256 + tl.arange(0, 256)
-    r, c = x // COLS, x % COLS
-    scale = tl.full((256,), 1.0, tl.float32)
-    bias = tl.full((256,), 0.0, tl.float32)
-    for step in range(CHUNK):
-        t = chunk * CHUNK + step
-        flat = (seq * LENGTH + t) * HEADS + head
-        rg = tl.full((256,), 1.0, tl.float32)
-        cg = tl.full((256,), 1.0, tl.float32)
-        if not UNIT_ROWS:
-            rg = tl.load(GR + flat * ROWS + r, (t < LENGTH) & (r < ROWS), 1)
-        if not UNIT_COLS:
-            cg = tl.load(GC + flat * COLS + c, (t < LENGTH) & (r < ROWS), 1)
-        k = tl.load(K + flat * ROWS + r, (t < LENGTH) & (r < ROWS), 0)
-        v = tl.load(V + flat * COLS + c, (t < LENGTH) & (r < ROWS), 0)
-        bias = rg * cg * bias + k * v
-        scale *= rg * cg
-    base = (sh * CHUNKS + chunk) * ROWS * COLS + x
-    tl.store(Scale + base, scale, x < ROWS * COLS)
-    tl.store(Bias + base, bias, x < ROWS * COLS)
 
 
 @triton.jit
@@ -228,53 +189,6 @@ def _identity_readout(
     )
 
 
-@triton.jit
-def _diagonal_readout(
-    GR,
-    GC,
-    K,
-    V,
-    Q,
-    Carry,
-    Output,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    BR: tl.constexpr,
-    UNIT_ROWS: tl.constexpr,
-    UNIT_COLS: tl.constexpr,
-    PRIOR: tl.constexpr,
-):
-    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    r = tl.arange(0, BR)
-    c = block * 16 + tl.arange(0, 16)
-    state = tl.load(
-        Carry + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
-        (r[:, None] < ROWS) & (c[None, :] < COLS),
-        0,
-    )
-    for step in range(CHUNK):
-        t = chunk * CHUNK + step
-        flat = (seq * LENGTH + t) * HEADS + head
-        q = tl.load(Q + flat * ROWS + r, (t < LENGTH) & (r < ROWS), 0)
-        if PRIOR:
-            out = tl.sum(state * q[:, None], 0)
-        rg = tl.full((BR,), 1.0, tl.float32)
-        cg = tl.full((16,), 1.0, tl.float32)
-        if not UNIT_ROWS:
-            rg = tl.load(GR + flat * ROWS + r, (t < LENGTH) & (r < ROWS), 1)
-        if not UNIT_COLS:
-            cg = tl.load(GC + flat * COLS + c, (t < LENGTH) & (c < COLS), 1)
-        k = tl.load(K + flat * ROWS + r, (t < LENGTH) & (r < ROWS), 0)
-        v = tl.load(V + flat * COLS + c, (t < LENGTH) & (c < COLS), 0)
-        state = state * rg[:, None] * cg[None, :] + k[:, None] * v[None, :]
-        if not PRIOR:
-            out = tl.sum(state * q[:, None], 0)
-        tl.store(Output + flat * COLS + c, out, (t < LENGTH) & (c < COLS))
-
 
 def prepare_state(
     *,
@@ -298,8 +212,15 @@ def prepare_state(
         key = key.reshape(batch * sequence_length, heads, rows).float().contiguous()
         key2, kl, kr = key, rows, 0
     value = value.reshape(batch * sequence_length, heads, columns).float().contiguous()
-    rows_gate = None if rows_gate is None else rows_gate.float().contiguous()
-    columns_gate = None if columns_gate is None else columns_gate.float().contiguous()
+    tokens = batch * sequence_length
+    rows_gate = (
+        None if rows_gate is None
+        else rows_gate.reshape(tokens, heads, -1).expand(tokens, heads, rows).float().contiguous()
+    )
+    columns_gate = (
+        None if columns_gate is None
+        else columns_gate.reshape(tokens, heads, -1).expand(tokens, heads, columns).float().contiguous()
+    )
     bias = torch.empty(
         batch * heads, chunks, rows, columns, device=initial.device, dtype=torch.float32
     )
@@ -311,37 +232,23 @@ def prepare_state(
             (batch * heads, chunks, triton.cdiv(rows, 32) * triton.cdiv(columns, 32))
         ](key, key2, value, bias, sequence_length, heads, rows, columns, chunks, kr, kl)
     else:
-        _diagonal_pairs[(batch * heads, chunks, triton.cdiv(rows * columns, 256))](
-            rows_gate,
-            columns_gate,
-            key,
-            value,
-            scale,
-            bias,
-            sequence_length,
-            heads,
-            rows,
-            columns,
-            chunks,
-            rows_gate is None,
-            columns_gate is None,
+        from ._stateful_diagonal_block import diagonal_block_summary
+
+        diagonal_block_summary(
+            rows_gate, columns_gate, key, key2, value, scale, bias,
+            sequence_length=sequence_length, heads=heads, rows=rows,
+            columns=columns, chunks=chunks, kl=kl, kr=kr,
         )
-    _carry[(batch * heads, triton.cdiv(rows * columns, 256))](
-        scale,
-        bias,
-        initial,
-        carry,
-        final,
-        rows,
-        columns,
-        chunks,
-        identity,
-        return_final_state,
+    from ._stateful_diagonal_scan import hierarchical_carry
+
+    hierarchical_carry(
+        scale, bias, initial, carry, final,
+        identity=identity, write_final=return_final_state,
     )
     return carry, final, (rows_gate, columns_gate, key, key2, value, kl, kr)
 
 
-def read_state(carry, factors, query, *, sequence_length, prior=False, identity=False):
+def read_state(carry, factors, query, *, sequence_length, prior=False, identity=False, product_scores=None):
     batch_heads, chunks, rows, columns = carry.shape
     rows_gate, columns_gate, key, key2, value, kl, kr = factors
     heads = key.shape[1]
@@ -351,6 +258,26 @@ def read_state(carry, factors, query, *, sequence_length, prior=False, identity=
     else:
         query = query.reshape(key.shape[0], heads, rows).float().contiguous()
         query2, ql, qr = query, rows, 0
+    if identity and kr and qr and kl == ql and kr == qr:
+        from ._stateful_product_kernels import product_chunk_scores, read_product_state
+
+        scores = None
+        if product_scores is not None:
+            cache_key = (
+                key.data_ptr(), key2.data_ptr(), query.data_ptr(), query2.data_ptr(),
+                kl, kr, sequence_length, prior,
+            )
+            scores = product_scores.get(cache_key)
+            if scores is None:
+                scores = product_chunk_scores(
+                    (key, key2), (query, query2),
+                    sequence_length=sequence_length, prior=prior,
+                )
+                product_scores[cache_key] = scores
+        return read_product_state(
+            carry, (key, key2), (query, query2), value,
+            sequence_length=sequence_length, prior=prior, scores=scores,
+        )
     output = torch.empty(
         key.shape[0], heads, columns, device=key.device, dtype=torch.float32
     )
@@ -375,23 +302,10 @@ def read_state(carry, factors, query, *, sequence_length, prior=False, identity=
             ql,
         )
     else:
-        _diagonal_readout[(batch_heads, chunks, triton.cdiv(columns, 16))](
-            rows_gate,
-            columns_gate,
-            key,
-            value,
-            query,
-            carry,
-            output,
-            sequence_length,
-            heads,
-            rows,
-            columns,
-            chunks,
-            triton.next_power_of_2(rows),
-            rows_gate is None,
-            columns_gate is None,
-            prior,
-            num_warps=4 if rows <= 128 else 8,
+        from ._stateful_diagonal_block import diagonal_block_readout
+
+        diagonal_block_readout(
+            carry, factors, query, query2, output,
+            sequence_length=sequence_length, prior=prior, ql=ql, qr=qr,
         )
     return output
