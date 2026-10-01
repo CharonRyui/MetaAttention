@@ -157,6 +157,50 @@ def test_linear_attention_dsl_matches_fp32_recurrence(
         )
 
 
+@pytest.mark.parametrize("seqlen,dim,dim_value", [(128, 64, 64), (192, 128, 128)])
+def test_feature_gla_chunked_state_continuation(seqlen, dim, dim_value, gpu_device, seed):
+    batch, heads = 1, 2
+    dtype = torch.bfloat16
+    compiled = _compile(
+        gla_attention(batch, heads, seqlen, dim, dim_value, dtype=dtype),
+        heads, dim, dim_value,
+    )
+    query = torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype)
+    key = torch.randn_like(query)
+    value = torch.randn(batch, heads, seqlen, dim_value, device=gpu_device, dtype=dtype)
+    gate = torch.randn(batch, heads, seqlen, dim, device=gpu_device).clamp(-0.05, 0)
+    gate[:, :, 63:66] = 0
+    gate[:, :, 127:130] = 0
+    initial = torch.randn(batch, heads, dim, dim_value, device=gpu_device)
+    inputs = {"query": query, "key": key, "value": value, "gate": gate}
+    state = StateTuple(("memory",), (initial,))
+    result = compiled(**inputs, initial_state=state, return_final_state=True)
+    expected, expected_final = _reference(query, key, value, gate, initial)
+    torch.testing.assert_close(result.outputs["output"], expected, rtol=0.02, atol=0.05)
+    assert result.final_state is not None
+    torch.testing.assert_close(
+        result.final_state["memory"], expected_final, rtol=0.01, atol=0.02
+    )
+    split = 64
+    prefix = compiled(
+        **{name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()},
+        initial_state=state, return_final_state=True,
+    )
+    assert prefix.final_state is not None
+    suffix = compiled(
+        **{name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()},
+        initial_state=prefix.final_state, return_final_state=True,
+    )
+    assert suffix.final_state is not None
+    torch.testing.assert_close(
+        torch.cat((prefix.outputs["output"], suffix.outputs["output"]), dim=2),
+        expected, rtol=0.02, atol=0.05,
+    )
+    torch.testing.assert_close(
+        suffix.final_state["memory"], expected_final, rtol=0.01, atol=0.02
+    )
+
+
 @pytest.mark.parametrize(
     ("factory", "gate_kind"),
     [

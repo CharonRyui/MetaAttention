@@ -1911,10 +1911,11 @@ class StatefulOperator:
             chunked = self._lower_chunked_elementwise(
                 values,
                 initial_state,
-                _evaluate(gate_expression, values),
+                _evaluate(gate_expression.operand, values),
                 None,
                 runtime,
                 executable,
+                log_gate_rows=True,
             )
             if chunked is not None:
                 output, final = chunked
@@ -1957,6 +1958,8 @@ class StatefulOperator:
         second_factor: torch.Tensor | None,
         runtime: _Runtime,
         executable: Any,
+        *,
+        log_gate_rows: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Run a diagonal recurrence through the chunked schedule.
 
@@ -2005,6 +2008,8 @@ class StatefulOperator:
             ),
             initial_state=(initial_state,),
             output_dtype=readout.output_dtype,
+            log_gate_rows=(log_gate_rows,),
+            unit_gate_columns=(second_factor is None,),
         )
         # one State reaches this path today; the entry returns a per-State pair so
         # a readout that composes several States can consume them

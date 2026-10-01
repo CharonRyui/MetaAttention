@@ -5,12 +5,11 @@ factors) needs no dense summary. This module runs such a Program through three
 kernels: one that computes each chunk's own affine pair, one that composes those
 pairs into the running pair at every chunk end, and one that replays each chunk
 independently with the State column in registers and the readout contracted in
-place. Splitting the pair walk per chunk is what keeps the serial depth at one
-chunk instead of the whole sequence. Nothing
-token-sized reaches global memory except the output.
-
-The kernels own their symbols and layouts, so they never share a TileLang cache
-entry with the per-token prefix kernel of the elementwise family.
+place. Log-gate exponentiation and unit column factors can be selected as
+compile-time kernel modes, avoiding materialized per-token factor tensors.
+Splitting the pair walk per chunk is what keeps the serial depth at one chunk
+instead of the whole sequence. Nothing token-sized reaches global memory except
+the output.
 """
 
 from __future__ import annotations
@@ -34,6 +33,8 @@ def _compile_chunk_pairs(
     chunk_tokens: int,
     threads: int,
     device_index: int,
+    log_gate_rows: bool,
+    unit_gate_columns: bool,
 ):
     """Write each chunk's own affine pair, one block per (sequence, head, chunk).
 
@@ -61,7 +62,15 @@ def _compile_chunk_pairs(
             local_bias: T.Tensor((chunk_count, heads, rows, columns), "float32"),
         ):
             if False:
-                _ = (chunk_count, matrix_blocks, rows, columns, threads)
+                _ = (
+                    chunk_count,
+                    matrix_blocks,
+                    rows,
+                    columns,
+                    threads,
+                    log_gate_rows,
+                    unit_gate_columns,
+                )
             with T.Kernel(
                 sequence_count * heads, chunk_count, matrix_blocks, threads=threads
             ) as (sequence_head, chunk, matrix_block):
@@ -80,17 +89,20 @@ def _compile_chunk_pairs(
                         if token < sequence_length:
                             # factors are token-major with batch-major flattening
                             flat = sequence * sequence_length + token
+                            if log_gate_rows:
+                                row_gate = T.exp(gate_rows[flat, head, row])
+                            else:
+                                row_gate = gate_rows[flat, head, row]
+                            column_gate = (
+                                1.0
+                                if unit_gate_columns
+                                else gate_columns[flat, head, column]
+                            )
                             bias[0] = (
-                                gate_rows[flat, head, row]
-                                * gate_columns[flat, head, column]
-                                * bias[0]
+                                row_gate * column_gate * bias[0]
                                 + key[flat, head, row] * value[flat, head, column]
                             )
-                            scale[0] = (
-                                gate_rows[flat, head, row]
-                                * gate_columns[flat, head, column]
-                                * scale[0]
-                            )
+                            scale[0] = row_gate * column_gate * scale[0]
                     local_scale[chunk, head, row, column] = scale[0]
                     local_bias[chunk, head, row, column] = bias[0]
 
@@ -165,6 +177,8 @@ def _compile_chunk_recurrence(
     chunk_tokens: int,
     thread_columns: int,
     device_index: int,
+    log_gate_rows: bool,
+    unit_gate_columns: bool,
 ):
     """Replay one chunk per block, State in registers, readout in place.
 
@@ -196,7 +210,10 @@ def _compile_chunk_recurrence(
             final: T.Tensor((sequence_count, heads, rows, columns), "float32"),
         ):
             if False:
-                _ = (output_dtype, chunk_count, column_blocks, rows, columns)
+                _ = (
+                    output_dtype, chunk_count, column_blocks, rows, columns,
+                    log_gate_rows, unit_gate_columns,
+                )
             with T.Kernel(
                 sequence_count * heads, chunk_count, column_blocks, threads=block_columns
             ) as (sequence_head, chunk, column_block):
@@ -206,6 +223,14 @@ def _compile_chunk_recurrence(
                 state = T.alloc_local((rows,), dtype="float32")
                 accumulated = T.alloc_local((1,), dtype="float32")
                 start = chunk * chunk_tokens
+                if log_gate_rows:
+                    gate_shared = T.alloc_shared((chunk_tokens, rows), dtype="float32")
+                    for step, row in T.Parallel(chunk_tokens, rows):
+                        if start + step < sequence_length:
+                            gate_shared[step, row] = T.exp(
+                                gate_rows[sequence * sequence_length + start + step, head, row]
+                            )
+                    T.sync_threads()
                 if column < columns:
                     for row in T.serial(rows):
                         if chunk == 0:
@@ -222,10 +247,18 @@ def _compile_chunk_recurrence(
                         flat = sequence * sequence_length + token
                         if column < columns:
                             for row in T.serial(rows):
+                                row_gate = (
+                                    gate_shared[token_in_chunk, row]
+                                    if log_gate_rows
+                                    else gate_rows[flat, head, row]
+                                )
+                                column_gate = (
+                                    1.0
+                                    if unit_gate_columns
+                                    else gate_columns[flat, head, column]
+                                )
                                 state[row] = (
-                                    gate_rows[flat, head, row]
-                                    * gate_columns[flat, head, column]
-                                    * state[row]
+                                    row_gate * column_gate * state[row]
                                     + key[flat, head, row] * value[flat, head, column]
                                 )
                             accumulated[0] = 0.0
@@ -254,6 +287,8 @@ def _chunked_state(
     initial_state: torch.Tensor,
     output_dtype: torch.dtype,
     chunk_tokens: int = CHUNK_TOKENS,
+    log_gate_rows: bool = False,
+    unit_gate_columns: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run one diagonal recurrence through the chunked schedule.
 
@@ -287,15 +322,17 @@ def _chunked_state(
         # a whole-State decay applies to every row
         rows_gate = rows_gate.expand(token_count, heads, rows)
     rows_gate = rows_gate.float().contiguous()
-    # the kernels accumulate in fp32, so the per-token factors are promoted here,
-    # at one declared point, rather than inside the kernel
     key = key.reshape(token_count, heads, -1).float().contiguous()
     value = value.reshape(token_count, heads, -1).float().contiguous()
     query = query.reshape(token_count, heads, -1).float().contiguous()
     columns_gate = (
-        torch.ones(token_count, heads, columns, device=device, dtype=torch.float32)
-        if gate_columns is None
-        else gate_columns.reshape(token_count, heads, columns).float().contiguous()
+        None
+        if unit_gate_columns
+        else (
+            torch.ones(token_count, heads, columns, device=device, dtype=torch.float32)
+            if gate_columns is None
+            else gate_columns.reshape(token_count, heads, columns).float().contiguous()
+        )
     )
     chunk_count = (token_count + chunk_tokens - 1) // chunk_tokens
     device_index = device.index
@@ -310,6 +347,8 @@ def _chunked_state(
         chunk_tokens,
         128,
         device_index,
+        log_gate_rows,
+        unit_gate_columns,
     )
     local_scale = torch.empty(
         chunk_count, heads, rows, columns, device=device, dtype=torch.float32
@@ -339,6 +378,8 @@ def _chunked_state(
         chunk_tokens,
         64,
         device_index,
+        log_gate_rows,
+        unit_gate_columns,
     )
     output = torch.empty(
         sequence_count, heads, token_count, columns, device=device, dtype=output_dtype
@@ -374,19 +415,18 @@ def chunked_elementwise_dense(
     initial_state: tuple[torch.Tensor, ...],
     output_dtype: torch.dtype,
     chunk_tokens: int = CHUNK_TOKENS,
+    log_gate_rows: tuple[bool, ...] = (),
+    unit_gate_columns: tuple[bool, ...] = (),
 ) -> tuple[tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """Run every diagonal recurrence of a program through the chunked schedule.
-
-    One ``(output, final)`` pair per State, in the order the States were given.
-    The States are independent here: a program whose readouts compose them must
-    apply that composition to the returned outputs. Each State compiles its own
-    kernels, since the sizes are part of their cache key, so a rank-1 State and a
-    dense one coexist without sharing a kernel instance.
-    """
+    """Run every diagonal recurrence through the chunked schedule."""
     state_count = len(initial_state)
     per_state = (gate_rows, gate_columns, key, value, query)
     if any(len(entry) != state_count for entry in per_state):
         raise ValueError("every per-State argument must name the same States")
+    if log_gate_rows and len(log_gate_rows) != state_count:
+        raise ValueError("log_gate_rows must name every State when provided")
+    if unit_gate_columns and len(unit_gate_columns) != state_count:
+        raise ValueError("unit_gate_columns must name every State when provided")
     outputs: list[torch.Tensor] = []
     finals: list[torch.Tensor] = []
     for index in range(state_count):
@@ -399,6 +439,8 @@ def chunked_elementwise_dense(
             initial_state=initial_state[index],
             output_dtype=output_dtype,
             chunk_tokens=chunk_tokens,
+            log_gate_rows=bool(log_gate_rows and log_gate_rows[index]),
+            unit_gate_columns=bool(unit_gate_columns and unit_gate_columns[index]),
         )
         outputs.append(output)
         finals.append(final)
