@@ -273,6 +273,10 @@ from `71` to `47` and `33` to `21`, respectively. GDN changed from `0.598` to
 `0.592 ms` graph time. Output, final State, and continuation correctness remain
 covered by the focused GPU suite.
 
+The follow-up dense-State pass also reuses identical broadcast value bindings
+across States; it changes no numerical path and is covered by the same focused
+GPU regression suite.
+
 ## Legacy Customized Linear Attention API
 
 The modifier-based `LinearAttentionEngine` remains available with its existing

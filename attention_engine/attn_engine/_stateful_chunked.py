@@ -455,6 +455,7 @@ def execute_chunked_states(
     final_states: dict[str, torch.Tensor] = {}
     term_values: dict[Any, torch.Tensor] = {}
     input_values: dict[Any, torch.Tensor] = {}
+    broadcast_values: dict[int, torch.Tensor] = {}
 
     def vector(value: torch.Tensor, size: int) -> torch.Tensor:
         if value.numel() == 1:
@@ -478,6 +479,15 @@ def execute_chunked_states(
                 input_expression(expression.right).reshape(token_count, heads, -1),
             )
         return vector(input_expression(expression), size)
+
+    def broadcast_value(size: int) -> torch.Tensor:
+        value = broadcast_values.get(size)
+        if value is None:
+            value = torch.ones(
+                token_count, heads, size, device=device, dtype=torch.float32
+            )
+            broadcast_values[size] = value
+        return value
 
     def prepare(name: str):
         if name in prepared:
@@ -514,9 +524,7 @@ def execute_chunked_states(
             else:
                 value = vector(input_expression(factor.expression), columns)
         if value is None:
-            value = torch.ones(
-                token_count, heads, columns, device=device, dtype=torch.float32
-            )
+            value = broadcast_value(columns)
         if scalar is not None:
             value = value * vector(scalar, 1)
         initial = initial_states[name]
