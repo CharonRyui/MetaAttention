@@ -106,6 +106,11 @@ def test_non_exp_feature_scale_uses_generic_axis_scale_candidate():
     plan = compiled.operator._plans[compiled.specialization].plan
     assert plan.candidate.lowerer == "tilelang-elementwise"
 
+def test_feature_vector_plan_remains_vector_candidate_for_chunked_runtime():
+    plan = _plan(gla_attention, rows=64, columns=64)
+    assert plan.candidate.lowerer == "tilelang-vector-propagation"
+    assert plan.workspace.bytes_per_token == 0
+
 def test_diagonal_decay_never_selects_a_dense_scan():
     plan = _plan(gla_attention)
     assert plan.candidate.lowerer not in DENSE_SCAN

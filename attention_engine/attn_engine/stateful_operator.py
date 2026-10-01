@@ -1904,15 +1904,33 @@ class StatefulOperator:
         state_spec = self.algorithm.states[0]
         first_role, second_role = state_spec.feature_roles
         transition = self.algorithm.transition
+        gate_expression = transition.propagations[0].factor
+        if runtime.sequence_count == 1 and runtime.uniform_length % 64 == 0:
+            # Chunk carries and State-column replay avoid the long per-token
+            # vector walk at aligned single-sequence inference lengths.
+            chunked = self._lower_chunked_elementwise(
+                values,
+                initial_state,
+                _evaluate(gate_expression, values),
+                None,
+                runtime,
+                executable,
+            )
+            if chunked is not None:
+                output, final = chunked
+                final_state = (
+                    StateTuple((state_spec.name,), (final,))
+                    if return_final_state
+                    else None
+                )
+                return (output,), final_state
         injection = transition.injections[0]
         factors = {
             factor.roles[0]: _evaluate(factor.expression, values)
             for factor in injection.factors
         }
         gate = _feature_vector(
-            _evaluate(transition.propagations[0].factor.operand, values),
-            first_role,
-            state_spec,
+            _evaluate(gate_expression.operand, values), first_role, state_spec
         )
         readout = self.algorithm.readouts[0]
         query = _feature_vector(
