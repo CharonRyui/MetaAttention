@@ -157,18 +157,30 @@ def test_linear_attention_dsl_matches_fp32_recurrence(
         )
 
 
-@pytest.mark.parametrize("seqlen,dim,dim_value", [(128, 64, 64), (192, 128, 128)])
-def test_feature_gla_chunked_state_continuation(seqlen, dim, dim_value, gpu_device, seed):
+@pytest.mark.parametrize(
+    "factory,gate_kind,seqlen,dim,dim_value",
+    [
+        (gla_attention, "feature", 128, 64, 64),
+        (gla_attention, "feature", 192, 128, 128),
+        (simple_gla_attention, "scalar", 128, 64, 64),
+        (simple_gla_attention, "scalar", 192, 128, 64),
+        (simple_gla_attention, "scalar", 2048, 64, 64),
+    ],
+)
+def test_gated_chunked_state_continuation(
+    factory, gate_kind, seqlen, dim, dim_value, gpu_device, seed
+):
     batch, heads = 1, 2
     dtype = torch.bfloat16
     compiled = _compile(
-        gla_attention(batch, heads, seqlen, dim, dim_value, dtype=dtype),
+        factory(batch, heads, seqlen, dim, dim_value, dtype=dtype),
         heads, dim, dim_value,
     )
     query = torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn(batch, heads, seqlen, dim_value, device=gpu_device, dtype=dtype)
-    gate = torch.randn(batch, heads, seqlen, dim, device=gpu_device).clamp(-0.05, 0)
+    gate_shape = (batch, heads, seqlen) if gate_kind == "scalar" else (batch, heads, seqlen, dim)
+    gate = torch.randn(*gate_shape, device=gpu_device).clamp(-0.05, 0)
     gate[:, :, 63:66] = 0
     gate[:, :, 127:130] = 0
     initial = torch.randn(batch, heads, dim, dim_value, device=gpu_device)

@@ -206,6 +206,27 @@ invalid packed offsets, unsupported specialization, resource failure, and
 codegen failure surface as structured `StatefulCompilationError` values. The
 complete contract is in `docs/stateful-operator-ir-spec.md`.
 
+### Scalar propagation inference schedule
+
+The scalar-factorized candidate uses the chunked diagonal pair/scan/replay
+schedule for dense, single-sequence inference with one scalar `Exp` propagation,
+one rank-one injection and one readout, when the sequence length is a multiple
+of 64 and the existing raw dense recipe applies. Dispatch follows typed IR,
+not an example/model name. The kernels consume the original log-gate, keep it
+as one scalar per token/head, and apply propagation before injection/readout.
+Identity propagation, multiple sequences, unaligned lengths, packed inputs and
+gradient execution retain their existing paths. Nonzero initial State and the
+returned final State remain valid for continuation.
+
+On an idle H20, BF16 `B=1,H=8,T=2048,K=V=64`, the same public callable measured
+0.380 ms end-to-end / 0.176 ms CUDA Graph replay for the chunked schedule versus
+0.296 ms / 0.228 ms for the original raw dense schedule (10 warmups, median of
+50 repetitions). Kernel replay improves about 22%, but end-to-end latency
+regresses about 28%; the multi-launch schedule is not an across-the-board speedup.
+Both schedules pass an independent FP32 token recurrence. Stock FLA on the
+benchmark's clamped scalar log-gates fails that oracle, so its timings are not
+reported as a valid speedup comparison.
+
 ## Legacy Customized Linear Attention API
 
 The modifier-based `LinearAttentionEngine` remains available with its existing

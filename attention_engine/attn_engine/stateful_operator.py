@@ -967,6 +967,14 @@ class StatefulOperator:
             )
         state = initial_states[self.algorithm.states[0].name]
         scalar_profile = getattr(plan, "scalar_factorized", None)
+        scalar_chunkable = (
+            runtime.sequence_count == 1
+            and runtime.uniform_length is not None
+            and runtime.uniform_length % 64 == 0
+            and scalar_profile is not None
+            and scalar_profile.dense is not None
+            and scalar_profile.dense.propagation[1].is_log_scale
+        )
         raw_dense = (
             plan.runtime_family == "scalar-factorized"
             and runtime.device.type == "cuda"
@@ -978,14 +986,42 @@ class StatefulOperator:
         )
         if raw_dense:
             assert runtime.uniform_length is not None
-            output, fused_final = plan.scalar_factorized_dense_raw(
-                inputs,
-                state,
-                sequence_count=runtime.sequence_count,
-                sequence_length=runtime.uniform_length,
-                output_dtype=self.algorithm.readouts[0].output_dtype,
-                return_final_state=return_final_state,
-            )
+            if scalar_chunkable:
+                values = self._normalize_inputs(inputs, runtime, role_sizes)
+                state_spec = self.algorithm.states[0]
+                propagation = self.algorithm.transition.propagations[0]
+                injection = self.algorithm.transition.injections[0]
+                factors = {
+                    factor.roles[0]: _evaluate(factor.expression, values)
+                    for factor in injection.factors
+                }
+                readout = _feature_vector(
+                    _evaluate(self.algorithm.readouts[0].operand, values),
+                    self.algorithm.readouts[0].role,
+                    state_spec,
+                )
+                outputs, finals = plan.chunked_elementwise_dense(
+                    gate_rows=(_token_major(_evaluate(propagation.factor.operand, values), runtime),),
+                    gate_columns=(None,),
+                    key=(_token_major(factors[state_spec.feature_roles[0]], runtime),),
+                    value=(_token_major(factors[state_spec.feature_roles[1]], runtime),),
+                    query=(_token_major(readout, runtime),),
+                    initial_state=(state,),
+                    output_dtype=self.algorithm.readouts[0].output_dtype,
+                    log_gate_rows=(True,),
+                    unit_gate_columns=(True,),
+                    scalar_gate=(True,),
+                )
+                output, fused_final = outputs[0], finals[0]
+            else:
+                output, fused_final = plan.scalar_factorized_dense_raw(
+                    inputs,
+                    state,
+                    sequence_count=runtime.sequence_count,
+                    sequence_length=runtime.uniform_length,
+                    output_dtype=self.algorithm.readouts[0].output_dtype,
+                    return_final_state=return_final_state,
+                )
             outputs = (output,)
             final_state = (
                 StateTuple((self.algorithm.states[0].name,), (fused_final,))

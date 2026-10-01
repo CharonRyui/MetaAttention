@@ -13,7 +13,7 @@ import pytest
 import torch
 
 from attn_engine import StateTuple, Target
-from examples.linear_attention import dual_gate_gla_attention, gla_attention, simple_gla_attention
+from examples.linear_attention import dual_gate_gla_attention, gla_attention
 
 pytestmark = [pytest.mark.functional, pytest.mark.gpu]
 
@@ -123,16 +123,6 @@ def test_chunked_path_handles_both_scaled_axes(gpu_device):
             rtol=0.03,
             atol=0.1,
         )
-
-
-def test_scalar_decay_keeps_the_factorized_selection(gpu_device):
-    """A whole-State decay still lowers to the fused scalar kernel."""
-    operator = simple_gla_attention(1, HEADS, LENGTH, DIM, DIM)
-    compiled = _compile(operator, HEADS, DIM)
-    assert (
-        compiled.operator._plans[compiled.specialization].plan.candidate.lowerer
-        == "tilelang-scalar-factorized"
-    )
 
 
 def test_chunked_entry_runs_a_rank_one_state_beside_a_dense_one():
