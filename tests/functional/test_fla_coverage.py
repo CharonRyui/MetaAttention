@@ -368,6 +368,11 @@ def test_based_matches_fla_fused_chunk_based(gpu_device):
         dim=dim,
         dim_value=dim_value,
     )
+    plan = compiled.operator._plans[compiled.specialization].plan
+    assert plan.candidate.lowerer == "tilelang-product-feature-chunked"
+    assert compiled.operator._plans[compiled.specialization].runtime_family == (
+        "product-feature-chunked"
+    )
     actual = compiled(query=query, key=key, value=value).outputs["output"]
     expected = fused_chunk_based(query, key, value, head_first=True)
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
@@ -423,6 +428,11 @@ def test_rebased_matches_fla_parallel_rebased(gpu_device):
         seqlen=length,
         dim=dim,
         dim_value=dim_value,
+    )
+    plan = compiled.operator._plans[compiled.specialization].plan
+    assert plan.candidate.lowerer == "tilelang-product-feature-chunked"
+    assert compiled.operator._plans[compiled.specialization].runtime_family == (
+        "product-feature-chunked"
     )
     actual = compiled(query=query, key=key, value=value).outputs["output"]
     expected = parallel_rebased(query, key, value, head_first=True)

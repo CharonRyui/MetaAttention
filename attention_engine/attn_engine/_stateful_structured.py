@@ -125,6 +125,21 @@ def factored_recurrence_eligibility(algorithm: Any) -> Eligibility:
         return False, "not-a-factored-recurrence"
     return True, None
 
+def product_feature_chunked_eligibility(algorithm: Any) -> Eligibility:
+    """Return whether typed ProductFeature states fit the chunked executor."""
+    from ._stateful_chunked import chunked_states_eligible
+    from .stateful_operator import ProductFeatureRole
+
+    if not chunked_states_eligible(algorithm):
+        return False, "program-is-not-chunked-eligible"
+    if not any(
+        isinstance(role, ProductFeatureRole)
+        for state in algorithm.states
+        for role in state.feature_roles
+    ):
+        return False, "no-product-feature-state"
+    return True, None
+
 
 RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
     "factored-recurrence": factored_recurrence_eligibility,
@@ -133,6 +148,7 @@ RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
     "product-injection-gemm": product_injection_eligibility,
     "rank-one-factorized": rank_one_eligibility,
     "shared-state-contraction": shared_state_contraction_eligibility,
+    "product-feature-chunked": product_feature_chunked_eligibility,
 }
 
 

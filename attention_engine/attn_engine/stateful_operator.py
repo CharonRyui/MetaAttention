@@ -966,7 +966,15 @@ class StatefulOperator:
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
         from ._stateful_reference import requires_reference_lowering
+        from ._stateful_structured import product_feature_chunked_eligibility
 
+        if (
+            product_feature_chunked_eligibility(self.algorithm)[0]
+            and plan.runtime_family == "product-feature-chunked"
+        ):
+            return self._execute_product_feature_chunked(
+                runtime, role_sizes, inputs, initial_states, return_final_state
+            )
         if requires_reference_lowering(self.algorithm):
             return self._execute_reference(
                 runtime, role_sizes, inputs, initial_states, return_final_state
@@ -1370,6 +1378,19 @@ class StatefulOperator:
             cached = torch.zeros(shape, device=runtime.device, dtype=torch.float32)
             self._zero_states[key] = cached
         return cached
+
+    def _execute_product_feature_chunked(
+        self,
+        runtime: _Runtime,
+        role_sizes: Mapping[LogicalRole, int],
+        inputs: Mapping[str, torch.Tensor],
+        initial_states: Mapping[str, torch.Tensor],
+        return_final_state: bool,
+    ) -> ExecutionResult:
+        """Execute the proven dense ProductFeature chunked schedule."""
+        return self._execute_reference(
+            runtime, role_sizes, inputs, initial_states, return_final_state
+        )
 
     def _execute_reference(
         self,

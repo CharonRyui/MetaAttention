@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import pytest
 
-from attn_engine import HeadRole, ProductFeatureRole, Target
+from attn_engine import FeatureRole, HeadRole, ProductFeatureRole, Target
+from examples.based_attention import based_attention
 from examples.gated_delta_rule import gated_delta_rule
 from examples.linear_attention import (
     dual_gate_gla_attention,
@@ -18,6 +19,7 @@ from examples.linear_attention import (
     linear_attention,
     simple_gla_attention,
 )
+from examples.rebased_attention import rebased_attention
 
 pytestmark = pytest.mark.unit
 
@@ -31,14 +33,25 @@ def _allow_cpu_stateful_operator(monkeypatch):
 
 
 def _sizes(operator, rows: int, columns: int) -> dict:
-    sizes: dict = {operator.algorithm.states[0].head_role: HEADS}
-    for index, role in enumerate(operator.algorithm.states[0].feature_roles):
-        sizes[role] = rows if index == 0 else columns
-    for spec in operator.algorithm.inputs:
+    sizes: dict = {}
+    for spec in (*operator.algorithm.inputs, *operator.algorithm.states):
         for role in spec.roles:
             if isinstance(role, HeadRole):
                 sizes.setdefault(role, HEADS)
             elif isinstance(role, ProductFeatureRole):
+                continue
+            elif isinstance(role, FeatureRole):
+                if role.name == "key_dim":
+                    sizes[role] = rows
+                elif role.name == "value_dim":
+                    sizes[role] = columns
+                elif role.name == "unit_dim":
+                    sizes[role] = 1
+                else:
+                    sizes.setdefault(role, columns)
+    for spec in (*operator.algorithm.inputs, *operator.algorithm.states):
+        for role in spec.roles:
+            if isinstance(role, ProductFeatureRole):
                 sizes[role] = sizes[role.left] * sizes[role.right]
     return sizes
 
@@ -61,6 +74,13 @@ def test_feature_vector_gla_selects_vector_propagation():
     representations = {item.representation for item in plan.mathematical_plans}
     assert "vector-propagation" in representations
     assert "axis-scale" in representations
+
+def test_product_feature_program_selects_chunked_runtime():
+    for factory, dim in ((based_attention, 16), (rebased_attention, 16)):
+        plan = _plan(factory, rows=dim, columns=64)
+        assert plan.candidate.lowerer == "tilelang-product-feature-chunked"
+        assert plan.candidate.lowerer not in DENSE_SCAN
+        assert plan.mathematical_plan.representation == "product-feature-chunked"
 
 
 def test_non_exp_feature_scale_uses_generic_axis_scale_candidate():

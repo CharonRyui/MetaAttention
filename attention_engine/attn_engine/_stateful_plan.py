@@ -23,6 +23,7 @@ class PlanRepresentation(str, Enum):
     SHARED_STATE_CONTRACTION = "shared-state-contraction"
     SCALAR_FACTORIZED = "scalar-factorized"
     FACTORED_RECURRENCE = "factored-recurrence"
+    PRODUCT_FEATURE_CHUNKED = "product-feature-chunked"
     STATEFUL_REFERENCE = "stateful-reference"
 
 
@@ -89,6 +90,14 @@ PLAN_RULES = {
             "contracting-first-feature-readout",
             "disjoint-single-feature-injections",
             "ordered-axis-scale-and-rank-one-propagations",
+        ),
+    ),
+    PlanRepresentation.PRODUCT_FEATURE_CHUNKED: PlanRule(
+        PlanRepresentation.PRODUCT_FEATURE_CHUNKED,
+        (
+            "typed-product-feature-injections",
+            "chunk-boundary-state-carries",
+            "typed-readout-expressions",
         ),
     ),
     PlanRepresentation.STATEFUL_REFERENCE: PlanRule(
@@ -347,6 +356,15 @@ class CandidateLowerer:
                 3,
                 heads * (summary + 2 * state) * 4,
             )
+        if representation is PlanRepresentation.PRODUCT_FEATURE_CHUNKED:
+            return CandidateEstimate(
+                True,
+                heads * (3 * shape.state_total_elements + shape.columns) * 4,
+                3 * heads * shape.state_total_elements,
+                3 * shape.state_count,
+                shape.chunked_states_workspace,
+                workspace_bytes_per_chunk=shape.chunked_states_chunk_bytes,
+            )
         if representation is PlanRepresentation.GENERIC_DENSE_AFFINE:
             return CandidateEstimate(
                 True,
@@ -423,6 +441,11 @@ LOWERERS = (
         "tilelang-factored-recurrence",
         (PlanRepresentation.FACTORED_RECURRENCE,),
         "factored-recurrence",
+    ),
+    CandidateLowerer(
+        "tilelang-product-feature-chunked",
+        (PlanRepresentation.PRODUCT_FEATURE_CHUNKED,),
+        "product-feature-chunked",
     ),
     CandidateLowerer(
         "reference-stateful",
@@ -742,6 +765,12 @@ class TileLangExecutable:
 
         return chunked_elementwise_dense(**kwargs)
 
+    def product_feature_chunked_dense(self, **kwargs):
+        """Run the typed ProductFeature chunked inference schedule."""
+        from ._stateful_chunked import execute_chunked_states
+
+        return execute_chunked_states(**kwargs)
+
     def factored_recurrence_dense(self, **kwargs):
         from ._stateful_factored import factored_recurrence_dense
 
@@ -840,8 +869,18 @@ def compile_plan(
 ) -> TileLangExecutable:
     """Enumerate mathematical plans, then bind one stable executable candidate."""
     from ._stateful_reference import requires_reference_lowering
+    from ._stateful_structured import product_feature_chunked_eligibility
 
-    if requires_reference_lowering(operator.algorithm):
+    product_feature_chunked = (
+        mode == "dense"
+        and backward_ir is None
+        and target.device_type == "cuda"
+        and product_feature_chunked_eligibility(operator.algorithm)[0]
+    )
+    if product_feature_chunked:
+        representations = (PlanRepresentation.PRODUCT_FEATURE_CHUNKED,)
+        rewrites = ()
+    elif requires_reference_lowering(operator.algorithm):
         representations = (PlanRepresentation.STATEFUL_REFERENCE,)
         rewrites = ()
     else:
