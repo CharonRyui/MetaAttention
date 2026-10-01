@@ -465,7 +465,7 @@ def execute_chunked_states(
         if expression not in input_values:
             result = _evaluate(
                 expression, values, segment=segment, squeeze_features=True
-            )
+            ).float().contiguous()
             input_values[expression] = (
                 result.unsqueeze(-1) if result.ndim == 2 else result
             )
@@ -543,7 +543,14 @@ def execute_chunked_states(
         prepared[name] = carry, factors, identity
         return prepared[name]
 
+    expression_values: dict[Any, torch.Tensor] = {}
+
     def evaluate(expression: Any) -> torch.Tensor:
+        if expression not in expression_values:
+            expression_values[expression] = evaluate_uncached(expression)
+        return expression_values[expression]
+
+    def evaluate_uncached(expression: Any) -> torch.Tensor:
         if _contracted_terms(expression) == []:
             return input_expression(expression)
         if isinstance(expression, StateTerm):

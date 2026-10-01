@@ -265,6 +265,14 @@ After results pass an independent FP32 token recurrence for outputs and every
 final State at lengths 65, 512 and 2048 with nonzero initial States, plus batched
 continuation split across nonaligned chunks.
 
+The follow-up packing pass reuses single injection/readout bindings and leaves
+unused Triton operation buffers at one element. On the same H20 workload, the
+`T=2048` graph timings changed from `0.792` to `0.712 ms` for Based and from
+`0.600` to `0.566 ms` for ReBased; profiler-attributed auxiliary launches fell
+from `71` to `47` and `33` to `21`, respectively. GDN changed from `0.598` to
+`0.592 ms` graph time. Output, final State, and continuation correctness remain
+covered by the focused GPU suite.
+
 ## Legacy Customized Linear Attention API
 
 The modifier-based `LinearAttentionEngine` remains available with its existing

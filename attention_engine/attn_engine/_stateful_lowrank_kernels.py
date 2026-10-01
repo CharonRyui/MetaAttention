@@ -281,17 +281,19 @@ def execute(
             return part.reshape(1, 1, 1).expand(tokens, heads, size)
         return part.reshape(tokens, heads, -1).expand(tokens, heads, size)
 
-    # Packed buffers replace per-operation dummy matrices and device opcode copies.
-    left = torch.empty(
-        len(codes), tokens, heads, rows, device=device, dtype=torch.float32
-    )
-    right = torch.empty_like(left)
-    coefficient = torch.empty(
-        len(codes), tokens, heads, device=device, dtype=torch.float32
-    )
-    gate = torch.empty(
-        len(codes), tokens, heads, columns, device=device, dtype=torch.float32
-    )
+    # Only the operation-specific buffers that a static Triton branch reads need
+    # the full packed shape. Unused pointers remain valid one-element tensors.
+    def packed(shape, used):
+        return torch.empty(shape if used else (1,), device=device, dtype=torch.float32)
+
+    left_used = any(code in (1, 2) for code in codes)
+    right_used = any(code == 2 for code in codes)
+    coefficient_used = any(code in (0, 2) for code in codes)
+    gate_used = any(code == 3 for code in codes)
+    left = packed((len(codes), tokens, heads, rows), left_used)
+    right = packed((len(codes), tokens, heads, rows), right_used)
+    coefficient = packed((len(codes), tokens, heads), coefficient_used)
+    gate = packed((len(codes), tokens, heads, columns), gate_used)
     for i, code in enumerate(codes):
         if code in (1, 2):
             left[i].copy_(binding(left_factors[i], rows))
@@ -301,21 +303,18 @@ def execute(
             coefficient[i].copy_(binding(coefficients[i], 1).squeeze(-1))
         if code == 3:
             gate[i].copy_(binding(left_factors[i], columns))
-    ik = (
-        torch.stack([binding(part, rows) for part in injection_left])
-        .float()
-        .contiguous()
-    )
-    iv = (
-        torch.stack([binding(part, columns) for part in injection_right])
-        .float()
-        .contiguous()
-    )
-    query = (
-        torch.stack([binding(part, rows) for part in readouts])
-        .float()
-        .contiguous()
-    )
+
+    def stack_or_bind(parts, size):
+        if len(parts) == 1:
+            return binding(parts[0], size).float().contiguous()
+        return torch.stack([binding(part, size) for part in parts]).float().contiguous()
+
+    # The common single-injection/single-readout case now reuses an already
+    # contiguous FP32 binding instead of allocating a one-leading-axis stack.
+    ik = stack_or_bind(injection_left, rows)
+    iv = stack_or_bind(injection_right, columns)
+    query = stack_or_bind(readouts, rows)
+
     transform = torch.empty(
         batch * heads, chunks, rows, rows, device=device, dtype=torch.float32
     )
