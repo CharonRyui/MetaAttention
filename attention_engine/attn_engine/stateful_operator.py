@@ -1910,7 +1910,9 @@ class StatefulOperator:
             for factor in injection.factors
         }
         gate = _feature_vector(
-            _evaluate(transition.propagations[0].factor, values), first_role, state_spec
+            _evaluate(transition.propagations[0].factor.operand, values),
+            first_role,
+            state_spec,
         )
         readout = self.algorithm.readouts[0]
         query = _feature_vector(
@@ -1919,7 +1921,7 @@ class StatefulOperator:
         key = _feature_vector(factors[first_role], first_role, state_spec)
         value = _feature_vector(factors[second_role], second_role, state_spec)
         output, final = executable.vector_propagation_dense(
-            gate=_token_major(gate, runtime),
+            log_gate=_token_major(gate, runtime),
             key=_token_major(key, runtime),
             value=_token_major(value, runtime),
             query=_token_major(query, runtime),

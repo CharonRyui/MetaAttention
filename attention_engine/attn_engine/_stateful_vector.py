@@ -35,7 +35,7 @@ def _compile_vector_propagation(
     def build_kernel():
         @T.prim_func
         def vector_propagation_kernel(
-            gate: T.Tensor((sequence_count * sequence_length, heads, rows), "float32"),
+            log_gate: T.Tensor((sequence_count * sequence_length, heads, rows), "float32"),
             key: T.Tensor((sequence_count * sequence_length, heads, rows), "float32"),
             value: T.Tensor(
                 (sequence_count * sequence_length, heads, columns), "float32"
@@ -48,7 +48,15 @@ def _compile_vector_propagation(
             final: T.Tensor((sequence_count, heads, rows, columns), "float32"),
         ):
             if False:
-                _ = (sequence_count, sequence_length, heads, rows, columns, column_blocks, output_dtype)
+                _ = (
+                    sequence_count,
+                    sequence_length,
+                    heads,
+                    rows,
+                    columns,
+                    column_blocks,
+                    output_dtype,
+                )
             with T.Kernel(
                 sequence_count * heads, column_blocks, threads=block_columns
             ) as (sequence_head, column_block):
@@ -57,14 +65,19 @@ def _compile_vector_propagation(
                 column = column_block * block_columns + T.get_thread_binding()
                 state = T.alloc_local((rows,), dtype="float32")
                 accumulated = T.alloc_local((1,), dtype="float32")
+                gate_shared = T.alloc_shared((rows,), dtype="float32")
                 if column < columns:
                     for row in T.serial(rows):
                         state[row] = initial[sequence, head, row, column]
-                    for token in T.serial(sequence_length):
-                        flat = sequence * sequence_length + token
+                for token in T.serial(sequence_length):
+                    flat = sequence * sequence_length + token
+                    for row in T.Parallel(rows):
+                        gate_shared[row] = T.exp(log_gate[flat, head, row])
+                    T.sync_threads()
+                    if column < columns:
                         for row in T.serial(rows):
                             state[row] = (
-                                gate[flat, head, row] * state[row]
+                                gate_shared[row] * state[row]
                                 + key[flat, head, row] * value[flat, head, column]
                             )
                         accumulated[0] = 0.0
@@ -73,6 +86,8 @@ def _compile_vector_propagation(
                                 accumulated[0] + query[flat, head, row] * state[row]
                             )
                         output[sequence, head, token, column] = accumulated[0]
+                    T.sync_threads()
+                if column < columns:
                     for row in T.serial(rows):
                         final[sequence, head, row, column] = state[row]
 
@@ -83,7 +98,7 @@ def _compile_vector_propagation(
 
 def vector_propagation_dense(
     *,
-    gate: torch.Tensor,
+    log_gate: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
     query: torch.Tensor,
@@ -91,21 +106,24 @@ def vector_propagation_dense(
     output_dtype: torch.dtype,
     thread_columns: int = 64,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Execute the feature-gated recurrence in one tiled CUDA launch."""
+    """Execute feature-gated recurrence with ``exp(log_gate)`` in the kernel."""
     if initial_state.ndim != 4:
         raise ValueError("vector propagation requires a rank-two State")
-    if not all(tensor.device.type == "cuda" for tensor in (gate, key, value, query, initial_state)):
+    if not all(
+        tensor.device.type == "cuda"
+        for tensor in (log_gate, key, value, query, initial_state)
+    ):
         raise ValueError("vector propagation requires CUDA tensors")
     sequence_count, heads, rows, columns = initial_state.shape
-    if gate.ndim != 3 or key.ndim != 3 or value.ndim != 3 or query.ndim != 3:
+    if any(tensor.ndim != 3 for tensor in (log_gate, key, value, query)):
         raise ValueError("vector propagation inputs must be token-major rank-three tensors")
-    token_count = gate.shape[0]
+    token_count = log_gate.shape[0]
     if any(tensor.shape[0] != token_count for tensor in (key, value, query)):
         raise ValueError("vector propagation inputs must have equal token counts")
-    if token_count != sequence_count * (token_count // sequence_count):
+    if token_count % sequence_count:
         raise ValueError("dense vector propagation requires uniform sequence lengths")
     sequence_length = token_count // sequence_count
-    gate = gate.reshape(token_count, heads, rows).float().contiguous()
+    log_gate = log_gate.reshape(token_count, heads, rows).float().contiguous()
     key = key.reshape(token_count, heads, rows).float().contiguous()
     value = value.reshape(token_count, heads, columns).float().contiguous()
     query = query.reshape(token_count, heads, rows).float().contiguous()
@@ -123,10 +141,13 @@ def vector_propagation_dense(
         device_index,
     )
     output = torch.empty(
-        sequence_count, heads, sequence_length, columns,
+        sequence_count,
+        heads,
+        sequence_length,
+        columns,
         device=initial_state.device,
         dtype=output_dtype,
     )
     final = torch.empty_like(initial_state, dtype=torch.float32)
-    kernel(gate, key, value, query, initial_state.float().contiguous(), output, final)
+    kernel(log_gate, key, value, query, initial_state.float().contiguous(), output, final)
     return output, final

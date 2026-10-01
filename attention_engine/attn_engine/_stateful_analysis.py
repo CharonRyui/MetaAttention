@@ -579,11 +579,21 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             readout_states.update(
                 term.state for _, term in _all_state_terms(readout.expression)
             )
+    propagation_factor = (
+        primary_transition.propagations[0].factor
+        if (
+            v1_shape
+            and len(primary_transition.propagations) == 1
+        )
+        else None
+    )
     vector_propagation = (
         v1_shape
         and len(algorithm.transitions) == 1
         and len(primary_transition.propagations) == 1
         and isinstance(primary_transition.propagations[0], AxisScale)
+        and isinstance(propagation_factor, Exp)
+        and isinstance(propagation_factor.operand, Input)
         and primary_transition.propagations[0].roles == (feature_roles[0],)
         and factorized_injections
         and len(primary_transition.injections) == 1

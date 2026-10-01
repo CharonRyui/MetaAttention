@@ -63,6 +63,49 @@ def test_feature_vector_gla_selects_vector_propagation():
     assert "axis-scale" in representations
 
 
+def test_non_exp_feature_scale_uses_generic_axis_scale_candidate():
+    from attn_engine import (
+        AlgorithmIR,
+        AxisScale,
+        HeadMapping,
+        Input,
+        ProductFactor,
+        ProductInjection,
+    )
+    from attn_engine import StateSpec, StateTransition, StateContraction, TensorInput
+    from attn_engine import Batch, FeatureRole, HeadRole, Sequence, StatefulOperator
+    import torch
+
+    key = FeatureRole("key_dim")
+    value = FeatureRole("value_dim")
+    heads = HeadRole("heads")
+    operator = StatefulOperator(
+        AlgorithmIR(
+            inputs=(
+                TensorInput("query", (Batch, heads, Sequence, key), torch.bfloat16),
+                TensorInput("key", (Batch, heads, Sequence, key), torch.bfloat16),
+                TensorInput("value", (Batch, heads, Sequence, value), torch.bfloat16),
+                TensorInput("gate", (Batch, heads, Sequence, key), torch.float32),
+            ),
+            states=(StateSpec("memory", (Batch, heads, key, value)),),
+            transition=StateTransition(
+                "memory",
+                propagations=(AxisScale(Input("gate"), (key,)),),
+                injections=(
+                    ProductInjection(
+                        (ProductFactor(Input("key"), (key,)), ProductFactor(Input("value"), (value,)))
+                    ),
+                ),
+            ),
+            readouts=(StateContraction("output", "memory", Input("query"), key, torch.bfloat16),),
+            head_mapping=HeadMapping({heads: heads}),
+        )
+    )
+    sizes = {heads: 1, key: 8, value: 8}
+    compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense")
+    plan = compiled.operator._plans[compiled.specialization].plan
+    assert plan.candidate.lowerer == "tilelang-elementwise"
+
 def test_diagonal_decay_never_selects_a_dense_scan():
     plan = _plan(gla_attention)
     assert plan.candidate.lowerer not in DENSE_SCAN
