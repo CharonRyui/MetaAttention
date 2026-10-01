@@ -32,6 +32,39 @@ def axis_scale_eligibility(algorithm: Any) -> Eligibility:
         return False, "propagation-sequence-contains-non-axis-scale"
     return True, None
 
+def vector_propagation_eligibility(algorithm: Any) -> Eligibility:
+    """Return whether one State has the feature-vector GLA algebra."""
+    from .stateful_operator import AxisScale, ProductInjection, StateContraction
+
+    if len(algorithm.states) != 1 or algorithm.states[0].rank != 2:
+        return False, "vector-propagation-requires-one-rank-two-state"
+    if len(algorithm.transitions) != 1:
+        return False, "vector-propagation-requires-one-transition"
+    transition = algorithm.transitions[0]
+    if len(transition.propagations) != 1 or not isinstance(
+        transition.propagations[0], AxisScale
+    ):
+        return False, "vector-propagation-requires-one-axis-scale"
+    if transition.propagations[0].roles != (algorithm.states[0].feature_roles[0],):
+        return False, "vector-propagation-requires-first-feature-scale"
+    if len(transition.injections) != 1:
+        return False, "vector-propagation-requires-one-injection"
+    injection = transition.injections[0]
+    if not isinstance(injection, ProductInjection) or len(injection.factors) != 2:
+        return False, "vector-propagation-requires-rank-one-injection"
+    if {factor.roles for factor in injection.factors} != {
+        (algorithm.states[0].feature_roles[0],),
+        (algorithm.states[0].feature_roles[1],),
+    }:
+        return False, "vector-propagation-injection-roles"
+    if len(algorithm.readouts) != 1 or not isinstance(
+        algorithm.readouts[0], StateContraction
+    ):
+        return False, "vector-propagation-requires-one-contraction"
+    if algorithm.readouts[0].role != algorithm.states[0].feature_roles[0]:
+        return False, "vector-propagation-requires-first-feature-readout"
+    return True, None
+
 
 def product_injection_eligibility(algorithm: Any) -> Eligibility:
     """Return whether injections have explicit role-compatible GEMM factors."""
@@ -95,6 +128,7 @@ def factored_recurrence_eligibility(algorithm: Any) -> Eligibility:
 
 RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
     "factored-recurrence": factored_recurrence_eligibility,
+    "vector-propagation": vector_propagation_eligibility,
     "axis-scale": axis_scale_eligibility,
     "product-injection-gemm": product_injection_eligibility,
     "rank-one-factorized": rank_one_eligibility,

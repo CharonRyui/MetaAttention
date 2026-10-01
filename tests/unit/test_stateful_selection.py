@@ -55,12 +55,19 @@ def _plan(factory, *, rows: int = 128, columns: int = 128, **options):
     return compiled.operator._plans[compiled.specialization].plan
 
 
+def test_feature_vector_gla_selects_vector_propagation():
+    plan = _plan(gla_attention, rows=64, columns=64)
+    assert plan.candidate.lowerer == "tilelang-vector-propagation"
+    representations = {item.representation for item in plan.mathematical_plans}
+    assert "vector-propagation" in representations
+    assert "axis-scale" in representations
+
+
 def test_diagonal_decay_never_selects_a_dense_scan():
     plan = _plan(gla_attention)
     assert plan.candidate.lowerer not in DENSE_SCAN
     selected = dict(plan.candidate_estimates)[plan.candidate.identity]
     assert selected.cost == min(estimate.cost for _, estimate in plan.candidate_estimates)
-
 
 def test_rank_one_propagation_never_selects_a_dense_scan():
     plan = _plan(gated_delta_rule)

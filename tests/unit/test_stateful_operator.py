@@ -96,26 +96,24 @@ def test_metadata_only_dense_compile_reuses_plan_across_dynamic_workloads():
     assert len(operator._plans) == 1
 
 
-def test_compile_rejects_target_without_feasible_workspace():
+def test_vector_propagation_fits_tiny_workspace_envelope():
     from attn_engine import Target
     from examples.linear_attention import gla_attention
 
-    # a per-axis decay has no zero-workspace candidate, so a one-byte envelope
-    # leaves nothing to select
     operator = gla_attention(1, 1, 8, 2, 3)
-    with pytest.raises(StatefulCompilationError) as captured:
-        operator.compile(
-            role_sizes={
-                role: 1 if isinstance(role, HeadRole) else 2
-                for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
-                for role in spec.roles
-                if isinstance(role, (HeadRole, FeatureRole))
-            },
-            target=Target(workspace_bytes=1),
-            mode="dense",
-        )
-    assert captured.value.category == "COMPILE_RESOURCE"
-    assert captured.value.path == "target.workspace_bytes"
+    compiled = operator.compile(
+        role_sizes={
+            role: 1 if isinstance(role, HeadRole) else 2
+            for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
+            for role in spec.roles
+            if isinstance(role, (HeadRole, FeatureRole))
+        },
+        target=Target(workspace_bytes=1),
+        mode="dense",
+    )
+    plan = compiled.operator._plans[compiled.specialization].plan
+    assert plan.candidate.lowerer == "tilelang-vector-propagation"
+    assert plan.workspace.bytes_per_token == 0
 
 
 def test_backward_compilation_publishes_compiler_owned_backward_candidate():

@@ -125,6 +125,7 @@ class SimplifiedIR:
 @dataclass(frozen=True)
 class StructuralFeatures:
     axis_scale: bool
+    vector_propagation: bool
     product_injection: bool
     rank_one: bool
     shared_state_contraction: bool
@@ -578,8 +579,19 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             readout_states.update(
                 term.state for _, term in _all_state_terms(readout.expression)
             )
+    vector_propagation = (
+        v1_shape
+        and len(algorithm.transitions) == 1
+        and len(primary_transition.propagations) == 1
+        and isinstance(primary_transition.propagations[0], AxisScale)
+        and primary_transition.propagations[0].roles == (feature_roles[0],)
+        and factorized_injections
+        and len(primary_transition.injections) == 1
+        and same_orientation
+    )
     structural_features = StructuralFeatures(
         axis_scale=any(isinstance(node, AxisScale) for node in all_propagations),
+        vector_propagation=vector_propagation,
         product_injection=any(transition.injections for transition in algorithm.transitions),
         rank_one=any(
             isinstance(node, RankOnePropagation) for node in all_propagations

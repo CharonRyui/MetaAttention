@@ -16,6 +16,7 @@ import torch
 
 class PlanRepresentation(str, Enum):
     GENERIC_DENSE_AFFINE = "generic-dense-affine"
+    VECTOR_PROPAGATION = "vector-propagation"
     AXIS_SCALE = "axis-scale"
     PRODUCT_INJECTION_GEMM = "product-injection-gemm"
     RANK_ONE_FACTORIZED = "rank-one-factorized"
@@ -47,6 +48,15 @@ PLAN_RULES = {
     PlanRepresentation.GENERIC_DENSE_AFFINE: PlanRule(
         PlanRepresentation.GENERIC_DENSE_AFFINE,
         ("validated-scanable-affine-program",),
+    ),
+    PlanRepresentation.VECTOR_PROPAGATION: PlanRule(
+        PlanRepresentation.VECTOR_PROPAGATION,
+        (
+            "typed-feature-vector-propagation",
+            "rank-one-injection",
+            "first-feature-readout",
+        ),
+        (PlanRepresentation.RANK_ONE_FACTORIZED.value,),
     ),
     PlanRepresentation.AXIS_SCALE: PlanRule(
         PlanRepresentation.AXIS_SCALE,
@@ -260,8 +270,16 @@ class CandidateLowerer:
         state = shape.state_elements
         summary = shape.summary_elements
         dense = shape.rows * shape.rows + shape.columns * shape.columns + state
-        if representation is PlanRepresentation.AXIS_SCALE and shape.chunked:
-            from ._stateful_chunked import CHUNK_TOKENS
+        from ._stateful_chunked import CHUNK_TOKENS
+        if representation is PlanRepresentation.VECTOR_PROPAGATION:
+            # State columns stay in registers; only the output is written.
+            return CandidateEstimate(
+                True,
+                heads * (shape.rows + 2 * shape.columns) * 4,
+                3 * heads * state,
+                1,
+                0,
+            )
         if representation is PlanRepresentation.SCALAR_FACTORIZED:
             # one fused kernel that moves the factors and the output only
             return CandidateEstimate(
@@ -353,6 +371,11 @@ class CandidateLowerer:
 
 LOWERERS = (
     CandidateLowerer("tilelang-generic", (PlanRepresentation.GENERIC_DENSE_AFFINE,)),
+    CandidateLowerer(
+        "tilelang-vector-propagation",
+        (PlanRepresentation.VECTOR_PROPAGATION,),
+        "vector-propagation",
+    ),
     CandidateLowerer(
         "tilelang-elementwise", (PlanRepresentation.AXIS_SCALE,), "axis-scale"
     ),
@@ -655,6 +678,12 @@ class TileLangExecutable:
             second=second,
         )
 
+    def vector_propagation_dense(self, **kwargs):
+        """Run the feature-vector propagation kernel."""
+        from ._stateful_vector import vector_propagation_dense
+
+        return vector_propagation_dense(**kwargs)
+
     def chunked_elementwise_dense(self, **kwargs):
         """Run the chunked diagonal schedule; the caller guarantees no gradient."""
         from ._stateful_chunked import chunked_elementwise_dense
@@ -820,6 +849,10 @@ def compile_plan(
         if active_rewrites.intersection(item.conflicts):
             continue
         for lowerer in LOWERERS:
+            if lowerer.runtime_family == "vector-propagation" and (
+                mode != "dense" or backward_ir is not None or target.device_type != "cuda"
+            ):
+                continue
             if lowerer.runtime_family == "scalar-factorized" and (
                 backward_ir is not None
                 or scalar_factorized is None
@@ -1026,6 +1059,8 @@ def compile_plan(
 
 def _structured_rewrites(features: Any) -> tuple[PlanRepresentation, ...]:
     rewrites = []
+    if features.vector_propagation:
+        rewrites.append(PlanRepresentation.VECTOR_PROPAGATION)
     if features.axis_scale:
         rewrites.append(PlanRepresentation.AXIS_SCALE)
     if features.product_injection:

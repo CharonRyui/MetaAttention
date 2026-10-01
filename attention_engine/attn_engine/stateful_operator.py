@@ -1594,6 +1594,12 @@ class StatefulOperator:
             return self._lower_factored_recurrence(
                 values, initial_state, runtime, return_final_state, executable
             )
+        if family == "vector-propagation" and runtime.device.type == "cuda":
+            return self._lower_vector_propagation(
+                values, initial_state, runtime, return_final_state, executable
+            )
+        if family == "vector-propagation":
+            family = "axis-scale"
         identity_only = not self.algorithm.transition.propagations
         needs_dense_transform = bool(getattr(executable, "dense_summary", False))
         second_factor: torch.Tensor | None = None
@@ -1877,6 +1883,51 @@ class StatefulOperator:
                 )[:, -1]
             final_state = StateTuple((state_spec.name,), (final,))
         return tuple(output_values), final_state
+
+    def _lower_vector_propagation(
+        self,
+        values: Mapping[str, torch.Tensor],
+        initial_state: torch.Tensor,
+        runtime: _Runtime,
+        return_final_state: bool,
+        executable: Any,
+    ) -> tuple[tuple[torch.Tensor, ...], StateTuple | None]:
+        if (
+            runtime.device.type != "cuda"
+            or runtime.packed
+            or runtime.uniform_length is None
+            or runtime.uniform_length * runtime.sequence_count != runtime.token_count
+            or any(tensor.requires_grad for tensor in values.values())
+            or initial_state.requires_grad
+        ):
+            raise RuntimeError("vector-propagation requires dense inference inputs")
+        state_spec = self.algorithm.states[0]
+        first_role, second_role = state_spec.feature_roles
+        transition = self.algorithm.transition
+        injection = transition.injections[0]
+        factors = {
+            factor.roles[0]: _evaluate(factor.expression, values)
+            for factor in injection.factors
+        }
+        gate = _feature_vector(
+            _evaluate(transition.propagations[0].factor, values), first_role, state_spec
+        )
+        readout = self.algorithm.readouts[0]
+        query = _feature_vector(
+            _evaluate(readout.operand, values), readout.role, state_spec
+        )
+        key = _feature_vector(factors[first_role], first_role, state_spec)
+        value = _feature_vector(factors[second_role], second_role, state_spec)
+        output, final = executable.vector_propagation_dense(
+            gate=_token_major(gate, runtime),
+            key=_token_major(key, runtime),
+            value=_token_major(value, runtime),
+            query=_token_major(query, runtime),
+            initial_state=initial_state,
+            output_dtype=readout.output_dtype,
+        )
+        final_state = StateTuple((state_spec.name,), (final,)) if return_final_state else None
+        return (output,), final_state
 
     def _lower_chunked_elementwise(
         self,
