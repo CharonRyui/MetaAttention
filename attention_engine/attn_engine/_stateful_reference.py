@@ -44,9 +44,8 @@ from .stateful_operator import (
 def requires_reference_lowering(algorithm: Any) -> bool:
     """Whether a Program needs the schema-v2 reference lowering.
 
-    The specialized single-State matrix lowerings keep serving the Programs they
-    already cover; anything that uses a second State, a rank-1 State, a readout
-    expression, or a token Shift is executed by the reference lowering instead.
+    Programs outside the original single-State matrix interface need this
+    semantic fallback unless the compiler selected a direct structured executor.
     """
     if (
         len(algorithm.states) != 1
@@ -258,25 +257,6 @@ def execute_reference(
     sequence_length: int | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None]:
     """Run one invocation of a v2 Program through the reference lowering."""
-    from ._stateful_chunked import execute_chunked_states
-
-    chunked = execute_chunked_states(
-        algorithm,
-        values=values,
-        initial_states=initial_states,
-        segment=segment,
-        role_sizes=role_sizes,
-        heads=heads,
-        token_count=token_count,
-        device=device,
-        return_final_state=return_final_state,
-        sequence_length=sequence_length,
-    )
-    if chunked is not None:
-        # Dense inference keeps only boundary States and contracted vectors;
-        # the fallback below materializes per-token States for packed, gradients
-        # or unsupported compositions.
-        return chunked
     order, axes = feature_layout(algorithm)
     state_values: dict[str, torch.Tensor] = {}
     prior_values: dict[str, torch.Tensor] = {}

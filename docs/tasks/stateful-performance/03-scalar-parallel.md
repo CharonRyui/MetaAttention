@@ -1,7 +1,7 @@
 # P1-C scalar/identity 序列并行
 
 ## 状态
-待实施；只有通过下述验收才能改为完成。
+原生 rank-1 diagonal/identity-readout 路径与 direct chunked runtime 已实现并通过 H20 验证；rank-2 scalar-factorized 路径不在本批改动范围。
 
 ## 依赖
 00
@@ -14,6 +14,16 @@ _stateful_scalar.py; private scalar chunk kernels; planner integration by owner
 
 ## 验收
 T=63/64/65/130/2048，B=1/2，FP32 final-State 与 continuation oracle；public/Graph 对比，短序列不退化。
+
+### Rank-1 实测验收
+
+`_stateful_rank1.py` 按 typed IR 匹配单 rank-1 State、一个原输入 vector injection、可选 vector gate/Exp gate、一个 post-State identity readout。原输入 symbolic binding 保留 HeadMapping 和 strides；T≤64 单 kernel，T>64 三 kernel：64-token vector affine summary、exclusive carry、replay/output。组合不使用逆递推；FMA fusion 关闭。输出 dtype cast 与可选 FP32 final-State 写出在 replay kernel 内完成。
+
+`stateful_operator.py` 的 `_execute_chunked_stateful` 使用 `_stateful_plan.py` 编译期保存的 recipe，跳过 reference segment/normalization plumbing；其他 chunked State 使用预绑定布局。reference executor 不再尝试 chunked inference。public validation、contiguous 输入合同、packed/grad fallback、dense 空序列拒绝保持不变。
+
+H20 GPU 3：B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，output-only/final-state/continuation，共 108 records。三次 warmup、五次 repetitions、e2e 与 Graph。产物 `/tmp/meta-rank1-before/`、`/tmp/meta-rank1-after/`。106 个可配对 workload 无 public latency 回退；各 contract public latency 几何平均分别下降 82.5%、82.2%、80.2%。单调用 CUDA activity 为 1（T≤64）或 3（T>64）；continuation 为 3 或 7，包含两次调用和输出 concat。旧 resource estimate 拒绝的 B=2/H=16/T=8192 output-only/final-state 新路径可运行。H>1 的 FLA headless adapter 失败，因此这些 workload 仅比较 Meta 修改前后，不声称跨框架 speedup。
+
+独立 CPU FP32 recurrence 回归覆盖 T=0 拒绝、1/63/64/65/130/2048/8192、非 2 次幂 feature、2→8 head sharing、BF16/FP32、identity/log/signed/zero gates、非零 initial State、不修改 initial、output-only、final-State、不同长度 continuation。首轮相关 suite 102 passed；最终 direct public smoke 覆盖 normalized-linear/RWKV6/GSA/Based/ReBased/HGRN 的 output/final/continuation，原生 vector smoke 覆盖至 B=2/H=16/T=8192；focused suite 54 passed。FLA 不作为独立 recurrence oracle。
 
 ## 原子提交
 本任务的有效代码、必要行为回归测试和观测证据一起提交。性能回退或错误实现不提交；明确记录失败，不缩小合同来宣称完成。共享文件由集成负责人修改；子代理不提交，不运行中途 build/lint/tests/formatters。GPU 验证由负责人检查空闲 GPU 与 workspace 风险后串行执行。

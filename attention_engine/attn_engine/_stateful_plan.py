@@ -293,7 +293,6 @@ class CandidateLowerer:
         state = shape.live_state_elements
         summary = shape.summary_elements
         dense = shape.dense_total_elements
-        from ._stateful_chunked import CHUNK_TOKENS
 
         if representation is PlanRepresentation.VECTOR_PROPAGATION:
             return CandidateEstimate(
@@ -695,6 +694,7 @@ class TileLangExecutable:
     rank_one_factored: Any | None = None
     composition: Composition | None = None
     backward_binding: Any | None = None
+    chunked_recipe: Any | None = None
 
     @property
     def runtime_family(self) -> str:
@@ -868,6 +868,9 @@ def compile_plan(
     compilation: Any,
 ) -> TileLangExecutable:
     """Enumerate mathematical plans, then bind one stable executable candidate."""
+    from ._stateful_chunked import compile_chunked_recipe
+
+    chunked_recipe = compile_chunked_recipe(operator.algorithm) if mode == "dense" else None
     from ._stateful_reference import requires_reference_lowering
     from ._stateful_structured import product_feature_chunked_eligibility
 
@@ -879,14 +882,12 @@ def compile_plan(
         and product_feature_chunked_eligibility(operator.algorithm)[0]
     )
 
-    from ._stateful_chunked import chunked_states_eligible
-
     chunked_stateful = (
         optimized
         and mode == "dense"
         and backward_ir is None
         and target.device_type == "cuda"
-        and chunked_states_eligible(operator.algorithm)
+        and chunked_recipe is not None
         and not product_feature_chunked
     )
     reference_required = requires_reference_lowering(operator.algorithm)
@@ -926,7 +927,6 @@ def compile_plan(
     )
     from ._stateful_structured import RUNTIME_FAMILY_ELIGIBILITY
 
-    active_rewrites: set[str] = set()
     fixed_sizes = dict(compilation.role_sizes)
     state = operator.algorithm.states[0]
     transitions = operator.algorithm.transitions
@@ -939,13 +939,13 @@ def compile_plan(
         and len(transitions[0].injections) == 1
         and len(operator.algorithm.readouts) == 1
     )
-    from ._stateful_chunked import chunked_states_eligible, chunked_states_workspace
+    from ._stateful_chunked import chunked_states_workspace
 
     chunked_states = (
         mode == "dense"
         and backward_ir is None
         and target.device_type == "cuda"
-        and chunked_states_eligible(operator.algorithm)
+        and chunked_recipe is not None
     )
     state_workspace, state_chunk_bytes = (
         chunked_states_workspace(
@@ -954,6 +954,11 @@ def compile_plan(
         if chunked_states
         else (0, 0)
     )
+    if chunked_stateful and chunked_recipe.rank_one is not None:
+        elements = fixed_sizes[state.head_role] * fixed_sizes[chunked_recipe.rank_one.feature]
+        # Native raw loads need output storage and three FP32 chunk vectors;
+        # the extra chunk in WorkspacePolicy conservatively covers final State.
+        state_workspace, state_chunk_bytes = 4 * elements, 12 * elements
     factored_token_bytes = factored_chunk_bytes = 0
     if rank_one_factored is not None and mode == "dense" and backward_ir is None:
         heads = fixed_sizes[state.head_role]
@@ -995,6 +1000,7 @@ def compile_plan(
         chunked=chunked_eligible,
         chunked_states=chunked_states,
         chunked_states_workspace=state_workspace,
+        chunked_states_chunk_bytes=state_chunk_bytes if chunked_stateful else 0,
         factored_workspace=factored_token_bytes,
         factored_chunk_bytes=factored_chunk_bytes,
     )
@@ -1091,6 +1097,7 @@ def compile_plan(
             dense_summary,
             scalar_factorized,
             rank_one_factored=rank_one_factored,
+            chunked_recipe=chunked_recipe,
         )
         device = torch.device(target.device_type)
         cache = None
@@ -1234,6 +1241,7 @@ def compile_plan(
         ),
         composition=composition,
         backward_binding=backward_binding,
+        chunked_recipe=chunked_recipe,
     )
 
 

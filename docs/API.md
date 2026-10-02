@@ -277,6 +277,32 @@ The follow-up dense-State pass also reuses identical broadcast value bindings
 across States; it changes no numerical path and is covered by the same focused
 GPU regression suite.
 
+Dense inference selected as `chunked-stateful` or `product-feature-chunked`
+now enters a direct executor with compile-time State/readout/layout recipes,
+without constructing reference sequence segments or repeating eligibility
+analysis. Reference execution remains the semantic path for unsupported
+structures, packed programs, gradients, and unoptimized v2 programs.
+
+The rank-1 diagonal/identity-readout structure (including HGRN) uses raw BF16/FP32
+bindings and native vector affine scans. A sequence of at most 64 tokens uses
+one output kernel; longer sequences use summary, carry, and output kernels.
+Only three FP32 chunk vectors are scratch; no promoted matrix, dense query of
+ones, FP32 input copy, or token-sized State scratch is created. Output casting
+and optional FP32 final-State writing occur in the output kernel. HeadMapping,
+nonzero initial State, tails, zero/signed gates and continuation are preserved.
+
+On H20, the HGRN matrix `B={1,2}`, `H={1,8,16}`,
+`T={63,64,65,130,2048,8192}` and all three contracts produced 108 runnable
+records. Of 106 before/after pairs, public latency geometric means decreased
+by 82.5% (output-only), 82.2% (final-state), and 80.2% (continuation), with no
+observed paired regression. Two B=2/H=16/T=8192 calls previously rejected by
+the old resource estimate now run with the native workspace bound. At B=H=1,
+T=64 output-only changed from 0.485 to 0.122 ms and CUDA activity count from
+11 to 1. Measurements used three warmups and five repetitions; FLA is only a
+performance baseline, and continuation includes two calls plus output concat.
+The headless FLA HGRN adapter rejects H>1; those rows compare Meta before/after
+only and do not establish a cross-framework speedup.
+
 ## Legacy Customized Linear Attention API
 
 The modifier-based `LinearAttentionEngine` remains available with its existing

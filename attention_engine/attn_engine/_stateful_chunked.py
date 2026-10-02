@@ -7,6 +7,8 @@ dependent readouts consume contracted vectors, never per-token matrix States.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping
 
 import torch
@@ -396,18 +398,112 @@ def chunked_states_workspace(
     return per_token, per_chunk
 
 
+@dataclass(frozen=True)
+class DenseInputRecipe:
+    name: str
+    axes: tuple[int, ...]
+    feature_axes: tuple[int, ...]
+    feature_positions: tuple[int | None, ...]
+    head_axis: int | None
+    sequence: bool
+
+
+@dataclass(frozen=True)
+class ChunkedRecipe:
+    specs: Mapping[str, Any]
+    transitions: Mapping[str, Any]
+    identity_read: frozenset[str]
+    readouts: tuple[tuple[Any, Any], ...]
+    rank_one: Any | None
+    inputs: tuple[Any, ...]
+    feature_order: tuple[Any, ...]
+
+
+def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
+    """Bind immutable State/readout structure once, independent of runtime B/T."""
+    if not chunked_states_eligible(algorithm):
+        return None
+    from ._stateful_rank1 import compile_rank_one
+    from ._stateful_reference import feature_layout
+    from .stateful_operator import Batch, FeatureRole, HeadRole, Sequence
+
+    feature_order = feature_layout(algorithm)[0]
+    bindings = []
+    for spec in algorithm.inputs:
+        roles = spec.roles
+        head_axis = next((index for index, role in enumerate(roles)
+                          if isinstance(role, HeadRole)), None)
+        features = tuple(role for role in roles if isinstance(role, FeatureRole))
+        sequence = Sequence in roles
+        axes = (roles.index(Batch), roles.index(Sequence)) if sequence else (0,)
+        axes += (head_axis,) if head_axis is not None else ()
+        axes += tuple(roles.index(role) for role in features)
+        bindings.append(DenseInputRecipe(
+            spec.name, axes, tuple(roles.index(role) for role in features),
+            tuple(roles.index(role) if role in features else None for role in feature_order),
+            head_axis, sequence,
+        ))
+
+    readouts = tuple((readout, _readout_expression(readout))
+                     for readout in algorithm.readouts)
+    return ChunkedRecipe(
+        MappingProxyType({state.name: state for state in algorithm.states}),
+        MappingProxyType({transition.state: transition for transition in algorithm.transitions}),
+        frozenset(term.state for _, expression in readouts
+                  for term in (_contracted_terms(expression) or ()) if term.role is None),
+        readouts,
+        compile_rank_one(algorithm),
+        tuple(bindings),
+        feature_order,
+    )
+
+
+def bind_chunked_inputs(recipe: ChunkedRecipe, inputs, runtime):
+    """Bind dense values without reference segments or per-call IR analysis."""
+
+    values = {}
+    for binding in recipe.inputs:
+        tensor = inputs[binding.name]
+        if binding.sequence:
+            value = tensor.permute(binding.axes)
+            feature_shape = tuple(tensor.shape[axis] for axis in binding.feature_axes)
+            head_shape = (tensor.shape[binding.head_axis],) if binding.head_axis is not None else ()
+            value = value.reshape(runtime.token_count, *head_shape, *feature_shape)
+        else:
+            # Non-sequence inputs use a stride-zero token broadcast until a
+            # consumer explicitly needs a contiguous materialization.
+            value = tensor.permute(binding.axes).unsqueeze(1)
+            value = value.expand(runtime.sequence_count, runtime.uniform_length, *value.shape[2:])
+            value = value.reshape(runtime.token_count, *value.shape[2:])
+        if binding.head_axis is None:
+            value = value.unsqueeze(1)
+        source_heads = value.shape[1]
+        if source_heads != runtime.state_heads:
+            if source_heads == 1:
+                value = value.expand(-1, runtime.state_heads, *value.shape[2:])
+            else:
+                value = value.repeat_interleave(runtime.state_heads // source_heads, dim=1)
+        shape = [tensor.shape[axis] if axis is not None else 1
+                 for axis in binding.feature_positions]
+        while len(shape) < 2:
+            shape.append(1)
+        values[binding.name] = value.reshape(runtime.token_count, runtime.state_heads, *shape)
+    return values
+
+
 def execute_chunked_states(
     algorithm: Any,
     *,
     values: Mapping[str, torch.Tensor],
     initial_states: Mapping[str, torch.Tensor],
-    segment: torch.Tensor,
+    segment: torch.Tensor | None,
     role_sizes: Mapping[Any, int],
     heads: int,
     token_count: int,
     device: torch.device,
     return_final_state: bool,
     sequence_length: int | None = None,
+    recipe: ChunkedRecipe | None = None,
 ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor] | None] | None:
     """Dense inference with boundary carries, GEMMs and dependent readout passes."""
     if device.type != "cuda" or sequence_length is None or sequence_length <= 0:
@@ -416,7 +512,9 @@ def execute_chunked_states(
         tensor.requires_grad for tensor in (*values.values(), *initial_states.values())
     ):
         return None
-    if not chunked_states_eligible(algorithm):
+    if recipe is None:
+        recipe = compile_chunked_recipe(algorithm)
+    if recipe is None:
         return None
     from .stateful_operator import (
         Add,
@@ -439,14 +537,9 @@ def execute_chunked_states(
     from ._stateful_reference import _matrix_view
     from ._stateful_diagonal_kernels import prepare_state, read_state
 
-    specs = {state.name: state for state in algorithm.states}
-    transitions = {transition.state: transition for transition in algorithm.transitions}
-    identity_read = {
-        term.state
-        for readout in algorithm.readouts
-        for term in (_contracted_terms(_readout_expression(readout)) or ())
-        if term.role is None
-    }
+    specs = recipe.specs
+    transitions = recipe.transitions
+    identity_read = recipe.identity_read
     prepared: dict[str, Any] = {}
     final_states: dict[str, torch.Tensor] = {}
     term_values: dict[Any, torch.Tensor] = {}
@@ -613,8 +706,8 @@ def execute_chunked_states(
         raise AssertionError("eligibility admitted an unsupported readout")
 
     outputs = {
-        readout.name: evaluate(_readout_expression(readout)).to(readout.output_dtype)
-        for readout in algorithm.readouts
+        readout.name: evaluate(expression).to(readout.output_dtype)
+        for readout, expression in recipe.readouts
     }
     if return_final_state:
         for state in algorithm.states:

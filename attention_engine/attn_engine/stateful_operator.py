@@ -966,20 +966,18 @@ class StatefulOperator:
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
         from ._stateful_reference import requires_reference_lowering
-        from ._stateful_structured import (
-            chunked_stateful_eligibility,
-            product_feature_chunked_eligibility,
-        )
-
         if (
-            product_feature_chunked_eligibility(self.algorithm)[0]
-            and plan.runtime_family == "product-feature-chunked"
-        ) or (
-            chunked_stateful_eligibility(self.algorithm)[0]
-            and plan.runtime_family == "chunked-stateful"
+            plan.runtime_family in ("chunked-stateful", "product-feature-chunked")
+            and plan.chunked_recipe is not None
+            and runtime.device.type == "cuda"
+            and not runtime.packed
+            and runtime.token_count > 0
+            and not requires_grad_state
+            and not any(tensor.requires_grad for tensor in inputs.values())
         ):
-            return self._execute_reference(
-                runtime, role_sizes, inputs, initial_states, return_final_state
+            return self._execute_chunked_stateful(
+                runtime, role_sizes, inputs, initial_states, return_final_state,
+                plan.chunked_recipe,
             )
         if requires_reference_lowering(self.algorithm):
             return self._execute_reference(
@@ -1385,17 +1383,57 @@ class StatefulOperator:
             self._zero_states[key] = cached
         return cached
 
-    def _execute_product_feature_chunked(
+    def _execute_chunked_stateful(
         self,
         runtime: _Runtime,
         role_sizes: Mapping[LogicalRole, int],
         inputs: Mapping[str, torch.Tensor],
         initial_states: Mapping[str, torch.Tensor],
         return_final_state: bool,
+        recipe: Any,
     ) -> ExecutionResult:
-        """Execute the proven dense ProductFeature chunked schedule."""
-        return self._execute_reference(
-            runtime, role_sizes, inputs, initial_states, return_final_state
+        """Execute compiler-proven dense inference without reference plumbing."""
+        from ._stateful_chunked import bind_chunked_inputs, execute_chunked_states
+
+        assert runtime.uniform_length is not None
+        if recipe.rank_one is not None:
+            from ._stateful_rank1 import execute_rank_one
+
+            output, final = execute_rank_one(
+                recipe.rank_one, inputs, initial_states[recipe.rank_one.state],
+                role_sizes=role_sizes, sequence_count=runtime.sequence_count,
+                sequence_length=runtime.uniform_length, heads=runtime.state_heads,
+                return_final_state=return_final_state,
+            )
+            return ExecutionResult(
+                NamedOutputTuple(
+                    tuple(name for name, _ in recipe.rank_one.outputs),
+                    tuple(output for _ in recipe.rank_one.outputs),
+                ),
+                StateTuple((recipe.rank_one.state,), (final,))
+                if final is not None else None,
+            )
+        values = bind_chunked_inputs(recipe, inputs, runtime)
+        result = execute_chunked_states(
+            self.algorithm, values=values, initial_states=initial_states,
+            segment=None, role_sizes=role_sizes, heads=runtime.state_heads,
+            token_count=runtime.token_count, device=runtime.device,
+            return_final_state=return_final_state,
+            sequence_length=runtime.uniform_length, recipe=recipe,
+        )
+        assert result is not None
+        outputs, finals = result
+        ordered = tuple(
+            outputs[readout.name].reshape(
+                runtime.sequence_count, runtime.uniform_length, runtime.state_heads, -1
+            ).permute(0, 2, 1, 3)
+            for readout in self.algorithm.readouts
+        )
+        return ExecutionResult(
+            NamedOutputTuple(tuple(readout.name for readout in self.algorithm.readouts), ordered),
+            StateTuple(tuple(state.name for state in self.algorithm.states),
+                       tuple(finals[state.name] for state in self.algorithm.states))
+            if finals is not None else None,
         )
 
     def _execute_reference(
