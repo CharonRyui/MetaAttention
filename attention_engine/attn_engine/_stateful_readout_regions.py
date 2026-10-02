@@ -49,6 +49,7 @@ def _two_state_region(
     QL: tl.constexpr, QR: tl.constexpr,
     UR1: tl.constexpr, UC1: tl.constexpr, UR2: tl.constexpr, UC2: tl.constexpr,
     PRIOR1: tl.constexpr, PRIOR2: tl.constexpr, SOFTMAX: tl.constexpr,
+    EPSILON: tl.constexpr,
 ):
     sh, chunk = tl.program_id(0), tl.program_id(1)
     seq, head = sh // HEADS, sh % HEADS
@@ -85,7 +86,7 @@ def _two_state_region(
                           R2, D2, KL2, KR2, UR2, UC2, t < LENGTH)
             if not PRIOR2:
                 denominator = tl.sum(s2 * q[:, None], 0)
-            out = first / tl.sum(denominator, 0)
+            out = first / (tl.sum(denominator, 0) + EPSILON)
         if SOFTMAX:
             tl.store(Output + flat * D2 + d2, out, (t < LENGTH) & (d2 < D2))
         else:
@@ -117,8 +118,65 @@ def readout_region_resources(first_shape, second_shape, *, softmax=True):
             "eligible": max(a, b, c, d) <= 256 and live <= 16384}
 
 
+@triton.jit
+def _identity_normalized_region(
+    C1, K1, K12, V1, C2, K2, K22, V2, Q, Q2, Output,
+    LENGTH: tl.constexpr, HEADS: tl.constexpr, CHUNKS: tl.constexpr,
+    ROWS: tl.constexpr, COLS: tl.constexpr,
+    KL1: tl.constexpr, KR1: tl.constexpr, KL2: tl.constexpr, KR2: tl.constexpr,
+    QL: tl.constexpr, QR: tl.constexpr,
+    PRIOR1: tl.constexpr, PRIOR2: tl.constexpr,
+    SHARED_KEY: tl.constexpr, EPSILON: tl.constexpr,
+):
+    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    seq, head = sh // HEADS, sh % HEADS
+    t = chunk * 64 + tl.arange(0, 64)
+    src = chunk * 64 + tl.arange(0, 64)
+    flat = (seq * LENGTH + t) * HEADS + head
+    src_flat = (seq * LENGTH + src) * HEADS + head
+    c = block * 32 + tl.arange(0, 32)
+    rr = tl.arange(0, 32)
+    scores = tl.full((64, 64), 0.0, tl.float32)
+    if not SHARED_KEY:
+        den_scores = tl.full((64, 64), 0.0, tl.float32)
+    numerator = tl.full((64, 32), 0.0, tl.float32)
+    denominator = tl.full((64,), 0.0, tl.float32)
+    for rb in range(tl.cdiv(ROWS, 32)):
+        r = rb * 32 + rr
+        q = _vector(Q, Q2, flat[:, None], r[None, :], ROWS, QL, QR,
+                    t[:, None] < LENGTH)
+        k = _vector(K1, K12, src_flat[None, :], r[:, None], ROWS, KL1, KR1,
+                    src[None, :] < LENGTH)
+        memory = tl.load(
+            C1 + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
+            (r[:, None] < ROWS) & (c[None, :] < COLS), 0.0,
+        )
+        key_sum = tl.load(C2 + (sh * CHUNKS + chunk) * ROWS + r, r < ROWS, 0.0)
+        scores += tl.dot(q, k, input_precision="tf32x3")
+        numerator += tl.dot(q, memory, input_precision="tf32x3")
+        denominator += tl.sum(q * key_sum[None, :], 1)
+        if not SHARED_KEY:
+            k2 = _vector(K2, K22, src_flat[None, :], r[:, None], ROWS, KL2, KR2,
+                         src[None, :] < LENGTH)
+            den_scores += tl.dot(q, k2, input_precision="tf32x3")
+    if SHARED_KEY:
+        den_scores = scores
+    causal1 = src[None, :] < t[:, None] if PRIOR1 else src[None, :] <= t[:, None]
+    causal2 = src[None, :] < t[:, None] if PRIOR2 else src[None, :] <= t[:, None]
+    scores = tl.where(causal1, scores, 0.0)
+    den_scores = tl.where(causal2, den_scores, 0.0)
+    value = tl.load(V1 + src_flat[:, None] * COLS + c[None, :],
+                    (src[:, None] < LENGTH) & (c[None, :] < COLS), 0.0)
+    den_value = tl.load(V2 + src_flat, src < LENGTH, 0.0)
+    numerator += tl.dot(scores, value, input_precision="tf32x3")
+    denominator += tl.sum(den_scores * den_value[None, :], 1)
+    output = numerator / (denominator[:, None] + EPSILON)
+    tl.store(Output + flat[:, None] * COLS + c[None, :], output,
+             (t[:, None] < LENGTH) & (c[None, :] < COLS))
+
+
 def _region(first, second, query, sequence_length, prior_first, prior_second,
-            output_dtype, *, softmax):
+            output_dtype, *, softmax, epsilon=0.0):
     c1, f1, _ = first
     c2, f2, _ = second
     if sequence_length <= 0:
@@ -143,6 +201,17 @@ def _region(first, second, query, sequence_length, prior_first, prior_second,
         return None
     q, q2, ql, qr = parts
     output = torch.empty(tokens, heads, d2 if softmax else d1, device=c1.device, dtype=output_dtype)
+    if not softmax and first[2] and second[2]:
+        shared_key = (k1.data_ptr() == k2.data_ptr() and k12.data_ptr() == k22.data_ptr()
+                      and (kl1, kr1) == (kl2, kr2))
+        _identity_normalized_region[(bh, chunks, triton.cdiv(d1, 32))](
+            c1, k1, k12, v1, c2, k2, k22, v2, q, q2, output,
+            sequence_length, heads, chunks, r1, d1,
+            kl1, kr1, kl2, kr2, ql, qr,
+            prior_first, prior_second, shared_key, epsilon,
+            num_warps=4, enable_fp_fusion=False,
+        )
+        return output
     _two_state_region[(bh, chunks)](
         c1, gr1, gc1, k1, k12, v1, c2, gr2, gc2, k2, k22, v2,
         q, q2, output, sequence_length, heads, chunks, r1, d1, r2, d2,
@@ -150,7 +219,7 @@ def _region(first, second, query, sequence_length, prior_first, prior_second,
         triton.next_power_of_2(r2), triton.next_power_of_2(d2),
         kl1, kr1, kl2, kr2, ql, qr,
         gr1 is None, gc1 is None, gr2 is None, gc2 is None,
-        prior_first, prior_second, softmax, num_warps=8, enable_fp_fusion=False,
+        prior_first, prior_second, softmax, epsilon, num_warps=8, enable_fp_fusion=False,
     )
     return output
 
@@ -169,14 +238,16 @@ def fused_readout_region(first, second, query, *, sequence_length,
 
 
 def fused_normalized_region(first, second, query, *, sequence_length,
-                            prior_first=False, prior_second=False, output_dtype=torch.float32):
+                            prior_first=False, prior_second=False,
+                            output_dtype=torch.float32, epsilon=0.0):
     """Fuse numerator/denominator with a scalar-column denominator.
 
-    No epsilon, clamp or changed zero-denominator semantics is introduced.
-    Both contractions reduce rows; division broadcasts the scalar.
+    ``epsilon`` is an authored FP32 epilogue constant.  The default preserves
+    the historical bare-division helper; normalized-linear supplies its
+    expression's ``EPS`` explicitly.
     """
     return _region(first, second, query, sequence_length, prior_first, prior_second,
-                   output_dtype, softmax=False)
+                   output_dtype, softmax=False, epsilon=epsilon)
 
 
 @triton.jit

@@ -128,6 +128,32 @@ def test_normalized_region_and_independent_shared_outputs(gpu_device, prior):
         torch.testing.assert_close(result.reshape_as(oracle).cpu(), oracle, rtol=2e-4, atol=2e-5)
 
 
+@pytest.mark.parametrize("prior_first,prior_second", [(False, False), (True, False), (False, True), (True, True)])
+def test_identity_normalized_independent_keys_and_priors(gpu_device, prior_first, prior_second):
+    first_host, first_data = _inputs(gpu_device, 17, 35)
+    second_host, _ = _inputs(gpu_device, 17, 1, seed=71)
+    second_host = (second_host[0].abs() + 0.1, second_host[1].abs() + 0.2,
+                   second_host[2], second_host[3], second_host[4], second_host[5].abs() + 0.1)
+    second_data = tuple(t.to(gpu_device) for t in second_host)
+    first, _ = _prepare(first_data, row=False, column=False)
+    second, _ = _prepare(second_data, row=False, column=False)
+    query_host = first_host[2].abs() + 0.1
+    epsilon = 1e-3
+    actual = fused_normalized_region(
+        first, second, query_host.to(gpu_device).flatten(0, 1), sequence_length=71,
+        prior_first=prior_first, prior_second=prior_second, epsilon=epsilon,
+    )
+    pre1, post1, _ = _states(first_host, row=False, column=False)
+    pre2, post2, _ = _states(second_host, row=False, column=False)
+    selected1, selected2 = (pre1 if prior_first else post1), (pre2 if prior_second else post2)
+    expected = torch.stack([
+        torch.einsum("bhr,bhrc->bhc", query_host[:, t], selected1[t])
+        / (torch.einsum("bhr,bhrc->bhc", query_host[:, t], selected2[t]) + epsilon)
+        for t in range(71)
+    ], 1)
+    torch.testing.assert_close(actual.reshape_as(expected).cpu(), expected, rtol=2e-4, atol=2e-5)
+
+
 def test_oversized_softmax_region_preserves_executor_fallback(gpu_device):
     _, first_data = _inputs(gpu_device, 96, 96, length=7)
     _, second_data = _inputs(gpu_device, 96, 33, length=7, seed=47)

@@ -116,6 +116,59 @@ def test_normalized_linear_attention_matches_streaming_reference(gpu_device):
             assert (difference / (atol + rtol * expected.abs())).max().item() < 1.0
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("length", [63, 64, 65, 130])
+def test_normalized_final_states_continuation_and_authored_epsilon(gpu_device, dtype, length):
+    from attn_engine import StateTuple
+
+    batch, heads, dim, dim_value = 2, 2, 17, 35
+    generator = torch.Generator().manual_seed(193)
+    query = (torch.rand(batch, heads, length, dim, generator=generator) + 0.1).to(dtype)
+    key = (torch.rand(batch, heads, length, dim, generator=generator) + 0.1).to(dtype)
+    value = torch.randn(batch, heads, length, dim_value, generator=generator).to(dtype)
+    memory = torch.rand(batch, heads, dim, dim_value, generator=generator) * 0.1 + 0.1
+    key_sum = torch.zeros(batch, heads, dim)
+    # Nonzero numerator and exactly zero denominator expose a dropped epsilon.
+    key[:, :, 0] = 0
+    initial = StateTuple(("memory", "key_sum"),
+                         (memory.to(gpu_device), key_sum.to(gpu_device)))
+    expected_outputs = []
+    # CUDA TensorIterator converts the scalar to the input computation dtype.
+    scale = torch.tensor(dim**-0.5, dtype=dtype)
+    for token in range(length):
+        memory = memory + key[:, :, token].float().unsqueeze(-1) * value[:, :, token].float().unsqueeze(-2)
+        key_sum = key_sum + key[:, :, token].float()
+        # Input arithmetic rounds in its authored dtype before the FP32 readout.
+        scaled = (query[:, :, token] * scale).float()
+        numerator = (scaled.unsqueeze(-1) * memory).sum(-2)
+        denominator = (scaled * key_sum).sum(-1, keepdim=True)
+        expected_outputs.append(numerator / (denominator + EPS))
+    expected = torch.stack(expected_outputs, 2).to(dtype).float()
+    compiled = _compile(
+        normalized_linear_attention,
+        {"query_heads": heads, "key_heads": heads, "value_heads": heads,
+         "state_heads": heads, "key_dim": dim, "value_dim": dim_value},
+        batch=batch, heads=heads, seqlen=length, dim=dim, dim_value=dim_value, dtype=dtype,
+    )
+    inputs = {name: tensor.to(gpu_device) for name, tensor in
+              (("query", query), ("key", key), ("value", value))}
+    full = compiled(**inputs, initial_state=initial, return_final_state=True)
+    output_only = compiled(**inputs, initial_state=initial)
+    split = 64 if length > 64 else length // 2
+    prefix = compiled(**{name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()},
+                      initial_state=initial, return_final_state=True)
+    suffix = compiled(**{name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()},
+                      initial_state=prefix.final_state, return_final_state=True)
+    tolerance = 1e-2 if dtype == torch.bfloat16 else 2e-4
+    for actual in (full.outputs["output"], output_only.outputs["output"],
+                   torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2)):
+        torch.testing.assert_close(actual.float().cpu(), expected, rtol=tolerance, atol=2e-5)
+    for result in (full, suffix):
+        assert result.final_state.names == ("memory", "key_sum")
+        torch.testing.assert_close(result.final_state["memory"].cpu(), memory, rtol=2e-4, atol=2e-5)
+        torch.testing.assert_close(result.final_state["key_sum"].cpu(), key_sum, rtol=2e-4, atol=2e-5)
+
+
 def _normalized_reference(query, key, value):
     """Streaming numerator/denominator recurrence in FP32."""
     scale = key.shape[-1] ** -0.5

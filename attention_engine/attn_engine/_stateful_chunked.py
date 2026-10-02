@@ -414,9 +414,40 @@ class ChunkedRecipe:
     transitions: Mapping[str, Any]
     identity_read: frozenset[str]
     readouts: tuple[tuple[Any, Any], ...]
+    normalized_readout: tuple[Any, Any, Any, float] | None
     rank_one: Any | None
     inputs: tuple[Any, ...]
     feature_order: tuple[Any, ...]
+
+
+def _normalized_readout(readout: Any, expression: Any, algorithm: Any):
+    """Prove two input-only row contractions and preserve the authored constant."""
+    from .stateful_operator import Add, Constant, Divide, StateTerm
+
+    if not isinstance(expression, Divide):
+        return None
+    numerator, denominator = expression.left, expression.right
+    if not isinstance(numerator, StateTerm) or numerator.role is None:
+        return None
+    if not isinstance(denominator, Add):
+        return None
+    if isinstance(denominator.left, StateTerm) and isinstance(denominator.right, Constant):
+        state_term, constant = denominator.left, denominator.right
+    elif isinstance(denominator.right, StateTerm) and isinstance(denominator.left, Constant):
+        state_term, constant = denominator.right, denominator.left
+    else:
+        return None
+    if state_term.role != numerator.role or _contracted_terms(numerator.operand) != []:
+        return None
+    if state_term.operand != numerator.operand:
+        return None
+    specs = {state.name: state for state in algorithm.states}
+    first, second = specs[numerator.state], specs[state_term.state]
+    if first.rank != 2 or second.rank != 1:
+        return None
+    if first.feature_roles[0] != second.feature_roles[0]:
+        return None
+    return readout, numerator, state_term, constant.value
 
 
 def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
@@ -446,12 +477,18 @@ def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
 
     readouts = tuple((readout, _readout_expression(readout))
                      for readout in algorithm.readouts)
+    normalized = (
+        _normalized_readout(*readouts[0], algorithm)
+        if len(readouts) == 1
+        else None
+    )
     return ChunkedRecipe(
         MappingProxyType({state.name: state for state in algorithm.states}),
         MappingProxyType({transition.state: transition for transition in algorithm.transitions}),
         frozenset(term.state for _, expression in readouts
                   for term in (_contracted_terms(expression) or ()) if term.role is None),
         readouts,
+        normalized,
         compile_rank_one(algorithm),
         tuple(bindings),
         feature_order,
@@ -642,6 +679,22 @@ def execute_chunked_states(
         return prepared[name]
 
     expression_values: dict[Any, torch.Tensor] = {}
+    fused_outputs: dict[str, torch.Tensor] = {}
+    if recipe.normalized_readout is not None:
+        from ._stateful_readout_regions import fused_normalized_region
+
+        readout, numerator_term, denominator_term, epsilon = recipe.normalized_readout
+        first = prepare(numerator_term.state)
+        second = prepare(denominator_term.state)
+        query = vector(input_expression(numerator_term.operand), first[0].shape[2])
+        fused = fused_normalized_region(
+            first, second, query, sequence_length=sequence_length,
+            prior_first=numerator_term.prior, prior_second=denominator_term.prior,
+            output_dtype=readout.output_dtype, epsilon=epsilon,
+        )
+        if fused is not None:
+            fused_outputs[readout.name] = fused
+
 
     def evaluate(expression: Any) -> torch.Tensor:
         if expression not in expression_values:
@@ -706,7 +759,8 @@ def execute_chunked_states(
         raise AssertionError("eligibility admitted an unsupported readout")
 
     outputs = {
-        readout.name: evaluate(expression).to(readout.output_dtype)
+        readout.name: (fused_outputs[readout.name] if readout.name in fused_outputs
+                       else evaluate(expression).to(readout.output_dtype))
         for readout, expression in recipe.readouts
     }
     if return_final_state:
