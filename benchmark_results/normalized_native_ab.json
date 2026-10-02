@@ -1,0 +1,3626 @@
+{
+  "baseline": "895d0ea",
+  "device": "NVIDIA H20",
+  "physical_gpu": 6,
+  "target_workspace_bytes": 4294967296,
+  "warmup": 3,
+  "repetitions": 20,
+  "output_parity": "PASS; every record bitwise identical",
+  "final_states_parity": "PASS; memory and key_sum bitwise identical for every returning contract",
+  "matrix": {
+    "batches": [1, 2],
+    "heads": [1, 8, 16],
+    "seqlens": [63, 64, 65, 130, 2048, 8192],
+    "contracts": ["output-only", "final-state", "continuation"]
+  },
+  "measurement": "Same operator, inputs, target, public validation and selected plan; baseline recipe, binding, summary/readout helpers and executor loaded from 895d0ea. Interleaved public CUDA events; peak before graph capture; compilation and warmup excluded.",
+  "rejected_probe": "BF16 raw load selected Triton dot kWidth=2, unlike staged FP32 kWidth=1; long continuation exceeded the existing State tolerance. Non-pure bitwise mov.b32 at the FP32 seam restores source-bitwidth analysis and bitwise parity without staging.",
+  "geomean_reduction_percent": {
+    "public_cuda_event_ms": 34.72,
+    "graph_ms": 40.05,
+    "peak_allocated_bytes": 40.05,
+    "peak_incremental_bytes": 56.61
+  },
+  "records": [
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 63,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 116224,
+        "peak_incremental_bytes": 74752,
+        "public_cuda_event_ms": 0.4528319984674454,
+        "kernel_ms": 0.027934999999999717,
+        "activities": 11,
+        "graph_ms": 0.034832000732421875
+      },
+      "after": {
+        "peak_allocated_bytes": 74240,
+        "peak_incremental_bytes": 32768,
+        "public_cuda_event_ms": 0.30430400371551514,
+        "kernel_ms": 0.015296000000000276,
+        "activities": 5,
+        "graph_ms": 0.022255999967455864
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 63,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 133120,
+        "peak_incremental_bytes": 91648,
+        "public_cuda_event_ms": 0.4870079904794693,
+        "kernel_ms": 0.028129000000000928,
+        "activities": 11,
+        "graph_ms": 0.03697599843144417
+      },
+      "after": {
+        "peak_allocated_bytes": 90624,
+        "peak_incremental_bytes": 49152,
+        "public_cuda_event_ms": 0.34201599657535553,
+        "kernel_ms": 0.015424000000000888,
+        "activities": 5,
+        "graph_ms": 0.022655999287962914
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 63,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 175616,
+        "peak_incremental_bytes": 134144,
+        "public_cuda_event_ms": 0.9658399820327759,
+        "kernel_ms": 0.05596599999999978,
+        "activities": 23,
+        "graph_ms": 0.068207997828722
+      },
+      "after": {
+        "peak_allocated_bytes": 111616,
+        "peak_incremental_bytes": 70144,
+        "public_cuda_event_ms": 0.6691679954528809,
+        "kernel_ms": 0.030658000000000355,
+        "activities": 11,
+        "graph_ms": 0.04024000093340874
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 64,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 116224,
+        "peak_incremental_bytes": 74752,
+        "public_cuda_event_ms": 0.48819200694561005,
+        "kernel_ms": 0.027678999999999176,
+        "activities": 11,
+        "graph_ms": 0.03630400076508522
+      },
+      "after": {
+        "peak_allocated_bytes": 74240,
+        "peak_incremental_bytes": 32768,
+        "public_cuda_event_ms": 0.34145601093769073,
+        "kernel_ms": 0.014880999999999858,
+        "activities": 5,
+        "graph_ms": 0.022655999287962914
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 64,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 133120,
+        "peak_incremental_bytes": 91648,
+        "public_cuda_event_ms": 0.523279994726181,
+        "kernel_ms": 0.027553000000000792,
+        "activities": 11,
+        "graph_ms": 0.03718400001525879
+      },
+      "after": {
+        "peak_allocated_bytes": 90624,
+        "peak_incremental_bytes": 49152,
+        "public_cuda_event_ms": 0.35734400153160095,
+        "kernel_ms": 0.015168999999999414,
+        "activities": 5,
+        "graph_ms": 0.02319999970495701
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 64,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 175616,
+        "peak_incremental_bytes": 134144,
+        "public_cuda_event_ms": 1.040287971496582,
+        "kernel_ms": 0.05606299999999988,
+        "activities": 23,
+        "graph_ms": 0.0679520033299923
+      },
+      "after": {
+        "peak_allocated_bytes": 111616,
+        "peak_incremental_bytes": 70144,
+        "public_cuda_event_ms": 0.7050080001354218,
+        "kernel_ms": 0.030400000000001,
+        "activities": 11,
+        "graph_ms": 0.0398080013692379
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 65,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 142336,
+        "peak_incremental_bytes": 99328,
+        "public_cuda_event_ms": 0.48265600204467773,
+        "kernel_ms": 0.028513000000000146,
+        "activities": 11,
+        "graph_ms": 0.0376800000667572
+      },
+      "after": {
+        "peak_allocated_bytes": 108544,
+        "peak_incremental_bytes": 65536,
+        "public_cuda_event_ms": 0.32286399602890015,
+        "kernel_ms": 0.015744000000000143,
+        "activities": 5,
+        "graph_ms": 0.023631999269127846
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 65,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 158720,
+        "peak_incremental_bytes": 115712,
+        "public_cuda_event_ms": 0.48887999355793,
+        "kernel_ms": 0.028800000000000294,
+        "activities": 11,
+        "graph_ms": 0.03846399858593941
+      },
+      "after": {
+        "peak_allocated_bytes": 124928,
+        "peak_incremental_bytes": 81920,
+        "public_cuda_event_ms": 0.34654401242733,
+        "kernel_ms": 0.01603200000000038,
+        "activities": 5,
+        "graph_ms": 0.02409599907696247
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 65,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 179712,
+        "peak_incremental_bytes": 136704,
+        "public_cuda_event_ms": 0.9722400009632111,
+        "kernel_ms": 0.05551999999999953,
+        "activities": 23,
+        "graph_ms": 0.06806399673223495
+      },
+      "after": {
+        "peak_allocated_bytes": 113152,
+        "peak_incremental_bytes": 70144,
+        "public_cuda_event_ms": 0.6671999990940094,
+        "kernel_ms": 0.03097300000000041,
+        "activities": 11,
+        "graph_ms": 0.04052799940109253
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 130,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 235520,
+        "peak_incremental_bytes": 167936,
+        "public_cuda_event_ms": 0.4955199956893921,
+        "kernel_ms": 0.028993000000000962,
+        "activities": 11,
+        "graph_ms": 0.03854399919509888
+      },
+      "after": {
+        "peak_allocated_bytes": 165888,
+        "peak_incremental_bytes": 98304,
+        "public_cuda_event_ms": 0.33262400329113007,
+        "kernel_ms": 0.0159380000000001,
+        "activities": 5,
+        "graph_ms": 0.02457600086927414
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 130,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 252416,
+        "peak_incremental_bytes": 184832,
+        "public_cuda_event_ms": 0.5040160119533539,
+        "kernel_ms": 0.029408000000001606,
+        "activities": 11,
+        "graph_ms": 0.03827200084924698
+      },
+      "after": {
+        "peak_allocated_bytes": 182272,
+        "peak_incremental_bytes": 114688,
+        "public_cuda_event_ms": 0.3580640107393265,
+        "kernel_ms": 0.016575999999999567,
+        "activities": 5,
+        "graph_ms": 0.024671999737620354
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 130,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 304640,
+        "peak_incremental_bytes": 237056,
+        "public_cuda_event_ms": 0.9894880056381226,
+        "kernel_ms": 0.05843400000000065,
+        "activities": 23,
+        "graph_ms": 0.0708640031516552
+      },
+      "after": {
+        "peak_allocated_bytes": 175104,
+        "peak_incremental_bytes": 107520,
+        "public_cuda_event_ms": 0.6854080259799957,
+        "kernel_ms": 0.033054999999999155,
+        "activities": 11,
+        "graph_ms": 0.04363200068473816
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 2048,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3179008,
+        "peak_incremental_bytes": 2375680,
+        "public_cuda_event_ms": 0.4978239983320236,
+        "kernel_ms": 0.04284999999999957,
+        "activities": 11,
+        "graph_ms": 0.052080001682043076
+      },
+      "after": {
+        "peak_allocated_bytes": 1851904,
+        "peak_incremental_bytes": 1048576,
+        "public_cuda_event_ms": 0.33907200396060944,
+        "kernel_ms": 0.03027199999999971,
+        "activities": 5,
+        "graph_ms": 0.03758399933576584
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 2048,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3195904,
+        "peak_incremental_bytes": 2392576,
+        "public_cuda_event_ms": 0.5146560072898865,
+        "kernel_ms": 0.04284900000000039,
+        "activities": 11,
+        "graph_ms": 0.052960000932216644
+      },
+      "after": {
+        "peak_allocated_bytes": 1868288,
+        "peak_incremental_bytes": 1064960,
+        "public_cuda_event_ms": 0.36366400122642517,
+        "kernel_ms": 0.02982300000000032,
+        "activities": 5,
+        "graph_ms": 0.03774400055408478
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 2048,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3474944,
+        "peak_incremental_bytes": 2671616,
+        "public_cuda_event_ms": 0.9886559844017029,
+        "kernel_ms": 0.07165200000000038,
+        "activities": 23,
+        "graph_ms": 0.08495999872684479
+      },
+      "after": {
+        "peak_allocated_bytes": 1491968,
+        "peak_incremental_bytes": 688640,
+        "public_cuda_event_ms": 0.676224023103714,
+        "kernel_ms": 0.04473399999999993,
+        "activities": 11,
+        "graph_ms": 0.05321599915623665
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 8192,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 12665344,
+        "peak_incremental_bytes": 9502720,
+        "public_cuda_event_ms": 0.5832160115242004,
+        "kernel_ms": 0.07903799999999979,
+        "activities": 15,
+        "graph_ms": 0.08801599964499474
+      },
+      "after": {
+        "peak_allocated_bytes": 7553536,
+        "peak_incremental_bytes": 4390912,
+        "public_cuda_event_ms": 0.4238720089197159,
+        "kernel_ms": 0.060352000000000204,
+        "activities": 9,
+        "graph_ms": 0.07064000144600868
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 8192,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 12682240,
+        "peak_incremental_bytes": 9519616,
+        "public_cuda_event_ms": 0.6061759889125824,
+        "kernel_ms": 0.07878499999999986,
+        "activities": 15,
+        "graph_ms": 0.08795199915766716
+      },
+      "after": {
+        "peak_allocated_bytes": 7569920,
+        "peak_incremental_bytes": 4407296,
+        "public_cuda_event_ms": 0.44785600900650024,
+        "kernel_ms": 0.06233699999999953,
+        "activities": 9,
+        "graph_ms": 0.07048000022768974
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 1,
+      "seqlen": 8192,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 13747712,
+        "peak_incremental_bytes": 10585088,
+        "public_cuda_event_ms": 1.011135995388031,
+        "kernel_ms": 0.13238399999999842,
+        "activities": 23,
+        "graph_ms": 0.1424800008535385
+      },
+      "after": {
+        "peak_allocated_bytes": 5817344,
+        "peak_incremental_bytes": 2654720,
+        "public_cuda_event_ms": 0.6904319822788239,
+        "kernel_ms": 0.10169800000000077,
+        "activities": 11,
+        "graph_ms": 0.11203200370073318
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 63,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 977920,
+        "peak_incremental_bytes": 651264,
+        "public_cuda_event_ms": 0.528656005859375,
+        "kernel_ms": 0.03321699999999987,
+        "activities": 14,
+        "graph_ms": 0.04339199885725975
+      },
+      "after": {
+        "peak_allocated_bytes": 588800,
+        "peak_incremental_bytes": 262144,
+        "public_cuda_event_ms": 0.33135999739170074,
+        "kernel_ms": 0.015295999999999935,
+        "activities": 5,
+        "graph_ms": 0.023567999713122845
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 63,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1111040,
+        "peak_incremental_bytes": 784384,
+        "public_cuda_event_ms": 0.5427199900150299,
+        "kernel_ms": 0.033951999999999774,
+        "activities": 14,
+        "graph_ms": 0.04396799951791763
+      },
+      "after": {
+        "peak_allocated_bytes": 719872,
+        "peak_incremental_bytes": 393216,
+        "public_cuda_event_ms": 0.3527360111474991,
+        "kernel_ms": 0.015678999999999974,
+        "activities": 5,
+        "graph_ms": 0.02393599972128868
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 63,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1570816,
+        "peak_incremental_bytes": 1050624,
+        "public_cuda_event_ms": 1.1032960414886475,
+        "kernel_ms": 0.0678730000000005,
+        "activities": 29,
+        "graph_ms": 0.08287999778985977
+      },
+      "after": {
+        "peak_allocated_bytes": 1078272,
+        "peak_incremental_bytes": 558080,
+        "public_cuda_event_ms": 0.6826399862766266,
+        "kernel_ms": 0.03264000000000078,
+        "activities": 11,
+        "graph_ms": 0.04287999868392944
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 64,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 989184,
+        "peak_incremental_bytes": 659456,
+        "public_cuda_event_ms": 0.5450240075588226,
+        "kernel_ms": 0.033407999999999785,
+        "activities": 14,
+        "graph_ms": 0.043168000876903534
+      },
+      "after": {
+        "peak_allocated_bytes": 591872,
+        "peak_incremental_bytes": 262144,
+        "public_cuda_event_ms": 0.32900799810886383,
+        "kernel_ms": 0.015167999999999893,
+        "activities": 5,
+        "graph_ms": 0.02348800003528595
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 64,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1122304,
+        "peak_incremental_bytes": 792576,
+        "public_cuda_event_ms": 0.550031989812851,
+        "kernel_ms": 0.033919000000000324,
+        "activities": 14,
+        "graph_ms": 0.04436799883842468
+      },
+      "after": {
+        "peak_allocated_bytes": 722944,
+        "peak_incremental_bytes": 393216,
+        "public_cuda_event_ms": 0.3530080020427704,
+        "kernel_ms": 0.015903999999999998,
+        "activities": 5,
+        "graph_ms": 0.02364799939095974
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 64,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1585152,
+        "peak_incremental_bytes": 1058816,
+        "public_cuda_event_ms": 1.0728960037231445,
+        "kernel_ms": 0.0680639999999994,
+        "activities": 29,
+        "graph_ms": 0.08323200047016144
+      },
+      "after": {
+        "peak_allocated_bytes": 1085440,
+        "peak_incremental_bytes": 559104,
+        "public_cuda_event_ms": 0.6892320215702057,
+        "kernel_ms": 0.03263999999999896,
+        "activities": 11,
+        "graph_ms": 0.0424639992415905
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 65,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1134080,
+        "peak_incremental_bytes": 801280,
+        "public_cuda_event_ms": 0.5391519963741302,
+        "kernel_ms": 0.03420799999999952,
+        "activities": 14,
+        "graph_ms": 0.044064000248909
+      },
+      "after": {
+        "peak_allocated_bytes": 857088,
+        "peak_incremental_bytes": 524288,
+        "public_cuda_event_ms": 0.33129599690437317,
+        "kernel_ms": 0.015968000000000076,
+        "activities": 5,
+        "graph_ms": 0.024143999442458153
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 65,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1267200,
+        "peak_incremental_bytes": 934400,
+        "public_cuda_event_ms": 0.5461919903755188,
+        "kernel_ms": 0.03491300000000001,
+        "activities": 14,
+        "graph_ms": 0.04491199925541878
+      },
+      "after": {
+        "peak_allocated_bytes": 988160,
+        "peak_incremental_bytes": 655360,
+        "public_cuda_event_ms": 0.3582720011472702,
+        "kernel_ms": 0.016351999999999974,
+        "activities": 5,
+        "graph_ms": 0.02457600086927414
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 65,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1600000,
+        "peak_incremental_bytes": 1067520,
+        "public_cuda_event_ms": 1.0867519974708557,
+        "kernel_ms": 0.0688000000000004,
+        "activities": 29,
+        "graph_ms": 0.08321600034832954
+      },
+      "after": {
+        "peak_allocated_bytes": 1091584,
+        "peak_incremental_bytes": 559104,
+        "public_cuda_event_ms": 0.684607982635498,
+        "kernel_ms": 0.03347499999999991,
+        "activities": 11,
+        "graph_ms": 0.0432640016078949
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 130,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2001408,
+        "peak_incremental_bytes": 1468928,
+        "public_cuda_event_ms": 0.6126559972763062,
+        "kernel_ms": 0.03686399999999969,
+        "activities": 14,
+        "graph_ms": 0.04641599953174591
+      },
+      "after": {
+        "peak_allocated_bytes": 1318912,
+        "peak_incremental_bytes": 786432,
+        "public_cuda_event_ms": 0.352512001991272,
+        "kernel_ms": 0.018207999999999856,
+        "activities": 5,
+        "graph_ms": 0.02643200010061264
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 130,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2134528,
+        "peak_incremental_bytes": 1602048,
+        "public_cuda_event_ms": 0.560912013053894,
+        "kernel_ms": 0.03737800000000038,
+        "activities": 14,
+        "graph_ms": 0.04692799970507622
+      },
+      "after": {
+        "peak_allocated_bytes": 1449984,
+        "peak_incremental_bytes": 917504,
+        "public_cuda_event_ms": 0.36030399799346924,
+        "kernel_ms": 0.01900799999999981,
+        "activities": 5,
+        "graph_ms": 0.0272000003606081
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 130,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2800640,
+        "peak_incremental_bytes": 1868800,
+        "public_cuda_event_ms": 1.1094719767570496,
+        "kernel_ms": 0.07165000000000077,
+        "activities": 29,
+        "graph_ms": 0.0862400010228157
+      },
+      "after": {
+        "peak_allocated_bytes": 1786880,
+        "peak_incremental_bytes": 855040,
+        "public_cuda_event_ms": 0.7098399996757507,
+        "kernel_ms": 0.03510600000000022,
+        "activities": 11,
+        "graph_ms": 0.04507200047373772
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 2048,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 27527168,
+        "peak_incremental_bytes": 21102592,
+        "public_cuda_event_ms": 0.5645920038223267,
+        "kernel_ms": 0.13696299999999917,
+        "activities": 14,
+        "graph_ms": 0.14156800508499146
+      },
+      "after": {
+        "peak_allocated_bytes": 14813184,
+        "peak_incremental_bytes": 8388608,
+        "public_cuda_event_ms": 0.33740799129009247,
+        "kernel_ms": 0.08605000000000018,
+        "activities": 5,
+        "graph_ms": 0.0939520001411438
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 2048,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 27660288,
+        "peak_incremental_bytes": 21235712,
+        "public_cuda_event_ms": 0.5628159940242767,
+        "kernel_ms": 0.13529700000000094,
+        "activities": 14,
+        "graph_ms": 0.14111999422311783
+      },
+      "after": {
+        "peak_allocated_bytes": 14944256,
+        "peak_incremental_bytes": 8519680,
+        "public_cuda_event_ms": 0.3559039980173111,
+        "kernel_ms": 0.08540799999999979,
+        "activities": 5,
+        "graph_ms": 0.0936799980700016
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 2048,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 34084864,
+        "peak_incremental_bytes": 21368832,
+        "public_cuda_event_ms": 1.1742079854011536,
+        "kernel_ms": 0.1707499999999992,
+        "activities": 29,
+        "graph_ms": 0.1791519969701767
+      },
+      "after": {
+        "peak_allocated_bytes": 18223104,
+        "peak_incremental_bytes": 5507072,
+        "public_cuda_event_ms": 0.7129919826984406,
+        "kernel_ms": 0.11020900000000074,
+        "activities": 11,
+        "graph_ms": 0.11745600029826164
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 8192,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 109709312,
+        "peak_incremental_bytes": 84410368,
+        "public_cuda_event_ms": 0.820000022649765,
+        "kernel_ms": 0.44697899999999846,
+        "activities": 18,
+        "graph_ms": 0.45206399261951447
+      },
+      "after": {
+        "peak_allocated_bytes": 60426240,
+        "peak_incremental_bytes": 35127296,
+        "public_cuda_event_ms": 0.5492799878120422,
+        "kernel_ms": 0.2675839999999998,
+        "activities": 9,
+        "graph_ms": 0.2786079943180084
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 8192,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 109842432,
+        "peak_incremental_bytes": 84543488,
+        "public_cuda_event_ms": 0.8010880053043365,
+        "kernel_ms": 0.4500469999999999,
+        "activities": 18,
+        "graph_ms": 0.45182399451732635
+      },
+      "after": {
+        "peak_allocated_bytes": 60557312,
+        "peak_incremental_bytes": 35258368,
+        "public_cuda_event_ms": 0.563071995973587,
+        "kernel_ms": 0.27030600000000027,
+        "activities": 9,
+        "graph_ms": 0.27935999631881714
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 8,
+      "seqlen": 8192,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 135141376,
+        "peak_incremental_bytes": 84676608,
+        "public_cuda_event_ms": 1.1917920112609863,
+        "kernel_ms": 0.5420190000000001,
+        "activities": 29,
+        "graph_ms": 0.5430079996585846
+      },
+      "after": {
+        "peak_allocated_bytes": 71700480,
+        "peak_incremental_bytes": 21235712,
+        "public_cuda_event_ms": 0.7558879852294922,
+        "kernel_ms": 0.3420189999999998,
+        "activities": 11,
+        "graph_ms": 0.3509120047092438
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 63,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1955840,
+        "peak_incremental_bytes": 1302528,
+        "public_cuda_event_ms": 0.5739359855651855,
+        "kernel_ms": 0.03414599999999882,
+        "activities": 14,
+        "graph_ms": 0.04439999908208847
+      },
+      "after": {
+        "peak_allocated_bytes": 1177600,
+        "peak_incremental_bytes": 524288,
+        "public_cuda_event_ms": 0.3489760011434555,
+        "kernel_ms": 0.01555200000000002,
+        "activities": 5,
+        "graph_ms": 0.02356800064444542
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 63,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2222080,
+        "peak_incremental_bytes": 1568768,
+        "public_cuda_event_ms": 0.5803039968013763,
+        "kernel_ms": 0.03443199999999979,
+        "activities": 14,
+        "graph_ms": 0.044815998524427414
+      },
+      "after": {
+        "peak_allocated_bytes": 1439744,
+        "peak_incremental_bytes": 786432,
+        "public_cuda_event_ms": 0.3595840036869049,
+        "kernel_ms": 0.01593399999999997,
+        "activities": 5,
+        "graph_ms": 0.023856000043451786
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 63,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3141632,
+        "peak_incremental_bytes": 2101248,
+        "public_cuda_event_ms": 1.1481119990348816,
+        "kernel_ms": 0.07033799999999905,
+        "activities": 29,
+        "graph_ms": 0.08456000313162804
+      },
+      "after": {
+        "peak_allocated_bytes": 2156544,
+        "peak_incremental_bytes": 1116160,
+        "public_cuda_event_ms": 0.6949760019779205,
+        "kernel_ms": 0.03340900000000056,
+        "activities": 11,
+        "graph_ms": 0.043136000633239746
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 64,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 1978368,
+        "peak_incremental_bytes": 1318912,
+        "public_cuda_event_ms": 0.5483039915561676,
+        "kernel_ms": 0.03421000000000038,
+        "activities": 14,
+        "graph_ms": 0.04364800080657005
+      },
+      "after": {
+        "peak_allocated_bytes": 1183744,
+        "peak_incremental_bytes": 524288,
+        "public_cuda_event_ms": 0.34147199988365173,
+        "kernel_ms": 0.015519999999999982,
+        "activities": 5,
+        "graph_ms": 0.02393599972128868
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 64,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2244608,
+        "peak_incremental_bytes": 1585152,
+        "public_cuda_event_ms": 0.5486719906330109,
+        "kernel_ms": 0.03468899999999962,
+        "activities": 14,
+        "graph_ms": 0.04456000030040741
+      },
+      "after": {
+        "peak_allocated_bytes": 1445888,
+        "peak_incremental_bytes": 786432,
+        "public_cuda_event_ms": 0.35574400424957275,
+        "kernel_ms": 0.016223999999999704,
+        "activities": 5,
+        "graph_ms": 0.02396799996495247
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 64,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3170304,
+        "peak_incremental_bytes": 2117632,
+        "public_cuda_event_ms": 1.084384024143219,
+        "kernel_ms": 0.07030399999999917,
+        "activities": 29,
+        "graph_ms": 0.08444800227880478
+      },
+      "after": {
+        "peak_allocated_bytes": 2170880,
+        "peak_incremental_bytes": 1118208,
+        "public_cuda_event_ms": 0.6939679980278015,
+        "kernel_ms": 0.03353599999999995,
+        "activities": 11,
+        "graph_ms": 0.04360000044107437
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 65,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2267648,
+        "peak_incremental_bytes": 1602048,
+        "public_cuda_event_ms": 0.6137280166149139,
+        "kernel_ms": 0.036352000000000544,
+        "activities": 14,
+        "graph_ms": 0.045712001621723175
+      },
+      "after": {
+        "peak_allocated_bytes": 1714176,
+        "peak_incremental_bytes": 1048576,
+        "public_cuda_event_ms": 0.3501279950141907,
+        "kernel_ms": 0.017984000000000264,
+        "activities": 5,
+        "graph_ms": 0.026079999282956123
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 65,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2533888,
+        "peak_incremental_bytes": 1868288,
+        "public_cuda_event_ms": 0.6148159801959991,
+        "kernel_ms": 0.036319999999999596,
+        "activities": 14,
+        "graph_ms": 0.04636799916625023
+      },
+      "after": {
+        "peak_allocated_bytes": 1976320,
+        "peak_incremental_bytes": 1310720,
+        "public_cuda_event_ms": 0.38176000118255615,
+        "kernel_ms": 0.018336000000000012,
+        "activities": 5,
+        "graph_ms": 0.0266720000654459
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 65,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3199488,
+        "peak_incremental_bytes": 2134528,
+        "public_cuda_event_ms": 1.124559998512268,
+        "kernel_ms": 0.07040100000000087,
+        "activities": 29,
+        "graph_ms": 0.084927998483181
+      },
+      "after": {
+        "peak_allocated_bytes": 2183168,
+        "peak_incremental_bytes": 1118208,
+        "public_cuda_event_ms": 0.6964159905910492,
+        "kernel_ms": 0.03468899999999985,
+        "activities": 11,
+        "graph_ms": 0.04396799951791763
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 130,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4002304,
+        "peak_incremental_bytes": 2937344,
+        "public_cuda_event_ms": 0.5526880025863647,
+        "kernel_ms": 0.045410999999999035,
+        "activities": 14,
+        "graph_ms": 0.05480000004172325
+      },
+      "after": {
+        "peak_allocated_bytes": 2637824,
+        "peak_incremental_bytes": 1572864,
+        "public_cuda_event_ms": 0.3494559973478317,
+        "kernel_ms": 0.02492899999999986,
+        "activities": 5,
+        "graph_ms": 0.03302399814128876
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 130,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4268544,
+        "peak_incremental_bytes": 3203584,
+        "public_cuda_event_ms": 0.5522400140762329,
+        "kernel_ms": 0.045470999999999775,
+        "activities": 14,
+        "graph_ms": 0.054496001452207565
+      },
+      "after": {
+        "peak_allocated_bytes": 2899968,
+        "peak_incremental_bytes": 1835008,
+        "public_cuda_event_ms": 0.3587840050458908,
+        "kernel_ms": 0.025632999999999812,
+        "activities": 5,
+        "graph_ms": 0.03376000002026558
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 130,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 5600256,
+        "peak_incremental_bytes": 3736576,
+        "public_cuda_event_ms": 1.1006560325622559,
+        "kernel_ms": 0.07657599999999923,
+        "activities": 29,
+        "graph_ms": 0.08979199826717377
+      },
+      "after": {
+        "peak_allocated_bytes": 3573760,
+        "peak_incremental_bytes": 1710080,
+        "public_cuda_event_ms": 0.6932159960269928,
+        "kernel_ms": 0.03984199999999987,
+        "activities": 11,
+        "graph_ms": 0.04992000013589859
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 2048,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 55054336,
+        "peak_incremental_bytes": 42205184,
+        "public_cuda_event_ms": 0.6321919858455658,
+        "kernel_ms": 0.24524799999999983,
+        "activities": 14,
+        "graph_ms": 0.2481760010123253
+      },
+      "after": {
+        "peak_allocated_bytes": 29626368,
+        "peak_incremental_bytes": 16777216,
+        "public_cuda_event_ms": 0.3762720078229904,
+        "kernel_ms": 0.143808,
+        "activities": 5,
+        "graph_ms": 0.15062399953603745
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 2048,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 55320576,
+        "peak_incremental_bytes": 42471424,
+        "public_cuda_event_ms": 0.6609599888324738,
+        "kernel_ms": 0.2400970000000002,
+        "activities": 14,
+        "graph_ms": 0.2497280016541481
+      },
+      "after": {
+        "peak_allocated_bytes": 29888512,
+        "peak_incremental_bytes": 17039360,
+        "public_cuda_event_ms": 0.41441600024700165,
+        "kernel_ms": 0.14342399999999975,
+        "activities": 5,
+        "graph_ms": 0.1512800008058548
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 2048,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 68169728,
+        "peak_incremental_bytes": 42737664,
+        "public_cuda_event_ms": 1.1447359919548035,
+        "kernel_ms": 0.28553699999999993,
+        "activities": 29,
+        "graph_ms": 0.2969599962234497
+      },
+      "after": {
+        "peak_allocated_bytes": 36446208,
+        "peak_incremental_bytes": 11014144,
+        "public_cuda_event_ms": 0.7143999934196472,
+        "kernel_ms": 0.18201700000000004,
+        "activities": 11,
+        "graph_ms": 0.18431999534368515
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 8192,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 219418624,
+        "peak_incremental_bytes": 168820736,
+        "public_cuda_event_ms": 1.058896005153656,
+        "kernel_ms": 0.8866890000000003,
+        "activities": 18,
+        "graph_ms": 0.8858720064163208
+      },
+      "after": {
+        "peak_allocated_bytes": 120852480,
+        "peak_incremental_bytes": 70254592,
+        "public_cuda_event_ms": 0.7343200147151947,
+        "kernel_ms": 0.5242940000000001,
+        "activities": 9,
+        "graph_ms": 0.5333919823169708
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 8192,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 219684864,
+        "peak_incremental_bytes": 169086976,
+        "public_cuda_event_ms": 1.0631360411643982,
+        "kernel_ms": 0.8907610000000008,
+        "activities": 18,
+        "graph_ms": 0.8882720172405243
+      },
+      "after": {
+        "peak_allocated_bytes": 121114624,
+        "peak_incremental_bytes": 70516736,
+        "public_cuda_event_ms": 0.7353920042514801,
+        "kernel_ms": 0.5279040000000003,
+        "activities": 9,
+        "graph_ms": 0.5334720015525818
+      }
+    },
+    {
+      "batch": 1,
+      "heads": 16,
+      "seqlen": 8192,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 270282752,
+        "peak_incremental_bytes": 169353216,
+        "public_cuda_event_ms": 2.1491199731826782,
+        "kernel_ms": 1.0012529999999988,
+        "activities": 29,
+        "graph_ms": 0.9986880123615265
+      },
+      "after": {
+        "peak_allocated_bytes": 143400960,
+        "peak_incremental_bytes": 42471424,
+        "public_cuda_event_ms": 1.198207974433899,
+        "kernel_ms": 0.6343199999999994,
+        "activities": 11,
+        "graph_ms": 0.640527993440628
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 63,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 229376,
+        "peak_incremental_bytes": 146944,
+        "public_cuda_event_ms": 0.4899680018424988,
+        "kernel_ms": 0.02822399999999948,
+        "activities": 11,
+        "graph_ms": 0.037167999893426895
+      },
+      "after": {
+        "peak_allocated_bytes": 147968,
+        "peak_incremental_bytes": 65536,
+        "public_cuda_event_ms": 0.32555198669433594,
+        "kernel_ms": 0.015008000000000039,
+        "activities": 5,
+        "graph_ms": 0.023615999147295952
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 63,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 262656,
+        "peak_incremental_bytes": 180224,
+        "public_cuda_event_ms": 0.4987040162086487,
+        "kernel_ms": 0.028575999999999907,
+        "activities": 11,
+        "graph_ms": 0.03739200159907341
+      },
+      "after": {
+        "peak_allocated_bytes": 180736,
+        "peak_incremental_bytes": 98304,
+        "public_cuda_event_ms": 0.3540799915790558,
+        "kernel_ms": 0.015582999999999628,
+        "activities": 5,
+        "graph_ms": 0.02407999988645315
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 63,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 395264,
+        "peak_incremental_bytes": 263680,
+        "public_cuda_event_ms": 0.9934239983558655,
+        "kernel_ms": 0.057695999999999796,
+        "activities": 23,
+        "graph_ms": 0.06960000097751617
+      },
+      "after": {
+        "peak_allocated_bytes": 271360,
+        "peak_incremental_bytes": 139776,
+        "public_cuda_event_ms": 0.6791040003299713,
+        "kernel_ms": 0.031229999999999564,
+        "activities": 11,
+        "graph_ms": 0.0403360016644001
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 64,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 230912,
+        "peak_incremental_bytes": 148480,
+        "public_cuda_event_ms": 0.4830400049686432,
+        "kernel_ms": 0.02767899999999963,
+        "activities": 11,
+        "graph_ms": 0.03726400062441826
+      },
+      "after": {
+        "peak_allocated_bytes": 147968,
+        "peak_incremental_bytes": 65536,
+        "public_cuda_event_ms": 0.3235040009021759,
+        "kernel_ms": 0.014751000000000203,
+        "activities": 5,
+        "graph_ms": 0.023024000227451324
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 64,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 264192,
+        "peak_incremental_bytes": 181760,
+        "public_cuda_event_ms": 0.5095359981060028,
+        "kernel_ms": 0.028032999999999562,
+        "activities": 11,
+        "graph_ms": 0.037167999893426895
+      },
+      "after": {
+        "peak_allocated_bytes": 180736,
+        "peak_incremental_bytes": 98304,
+        "public_cuda_event_ms": 0.3543520122766495,
+        "kernel_ms": 0.015360000000000014,
+        "activities": 5,
+        "graph_ms": 0.023423999547958374
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 64,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 396800,
+        "peak_incremental_bytes": 265216,
+        "public_cuda_event_ms": 1.0050080120563507,
+        "kernel_ms": 0.056958000000000654,
+        "activities": 23,
+        "graph_ms": 0.06960000097751617
+      },
+      "after": {
+        "peak_allocated_bytes": 271360,
+        "peak_incremental_bytes": 139776,
+        "public_cuda_event_ms": 0.6862559914588928,
+        "kernel_ms": 0.030975999999999886,
+        "activities": 11,
+        "graph_ms": 0.04062400013208389
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 65,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 281600,
+        "peak_incremental_bytes": 197632,
+        "public_cuda_event_ms": 0.4829600006341934,
+        "kernel_ms": 0.028864999999999894,
+        "activities": 11,
+        "graph_ms": 0.03836800158023834
+      },
+      "after": {
+        "peak_allocated_bytes": 215040,
+        "peak_incremental_bytes": 131072,
+        "public_cuda_event_ms": 0.33166399598121643,
+        "kernel_ms": 0.016096999999999754,
+        "activities": 5,
+        "graph_ms": 0.024383999407291412
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 65,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 314368,
+        "peak_incremental_bytes": 230400,
+        "public_cuda_event_ms": 0.49193599820137024,
+        "kernel_ms": 0.02953599999999983,
+        "activities": 11,
+        "graph_ms": 0.038416000083088875
+      },
+      "after": {
+        "peak_allocated_bytes": 247808,
+        "peak_incremental_bytes": 163840,
+        "public_cuda_event_ms": 0.3431999981403351,
+        "kernel_ms": 0.016447000000000003,
+        "activities": 5,
+        "graph_ms": 0.02465599961578846
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 65,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 402432,
+        "peak_incremental_bytes": 267776,
+        "public_cuda_event_ms": 0.99412801861763,
+        "kernel_ms": 0.05722099999999932,
+        "activities": 23,
+        "graph_ms": 0.0697920024394989
+      },
+      "after": {
+        "peak_allocated_bytes": 274432,
+        "peak_incremental_bytes": 139776,
+        "public_cuda_event_ms": 0.6843360066413879,
+        "kernel_ms": 0.03216099999999869,
+        "activities": 11,
+        "graph_ms": 0.041840000078082085
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 130,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 467456,
+        "peak_incremental_bytes": 334336,
+        "public_cuda_event_ms": 0.49275200068950653,
+        "kernel_ms": 0.029247999999999365,
+        "activities": 11,
+        "graph_ms": 0.038495998829603195
+      },
+      "after": {
+        "peak_allocated_bytes": 329728,
+        "peak_incremental_bytes": 196608,
+        "public_cuda_event_ms": 0.32788801193237305,
+        "kernel_ms": 0.016512000000000172,
+        "activities": 5,
+        "graph_ms": 0.024191999807953835
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 130,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 500736,
+        "peak_incremental_bytes": 367616,
+        "public_cuda_event_ms": 0.5476000010967255,
+        "kernel_ms": 0.02976199999999983,
+        "activities": 11,
+        "graph_ms": 0.03899199888110161
+      },
+      "after": {
+        "peak_allocated_bytes": 362496,
+        "peak_incremental_bytes": 229376,
+        "public_cuda_event_ms": 0.37067200243473053,
+        "kernel_ms": 0.016639999999999874,
+        "activities": 5,
+        "graph_ms": 0.025151999667286873
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 130,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 702976,
+        "peak_incremental_bytes": 468480,
+        "public_cuda_event_ms": 0.9848320186138153,
+        "kernel_ms": 0.06019300000000044,
+        "activities": 23,
+        "graph_ms": 0.07188800349831581
+      },
+      "after": {
+        "peak_allocated_bytes": 448512,
+        "peak_incremental_bytes": 214016,
+        "public_cuda_event_ms": 0.685151994228363,
+        "kernel_ms": 0.033344000000000054,
+        "activities": 11,
+        "graph_ms": 0.04387199878692627
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 2048,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 6357504,
+        "peak_incremental_bytes": 4751360,
+        "public_cuda_event_ms": 0.51009601354599,
+        "kernel_ms": 0.05254500000000007,
+        "activities": 11,
+        "graph_ms": 0.0618400014936924
+      },
+      "after": {
+        "peak_allocated_bytes": 3703296,
+        "peak_incremental_bytes": 2097152,
+        "public_cuda_event_ms": 0.33686399459838867,
+        "kernel_ms": 0.038621999999999615,
+        "activities": 5,
+        "graph_ms": 0.046271998435258865
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 2048,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 6390784,
+        "peak_incremental_bytes": 4784640,
+        "public_cuda_event_ms": 0.5103519856929779,
+        "kernel_ms": 0.05279999999999939,
+        "activities": 11,
+        "graph_ms": 0.06217600032687187
+      },
+      "after": {
+        "peak_allocated_bytes": 3736064,
+        "peak_incremental_bytes": 2129920,
+        "public_cuda_event_ms": 0.35571199655532837,
+        "kernel_ms": 0.03830499999999984,
+        "activities": 5,
+        "graph_ms": 0.046192001551389694
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 2048,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 8521216,
+        "peak_incremental_bytes": 5342208,
+        "public_cuda_event_ms": 1.1756479740142822,
+        "kernel_ms": 0.07644900000000053,
+        "activities": 23,
+        "graph_ms": 0.08894399926066399
+      },
+      "after": {
+        "peak_allocated_bytes": 4555776,
+        "peak_incremental_bytes": 1376768,
+        "public_cuda_event_ms": 0.7645120024681091,
+        "kernel_ms": 0.0495359999999996,
+        "activities": 11,
+        "graph_ms": 0.05958399921655655
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 8192,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 25330176,
+        "peak_incremental_bytes": 19005440,
+        "public_cuda_event_ms": 0.6252959966659546,
+        "kernel_ms": 0.12457600000000013,
+        "activities": 15,
+        "graph_ms": 0.13025599718093872
+      },
+      "after": {
+        "peak_allocated_bytes": 15106560,
+        "peak_incremental_bytes": 8781824,
+        "public_cuda_event_ms": 0.4487359970808029,
+        "kernel_ms": 0.09612799999999994,
+        "activities": 9,
+        "graph_ms": 0.10385600104928017
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 8192,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 25363456,
+        "peak_incremental_bytes": 19038720,
+        "public_cuda_event_ms": 0.6103839874267578,
+        "kernel_ms": 0.12499199999999962,
+        "activities": 15,
+        "graph_ms": 0.13180800527334213
+      },
+      "after": {
+        "peak_allocated_bytes": 15139328,
+        "peak_incremental_bytes": 8814592,
+        "public_cuda_event_ms": 0.4567999988794327,
+        "kernel_ms": 0.0967349999999999,
+        "activities": 9,
+        "graph_ms": 0.10494400188326836
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 1,
+      "seqlen": 8192,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 33785344,
+        "peak_incremental_bytes": 21169152,
+        "public_cuda_event_ms": 0.9969439804553986,
+        "kernel_ms": 0.17312099999999986,
+        "activities": 23,
+        "graph_ms": 0.18612799793481827
+      },
+      "after": {
+        "peak_allocated_bytes": 17925120,
+        "peak_incremental_bytes": 5308928,
+        "public_cuda_event_ms": 0.6890240013599396,
+        "kernel_ms": 0.13968000000000005,
+        "activities": 11,
+        "graph_ms": 0.14825599640607834
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 63,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2213888,
+        "peak_incremental_bytes": 1560576,
+        "public_cuda_event_ms": 0.5387519896030426,
+        "kernel_ms": 0.03555200000000025,
+        "activities": 14,
+        "graph_ms": 0.0456480011343956
+      },
+      "after": {
+        "peak_allocated_bytes": 1177600,
+        "peak_incremental_bytes": 524288,
+        "public_cuda_event_ms": 0.33236800134181976,
+        "kernel_ms": 0.015553000000000794,
+        "activities": 5,
+        "graph_ms": 0.02340799942612648
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 63,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2480128,
+        "peak_incremental_bytes": 1826816,
+        "public_cuda_event_ms": 0.5416159927845001,
+        "kernel_ms": 0.036482999999999835,
+        "activities": 14,
+        "graph_ms": 0.046431999653577805
+      },
+      "after": {
+        "peak_allocated_bytes": 1439744,
+        "peak_incremental_bytes": 786432,
+        "public_cuda_event_ms": 0.3582720011472702,
+        "kernel_ms": 0.016032000000000154,
+        "activities": 5,
+        "graph_ms": 0.02409599907696247
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 63,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3528704,
+        "peak_incremental_bytes": 2488320,
+        "public_cuda_event_ms": 1.0932320356369019,
+        "kernel_ms": 0.07315200000000038,
+        "activities": 29,
+        "graph_ms": 0.08692799881100655
+      },
+      "after": {
+        "peak_allocated_bytes": 2156544,
+        "peak_incremental_bytes": 1116160,
+        "public_cuda_event_ms": 0.6952800154685974,
+        "kernel_ms": 0.03359999999999991,
+        "activities": 11,
+        "graph_ms": 0.04347199946641922
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 64,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2240512,
+        "peak_incremental_bytes": 1581056,
+        "public_cuda_event_ms": 0.5782399773597717,
+        "kernel_ms": 0.035392000000000055,
+        "activities": 14,
+        "graph_ms": 0.04492799937725067
+      },
+      "after": {
+        "peak_allocated_bytes": 1183744,
+        "peak_incremental_bytes": 524288,
+        "public_cuda_event_ms": 0.3465439975261688,
+        "kernel_ms": 0.0153599999999999,
+        "activities": 5,
+        "graph_ms": 0.023792000487446785
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 64,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2506752,
+        "peak_incremental_bytes": 1847296,
+        "public_cuda_event_ms": 0.5451680123806,
+        "kernel_ms": 0.03618800000000033,
+        "activities": 14,
+        "graph_ms": 0.04593599960207939
+      },
+      "after": {
+        "peak_allocated_bytes": 1445888,
+        "peak_incremental_bytes": 786432,
+        "public_cuda_event_ms": 0.34670400619506836,
+        "kernel_ms": 0.01619200000000012,
+        "activities": 5,
+        "graph_ms": 0.02454400062561035
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 64,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3563520,
+        "peak_incremental_bytes": 2510848,
+        "public_cuda_event_ms": 1.0719359517097473,
+        "kernel_ms": 0.0741130000000004,
+        "activities": 29,
+        "graph_ms": 0.08771199733018875
+      },
+      "after": {
+        "peak_allocated_bytes": 2170880,
+        "peak_incremental_bytes": 1118208,
+        "public_cuda_event_ms": 0.6725919842720032,
+        "kernel_ms": 0.033631999999999836,
+        "activities": 11,
+        "graph_ms": 0.043776001781225204
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 65,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2646016,
+        "peak_incremental_bytes": 1980416,
+        "public_cuda_event_ms": 0.5735200047492981,
+        "kernel_ms": 0.037758999999999786,
+        "activities": 14,
+        "graph_ms": 0.04739199951291084
+      },
+      "after": {
+        "peak_allocated_bytes": 1714176,
+        "peak_incremental_bytes": 1048576,
+        "public_cuda_event_ms": 0.3484160006046295,
+        "kernel_ms": 0.018144000000000004,
+        "activities": 5,
+        "graph_ms": 0.026064000092446804
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 65,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 2908160,
+        "peak_incremental_bytes": 2242560,
+        "public_cuda_event_ms": 0.554639995098114,
+        "kernel_ms": 0.03814399999999995,
+        "activities": 14,
+        "graph_ms": 0.048239998519420624
+      },
+      "after": {
+        "peak_allocated_bytes": 1976320,
+        "peak_incremental_bytes": 1310720,
+        "public_cuda_event_ms": 0.36851200461387634,
+        "kernel_ms": 0.018207999999999856,
+        "activities": 5,
+        "graph_ms": 0.02643200010061264
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 65,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 3598848,
+        "peak_incremental_bytes": 2533888,
+        "public_cuda_event_ms": 1.1040000319480896,
+        "kernel_ms": 0.07385900000000038,
+        "activities": 29,
+        "graph_ms": 0.08766399696469307
+      },
+      "after": {
+        "peak_allocated_bytes": 2183168,
+        "peak_incremental_bytes": 1118208,
+        "public_cuda_event_ms": 0.6729920208454132,
+        "kernel_ms": 0.03468600000000049,
+        "activities": 11,
+        "graph_ms": 0.04403200000524521
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 130,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4534784,
+        "peak_incremental_bytes": 3469824,
+        "public_cuda_event_ms": 0.556879997253418,
+        "kernel_ms": 0.04649500000000046,
+        "activities": 14,
+        "graph_ms": 0.0557279996573925
+      },
+      "after": {
+        "peak_allocated_bytes": 2637824,
+        "peak_incremental_bytes": 1572864,
+        "public_cuda_event_ms": 0.3646239936351776,
+        "kernel_ms": 0.024960000000000038,
+        "activities": 5,
+        "graph_ms": 0.03336000069975853
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 130,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4801024,
+        "peak_incremental_bytes": 3736064,
+        "public_cuda_event_ms": 0.5579519867897034,
+        "kernel_ms": 0.04643100000000015,
+        "activities": 14,
+        "graph_ms": 0.05615999922156334
+      },
+      "after": {
+        "peak_allocated_bytes": 2899968,
+        "peak_incremental_bytes": 1835008,
+        "public_cuda_event_ms": 0.35868799686431885,
+        "kernel_ms": 0.025855000000000017,
+        "activities": 5,
+        "graph_ms": 0.033904001116752625
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 130,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 6398976,
+        "peak_incremental_bytes": 4535296,
+        "public_cuda_event_ms": 1.098639965057373,
+        "kernel_ms": 0.08022500000000025,
+        "activities": 29,
+        "graph_ms": 0.09291199967265129
+      },
+      "after": {
+        "peak_allocated_bytes": 3573760,
+        "peak_incremental_bytes": 1710080,
+        "public_cuda_event_ms": 0.6946079730987549,
+        "kernel_ms": 0.03974299999999994,
+        "activities": 11,
+        "graph_ms": 0.04979199916124344
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 2048,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 63442944,
+        "peak_incremental_bytes": 50593792,
+        "public_cuda_event_ms": 0.6115999817848206,
+        "kernel_ms": 0.24157000000000006,
+        "activities": 14,
+        "graph_ms": 0.24907200038433075
+      },
+      "after": {
+        "peak_allocated_bytes": 29626368,
+        "peak_incremental_bytes": 16777216,
+        "public_cuda_event_ms": 0.37296000123023987,
+        "kernel_ms": 0.14559899999999992,
+        "activities": 5,
+        "graph_ms": 0.15091200172901154
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 2048,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 63709184,
+        "peak_incremental_bytes": 50860032,
+        "public_cuda_event_ms": 0.6135520040988922,
+        "kernel_ms": 0.2389150000000005,
+        "activities": 14,
+        "graph_ms": 0.24960000067949295
+      },
+      "after": {
+        "peak_allocated_bytes": 29888512,
+        "peak_incremental_bytes": 17039360,
+        "public_cuda_event_ms": 0.3882559984922409,
+        "kernel_ms": 0.1436490000000001,
+        "activities": 5,
+        "graph_ms": 0.15147200226783752
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 2048,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 80752640,
+        "peak_incremental_bytes": 55320576,
+        "public_cuda_event_ms": 1.1083199977874756,
+        "kernel_ms": 0.2856969999999994,
+        "activities": 29,
+        "graph_ms": 0.2983039915561676
+      },
+      "after": {
+        "peak_allocated_bytes": 36446208,
+        "peak_incremental_bytes": 11014144,
+        "public_cuda_event_ms": 0.6750879883766174,
+        "kernel_ms": 0.18035199999999987,
+        "activities": 11,
+        "graph_ms": 0.18460800498723984
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 8192,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 252973056,
+        "peak_incremental_bytes": 202375168,
+        "public_cuda_event_ms": 0.9964959919452667,
+        "kernel_ms": 0.8869129999999995,
+        "activities": 18,
+        "graph_ms": 0.8888639807701111
+      },
+      "after": {
+        "peak_allocated_bytes": 120852480,
+        "peak_incremental_bytes": 70254592,
+        "public_cuda_event_ms": 0.7255840003490448,
+        "kernel_ms": 0.5230420000000002,
+        "activities": 9,
+        "graph_ms": 0.5337119996547699
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 8192,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 253239296,
+        "peak_incremental_bytes": 202641408,
+        "public_cuda_event_ms": 0.998528003692627,
+        "kernel_ms": 0.8925479999999997,
+        "activities": 18,
+        "graph_ms": 0.8901279866695404
+      },
+      "after": {
+        "peak_allocated_bytes": 121114624,
+        "peak_incremental_bytes": 70516736,
+        "public_cuda_event_ms": 0.7275680005550385,
+        "kernel_ms": 0.5259170000000002,
+        "activities": 9,
+        "graph_ms": 0.5344320237636566
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 8,
+      "seqlen": 8192,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 320614400,
+        "peak_incremental_bytes": 219684864,
+        "public_cuda_event_ms": 1.2631999850273132,
+        "kernel_ms": 1.004966,
+        "activities": 29,
+        "graph_ms": 1.006127953529358
+      },
+      "after": {
+        "peak_allocated_bytes": 143400960,
+        "peak_incremental_bytes": 42471424,
+        "public_cuda_event_ms": 0.8676480054855347,
+        "kernel_ms": 0.6304969999999996,
+        "activities": 11,
+        "graph_ms": 0.6414079964160919
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 63,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4427776,
+        "peak_incremental_bytes": 3121152,
+        "public_cuda_event_ms": 0.5459520220756531,
+        "kernel_ms": 0.038241000000000726,
+        "activities": 14,
+        "graph_ms": 0.0483039990067482
+      },
+      "after": {
+        "peak_allocated_bytes": 2355200,
+        "peak_incremental_bytes": 1048576,
+        "public_cuda_event_ms": 0.33851200342178345,
+        "kernel_ms": 0.017729000000000043,
+        "activities": 5,
+        "graph_ms": 0.025679999962449074
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 63,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4960256,
+        "peak_incremental_bytes": 3653632,
+        "public_cuda_event_ms": 0.5629599988460541,
+        "kernel_ms": 0.03920100000000059,
+        "activities": 14,
+        "graph_ms": 0.04851200059056282
+      },
+      "after": {
+        "peak_allocated_bytes": 2879488,
+        "peak_incremental_bytes": 1572864,
+        "public_cuda_event_ms": 0.3580320030450821,
+        "kernel_ms": 0.018047000000000025,
+        "activities": 5,
+        "graph_ms": 0.026096000336110592
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 63,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 7057408,
+        "peak_incremental_bytes": 4976640,
+        "public_cuda_event_ms": 1.1140320301055908,
+        "kernel_ms": 0.07846299999999963,
+        "activities": 29,
+        "graph_ms": 0.09175999835133553
+      },
+      "after": {
+        "peak_allocated_bytes": 4313088,
+        "peak_incremental_bytes": 2232320,
+        "public_cuda_event_ms": 0.6840800046920776,
+        "kernel_ms": 0.038431999999999675,
+        "activities": 11,
+        "graph_ms": 0.04801600053906441
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 64,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 4481024,
+        "peak_incremental_bytes": 3162112,
+        "public_cuda_event_ms": 0.5408480167388916,
+        "kernel_ms": 0.03804899999999918,
+        "activities": 14,
+        "graph_ms": 0.04793599992990494
+      },
+      "after": {
+        "peak_allocated_bytes": 2367488,
+        "peak_incremental_bytes": 1048576,
+        "public_cuda_event_ms": 0.3364800065755844,
+        "kernel_ms": 0.01763200000000006,
+        "activities": 5,
+        "graph_ms": 0.025919999927282333
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 64,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 5013504,
+        "peak_incremental_bytes": 3694592,
+        "public_cuda_event_ms": 0.5582399964332581,
+        "kernel_ms": 0.03843200000000013,
+        "activities": 14,
+        "graph_ms": 0.04827199876308441
+      },
+      "after": {
+        "peak_allocated_bytes": 2891776,
+        "peak_incremental_bytes": 1572864,
+        "public_cuda_event_ms": 0.35758399963378906,
+        "kernel_ms": 0.01830300000000011,
+        "activities": 5,
+        "graph_ms": 0.02643200010061264
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 64,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 7127040,
+        "peak_incremental_bytes": 5021696,
+        "public_cuda_event_ms": 1.0938720107078552,
+        "kernel_ms": 0.0785560000000014,
+        "activities": 29,
+        "graph_ms": 0.09145600348711014
+      },
+      "after": {
+        "peak_allocated_bytes": 4341760,
+        "peak_incremental_bytes": 2236416,
+        "public_cuda_event_ms": 0.7031359970569611,
+        "kernel_ms": 0.038046999999999796,
+        "activities": 11,
+        "graph_ms": 0.04785599932074547
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 65,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 5292032,
+        "peak_incremental_bytes": 3960832,
+        "public_cuda_event_ms": 0.5467040240764618,
+        "kernel_ms": 0.04751999999999987,
+        "activities": 14,
+        "graph_ms": 0.056992001831531525
+      },
+      "after": {
+        "peak_allocated_bytes": 3428352,
+        "peak_incremental_bytes": 2097152,
+        "public_cuda_event_ms": 0.33959999680519104,
+        "kernel_ms": 0.026369000000000028,
+        "activities": 5,
+        "graph_ms": 0.03404799848794937
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 65,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 5816320,
+        "peak_incremental_bytes": 4485120,
+        "public_cuda_event_ms": 0.5481280088424683,
+        "kernel_ms": 0.04847900000000038,
+        "activities": 14,
+        "graph_ms": 0.0579840000718832
+      },
+      "after": {
+        "peak_allocated_bytes": 3952640,
+        "peak_incremental_bytes": 2621440,
+        "public_cuda_event_ms": 0.36161600053310394,
+        "kernel_ms": 0.02700800000000004,
+        "activities": 5,
+        "graph_ms": 0.03484800085425377
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 65,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 7197184,
+        "peak_incremental_bytes": 5067264,
+        "public_cuda_event_ms": 1.1140320301055908,
+        "kernel_ms": 0.07865799999999991,
+        "activities": 29,
+        "graph_ms": 0.09131200239062309
+      },
+      "after": {
+        "peak_allocated_bytes": 4366336,
+        "peak_incremental_bytes": 2236416,
+        "public_cuda_event_ms": 0.6888960003852844,
+        "kernel_ms": 0.039009000000000245,
+        "activities": 11,
+        "graph_ms": 0.048895999789237976
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 130,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 9576960,
+        "peak_incremental_bytes": 7447040,
+        "public_cuda_event_ms": 0.5526399910449982,
+        "kernel_ms": 0.060319000000000074,
+        "activities": 14,
+        "graph_ms": 0.07169600203633308
+      },
+      "after": {
+        "peak_allocated_bytes": 5275648,
+        "peak_incremental_bytes": 3145728,
+        "public_cuda_event_ms": 0.3404480069875717,
+        "kernel_ms": 0.041407999999999785,
+        "activities": 5,
+        "graph_ms": 0.049056001007556915
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 130,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 10109440,
+        "peak_incremental_bytes": 7979520,
+        "public_cuda_event_ms": 0.5496160089969635,
+        "kernel_ms": 0.060352000000000315,
+        "activities": 14,
+        "graph_ms": 0.07012799754738808
+      },
+      "after": {
+        "peak_allocated_bytes": 5799936,
+        "peak_incremental_bytes": 3670016,
+        "public_cuda_event_ms": 0.35065600275993347,
+        "kernel_ms": 0.04220900000000006,
+        "activities": 5,
+        "graph_ms": 0.04950400069355965
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 130,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 12796928,
+        "peak_incremental_bytes": 9069568,
+        "public_cuda_event_ms": 1.1006560325622559,
+        "kernel_ms": 0.10099400000000025,
+        "activities": 29,
+        "graph_ms": 0.11286400258541107
+      },
+      "after": {
+        "peak_allocated_bytes": 7147520,
+        "peak_incremental_bytes": 3420160,
+        "public_cuda_event_ms": 0.6938880085945129,
+        "kernel_ms": 0.05785700000000088,
+        "activities": 11,
+        "graph_ms": 0.06721599772572517
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 2048,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 126885888,
+        "peak_incremental_bytes": 101187584,
+        "public_cuda_event_ms": 0.7031520009040833,
+        "kernel_ms": 0.4574770000000001,
+        "activities": 14,
+        "graph_ms": 0.46136000752449036
+      },
+      "after": {
+        "peak_allocated_bytes": 59252736,
+        "peak_incremental_bytes": 33554432,
+        "public_cuda_event_ms": 0.4612800031900406,
+        "kernel_ms": 0.2686729999999999,
+        "activities": 5,
+        "graph_ms": 0.2768799960613251
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 2048,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 127418368,
+        "peak_incremental_bytes": 101720064,
+        "public_cuda_event_ms": 0.6896479725837708,
+        "kernel_ms": 0.45257500000000017,
+        "activities": 14,
+        "graph_ms": 0.46160000562667847
+      },
+      "after": {
+        "peak_allocated_bytes": 59777024,
+        "peak_incremental_bytes": 34078720,
+        "public_cuda_event_ms": 0.4716000109910965,
+        "kernel_ms": 0.2693119999999999,
+        "activities": 5,
+        "graph_ms": 0.2778719961643219
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 2048,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 161505280,
+        "peak_incremental_bytes": 110641152,
+        "public_cuda_event_ms": 1.1892319917678833,
+        "kernel_ms": 0.5032340000000003,
+        "activities": 29,
+        "graph_ms": 0.5130079984664917
+      },
+      "after": {
+        "peak_allocated_bytes": 72892416,
+        "peak_incremental_bytes": 22028288,
+        "public_cuda_event_ms": 0.7291840016841888,
+        "kernel_ms": 0.305924,
+        "activities": 11,
+        "graph_ms": 0.314751997590065
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 8192,
+      "contract": "output-only",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 505946112,
+        "peak_incremental_bytes": 404750336,
+        "public_cuda_event_ms": 1.8691360354423523,
+        "kernel_ms": 1.7668929999999994,
+        "activities": 18,
+        "graph_ms": 1.7514399886131287
+      },
+      "after": {
+        "peak_allocated_bytes": 241704960,
+        "peak_incremental_bytes": 140509184,
+        "public_cuda_event_ms": 1.2491520047187805,
+        "kernel_ms": 1.028612,
+        "activities": 9,
+        "graph_ms": 1.0406720042228699
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 8192,
+      "contract": "final-state",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 506478592,
+        "peak_incremental_bytes": 405282816,
+        "public_cuda_event_ms": 1.8704800009727478,
+        "kernel_ms": 1.7638129999999996,
+        "activities": 18,
+        "graph_ms": 1.7521599531173706
+      },
+      "after": {
+        "peak_allocated_bytes": 242229248,
+        "peak_incremental_bytes": 141033472,
+        "public_cuda_event_ms": 1.2476800084114075,
+        "kernel_ms": 1.0295050000000001,
+        "activities": 9,
+        "graph_ms": 1.0420319437980652
+      }
+    },
+    {
+      "batch": 2,
+      "heads": 16,
+      "seqlen": 8192,
+      "contract": "continuation",
+      "parity": {
+        "output:output": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:memory": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        },
+        "state:key_sum": {
+          "max_abs": 0.0,
+          "bitwise_equal": true
+        }
+      },
+      "before": {
+        "peak_allocated_bytes": 641228800,
+        "peak_incremental_bytes": 439369728,
+        "public_cuda_event_ms": 2.0302239656448364,
+        "kernel_ms": 1.9113069999999994,
+        "activities": 29,
+        "graph_ms": 1.9048159718513489
+      },
+      "after": {
+        "peak_allocated_bytes": 286801920,
+        "peak_incremental_bytes": 84942848,
+        "public_cuda_event_ms": 1.3895360231399536,
+        "kernel_ms": 1.172068,
+        "activities": 11,
+        "graph_ms": 1.183888018131256
+      }
+    }
+  ]
+}

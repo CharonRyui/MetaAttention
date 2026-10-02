@@ -116,16 +116,21 @@ def test_normalized_linear_attention_matches_streaming_reference(gpu_device):
             assert (difference / (atol + rtol * expected.abs())).max().item() < 1.0
 
 
+@pytest.mark.parametrize("layout,source_heads", [("bht", (2, 2, 2)), ("bth", (2, 1, 2))])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("length", [63, 64, 65, 130])
-def test_normalized_final_states_continuation_and_authored_epsilon(gpu_device, dtype, length):
-    from attn_engine import StateTuple
+def test_normalized_final_states_continuation_and_authored_epsilon(
+    gpu_device, dtype, length, layout, source_heads,
+):
+    from attn_engine import AlgorithmIR, Batch, Sequence, StatefulOperator, StateTuple, Target, TensorInput
+    from examples.normalized_linear_attention import KEY, VALUE, QUERY_HEADS, KEY_HEADS, VALUE_HEADS, STATE_HEADS
 
-    batch, heads, dim, dim_value = 2, 2, 17, 35
+    batch, heads, dim, dim_value = 2, (4 if layout == "bth" else 2), 17, 35
+    qh, kh, vh = source_heads
     generator = torch.Generator().manual_seed(193)
-    query = (torch.rand(batch, heads, length, dim, generator=generator) + 0.1).to(dtype)
-    key = (torch.rand(batch, heads, length, dim, generator=generator) + 0.1).to(dtype)
-    value = torch.randn(batch, heads, length, dim_value, generator=generator).to(dtype)
+    query = (torch.rand(batch, qh, length, dim, generator=generator) + 0.1).to(dtype)
+    key = (torch.rand(batch, kh, length, dim, generator=generator) + 0.1).to(dtype)
+    value = torch.randn(batch, vh, length, dim_value, generator=generator).to(dtype)
     memory = torch.rand(batch, heads, dim, dim_value, generator=generator) * 0.1 + 0.1
     key_sum = torch.zeros(batch, heads, dim)
     # Nonzero numerator and exactly zero denominator expose a dropped epsilon.
@@ -133,31 +138,41 @@ def test_normalized_final_states_continuation_and_authored_epsilon(gpu_device, d
     initial = StateTuple(("memory", "key_sum"),
                          (memory.to(gpu_device), key_sum.to(gpu_device)))
     expected_outputs = []
+    q_oracle = query.repeat_interleave(heads // qh, dim=1)
+    k_oracle = key.repeat_interleave(heads // kh, dim=1)
+    v_oracle = value.repeat_interleave(heads // vh, dim=1)
     # CUDA TensorIterator converts the scalar to the input computation dtype.
     scale = torch.tensor(dim**-0.5, dtype=dtype)
     for token in range(length):
-        memory = memory + key[:, :, token].float().unsqueeze(-1) * value[:, :, token].float().unsqueeze(-2)
-        key_sum = key_sum + key[:, :, token].float()
+        memory = memory + k_oracle[:, :, token].float().unsqueeze(-1) * v_oracle[:, :, token].float().unsqueeze(-2)
+        key_sum = key_sum + k_oracle[:, :, token].float()
         # Input arithmetic rounds in its authored dtype before the FP32 readout.
-        scaled = (query[:, :, token] * scale).float()
+        scaled = (q_oracle[:, :, token] * scale).float()
         numerator = (scaled.unsqueeze(-1) * memory).sum(-2)
         denominator = (scaled * key_sum).sum(-1, keepdim=True)
         expected_outputs.append(numerator / (denominator + EPS))
     expected = torch.stack(expected_outputs, 2).to(dtype).float()
-    compiled = _compile(
-        normalized_linear_attention,
-        {"query_heads": heads, "key_heads": heads, "value_heads": heads,
-         "state_heads": heads, "key_dim": dim, "value_dim": dim_value},
-        batch=batch, heads=heads, seqlen=length, dim=dim, dim_value=dim_value, dtype=dtype,
+    algorithm = normalized_linear_attention(batch, heads, length, dim, dim_value, dtype=dtype).algorithm
+    if layout == "bth":
+        inputs_ir = tuple(TensorInput(spec.name, (Batch, Sequence, spec.roles[1], spec.roles[-1]), dtype)
+                          for spec in algorithm.inputs)
+        algorithm = AlgorithmIR(inputs=inputs_ir, states=algorithm.states,
+                                transition=algorithm.transitions, readouts=algorithm.readouts,
+                                head_mapping=algorithm.head_mapping)
+    compiled = StatefulOperator(algorithm).compile(
+        role_sizes={QUERY_HEADS: qh, KEY_HEADS: kh, VALUE_HEADS: vh, STATE_HEADS: heads,
+                    KEY: dim, VALUE: dim_value}, target=Target(), mode="dense", optimized=True,
     )
-    inputs = {name: tensor.to(gpu_device) for name, tensor in
-              (("query", query), ("key", key), ("value", value))}
+    inputs = {name: (tensor.transpose(1, 2).contiguous() if layout == "bth" else tensor).to(gpu_device)
+              for name, tensor in (("query", query), ("key", key), ("value", value))}
     full = compiled(**inputs, initial_state=initial, return_final_state=True)
     output_only = compiled(**inputs, initial_state=initial)
     split = 64 if length > 64 else length // 2
-    prefix = compiled(**{name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()},
+    axis = 1 if layout == "bth" else 2
+    prefix = compiled(**{name: tensor.narrow(axis, 0, split).contiguous() for name, tensor in inputs.items()},
                       initial_state=initial, return_final_state=True)
-    suffix = compiled(**{name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()},
+    suffix = compiled(**{name: tensor.narrow(axis, split, length - split).contiguous()
+                        for name, tensor in inputs.items()},
                       initial_state=prefix.final_state, return_final_state=True)
     tolerance = 1e-2 if dtype == torch.bfloat16 else 2e-4
     for actual in (full.outputs["output"], output_only.outputs["output"],
@@ -167,6 +182,25 @@ def test_normalized_final_states_continuation_and_authored_epsilon(gpu_device, d
         assert result.final_state.names == ("memory", "key_sum")
         torch.testing.assert_close(result.final_state["memory"].cpu(), memory, rtol=2e-4, atol=2e-5)
         torch.testing.assert_close(result.final_state["key_sum"].cpu(), key_sum, rtol=2e-4, atol=2e-5)
+    if dtype == torch.bfloat16:
+        # Injections are FP32: lossless input promotion cannot change either
+        # final State. Catch raw-load dot layouts reordering BF16 accumulation.
+        promoted = AlgorithmIR(
+            inputs=tuple(TensorInput(spec.name, spec.roles, torch.float32) for spec in algorithm.inputs),
+            states=algorithm.states, transition=algorithm.transitions,
+            readouts=algorithm.readouts, head_mapping=algorithm.head_mapping,
+        )
+        promoted_compiled = StatefulOperator(promoted).compile(
+            role_sizes={QUERY_HEADS: qh, KEY_HEADS: kh, VALUE_HEADS: vh, STATE_HEADS: heads,
+                        KEY: dim, VALUE: dim_value}, target=Target(), mode="dense", optimized=True,
+        )
+        promoted_result = promoted_compiled(
+            **{name: tensor.float() for name, tensor in inputs.items()},
+            initial_state=initial, return_final_state=True,
+        )
+        for name in full.final_state.names:
+            torch.testing.assert_close(full.final_state[name], promoted_result.final_state[name],
+                                       rtol=0, atol=0)
 
 
 def _normalized_reference(query, key, value):

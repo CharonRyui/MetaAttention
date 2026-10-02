@@ -416,6 +416,7 @@ class ChunkedRecipe:
     readouts: tuple[tuple[Any, Any], ...]
     normalized_readout: tuple[Any, Any, Any, float] | None
     rank_one: Any | None
+    native_normalized: Any | None
     inputs: tuple[Any, ...]
     feature_order: tuple[Any, ...]
 
@@ -450,11 +451,12 @@ def _normalized_readout(readout: Any, expression: Any, algorithm: Any):
     return readout, numerator, state_term, constant.value
 
 
-def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
+def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | None:
     """Bind immutable State/readout structure once, independent of runtime B/T."""
     if not chunked_states_eligible(algorithm):
         return None
     from ._stateful_rank1 import compile_rank_one
+    from ._stateful_native import compile_native_normalized
     from ._stateful_reference import feature_layout
     from .stateful_operator import Batch, FeatureRole, HeadRole, Sequence
 
@@ -482,6 +484,18 @@ def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
         if len(readouts) == 1
         else None
     )
+    native = compile_native_normalized(algorithm, normalized)
+    if native is not None:
+        from ._stateful_readout_regions import readout_region_resources
+
+        state = next(state for state in algorithm.states if state.name == native.memory)
+        if role_sizes is None:
+            native = None
+        else:
+            rows, columns = (role_sizes[role] for role in state.feature_roles)
+            if not readout_region_resources((1, 1, rows, columns), (1, 1, rows, 1),
+                                            softmax=False)["eligible"]:
+                native = None
     return ChunkedRecipe(
         MappingProxyType({state.name: state for state in algorithm.states}),
         MappingProxyType({transition.state: transition for transition in algorithm.transitions}),
@@ -490,6 +504,7 @@ def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
         readouts,
         normalized,
         compile_rank_one(algorithm),
+        native,
         tuple(bindings),
         feature_order,
     )
@@ -497,6 +512,9 @@ def compile_chunked_recipe(algorithm: Any) -> ChunkedRecipe | None:
 
 def bind_chunked_inputs(recipe: ChunkedRecipe, inputs, runtime):
     """Bind dense values without reference segments or per-call IR analysis."""
+
+    if recipe.native_normalized is not None:
+        return inputs
 
     values = {}
     for binding in recipe.inputs:
@@ -550,9 +568,17 @@ def execute_chunked_states(
     ):
         return None
     if recipe is None:
-        recipe = compile_chunked_recipe(algorithm)
+        recipe = compile_chunked_recipe(algorithm, role_sizes)
     if recipe is None:
         return None
+    if recipe.native_normalized is not None:
+        from ._stateful_native import execute_native_normalized
+
+        return execute_native_normalized(
+            recipe.native_normalized, values, initial_states, role_sizes=role_sizes,
+            sequence_count=token_count // sequence_length, sequence_length=sequence_length,
+            heads=heads, return_final_state=return_final_state,
+        )
     from .stateful_operator import (
         Add,
         Clamp,

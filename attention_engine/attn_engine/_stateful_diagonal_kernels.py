@@ -11,6 +11,8 @@ import torch
 import triton
 import triton.language as tl
 
+from ._stateful_native import _load_dense
+
 CHUNK = tl.constexpr(64)
 
 
@@ -27,6 +29,10 @@ def _identity_pairs(
     CHUNKS: tl.constexpr,
     KR: tl.constexpr,
     KL: tl.constexpr,
+    NATIVE: tl.constexpr = False,
+    KS: tl.constexpr = (), KG: tl.constexpr = 1,
+    VS: tl.constexpr = (), VG: tl.constexpr = 1,
+    UNIT_VALUE: tl.constexpr = False,
 ):
     sh = tl.program_id(0)
     chunk = tl.program_id(1)
@@ -35,7 +41,10 @@ def _identity_pairs(
     r = tile // tl.cdiv(COLS, 32) * 32 + tl.arange(0, 32)
     c = tile % tl.cdiv(COLS, 32) * 32 + tl.arange(0, 32)
     t = chunk * CHUNK + tl.arange(0, CHUNK)
-    if KR:
+    if NATIVE:
+        k = _load_dense(K, seq, head, t[None, :], r[:, None], ROWS, KS, KG,
+                        t[None, :] < LENGTH)
+    elif KR:
         k = tl.load(
             K + ((seq * LENGTH + t[None, :]) * HEADS + head) * KL + r[:, None] // KR,
             (t[None, :] < LENGTH) & (r[:, None] < ROWS),
@@ -52,11 +61,18 @@ def _identity_pairs(
             (t[None, :] < LENGTH) & (r[:, None] < ROWS),
             0,
         )
-    v = tl.load(
-        V + ((seq * LENGTH + t[:, None]) * HEADS + head) * COLS + c[None, :],
-        (t[:, None] < LENGTH) & (c[None, :] < COLS),
-        0,
-    )
+    if NATIVE:
+        if UNIT_VALUE:
+            v = tl.where((t[:, None] < LENGTH) & (c[None, :] < COLS), 1.0, 0.0)
+        else:
+            v = _load_dense(V, seq, head, t[:, None], c[None, :], COLS, VS, VG,
+                            t[:, None] < LENGTH)
+    else:
+        v = tl.load(
+            V + ((seq * LENGTH + t[:, None]) * HEADS + head) * COLS + c[None, :],
+            (t[:, None] < LENGTH) & (c[None, :] < COLS),
+            0,
+        )
     bias = tl.dot(k, v, input_precision="tf32x3")
     tl.store(
         Bias + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],

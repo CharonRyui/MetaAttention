@@ -870,7 +870,8 @@ def compile_plan(
     """Enumerate mathematical plans, then bind one stable executable candidate."""
     from ._stateful_chunked import compile_chunked_recipe
 
-    chunked_recipe = compile_chunked_recipe(operator.algorithm) if mode == "dense" else None
+    chunked_recipe = (compile_chunked_recipe(operator.algorithm, dict(compilation.role_sizes))
+                      if mode == "dense" else None)
     from ._stateful_reference import requires_reference_lowering
     from ._stateful_structured import product_feature_chunked_eligibility
 
@@ -959,6 +960,15 @@ def compile_plan(
         # Native raw loads need output storage and three FP32 chunk vectors;
         # the extra chunk in WorkspacePolicy conservatively covers final State.
         state_workspace, state_chunk_bytes = 4 * elements, 12 * elements
+    if chunked_stateful and chunked_recipe.native_normalized is not None:
+        native = chunked_recipe.native_normalized
+        memory = next(spec for spec in operator.algorithm.states if spec.name == native.memory)
+        heads = fixed_sizes[memory.head_role]
+        rows, columns = (fixed_sizes[role] for role in memory.feature_roles)
+        # Output plus independent summary/carry pairs and bounded recursive
+        # group buffers. The extra boundary also covers both final States.
+        state_workspace = 4 * heads * columns
+        state_chunk_bytes = 12 * heads * rows * (columns + 1)
     factored_token_bytes = factored_chunk_bytes = 0
     if rank_one_factored is not None and mode == "dense" and backward_ir is None:
         heads = fixed_sizes[state.head_role]

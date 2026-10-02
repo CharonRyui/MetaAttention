@@ -117,3 +117,20 @@ def test_chunk_workspace_counts_tail_and_batch_before_rejecting():
     with pytest.raises(RuntimeError, match="resource envelope"):
         workspace.required_bytes(66, sequence_length=66)
     assert workspace.required_bytes(0, sequence_count=2, sequence_length=0) == 0
+
+
+def test_native_normalized_bounds_long_sequences_without_input_staging():
+    from examples.normalized_linear_attention import normalized_linear_attention
+
+    _, workspace = _workspace(
+        _compile(normalized_linear_attention, seqlen=8192, backward=False, size=64)
+    )
+    # Two sequences and recursive carries fit without raising the production cap.
+    assert 0 < workspace.required_bytes(
+        2 * 8192, sequence_count=2, sequence_length=8192
+    ) < ENVELOPE
+    # Batch still scales scratch; eliminating staging cannot bypass the gate.
+    with pytest.raises(RuntimeError, match="resource envelope"):
+        workspace.required_bytes(
+            32 * 32769, sequence_count=32, sequence_length=32769
+        )

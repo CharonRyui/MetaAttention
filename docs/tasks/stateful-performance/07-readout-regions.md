@@ -44,11 +44,31 @@ GSA、normalized、prior readouts、多个输出独立 oracle；launch/peak memo
 
 串行 replay 融合探针曾使 H1/T64 Graph 0.049→0.112 ms、H8/T2048 0.184→0.300 ms；已改为并行 chunk GEMM，回退实现不提交。
 
-### 下一个重点：原输入 symbolic binding 与 staging 消除
+### 原输入 symbolic binding 与 staging 消除实测（2026-10-02）
 
-H1/T64 output-only activity 实测 11：两个 State 各 summary/carry 共 4，融合 readout 1，FP32 copy 3、query multiply 1、fill 2 共 6。public 0.456 ms 对 Graph 0.036 ms，短序列需同时减少 Python tensor bookkeeping 与 staging launches。优先扩展编译 recipe，为 key/value/query 绑定原 B/H/T strides、head mapping 与 authored operation/dtype；kernel 直接 load BF16→FP32，query scale 保留原 scalar 转换与 BF16 rounding，rank-1 单位 value/常量在 kernel 内合成。保持两个 State 独立 summary/carry、public contiguous/grad/packed 合同；不以改默认 workspace 上限或 tile autotuning 代替优化。
+`_stateful_native.py` 从 typed IR 证明两个 identity States、原输入 key/value 和共享 Input 或 scalar-scaled Input query；编译 recipe 在资源允许时启用，其他结构保留通用路径。summary/readout 直接按 BindingDescriptor 的 B/H/T/Feature strides 与 grouped HeadMapping load 原 BF16/FP32，不生成 FP32 copy、query multiply 或常量 fill tensor。query scale 保留 CUDA scalar 转换及 authored BF16 rounding；单位 denominator value、epsilon 在 kernel 内合成。memory/key_sum 仍各自 summary/carry，final States 与 continuation 不变；未做跨 State 合并或 tile autotuning。
 
-验收沿用同一 108 点 A/B、三 contracts、public/Graph/activity/peak，新增 grouped heads 和 authored BF16 舍入回归。先核对 copy/fill activity 消除及 workspace 真实 charge，再以实测选下一调度；summary/carry 跨 State 合并是后续独立优化，不在本步同时实施。
+基线 `895d0ea` recipe、binding、executor、summary/readout helpers 独立加载，使用同一 operator、输入、public validation 和 target。H20 GPU 6，B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，三个 contracts 共 108 点，warmup=3，repetitions=20；public 交错采样，peak 在 Graph capture 前测量。两侧均用 4 GiB cap 以排除基线 estimate 拒绝，生产默认仍为 1 GiB。原始记录 `benchmark_results/normalized_native_ab.json`。
+
+| contract | 点数 | public 几何平均下降 | Graph 几何平均下降 | peak allocated 几何平均下降 | peak incremental 几何平均下降 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| output-only | 36 | 35.65% | 39.24% | 40.26% | 55.74% |
+| final-state | 36 | 33.01% | 39.03% | 37.99% | 51.02% |
+| continuation | 36 | 35.48% | 41.85% | 41.84% | 62.32% |
+
+全矩阵 public 下降 34.72%，Graph 下降 40.05%，peak allocated 下降 40.05%，peak incremental 下降 56.61%；108 点四项均无回退，最大实测 peak 273.52 MiB。单调用 activity 11/14→5，T8192 递归 carry 15/18→9，continuation 23/29→11。前后全部 output 与所有返回的 memory/key_sum 均逐位一致，包括 continuation；FLA 不作本次正确性 oracle 或收益分母。
+
+未约束 source-bitwidth 的 BF16 raw-load 探针使 Triton dot operand `kWidth=1→2`，改变 summary 累加顺序；B1/H8/T8192 continuation 一个 State 元素越过既有容差。纯 `mov.b32` 不阻止 compiler 回溯，已删除；最终 FP32 seam 使用非 pure bitwise move，恢复 `kWidth=1` 和逐位 parity，不新增 global allocation 或 kernel launch。此处编译器约束必须保留，不能因 load 已转 FP32 而删除。
+
+workspace 按实际 output 与独立 summary/carry、递归 group buffers 收费：`4*H*V` bytes/token，`12*H*K*(V+1)` bytes/chunk/sequence，额外 boundary 覆盖 final States。默认 target 的 B2/H16/T8192 估计 273178624 bytes，实测单调用 incremental output-only 140509184、final-state 141033472、continuation 84942848 bytes；不提高默认上限。
+
+独立 FP32 recurrence 回归保留 T=63/64/65/130、17×35 State、非零 initial、exact-zero denominator + EPS、output-only/final-state/continuation，扩展 B/T/H 原布局与 query/key/value 2/1/2→4 grouped heads；BF16 输入无损提升为 FP32 后的 final States 逐位不变式锁定累加 seam。GPU normalized 17 passed，readout/rank-1 全套 57 passed，CPU selection/v2/binding/workspace 34 passed，Ruff 通过。额外 public smoke 验证 independent keys、四种 prior/post 组合、FP32/BF16、65+6 continuation，8/8 通过。B2/H16/T8192 continuation 独立 FP32 recurrence 的 memory 最大误差 0.001007080078125、key_sum 0，满足既有长序列 benchmark State 容差（rtol=0.01, atol=0.02）。两个不同 grouping 的长 scan 不要求短序列 oracle 的绝对容差；本次前后同合同 A/B 全部逐位一致。
+
+最终默认 target CLI：`../bench.sh --families normalized-linear --seqlens 64 2048 8192 --batches 2 --heads 16 --contract all --timing both --warmup 3 --repetitions 10 --gpu 6 --output-dir benchmark_results/normalized_native_public_smoke`，9/9 Meta records OK，覆盖最长默认 envelope。FLA final-state/continuation 仍被明确标为 output-only、不具可比 State 合同。64×64 native BF16 summary/readout 资源分别为 125/170 registers/thread、0 spills、32768/57344 bytes shared memory，均 4 warps。
+
+### 下一个重点：双 State summary/carry 调度
+
+短序列 staging activity 已移除，输出 kernel 已融合 contraction、EPS、divide、cast。下一步独立评估两个 State 的 summary/carry 合并：先减少 4 个 summary/carry launches 和 Python tensor bookkeeping，再比较长序列带宽、register/shared-memory 与递归 carry 成本。保留两个 named final States、独立初值和 continuation；不把跨 State 合并与 tile autotuning 同时引入。仍沿用完整 108 点 A/B 和独立 FP32 oracle，不以单点 Graph 收益替代 public 验收。
 
 
 
