@@ -20,6 +20,7 @@ from examples.linear_attention import (
     simple_gla_attention,
 )
 from examples.rebased_attention import rebased_attention
+from examples.hgrn import hgrn
 
 pytestmark = pytest.mark.unit
 
@@ -150,6 +151,36 @@ def test_scalar_decay_keeps_the_factorized_selection():
     assert plan.candidate.lowerer == "tilelang-scalar-factorized"
     costs = [estimate.cost for _, estimate in plan.candidate_estimates]
     assert costs == sorted(costs)
+
+
+def test_rank_one_identity_readout_uses_chunked_stateful_candidate():
+    operator = hgrn(1, 1, 512, 64)
+    compiled = operator.compile(
+        role_sizes=_sizes(operator, 64, 1),
+        target=Target(),
+        mode="dense",
+        optimized=True,
+    )
+    plan = compiled.operator._plans[compiled.specialization].plan
+    assert plan.candidate.lowerer == "tilelang-chunked-stateful"
+    assert plan.candidate.lowerer not in DENSE_SCAN
+@pytest.mark.parametrize("name", ["rwkv6", "gsa", "normalized-linear"])
+def test_reference_hotspots_select_chunked_stateful_candidate(name):
+    from testing.benchmark_stateful_plans import CASES, role_sizes_for
+
+    case = next(case for case in CASES if case.name == name)
+    operator = case.factory(**case.kwargs(65))
+    compiled = operator.compile(
+        role_sizes=role_sizes_for(operator, case, 65),
+        target=Target(),
+        mode="dense",
+        optimized=True,
+    )
+    plan = compiled.operator._plans[compiled.specialization].plan
+    assert plan.candidate.lowerer == "tilelang-chunked-stateful"
+    assert plan.mathematical_plan.representation == "chunked-stateful"
+
+
 
 
 def test_estimates_are_inspectable_with_all_three_components():

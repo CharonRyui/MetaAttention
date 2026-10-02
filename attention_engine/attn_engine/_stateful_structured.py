@@ -139,6 +139,22 @@ def product_feature_chunked_eligibility(algorithm: Any) -> Eligibility:
     ):
         return False, "no-product-feature-state"
     return True, None
+def chunked_stateful_eligibility(algorithm: Any) -> Eligibility:
+    """Return whether the generic typed State schedule can run in chunks."""
+    from ._stateful_chunked import chunked_states_eligible
+    from .stateful_operator import ProductFeatureRole
+
+    if any(
+        isinstance(role, ProductFeatureRole)
+        for state in algorithm.states
+        for role in state.feature_roles
+    ):
+        return False, "product-feature-state-uses-specialized-schedule"
+    if not chunked_states_eligible(algorithm):
+        return False, "program-is-not-chunked-eligible"
+    return True, None
+
+
 
 
 RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
@@ -149,6 +165,7 @@ RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
     "rank-one-factorized": rank_one_eligibility,
     "shared-state-contraction": shared_state_contraction_eligibility,
     "product-feature-chunked": product_feature_chunked_eligibility,
+    "chunked-stateful": chunked_stateful_eligibility,
 }
 
 

@@ -20,7 +20,7 @@ import json
 import statistics
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -98,6 +98,7 @@ class Case:
         return values
 
 
+
 CASES = (
     Case("linear", linear_attention),
     Case("simple-gla", simple_gla_attention),
@@ -123,6 +124,70 @@ CASES = (
     Case("mamba2", mamba2, signature=("B", "HQ", "S", "D", "DV")),
     Case("retnet", retnet_recurrent, signature=("B", "H", "S", "D", "DV")),
 )
+MATRIX_BATCHES = (1, 2)
+MATRIX_HEADS = (1, 8, 16)
+MATRIX_SEQLENS = (63, 64, 65, 130, 2048, 8192)
+
+
+def expand_matrix(
+    cases=CASES,
+    *,
+    batches=MATRIX_BATCHES,
+    heads=MATRIX_HEADS,
+    seqlens=MATRIX_SEQLENS,
+):
+    """Return the deterministic ``(Case, seqlen)`` matrix workload list.
+
+    This helper only clones shape metadata; it does not construct an operator or
+    allocate tensors, so callers can use it for planning and CPU-only tests.
+    The case's feature dimensions are deliberately preserved, including
+    non-square state dimensions such as GSA's key/slot/value axes.
+    """
+    batches = tuple(batches)
+    heads = tuple(heads)
+    seqlens = tuple(seqlens)
+    if not batches or not heads or not seqlens:
+        raise ValueError("matrix axes must not be empty")
+    if any(value < 1 for value in (*batches, *heads, *seqlens)):
+        raise ValueError("matrix axes must be positive")
+    return tuple(
+        (
+            replace(case, batch=batch, heads=head),
+            seqlen,
+        )
+        for case in cases
+        for batch in batches
+        for head in heads
+        for seqlen in seqlens
+    )
+
+
+MATRIX_RECORD_FIELDS = (
+    "family",
+    "batch",
+    "heads",
+    "seqlen",
+    "contract",
+    "status",
+    "device",
+    "lowerer",
+    "mathematical_representation",
+    "rewrites",
+    "static_estimate",
+    "kernel_ms",
+    "public_cuda_event_ms",
+    "graph_ms",
+    "total_launches",
+    "peak_allocated_bytes",
+    "peak_reserved_bytes",
+    "meta_correctness",
+    "fla_correctness",
+)
+
+
+def matrix_record_schema(record: dict) -> dict:
+    """Return the stable, JSON-safe matrix subset of a measurement record."""
+    return {name: record.get(name) for name in MATRIX_RECORD_FIELDS}
 
 
 def role_sizes_for(operator, case: Case, seqlen: int) -> dict:
@@ -631,6 +696,7 @@ def measure(
               "timing_units": "milliseconds", "ratio_direction": "FLA / Meta (>1 means Meta faster)",
               "input_layout": "B,H,T,features; preparation inside public-call intervals",
               "initial_state": "zero; continuation suffix receives actual prefix final-State"}
+    record["fla_correctness"] = None
     record["contract_scope"] = (
         "one public call; output only" if contract == "output-only" else
         "one public call; all declared final States" if contract == "final-state" else
@@ -642,9 +708,17 @@ def measure(
         record.update(status="COMPILE_REJECTED", error=f"{error.category} at {error.path}")
         return record
     plan = compiled.operator._plans[compiled.specialization]
-    record.update(lowerer=plan.plan.candidate.lowerer,
-                  representation=plan.plan.mathematical_plan.representation.value,
-                  rewrites=list(plan.plan.mathematical_plan.rewrites))
+    selected_estimate = next(
+        estimate for identity, estimate in plan.plan.candidate_estimates
+        if identity == plan.plan.candidate.identity
+    )
+    record.update(
+        lowerer=plan.plan.candidate.lowerer,
+        representation=plan.plan.mathematical_plan.representation.value,
+        mathematical_representation=plan.plan.mathematical_plan.representation.value,
+        rewrites=list(plan.plan.mathematical_plan.rewrites),
+        static_estimate=asdict(selected_estimate),
+    )
     workspace = plan.plan.workspace
     record.update(workspace_bytes_per_token=workspace.bytes_per_token,
                   workspace_bytes_per_chunk=workspace.bytes_per_chunk,
@@ -712,12 +786,19 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seqlen", type=int, nargs="+", default=[512, 2048, 8192])
     parser.add_argument("--families", help="comma separated family names")
+    parser.add_argument("--matrix-families", dest="matrix_families", help="matrix-only comma separated family names")
+    parser.add_argument("--matrix-cases", dest="matrix_families", help=argparse.SUPPRESS)
     parser.add_argument("--heads", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--json", type=Path, help="write the records as JSON")
     parser.add_argument("--contract", choices=(*CONTRACTS, "all"), default="final-state")
+    parser.add_argument("--matrix-contract", choices=(*CONTRACTS, "all"), default=None)
     parser.add_argument("--timing", choices=("e2e", "graph", "both"), default="both")
+    parser.add_argument("--matrix", action="store_true", help="run the deterministic B/H/T matrix (opt-in)")
+    parser.add_argument("--matrix-batches", type=int, nargs="+", default=MATRIX_BATCHES)
+    parser.add_argument("--matrix-heads", type=int, nargs="+", default=MATRIX_HEADS)
+    parser.add_argument("--matrix-seqlens", type=int, nargs="+", default=MATRIX_SEQLENS)
     parser.add_argument(
         "--fla",
         action="store_true",
@@ -728,33 +809,52 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     device = torch.device("cuda")
-    wanted = set(args.families.split(",")) if args.families else None
+    family_arg = args.matrix_families if args.matrix and args.matrix_families else args.families
+    wanted = set(family_arg.split(",")) if family_arg else None
     known = {case.name for case in CASES}
     if wanted is not None and not wanted <= known:
         parser.error(f"unknown families: {sorted(wanted - known)}")
-    contracts = CONTRACTS if args.contract == "all" else (args.contract,)
-    if args.warmup < 0 or args.repetitions < 1 or any(length < (2 if "continuation" in contracts else 1) for length in args.seqlen):
-        parser.error("positive lengths/repetitions and nonnegative warmup required; continuation needs >=2 tokens")
+    contract_arg = args.matrix_contract if args.matrix and args.matrix_contract else args.contract
+    contracts = CONTRACTS if contract_arg == "all" else (contract_arg,)
+    if args.warmup < 0 or args.repetitions < 1:
+        parser.error("positive repetitions and nonnegative warmup required")
     if args.heads is not None and args.heads < 1:
         parser.error("heads must be positive")
+    if args.matrix:
+        if args.heads is not None:
+            parser.error("--heads cannot be combined with --matrix; use --matrix-heads")
+        workloads = expand_matrix(
+            tuple(case for case in CASES if wanted is None or case.name in wanted),
+            batches=args.matrix_batches,
+            heads=args.matrix_heads,
+            seqlens=args.matrix_seqlens,
+        )
+    else:
+        if any(length < (2 if "continuation" in contracts else 1) for length in args.seqlen):
+            parser.error("positive lengths; continuation needs >=2 tokens")
+        workloads = tuple(
+            (replace(case, heads=args.heads) if args.heads else case, seqlen)
+            for seqlen in args.seqlen
+            for case in CASES
+            if wanted is None or case.name in wanted
+        )
     records = []
-    for seqlen in args.seqlen:
-        for case in CASES:
-            if wanted is not None and case.name not in wanted:
-                continue
-            case = (
-                Case(**{**case.__dict__, "heads": args.heads}) if args.heads else case
+    for case, seqlen in workloads:
+        for contract in contracts:
+            if seqlen < (2 if contract == "continuation" else 1):
+                parser.error("positive lengths; continuation needs >=2 tokens")
+            torch.manual_seed(42)
+            record = measure(
+                case, seqlen, device, args.warmup, args.repetitions,
+                fla=args.fla, contract=contract, timing=args.timing,
             )
-            for contract in contracts:
-                torch.manual_seed(42)
-                record = measure(
-                    case, seqlen, device, args.warmup, args.repetitions,
-                    fla=args.fla, contract=contract, timing=args.timing,
-                )
-                records.append(record)
-                _print_record(record)
+            records.append(record)
+            _print_record(matrix_record_schema(record) if args.matrix else record)
     if args.json is not None:
-        args.json.write_text(json.dumps(records, indent=2))
+        args.json.write_text(json.dumps(
+            [matrix_record_schema(record) for record in records] if args.matrix else records,
+            indent=2,
+        ))
     if any(record["status"] != "OK" for record in records):
         raise SystemExit("Meta measurement failed; see records (FLA diagnostics do not determine this status)")
 

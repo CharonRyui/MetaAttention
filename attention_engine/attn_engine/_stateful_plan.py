@@ -24,6 +24,7 @@ class PlanRepresentation(str, Enum):
     SCALAR_FACTORIZED = "scalar-factorized"
     FACTORED_RECURRENCE = "factored-recurrence"
     PRODUCT_FEATURE_CHUNKED = "product-feature-chunked"
+    CHUNKED_STATEFUL = "chunked-stateful"
     STATEFUL_REFERENCE = "stateful-reference"
 
 
@@ -96,6 +97,14 @@ PLAN_RULES = {
         PlanRepresentation.PRODUCT_FEATURE_CHUNKED,
         (
             "typed-product-feature-injections",
+            "chunk-boundary-state-carries",
+            "typed-readout-expressions",
+        ),
+    ),
+    PlanRepresentation.CHUNKED_STATEFUL: PlanRule(
+        PlanRepresentation.CHUNKED_STATEFUL,
+        (
+            "typed-stateful-injections",
             "chunk-boundary-state-carries",
             "typed-readout-expressions",
         ),
@@ -338,10 +347,12 @@ class CandidateLowerer:
                 3,
                 heads * (summary + 2 * state) * 4,
             )
-        if representation is PlanRepresentation.PRODUCT_FEATURE_CHUNKED:
-            # The chunked ProductFeature schedule keeps boundary carries and
-            # contracted outputs; it does not materialize the generic dense
-            # summary matrices charged by the reference executor.
+        if representation in {
+            PlanRepresentation.PRODUCT_FEATURE_CHUNKED,
+            PlanRepresentation.CHUNKED_STATEFUL,
+        }:
+            # The chunked schedule keeps boundary carries and contracted
+            # outputs; it does not materialize a token-sized State history.
             return CandidateEstimate(
                 True,
                 heads * (3 * shape.state_total_elements + shape.columns) * 4,
@@ -431,6 +442,11 @@ LOWERERS = (
         "tilelang-product-feature-chunked",
         (PlanRepresentation.PRODUCT_FEATURE_CHUNKED,),
         "product-feature-chunked",
+    ),
+    CandidateLowerer(
+        "tilelang-chunked-stateful",
+        (PlanRepresentation.CHUNKED_STATEFUL,),
+        "chunked-stateful",
     ),
     CandidateLowerer(
         "reference-stateful",
@@ -856,10 +872,22 @@ def compile_plan(
     from ._stateful_structured import product_feature_chunked_eligibility
 
     product_feature_chunked = (
-        mode == "dense"
+        optimized
+        and mode == "dense"
         and backward_ir is None
         and target.device_type == "cuda"
         and product_feature_chunked_eligibility(operator.algorithm)[0]
+    )
+
+    from ._stateful_chunked import chunked_states_eligible
+
+    chunked_stateful = (
+        optimized
+        and mode == "dense"
+        and backward_ir is None
+        and target.device_type == "cuda"
+        and chunked_states_eligible(operator.algorithm)
+        and not product_feature_chunked
     )
     reference_required = requires_reference_lowering(operator.algorithm)
     rewrites = _structured_rewrites(structural_features) if optimized else ()
@@ -873,7 +901,9 @@ def compile_plan(
             representations.append(PlanRepresentation.FACTORED_RECURRENCE)
     if product_feature_chunked:
         representations.append(PlanRepresentation.PRODUCT_FEATURE_CHUNKED)
-    if reference_required:
+    if chunked_stateful:
+        representations.append(PlanRepresentation.CHUNKED_STATEFUL)
+    if reference_required and not chunked_stateful:
         representations.append(PlanRepresentation.STATEFUL_REFERENCE)
     if not representations:
         representations.append(PlanRepresentation.GENERIC_DENSE_AFFINE)

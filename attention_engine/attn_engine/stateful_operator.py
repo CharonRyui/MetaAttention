@@ -966,13 +966,19 @@ class StatefulOperator:
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
         from ._stateful_reference import requires_reference_lowering
-        from ._stateful_structured import product_feature_chunked_eligibility
+        from ._stateful_structured import (
+            chunked_stateful_eligibility,
+            product_feature_chunked_eligibility,
+        )
 
         if (
             product_feature_chunked_eligibility(self.algorithm)[0]
             and plan.runtime_family == "product-feature-chunked"
+        ) or (
+            chunked_stateful_eligibility(self.algorithm)[0]
+            and plan.runtime_family == "chunked-stateful"
         ):
-            return self._execute_product_feature_chunked(
+            return self._execute_reference(
                 runtime, role_sizes, inputs, initial_states, return_final_state
             )
         if requires_reference_lowering(self.algorithm):
