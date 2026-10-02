@@ -2,8 +2,8 @@
 
 Direct interval products use parallel associative scans, including signed/zero
 factors. No reciprocal, log difference or reconstructed prefix quotient occurs.
-Each target contracts weighted factors with TF32x3 GEMMs; no token States are
-stored. Chunk summaries likewise use weighted key/value block GEMMs.
+Bounded target tiles contract weighted factors with FP32 reductions; no token
+States are stored. Chunk summaries use TF32x3 weighted key/value block GEMMs.
 """
 from __future__ import annotations
 
@@ -74,10 +74,13 @@ def _block_readout(GR, GC, K, K2, V, Q, Q2, Carry, Output,
                    LENGTH: tl.constexpr, HEADS: tl.constexpr,
                    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
                    UNIT_ROWS: tl.constexpr, UNIT_COLS: tl.constexpr, PRIOR: tl.constexpr,
-                   KL: tl.constexpr, KR: tl.constexpr, QL: tl.constexpr, QR: tl.constexpr):
-    sh, target_index, cb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+                   KL: tl.constexpr, KR: tl.constexpr, QL: tl.constexpr, QR: tl.constexpr,
+                   TARGETS: tl.constexpr):
+    sh, target_block, cb = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seq, head = sh // HEADS, sh % HEADS
-    chunk, target = target_index // 64, target_index % 64
+    chunk = target_block // (64 // TARGETS)
+    target = (target_block % (64 // TARGETS)) * TARGETS + tl.arange(0, TARGETS)
+    target_index = chunk * 64 + target
     # Prior contraction targets S_(t-1), not a pre-decayed S_t.
     end = target - 1 if PRIOR else target
     local = tl.arange(0, 64)
@@ -85,42 +88,53 @@ def _block_readout(GR, GC, K, K2, V, Q, Q2, Carry, Output,
     flat = (seq * LENGTH + t) * HEADS + head
     qflat = (seq * LENGTH + target_index) * HEADS + head
     c = cb * 32 + tl.arange(0, 32)
-    cg = tl.full((64, 32), 1.0, tl.float32)
-    if not UNIT_COLS:
-        cg = tl.load(GC + (flat[:, None] + HEADS) * COLS + c[None, :],
-                     (local[:, None] < end) & (t[:, None] + 1 < LENGTH) & (c[None, :] < COLS), 1.0)
-    column_suffix = tl.associative_scan(cg, 0, _multiply, reverse=True)
-    column_prefix = tl.sum(tl.where(local[:, None] == 0, column_suffix, 0.0), 0)
-    if not UNIT_COLS:
-        column_prefix *= tl.load(GC + ((seq * LENGTH + chunk * 64) * HEADS + head) * COLS + c,
-                                 (end >= 0) & (c < COLS), 1.0)
-    scores = tl.full((16, 64), 0.0, tl.float32)
-    boundary = tl.full((16, 32), 0.0, tl.float32)
+    scores = tl.full((TARGETS, 64), 0.0, tl.float32)
+    boundary = tl.full((TARGETS, 32), 0.0, tl.float32)
     for rb in range(tl.cdiv(ROWS, 32)):
         r = rb * 32 + tl.arange(0, 32)
         rg = tl.full((32, 64), 1.0, tl.float32)
         if not UNIT_ROWS:
             rg = tl.load(GR + (flat[None, :] + HEADS) * ROWS + r[:, None],
-                         (local[None, :] < end) & (t[None, :] + 1 < LENGTH) & (r[:, None] < ROWS), 1.0)
-        row_suffix = tl.associative_scan(rg, 1, _multiply, reverse=True)
-        row_prefix = tl.sum(tl.where(local[None, :] == 0, row_suffix, 0.0), 1)
+                         (local[None, :] < 63) & (t[None, :] + 1 < LENGTH)
+                         & (r[:, None] < ROWS), 1.0)
+        rg = tl.where(local[None, None, :] < end[:, None, None], rg[None, :, :], 1.0)
+        row_suffix = tl.associative_scan(rg, 2, _multiply, reverse=True)
+        row_prefix = tl.sum(tl.where(local[None, None, :] == 0, row_suffix, 0.0), 2)
         if not UNIT_ROWS:
-            row_prefix *= tl.load(GR + ((seq * LENGTH + chunk * 64) * HEADS + head) * ROWS + r,
-                                  (end >= 0) & (r < ROWS), 1.0)
-        q = _factor(Q, Q2, qflat, r, ROWS, QL, QR, target_index < LENGTH)
-        # Matrix dot has a hardware minimum of 16 rows; only row zero is stored.
-        qq = tl.broadcast_to(q[None, :], (16, 32))
+            first_row = tl.load(GR + ((seq * LENGTH + chunk * 64) * HEADS + head) * ROWS + r,
+                                r < ROWS, 1.0)
+            row_prefix *= tl.where(end[:, None] >= 0, first_row[None, :], 1.0)
+        q = _factor(Q, Q2, qflat[:, None], r[None, :], ROWS, QL, QR,
+                    target_index[:, None] < LENGTH)
         key = _factor(K, K2, flat[None, :], r[:, None], ROWS, KL, KR,
-                      (local[None, :] <= end) & (t[None, :] < LENGTH))
-        scores += tl.dot(qq, key * row_suffix, input_precision="tf32x3")
+                      t[None, :] < LENGTH)
+        weighted_key = key[None, :, :] * row_suffix
+        scores += tl.sum(q[:, :, None] * weighted_key, 1)
         state = tl.load(Carry + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
                         (r[:, None] < ROWS) & (c[None, :] < COLS), 0.0)
-        boundary += tl.dot(qq * row_prefix[None, :], state, input_precision="tf32x3")
+        boundary += tl.sum((q * row_prefix)[:, :, None] * state[None, :, :], 1)
+    scores = tl.where(local[None, :] <= end[:, None], scores, 0.0)
+    cg = tl.full((64, 32), 1.0, tl.float32)
+    if not UNIT_COLS:
+        cg = tl.load(GC + (flat[:, None] + HEADS) * COLS + c[None, :],
+                     (local[:, None] < 63) & (t[:, None] + 1 < LENGTH)
+                     & (c[None, :] < COLS), 1.0)
+    # Share source factors across a bounded target tile. Products remain direct
+    # source-to-target scans, so signed and exactly-zero gates need no inverse.
+    cg = tl.where(local[None, :, None] < end[:, None, None], cg[None, :, :], 1.0)
+    column_suffix = tl.associative_scan(cg, 1, _multiply, reverse=True)
+    column_prefix = tl.sum(tl.where(local[None, :, None] == 0, column_suffix, 0.0), 1)
+    if not UNIT_COLS:
+        first_column = tl.load(GC + ((seq * LENGTH + chunk * 64) * HEADS + head) * COLS + c,
+                               c < COLS, 1.0)
+        column_prefix *= tl.where(end[:, None] >= 0, first_column[None, :], 1.0)
     value = tl.load(V + flat[:, None] * COLS + c[None, :],
-                    (local[:, None] <= end) & (t[:, None] < LENGTH) & (c[None, :] < COLS), 0.0)
-    out = boundary * column_prefix[None, :] + tl.dot(scores, value * column_suffix, input_precision="tf32x3")
-    result = tl.sum(tl.where(tl.arange(0, 16)[:, None] == 0, out, 0.0), 0)
-    tl.store(Output + qflat * COLS + c, result, (target_index < LENGTH) & (c < COLS))
+                    (t[:, None] < LENGTH) & (c[None, :] < COLS), 0.0)
+    weighted_value = tl.where(local[None, :, None] <= end[:, None, None],
+                              value[None, :, :], 0.0) * column_suffix
+    result = boundary * column_prefix + tl.sum(scores[:, :, None] * weighted_value, 1)
+    tl.store(Output + qflat[:, None] * COLS + c[None, :], result,
+             (target_index[:, None] < LENGTH) & (c[None, :] < COLS))
 
 
 def diagonal_block_summary(rows_gate, columns_gate, key, key2, value, scale, bias,
@@ -139,8 +153,9 @@ def diagonal_block_readout(carry, factors, query, query2, output, *, sequence_le
     bh, chunks, rows, columns = carry.shape
     gr, gc, key, key2, value, kl, kr = factors
     heads = key.shape[1]
-    _block_readout[(bh, sequence_length, triton.cdiv(columns, 32))](
+    targets = 2
+    _block_readout[(bh, triton.cdiv(sequence_length, targets), triton.cdiv(columns, 32))](
         gr, gc, key, key2, value, query, query2, carry, output,
         sequence_length, heads, rows, columns, chunks, gr is None, gc is None,
-        prior, kl, kr, ql, qr, num_warps=4, enable_fp_fusion=False,
+        prior, kl, kr, ql, qr, targets, num_warps=4, enable_fp_fusion=False,
     )

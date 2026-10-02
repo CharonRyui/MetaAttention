@@ -16,7 +16,7 @@ expression tensor is required by the evaluator itself.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 import torch
 
@@ -68,6 +68,7 @@ class CompiledExpression:
         "_roots",
         "_nodes",
         "_output_dtype",
+        "_kernel_identity",
         "_name_roots",
         "_leaf_names",
         "_state_leaves",
@@ -137,6 +138,10 @@ class CompiledExpression:
             return index
 
         self._roots = tuple(visit(root) for root in roots_expr)
+        self._kernel_identity = (
+            tuple((node.kind, node.expression, node.children) for node in self._nodes),
+            self._roots,
+        )
         self._leaf_names = tuple(
             node.expression.name
             for node in self._nodes

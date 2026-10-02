@@ -26,6 +26,52 @@ except ImportError:  # pragma: no cover - exercised only without Triton installe
 _CACHE: dict[tuple[Any, ...], Any] = {}
 
 
+def _descriptor_cache_key(source: Any) -> tuple[Any, ...]:
+    """Return metadata that changes a descriptor's generated address formula.
+
+    Runtime strides remain launch arguments, so they deliberately do not belong
+    in the key.  The role order, extents, grouping, and other values below are
+    embedded in the generated source and therefore must distinguish kernels.
+    """
+    if not _descriptor(source):
+        return ("tensor",)
+    return (
+        "descriptor",
+        tuple(source.source_roles),
+        tuple(source.feature_roles),
+        tuple(int(extent) for extent in source.source_shape),
+        int(source.target_heads),
+        int(source.head_group_size),
+        source.mode,
+        None if source.sequence_length is None else int(source.sequence_length),
+        int(source.storage_offset),
+    )
+
+
+def _kernel_cache_key(
+    compiled: Any,
+    sources: Sequence[Any],
+    outputs: Sequence[torch.Tensor],
+    block: int,
+) -> tuple[Any, ...]:
+    """Identify generated source without retaining tensor identities.
+
+    Node expressions are frozen/hashable IR values.  Keeping the expressions,
+    node edges, and roots in the key distinguishes operators, constants, and
+    output ordering even when their node counts and shapes happen to match.
+    """
+    expression, roots = compiled._kernel_identity
+    return (
+        expression,
+        roots,
+        tuple(t.dtype for t in (s.tensor if _descriptor(s) else s for s in sources)),
+        tuple(o.dtype for o in outputs),
+        tuple(_logical_shape(s) for s in sources),
+        tuple(_descriptor_cache_key(s) for s in sources),
+        int(block),
+    )
+
+
 def _descriptor(source: Any) -> bool:
     return hasattr(source, "source_roles") and hasattr(source, "source_strides")
 
@@ -190,10 +236,7 @@ def launch_expression(compiled: Any, bindings: Mapping[str, Any], states: Mappin
     device = tensors[0].device
     result_dtype = output_dtype or (sources[0].dtype if hasattr(sources[0], "dtype") else tensors[0].dtype)
     outputs = [torch.empty(shape, device=device, dtype=result_dtype) for _ in compiled._roots]
-    key = (
-        compiled.node_count, len(outputs), tuple(t.dtype for t in tensors),
-        tuple(o.dtype for o in outputs), tuple(_logical_shape(s) for s in sources),
-    )
+    key = _kernel_cache_key(compiled, sources, outputs, 128)
     kernel = _CACHE.get(key)
     if kernel is None:
         kernel = _make_kernel(compiled, sources, (), compiled._roots, [o.dtype for o in outputs], 128)

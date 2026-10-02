@@ -177,8 +177,9 @@ def test_oversized_softmax_region_preserves_executor_fallback(gpu_device):
 
 @pytest.mark.parametrize("axes", ["scalar", "row", "column", "dual"])
 @pytest.mark.parametrize("prior", [False, True])
-def test_parallel_diagonal_block_fp32_oracle(gpu_device, axes, prior):
-    host, _ = _inputs(gpu_device, 35, 23, length=137)
+@pytest.mark.parametrize("length", [1, 63, 64, 65, 137])
+def test_parallel_diagonal_block_fp32_oracle(gpu_device, axes, prior, length):
+    host, _ = _inputs(gpu_device, 35, 23, length=length)
     key, value, query, gr, gc, initial = host
     row, column = axes != "column", axes in ("column", "dual")
     if axes == "scalar":
@@ -187,7 +188,7 @@ def test_parallel_diagonal_block_fp32_oracle(gpu_device, axes, prior):
     data = tuple(t.to(gpu_device) for t in host)
     prepared, final = _prepare(data, row=row, column=column)
     actual = read_state(prepared[0], prepared[1], data[2].flatten(0, 1),
-                        sequence_length=137, prior=prior, identity=False)
+                        sequence_length=length, prior=prior, identity=False)
     before, after, expected_final = _states(host, row=row, column=column)
     selected = before if prior else after
     expected = torch.stack([
@@ -196,6 +197,24 @@ def test_parallel_diagonal_block_fp32_oracle(gpu_device, axes, prior):
     ], 1)
     torch.testing.assert_close(actual.reshape_as(expected).cpu(), expected, rtol=2e-4, atol=2e-5)
     torch.testing.assert_close(final.cpu(), expected_final, rtol=2e-4, atol=2e-5)
+    if length > 64:
+        # A nonaligned split changes both chunk and two-target tile phase.
+        split = 17
+        prefix_data = tuple(t[:, :split] for t in data[:-1]) + (data[-1],)
+        prefix, prefix_final = _prepare(prefix_data, row=row, column=column)
+        prefix_output = read_state(
+            prefix[0], prefix[1], prefix_data[2].flatten(0, 1),
+            sequence_length=split, prior=prior, identity=False,
+        ).reshape(key.shape[0], split, key.shape[2], value.shape[-1])
+        suffix_data = tuple(t[:, split:] for t in data[:-1]) + (prefix_final,)
+        suffix, suffix_final = _prepare(suffix_data, row=row, column=column)
+        suffix_output = read_state(
+            suffix[0], suffix[1], suffix_data[2].flatten(0, 1),
+            sequence_length=length - split, prior=prior, identity=False,
+        ).reshape(key.shape[0], length - split, key.shape[2], value.shape[-1])
+        continued = torch.cat((prefix_output, suffix_output), 1)
+        torch.testing.assert_close(continued.cpu(), expected, rtol=2e-4, atol=2e-5)
+        torch.testing.assert_close(suffix_final.cpu(), expected_final, rtol=2e-4, atol=2e-5)
 
 
 @pytest.mark.parametrize("prior", [False, True])
