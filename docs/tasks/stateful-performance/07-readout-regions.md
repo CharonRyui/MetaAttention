@@ -105,6 +105,45 @@ direct carry 在读取当前 summary 后原地写 exclusive carry，对最多 64
 
 
 
+### 单 chunk 无消费者 summary/carry 消除
+
+固定接续基线为 `b6af87d`，不重复归因前两轮收益。`_prepare_normalized_pair` 对单个 64-token chunk 直接把原 initial States 作为 exclusive carry；output-only 不创建 summary/carry 或 final tensors、不启动 summary/scan。requested finals 仍用原 32×32、`tf32x3` summary dot 与 denominator 单位 value dot，随后进行独立 FP32 `initial + summary`，写入两个新分配 finals；`enable_fp_fusion=False` 禁止把 initial 融入 dot accumulator。此分支只依赖合法 native recipe 和 runtime chunks=1，不按模型或特定 B/H dispatch。readout 数学、输入 layout/Head Mapping、EPS、prior flags、BF16 编译约束及 public validation 不变，所有 multi-chunk recurrence/scan 路径不变。
+
+Finals 使用专用 `_identity_final_native_pair` launch，但复用同一个 `_identity_summary_body` 数学；原 `_identity_pairs_native_pair` 的长路径参数不变。初版向通用 paired summary launch 加入两个可选 initial 参数，虽全 108 点 gates 通过，但未变长路径 public 几何平均增加 0.57%，B2/H16/T65 output-only 首轮增加 6.47%、复测中值 4.46%；记录 `normalized_single_chunk_optional_args_ab.json`。移除通用 launch 参数扩张后重新验证，不用缩小矩阵或隐藏微小回退宣布成功。
+
+
+单调用结构目标为 output-only 3→1、final-state 3→2；T63/64/65 continuation 的两段都≤64，按两次 final-state 调用与 concat 计 7→5；T130 split65/65 不进入新分支。默认 workspace 收费与 1 GiB cap 保留现有保守值。
+
+实测 public smoke：B1/H1/T64 output-only 旧 activity 为 summary 3.008 µs、carry 0.864 µs、readout 7.616 µs；新仅 readout 7.744 µs。100 次 cProfile 仅用于定位 host 开销，不当正式计时：调用总 cumtime 0.051→0.038 s，Triton launches 300→100，`torch.empty` 300→100；原始记录 `normalized_single_chunk_baseline_profile.json`/`normalized_single_chunk_current_profile.json`。
+
+GPU 行为回归 normalized 42 passed（新增 independent-key T64/BTH 的四 prior/post×两 dtype），readout/rank1/hierarchical 共 60 passed。CPU selection/bindings/workspace/v2 为 33 passed、1 deselected；明确跳过上轮已证明在基线/当前同样失败的未固定 seed backward case，不修改其测试或容差。修改的 Python 文件 Ruff 全部通过。
+
+`normalized_single_chunk_behavior.json` 35 个独立 public 场景全部通过：相对 `b6af87d` 的 output-only、final-state、continuation（含 prefix finals）逐位一致；独立 FP32 recurrence 保持 FP32 2e-4/2e-5、BF16 output 1e-2/2e-5 原容差。覆盖 T1/31/63/64/65/71/130、独立 denominator key、四种 prior、nonzero/supplied/cached-zero initials、signed ±zero、抵消、exact-zero denominator+EPS1e-10、无 Head 输入广播、混合轴置换、同 compiled callable T64→65→31→64、T4097 recursive tail 和 BF16 lossless promotion 的所有 final States。Dense T0 检查两侧同样 `RUNTIME_SHAPE` 拒绝，不扩展为新的空序列合同。
+
+Smoke 初版三个 fixture 错误（假定 dense T0 有效、无 Head 却留下 undeclared Head role_sizes/mappings、置换后错误地取 roles[-1] 为 Feature）保留在 `normalized_single_chunk_behavior_fixture_failure.json`，修正 fixtures，不修改 public validation 来放行。早期 A/B profiler `record_function` 生成同名 CUDA annotation，误计为 activity，已从探针删除；首轮失败保留 `normalized_single_chunk_profile_annotation_quick.json`，不当 kernel 证据。
+
+专用 final launch 切换后再次运行默认 Target CLI：`../bench.sh --families normalized-linear --seqlens 63 64 65 130 2048 8192 --batches 1 2 --heads 1 8 16 --contract all --timing both --warmup 3 --repetitions 20 --gpu 6 --output-dir benchmark_results/normalized_single_chunk_public_smoke`。`records.json` Meta 108/108 `OK`，最大 B2/H16/T8192 三 contracts 通过，cap/workspace 不变。FLA 108/108 runtime `OK`，其中 72 个 final-state/continuation records 保持 output-only、不可比，不作本轮收益/State oracle。
+
+#### 最终同合同 A/B
+
+`benchmark_results/normalized_single_chunk_ab.json`：固定 `b6af87d` 与当前源码快照，H20 UUID `GPU-b4d0a767-f523-7e86-ba91-d97ce67b4359`；B∈{1,2}、H∈{1,8,16}、T∈{63,64,65,130,2048,8192}、K=V=64、三 contracts，默认 `Target()`/1 GiB cap。warmup=3、repetitions=20，public CUDA events 与同步 CPU wall 分开调用、交错轮换 before/after；Graph 每次只保留一个 fresh pool；peak 在任何 capture 前、只预热被测版本。任一首轮 timing 回退保留原始结果并加两轮复测，gate 用三轮 ratio 中值，阈值 ≤1.05；完整 108/108 `PASS`，共 224 个 timing rounds。下表只用首轮 raw medians 计算几何平均下降，不用复测替换初始收益。
+
+| contract | 点数 | public 下降 | CPU wall 下降 | Graph 下降 | peak allocated 下降 | peak incremental 下降 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| output-only | 36 | 8.99% | 9.74% | 10.22% | 9.26% | 31.02% |
+| final-state | 36 | 5.70% | 5.04% | 2.78% | 7.24% | 15.74% |
+| continuation | 36 | 6.89% | 7.31% | 3.30% | 3.60% | 7.53% |
+| 全部 | 108 | 7.20% | 7.38% | 5.49% | 6.73% | 18.70% |
+
+实际改变的 42 点（T63/64 三 contracts、T65 continuation）首轮 public/CPU/Graph 几何平均下降 17.32%/18.06%/13.54%，全部逐点改善；public 最差 after/before 0.89411。未改变的 66 点 public 下降 0.13%、CPU 增加 0.13%、Graph 增加 0.02%，不把这些差异归因于本次优化。首轮 public 最差增加 6.07%（B1/H1/T65 final-state），CPU 最差增加 5.76%（B1/H8/T65 final-state）；全矩阵复测中值最差 public/CPU/Graph 为 1.04110/1.04922/1.01224，不宣称逐点无回退或已达到 public ≥20% 的更高目标。
+
+所有 outputs、两个 named finals 与 continuation prefix finals 相对基线逐位一致；supplied/cached-zero initials 在调用、profiling、Graph 后均不变，finals 不别名 initials。108 点峰值均不增加，compiled kernels 全部 4 warps、0 spills。新 final kernel 为 167–182 registers/thread、32768 bytes shared；长 summary 仍为 165–168 registers/thread、32768 bytes shared，原 readout 未修改。B1/H1/T64 incremental peak：output-only 25088→8192 bytes、final-state 41984→25088 bytes、continuation 58880→50176 bytes。CUPTI 确认 activity 分别 3→1、3→2、7→5；B2/H16/T8192 三 contracts 的 activity 与峰值均不变。
+
+源码 SHA256、逐点 samples、CUPTI 原始 activities/priming、compiled resources、全部原始回退与复测均随 JSON 保留；35 场景 public behavior smoke 及 42+60 GPU tests 在专用 final launch 切换后重新全部通过。
+
+
+
+
 ## 原子提交
 本任务的有效代码、必要行为回归测试和观测证据一起提交。性能回退或错误实现不提交；明确记录失败，不缩小合同来宣称完成。共享文件由集成负责人修改；子代理不提交，不运行中途 build/lint/tests/formatters。GPU 验证由负责人检查空闲 GPU 与 workspace 风险后串行执行。
 

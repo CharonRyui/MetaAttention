@@ -113,6 +113,20 @@ def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
     rows, columns = initial.shape[-2:]
     bh = initial.shape[0] * heads
     chunks = triton.cdiv(sequence_length, 64)
+    if chunks == 1:
+        # The only exclusive carry is the initial State; no scratch is consumed.
+        if not return_final_state:
+            return initial, den_initial, None, None
+        from ._stateful_diagonal_kernels import _identity_final_native_pair
+
+        final, den_final = torch.empty_like(initial), torch.empty_like(den_initial)
+        tiles = triton.cdiv(rows, 32) * triton.cdiv(columns, 32)
+        _identity_final_native_pair[(bh, tiles + triton.cdiv(rows, 32))](
+            key, den_key, value, initial, den_initial, final, den_final,
+            sequence_length, heads, rows, columns, tiles,
+            ks, kg, dks, dkg, vs, vg, enable_fp_fusion=False,
+        )
+        return initial, den_initial, final, den_final
     carry = torch.empty((bh, chunks, rows, columns),
                         device=initial.device, dtype=torch.float32)
     den_carry = torch.empty((bh, chunks, rows, 1),

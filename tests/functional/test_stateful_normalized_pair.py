@@ -97,7 +97,7 @@ def _reference(inputs, memory, key_sum, prior_memory, prior_normalizer):
     (False, False), (False, True), (True, False), (True, True),
 ])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("length,layout", [(1, "bht"), (71, "bth")])
+@pytest.mark.parametrize("length,layout", [(1, "bht"), (64, "bth"), (71, "bth")])
 def test_normalized_independent_keys_prior_and_continuation(
     gpu_device, dtype, length, layout, prior_memory, prior_normalizer,
 ):

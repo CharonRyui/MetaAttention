@@ -24,6 +24,7 @@ def _identity_summary_body(
     KR: tl.constexpr, KL: tl.constexpr,
     NATIVE: tl.constexpr, KS: tl.constexpr, KG: tl.constexpr,
     VS: tl.constexpr, VG: tl.constexpr, UNIT_VALUE: tl.constexpr,
+    Initial=None,
 ):
     seq, head = sh // HEADS, sh % HEADS
     r = tile // tl.cdiv(COLS, 32) * 32 + tl.arange(0, 32)
@@ -62,6 +63,14 @@ def _identity_summary_body(
             0,
         )
     bias = tl.dot(k, v, input_precision="tf32x3")
+    if Initial is not None:
+        tl.static_assert(CHUNKS == 1)
+        # Match the direct prefix's separate FP32 initial + summary addition.
+        initial = tl.load(
+            Initial + (sh * ROWS + r[:, None]) * COLS + c[None, :],
+            (r[:, None] < ROWS) & (c[None, :] < COLS), 0.0,
+        )
+        bias = initial + bias
     tl.store(
         Bias + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
         bias,
@@ -104,6 +113,29 @@ def _identity_pairs_native_pair(
             DenKey, DenKey, V, DenBias, sh, chunk, tile - TILES,
             LENGTH, HEADS, ROWS, 1, CHUNKS, 0, ROWS,
             True, DKS, DKG, VS, VG, True,
+        )
+
+
+@triton.jit
+def _identity_final_native_pair(
+    K, DenKey, V, Initial, DenInitial, Final, DenFinal,
+    LENGTH: tl.constexpr, HEADS: tl.constexpr,
+    ROWS: tl.constexpr, COLS: tl.constexpr, TILES: tl.constexpr,
+    KS: tl.constexpr, KG: tl.constexpr, DKS: tl.constexpr, DKG: tl.constexpr,
+    VS: tl.constexpr, VG: tl.constexpr,
+):
+    sh, tile = tl.program_id(0), tl.program_id(1)
+    if tile < TILES:
+        _identity_summary_body(
+            K, K, V, Final, sh, 0, tile,
+            LENGTH, HEADS, ROWS, COLS, 1, 0, ROWS,
+            True, KS, KG, VS, VG, False, Initial,
+        )
+    else:
+        _identity_summary_body(
+            DenKey, DenKey, V, DenFinal, sh, 0, tile - TILES,
+            LENGTH, HEADS, ROWS, 1, 1, 0, ROWS,
+            True, DKS, DKG, VS, VG, True, DenInitial,
         )
 
 
