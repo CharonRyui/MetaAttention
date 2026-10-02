@@ -17,26 +17,14 @@ CHUNK = tl.constexpr(64)
 
 
 @triton.jit
-def _identity_pairs(
-    K,
-    K2,
-    V,
-    Bias,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    KR: tl.constexpr,
-    KL: tl.constexpr,
-    NATIVE: tl.constexpr = False,
-    KS: tl.constexpr = (), KG: tl.constexpr = 1,
-    VS: tl.constexpr = (), VG: tl.constexpr = 1,
-    UNIT_VALUE: tl.constexpr = False,
+def _identity_summary_body(
+    K, K2, V, Bias, sh, chunk, tile,
+    LENGTH: tl.constexpr, HEADS: tl.constexpr,
+    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
+    KR: tl.constexpr, KL: tl.constexpr,
+    NATIVE: tl.constexpr, KS: tl.constexpr, KG: tl.constexpr,
+    VS: tl.constexpr, VG: tl.constexpr, UNIT_VALUE: tl.constexpr,
 ):
-    sh = tl.program_id(0)
-    chunk = tl.program_id(1)
-    tile = tl.program_id(2)
     seq, head = sh // HEADS, sh % HEADS
     r = tile // tl.cdiv(COLS, 32) * 32 + tl.arange(0, 32)
     c = tile % tl.cdiv(COLS, 32) * 32 + tl.arange(0, 32)
@@ -81,27 +69,59 @@ def _identity_pairs(
     )
 
 
+@triton.jit
+def _identity_pairs(
+    K, K2, V, Bias,
+    LENGTH: tl.constexpr, HEADS: tl.constexpr,
+    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
+    KR: tl.constexpr, KL: tl.constexpr,
+):
+    _identity_summary_body(
+        K, K2, V, Bias, tl.program_id(0), tl.program_id(1), tl.program_id(2),
+        LENGTH, HEADS, ROWS, COLS, CHUNKS, KR, KL,
+        False, (), 1, (), 1, False,
+    )
+
 
 @triton.jit
-def _carry(
-    Scale,
-    Bias,
-    Initial,
-    Carry,
-    Final,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    IDENTITY: tl.constexpr,
-    WRITE_FINAL: tl.constexpr,
+def _identity_pairs_native_pair(
+    K, DenKey, V, Bias, DenBias,
+    LENGTH: tl.constexpr, HEADS: tl.constexpr,
+    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
+    TILES: tl.constexpr, KS: tl.constexpr, KG: tl.constexpr,
+    DKS: tl.constexpr, DKG: tl.constexpr, VS: tl.constexpr, VG: tl.constexpr,
 ):
-    sh, block = tl.program_id(0), tl.program_id(1)
+    # Each CTA holds only one State's original 32x32 summary tile.
+    sh, chunk, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    if tile < TILES:
+        _identity_summary_body(
+            K, K, V, Bias, sh, chunk, tile,
+            LENGTH, HEADS, ROWS, COLS, CHUNKS, 0, ROWS,
+            True, KS, KG, VS, VG, False,
+        )
+    else:
+        _identity_summary_body(
+            DenKey, DenKey, V, DenBias, sh, chunk, tile - TILES,
+            LENGTH, HEADS, ROWS, 1, CHUNKS, 0, ROWS,
+            True, DKS, DKG, VS, VG, True,
+        )
+
+
+@triton.jit
+def _carry_body(
+    Scale, Bias, Initial, Carry, Final, sh, block,
+    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
+    IDENTITY: tl.constexpr, WRITE_FINAL: tl.constexpr, INPLACE: tl.constexpr = False,
+):
     x = block * 256 + tl.arange(0, 256)
     state = tl.load(Initial + sh * ROWS * COLS + x, x < ROWS * COLS, 0)
-    for chunk in range(CHUNKS):
+    # Paired direct prefixes have at most 64 chunks. Expose every disjoint
+    # address so in-place stores cannot serialize later summary loads.
+    for chunk in tl.range(CHUNKS, loop_unroll_factor=CHUNKS if INPLACE else 1):
         base = (sh * CHUNKS + chunk) * ROWS * COLS + x
-        tl.store(Carry + base, state, x < ROWS * COLS)
+        # Load the current summary before replacing it with its exclusive carry.
         bias = tl.load(Bias + base, x < ROWS * COLS, 0)
+        tl.store(Carry + base, state, x < ROWS * COLS)
         if IDENTITY:
             state += bias
         else:
@@ -109,6 +129,33 @@ def _carry(
             state = state * scale + bias
     if WRITE_FINAL:
         tl.store(Final + sh * ROWS * COLS + x, state, x < ROWS * COLS)
+
+
+@triton.jit
+def _carry(
+    Scale, Bias, Initial, Carry, Final,
+    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
+    IDENTITY: tl.constexpr, WRITE_FINAL: tl.constexpr,
+):
+    _carry_body(
+        Scale, Bias, Initial, Carry, Final, tl.program_id(0), tl.program_id(1),
+        ROWS, COLS, CHUNKS, IDENTITY, WRITE_FINAL,
+    )
+
+
+@triton.jit
+def _identity_carry_pair(
+    Bias, DenBias, Initial, DenInitial, Final, DenFinal,
+    ROWS: tl.constexpr, COLS: tl.constexpr, CHUNKS: tl.constexpr,
+    BLOCKS: tl.constexpr, WRITE_FINAL: tl.constexpr,
+):
+    sh, block = tl.program_id(0), tl.program_id(1)
+    if block < BLOCKS:
+        _carry_body(None, Bias, Initial, Bias, Final, sh, block,
+                    ROWS, COLS, CHUNKS, True, WRITE_FINAL, True)
+    else:
+        _carry_body(None, DenBias, DenInitial, DenBias, DenFinal, sh, block - BLOCKS,
+                    ROWS, 1, CHUNKS, True, WRITE_FINAL, True)
 
 
 @triton.jit

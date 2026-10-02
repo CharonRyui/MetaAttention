@@ -137,6 +137,16 @@ def test_normalized_final_states_continuation_and_authored_epsilon(
     key[:, :, 0] = 0
     initial = StateTuple(("memory", "key_sum"),
                          (memory.to(gpu_device), key_sum.to(gpu_device)))
+    initial_before = {name: initial[name].clone() for name in initial.names}
+
+    def assert_initial_unchanged(before, state, result):
+        for name in state.names:
+            tensor = state[name]
+            torch.testing.assert_close(tensor, before[name], rtol=0, atol=0)
+            if result.final_state is not None:
+                for final in result.final_state:
+                    assert final.untyped_storage().data_ptr() != tensor.untyped_storage().data_ptr()
+
     expected_outputs = []
     q_oracle = query.repeat_interleave(heads // qh, dim=1)
     k_oracle = key.repeat_interleave(heads // kh, dim=1)
@@ -166,14 +176,21 @@ def test_normalized_final_states_continuation_and_authored_epsilon(
     inputs = {name: (tensor.transpose(1, 2).contiguous() if layout == "bth" else tensor).to(gpu_device)
               for name, tensor in (("query", query), ("key", key), ("value", value))}
     full = compiled(**inputs, initial_state=initial, return_final_state=True)
+    assert_initial_unchanged(initial_before, initial, full)
     output_only = compiled(**inputs, initial_state=initial)
+    assert output_only.final_state is None
+    assert_initial_unchanged(initial_before, initial, output_only)
     split = 64 if length > 64 else length // 2
     axis = 1 if layout == "bth" else 2
     prefix = compiled(**{name: tensor.narrow(axis, 0, split).contiguous() for name, tensor in inputs.items()},
                       initial_state=initial, return_final_state=True)
+    assert_initial_unchanged(initial_before, initial, prefix)
+    prefix_before = {name: prefix.final_state[name].clone() for name in prefix.final_state.names}
     suffix = compiled(**{name: tensor.narrow(axis, split, length - split).contiguous()
                         for name, tensor in inputs.items()},
                       initial_state=prefix.final_state, return_final_state=True)
+    assert_initial_unchanged(initial_before, initial, suffix)
+    assert_initial_unchanged(prefix_before, prefix.final_state, suffix)
     tolerance = 1e-2 if dtype == torch.bfloat16 else 2e-4
     for actual in (full.outputs["output"], output_only.outputs["output"],
                    torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2)):
@@ -198,6 +215,7 @@ def test_normalized_final_states_continuation_and_authored_epsilon(
             **{name: tensor.float() for name, tensor in inputs.items()},
             initial_state=initial, return_final_state=True,
         )
+        assert_initial_unchanged(initial_before, initial, promoted_result)
         for name in full.final_state.names:
             torch.testing.assert_close(full.final_state[name], promoted_result.final_state[name],
                                        rtol=0, atol=0)

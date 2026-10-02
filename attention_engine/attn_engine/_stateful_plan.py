@@ -965,8 +965,8 @@ def compile_plan(
         memory = next(spec for spec in operator.algorithm.states if spec.name == native.memory)
         heads = fixed_sizes[memory.head_role]
         rows, columns = (fixed_sizes[role] for role in memory.feature_roles)
-        # Output plus independent summary/carry pairs and bounded recursive
-        # group buffers. The extra boundary also covers both final States.
+        # Output plus paired summaries/carries and recursive group buffers;
+        # direct prefixes reuse storage; the extra boundary covers both finals.
         state_workspace = 4 * heads * columns
         state_chunk_bytes = 12 * heads * rows * (columns + 1)
     factored_token_bytes = factored_chunk_bytes = 0

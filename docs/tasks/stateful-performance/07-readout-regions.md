@@ -66,9 +66,42 @@ workspace 按实际 output 与独立 summary/carry、递归 group buffers 收费
 
 最终默认 target CLI：`../bench.sh --families normalized-linear --seqlens 64 2048 8192 --batches 2 --heads 16 --contract all --timing both --warmup 3 --repetitions 10 --gpu 6 --output-dir benchmark_results/normalized_native_public_smoke`，9/9 Meta records OK，覆盖最长默认 envelope。FLA final-state/continuation 仍被明确标为 output-only、不具可比 State 合同。64×64 native BF16 summary/readout 资源分别为 125/170 registers/thread、0 spills、32768/57344 bytes shared memory，均 4 warps。
 
-### 下一个重点：双 State summary/carry 调度
+### 双 State summary/carry 共调度（2026-10-02）
 
-短序列 staging activity 已移除，输出 kernel 已融合 contraction、EPS、divide、cast。下一步独立评估两个 State 的 summary/carry 合并：先减少 4 个 summary/carry launches 和 Python tensor bookkeeping，再比较长序列带宽、register/shared-memory 与递归 carry 成本。保留两个 named final States、独立初值和 continuation；不把跨 State 合并与 tile autotuning 同时引入。仍沿用完整 108 点 A/B 和独立 FP32 oracle，不以单点 Graph 收益替代 public 验收。
+`_stateful_native.py::_prepare_normalized_pair` 隐藏两个独立 identity States 的 summary/carry 调度和 scratch 生命周期；`execute_native_normalized` 只消费两个 carries 与按需两个 finals，readout 指针布局及数学不变。summary 使用互不重叠的 CTA tile 区间，复用通用 identity summary JIT body，保持 32×32 tiles、64-token chunk、`tf32x3` 与 denominator 的单位 value dot；不合并数学 State、不共享 key load，也不改 native eligibility、EPS、grouped heads、BF16 seam 或默认 1 GiB cap。
+
+direct carry 在读取当前 summary 后原地写 exclusive carry，对最多 64 chunks 完全展开，只暴露独立地址的调度，不改 chunk 累加先后；通用 affine caller 保持原 loop。`chunks>64` 仍用 GROUP=32 的 local/group-prefix/apply recursion，各层配对。identity group_scale 从未读取，不分配；group summaries 在 direct recursion 中复用为 carries。长 apply 使用独立 destinations，并在 private prepare 返回前释放所有已消费 summaries/group scratch，随后才分配 output。finals 独立于 initials，output-only 不写 initials；workspace 保留现有保守收费 `4*H*V` bytes/token 和 `12*H*K*(V+1)` bytes/chunk/sequence。
+
+#### 最终实测与未达目标
+
+固定基线 `ee453bf`；同 seed、同输入、默认 `Target()`/1 GiB cap；H20 GPU UUID `GPU-b4d0a767-f523-7e86-ba91-d97ce67b4359`。完整 B∈{1,2}、H∈{1,8,16}、T∈{63,64,65,130,2048,8192}、K=V=64、三 contracts，共 108 点。warmup=3、repetitions=20；public/CPU 交错并轮换先后，Graph pools 独立，peak 在任何 Graph capture 前测量。原始记录 `benchmark_results/normalized_state_pair_ab.json`，包含源码 SHA256、逐点 timing samples、CUPTI activity、compiled resources 与所有复测。
+
+| contract | 点数 | public 几何平均下降 | CPU wall 下降 | Graph 下降 | peak allocated 下降 | peak incremental 下降 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| output-only | 36 | 13.08% | 13.43% | 13.90% | 13.17% | 24.52% |
+| final-state | 36 | 12.18% | 12.85% | 15.14% | 11.49% | 19.25% |
+| continuation | 36 | 12.63% | 13.08% | 17.46% | 8.32% | 18.26% |
+| 全部 | 108 | 12.63% | 13.12% | 15.51% | 11.01% | 20.72% |
+
+108 点五项均无回退：最差 after/before 为 public 0.99128、CPU 0.98999、Graph 0.98774、peak allocated 0.99155、incremental 0.98548。全部 output 与返回的 memory/key_sum 相对基线逐位一致，包括各自 continuation；supplied/cached-zero initials 在普通调用、profiling 与 Graph 后均不变，finals 不别名 initials。所有 point gates 通过，**但建议的 public ≥20% 目标未达到**；JSON 总体保留 `status=FAILED` 和 `public_geomean_at_least_20_percent_lower=false`，不以 Graph 或 activity 改善代替该目标。
+
+实测 activity：direct 5→3、T8192 单调用 9→5、完整矩阵 continuation 11→7。B1/H1/T64 output-only incremental peak 32768→25088 bytes；B2/H16/T8192 output-only/final-state/continuation 为 138444800/138977280/68698112 bytes，workspace estimate 273178624 bytes 不变，矩阵最大 peak allocated 为 258.02 MiB。paired summary 为 162–168 registers/thread、32768 bytes shared；direct 为 10–32 registers/thread、0–1024 bytes shared；local 为 32 registers/thread、apply 为 26–32，二者 shared=0。全部 compiled kernels 为 4 warps、0 spills；readout 本身未修改。
+
+`normalized_state_pair_boundaries.json` 的 18 点全部 gates 通过：非零独立 initials、完整短/中 outputs 与长序列选定 token outputs、所有 final States 均由独立 FP32 token recurrence 检查，并对旧实现逐位 A/B。T4096/4097 单调用 5→3/9→5；T8193 continuation 15→9；T131072/131073 单调用 9→5/13→7，continuation 19→11，确认第二层 recursion 与尾组。CUPTI 首次启动可能漏首 kernel；采集前使用独立 spin priming，原始 priming 单列记录、不计 public activity，partial capture 按精确预期数量重试。早期 partial/miscount 两次记录保留为 `normalized_state_pair_partial_cupti_boundaries.json`、`normalized_state_pair_priming_count_boundaries.json`，不把它们当完整 activity 证据。
+
+最终 GPU 行为回归：normalized 34 passed（含新增 independent denominator key、四种 prior/post、T1、65+6 continuation、grouped heads、17×35 State、initial 不变及 65-chunk exclusive prefix），readout/rank1/hierarchical 共 60 passed。Ruff 全部通过。CPU 原四文件此前 34 passed；最后一次 33 passed/1 failed 于未固定 initial/weights seed 的 `test_two_state_program_carries_gradients_from_the_readout`（1/12 elements，absolute 2.479553e-5）。本轮不改 backward/CPU 数学或容差；同输入、同 seed 的基线/当前差分 replay 在 seed=544 均产生完全相同的失败（1/8 elements，absolute 0.0007853508），545 个 seed 的两侧 verdict/error 全相同，记录 `normalized_state_pair_cpu_backward_replay.json`。这不是本轮 GPU inference 优化回归，保留失败证据，不声称最后 CPU suite 全绿。
+
+默认 Target CLI 已实际执行：`../bench.sh --families normalized-linear --seqlens 63 64 65 130 2048 8192 --batches 1 2 --heads 1 8 16 --contract all --timing both --warmup 3 --repetitions 20 --gpu 6 --output-dir benchmark_results/normalized_state_pair_public_smoke`。manifest 与 records 均为 108 点，Meta 108/108 `OK`，包括最大 envelope 的三个 contracts；CLI 自身确认 GPU 无 compute PID、利用率 0%、仅 4 MiB 已用。FLA 108/108 runtime `OK`，但 72 个 final-state/continuation records 均明确为 FLA output-only、`fla_contract_comparable=false`；不将这些 speedup 或 FLA 结果用于本轮同合同收益/正确性验收。
+
+
+
+#### 已拒绝的实验
+
+全原地 hierarchical apply 虽逐位一致、无 spills 且降低峰值，却使 B2/H16/T8192 output-only public 慢 29.76%、Graph 慢 35.57%；两轮交错复测仍回退。CUPTI paired apply 为 426.882 µs，基线 memory apply 为 44.992 µs。仅将长 apply destinations 改为独立 storage 后，paired apply 为 45.248 µs，九点早期 gates 全通过；保留 `benchmark_results/normalized_state_pair_quick.json` 与 `normalized_state_pair_outplace_apply_quick.json`，不提交回退实现。
+
+首轮完整 108 点的 serial direct carry 在 B2/H16/T2048 output-only 仍稳定回退：public 9.40%，两轮为 6.81%/8.00%，Graph 10.13%；paired direct carry 为 52.576 µs，旧两个 direct carry 合计 23.168 µs。四次 loop unroll 的同点探针保持逐位一致、无峰值增加和 spills，paired carry 为 32.607 µs，public/Graph 比值为 1.0052/1.0036；八次 unroll 为 31.264 µs，但 public/Graph 比值 1.0226/1.0090，没有额外实测收益。首轮完整原始记录 `normalized_state_pair_serial_direct_ab.json`，探针 `normalized_state_pair_direct_unroll_probe.json`/`normalized_state_pair_direct_unroll8_probe.json`。
+
+四次展开的完整矩阵又发现 B2/H16/T8192 continuation 稳定回退：public 20.12%，两轮 19.51%/20.29%，Graph 23.36%；两段各 T4096/64 chunks，paired carry 为 188.864/188.288 µs，而旧两 States carry 合计每段约 49 µs。完整失败记录 `normalized_state_pair_unroll4_ab.json`。只将 direct loop 改为完全展开后，同合同探针 paired carry 为 26.753/26.880 µs，public/Graph 比值 0.9725/0.9651，逐位、峰值和资源 gates 全通过；探针 `normalized_state_pair_direct_fullunroll_probe.json`。所有初始失败及微小回退均保留，最后放行以完整矩阵为准。
 
 
 

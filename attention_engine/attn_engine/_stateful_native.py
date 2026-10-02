@@ -103,11 +103,38 @@ def _load_dense(P, seq, head, t, x, SIZE: tl.constexpr, STRIDES: tl.constexpr,
     return tl.where(VALID & (x < SIZE), result, 0.0)
 
 
+def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
+                             *, sequence_length, heads, ks, kg, dks, dkg, vs, vg,
+                             return_final_state):
+    """Own paired summaries/carries and release recursive scratch before readout."""
+    from ._stateful_diagonal_kernels import _identity_pairs_native_pair
+    from ._stateful_diagonal_scan import _hierarchical_carry_pair
+
+    rows, columns = initial.shape[-2:]
+    bh = initial.shape[0] * heads
+    chunks = triton.cdiv(sequence_length, 64)
+    carry = torch.empty((bh, chunks, rows, columns),
+                        device=initial.device, dtype=torch.float32)
+    den_carry = torch.empty((bh, chunks, rows, 1),
+                            device=den_initial.device, dtype=torch.float32)
+    final = torch.empty_like(initial) if return_final_state else initial
+    den_final = torch.empty_like(den_initial) if return_final_state else den_initial
+    tiles = triton.cdiv(rows, 32) * triton.cdiv(columns, 32)
+    _identity_pairs_native_pair[(bh, chunks, tiles + triton.cdiv(rows, 32))](
+        key, den_key, value, carry, den_carry,
+        sequence_length, heads, rows, columns, chunks, tiles,
+        ks, kg, dks, dkg, vs, vg,
+    )
+    carry, den_carry = _hierarchical_carry_pair(
+        carry, den_carry, initial, den_initial, final, den_final,
+        write_final=return_final_state,
+    )
+    return carry, den_carry, final, den_final
+
+
 def execute_native_normalized(recipe, inputs, initial_states, *, role_sizes,
                               sequence_count, sequence_length, heads, return_final_state):
     from .stateful_operator import Batch, FeatureRole, HeadRole, Sequence
-    from ._stateful_diagonal_kernels import _identity_pairs
-    from ._stateful_diagonal_scan import hierarchical_carry
     from ._stateful_readout_regions import _identity_normalized_region
 
     bindings = {}
@@ -136,23 +163,12 @@ def execute_native_normalized(recipe, inputs, initial_states, *, role_sizes,
     rows, columns = initial_memory.shape[-2:]
     chunks = triton.cdiv(sequence_length, 64)
 
-    def prepare(initial, source, strides, group, unit_value):
-        cols = initial.shape[-1]
-        bias = torch.empty(sequence_count * heads, chunks, rows, cols,
-                           device=initial.device, dtype=torch.float32)
-        carry = torch.empty_like(bias)
-        final = torch.empty_like(initial) if return_final_state else initial
-        _identity_pairs[(sequence_count * heads, chunks,
-                         triton.cdiv(rows, 32) * triton.cdiv(cols, 32))](
-            source, source, value, bias, sequence_length, heads, rows, cols, chunks, 0, rows,
-            NATIVE=True, KS=strides, KG=group, VS=vs, VG=vg, UNIT_VALUE=unit_value,
-        )
-        hierarchical_carry(None, bias, initial, carry, final,
-                           identity=True, write_final=return_final_state)
-        return carry, final
-
-    memory, final_memory = prepare(initial_memory, key, ks, kg, False)
-    normalizer, final_normalizer = prepare(initial_normalizer, den_key, dks, dkg, True)
+    memory, normalizer, final_memory, final_normalizer = _prepare_normalized_pair(
+        key, den_key, value, initial_memory, initial_normalizer,
+        sequence_length=sequence_length, heads=heads,
+        ks=ks, kg=kg, dks=dks, dkg=dkg, vs=vs, vg=vg,
+        return_final_state=return_final_state,
+    )
     output = torch.empty(sequence_count * sequence_length, heads, columns,
                          device=query.device, dtype=recipe.output_dtype)
     _identity_normalized_region[(sequence_count * heads, chunks, triton.cdiv(columns, 32))](
