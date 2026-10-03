@@ -317,13 +317,13 @@ def _local_vjp(L, R, C, IK, IV, Q, Metadata, Offsets, Checkpoints, Carry, DY,
                         adjoint = adjoint * coefficient
                     elif code == 1:
                         gate = tl.load(L + (op * TOTAL + flat) * LEFT_WIDTH + r, r < ROWS, 1.0)
-                        dl = tl.sum(adjoint * state, 1)
-                        tl.store(DL + ((block * len(OPS) + op) * TOTAL + flat) * LEFT_WIDTH + r, dl, r < ROWS)
+                        dl_row = tl.sum(adjoint * state, 1)
+                        tl.store(DL + ((block * len(OPS) + op) * TOTAL + flat) * LEFT_WIDTH + r, dl_row, r < ROWS)
                         adjoint = adjoint * gate[:, None]
                     elif code == 3:
                         gate = tl.load(L + (op * TOTAL + flat) * LEFT_WIDTH + c, c < COLS, 1.0)
-                        dl = tl.sum(adjoint * state, 0)
-                        tl.store(DL + ((block * len(OPS) + op) * TOTAL + flat) * LEFT_WIDTH + c, dl, c < COLS)
+                        dl_column = tl.sum(adjoint * state, 0)
+                        tl.store(DL + ((block * len(OPS) + op) * TOTAL + flat) * LEFT_WIDTH + c, dl_column, c < COLS)
                         adjoint = adjoint * gate[None, :]
                     else:
                         left = tl.load(L + (op * TOTAL + flat) * LEFT_WIDTH + r, r < ROWS, 0.0)

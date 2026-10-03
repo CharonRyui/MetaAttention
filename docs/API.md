@@ -279,9 +279,32 @@ The follow-up packing pass reuses single injection/readout bindings and leaves
 unused Triton operation buffers at one element. On the same H20 workload, the
 `T=2048` graph timings changed from `0.792` to `0.712 ms` for Based and from
 `0.600` to `0.566 ms` for ReBased; profiler-attributed auxiliary launches fell
+
 from `71` to `47` and `33` to `21`, respectively. GDN changed from `0.598` to
 `0.592 ms` graph time. Output, final State, and continuation correctness remain
 covered by the focused GPU suite.
+
+The compiler-only compositional comparison was measured on an otherwise idle H20
+with BF16 inputs, FP32 gates and State, `B=1`, `(row,column)=(64,128)`, `T=129`,
+one public call with final State, three warmups, five CUDA-event samples per batch,
+and ten alternating batches per side. The generic side used the same Algorithm IR
+and `optimized=False`; compilation was excluded. Paired batch medians were:
+
+| Composition | Optimized lowerer | Generic CUDA-event ms | Optimized CUDA-event ms | Generic / optimized | Optimized peak / generic peak |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Axis scales | `tilelang-chunked-stateful` | 5.106 | 0.233 | 21.95x | 0.28% |
+| Axis + Rank-One | `tilelang-factored-recurrence` | 5.319 | 0.778 | 6.83x | 1.88% |
+| Multiple injections | `tilelang-product-gemm` | 0.744 | 0.761 | 0.98x | 100.42% |
+| Rank-One | `tilelang-factored-recurrence` | 5.131 | 0.543 | 9.46x | 1.41% |
+
+The multiple-injection candidate is semantically valid and stays within the
+predeclared 1.10x latency and memory upper-bound gate: its optimized/generic
+CUDA-event ratio is 1.023 with a bootstrap 95% interval of [1.006, 1.050], and
+its optimized/generic incremental-allocation ratio is 1.004. It is 2.3% slower
+than generic at this workload, so the measurement supports retaining the
+candidate for semantic coverage, not claiming a speedup. Full raw records are
+in `benchmark_results/composition_profiles_final.json`; this artifact is local
+measurement evidence, not a tracked API contract.
 
 The follow-up dense-State pass also reuses identical broadcast value bindings
 across States; it changes no numerical path and is covered by the same focused

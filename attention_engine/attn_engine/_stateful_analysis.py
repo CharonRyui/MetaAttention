@@ -590,7 +590,11 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
             )
     propagation_factor = (
         primary_transition.propagations[0].factor
-        if (v1_shape and len(primary_transition.propagations) == 1)
+        if (
+            v1_shape
+            and len(primary_transition.propagations) == 1
+            and isinstance(primary_transition.propagations[0], AxisScale)
+        )
         else None
     )
     vector_propagation = (
