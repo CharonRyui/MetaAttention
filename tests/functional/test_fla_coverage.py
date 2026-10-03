@@ -420,6 +420,52 @@ def test_rwkv6_matches_fla_chunk_rwkv6(gpu_device):
     )[0]
     torch.testing.assert_close(actual.float(), expected.float(), rtol=5e-2, atol=5e-2)
 
+@pytest.mark.parametrize("length", [63, 64, 65, 130])
+def test_rwkv6_final_state_and_continuation(gpu_device, length):
+    from attn_engine import FeatureRole, HeadRole, StateTuple, Target
+
+    batch, heads, dim, dim_value = 2, 4, 64, 64
+    source_heads = (2, 1, 2)
+    generator = torch.Generator().manual_seed(811)
+    query = torch.randn(batch, source_heads[0], length, dim, generator=generator, dtype=torch.bfloat16)
+    key = torch.randn(batch, source_heads[1], length, dim, generator=generator, dtype=torch.bfloat16)
+    value = torch.randn(batch, source_heads[2], length, dim_value, generator=generator, dtype=torch.bfloat16)
+    decay = torch.randn(batch, heads, length, dim, generator=generator)
+    bonus = torch.randn(batch, heads, length, dim, generator=generator, dtype=torch.bfloat16)
+    inputs = {name: tensor.to(gpu_device) for name, tensor in {
+        "query": query, "key": key, "value": value, "decay": decay, "bonus": bonus,
+    }.items()}
+    operator = rwkv6_attention(batch, heads, length, dim, dim_value)
+    roles = {
+        role.name: role
+        for spec in (*operator.algorithm.inputs, *operator.algorithm.states)
+        for role in spec.roles
+        if isinstance(role, (FeatureRole, HeadRole))
+    }
+    compiled = operator.compile(
+        role_sizes={
+            roles["query_heads"]: source_heads[0], roles["key_heads"]: source_heads[1],
+            roles["value_heads"]: source_heads[2], roles["state_heads"]: heads,
+            roles["key_dim"]: dim, roles["value_dim"]: dim_value,
+        }, target=Target(), mode="dense", optimized=True,
+    )
+    initial = StateTuple(("memory",), (torch.randn(
+        batch, heads, dim, dim_value, device=gpu_device,
+    ),))
+    full = compiled(**inputs, initial_state=initial, return_final_state=True)
+    split = 64 if length > 64 else length // 2
+    prefix_inputs = {name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()}
+    suffix_inputs = {name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()}
+    prefix = compiled(**prefix_inputs, initial_state=initial, return_final_state=True)
+    suffix = compiled(**suffix_inputs, initial_state=prefix.final_state, return_final_state=True)
+    torch.testing.assert_close(
+        torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2),
+        full.outputs["output"], rtol=5e-2, atol=2e-2,
+    )
+    torch.testing.assert_close(
+        suffix.final_state["memory"], full.final_state["memory"], rtol=1e-2, atol=2e-2,
+    )
+
 
 def test_based_matches_fla_fused_chunk_based(gpu_device):
     """Second-order Taylor Program vs ``fused_chunk_based``."""

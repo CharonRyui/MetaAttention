@@ -54,6 +54,15 @@ summary 是一次 kernel launch；短序列 carry 一次，readout 一次，长�
 
 综合摘要 `benchmark_results/diagonal_readout_acceptance.json` 列出全部数值、复测、默认 cap 拒绝和证据源。原始 JSON 保留本地，交付同时归档 gzip 压缩记录；一次性 GPU/oracle/复测脚本已删除，用户既存 `testing/benchmark_fla_meta_stateful.py` 未改动。
 
+### RWKV6 prior-State bonus fusion (2026-10-03)
+
+The typed chunked executor now recognizes the RWKV6-shaped prior State term plus current-token bonus contraction and dispatches a private bounded 2-target kernel. Eligibility remains structural: one rank-2 State, one single-key-axis `AxisScale`, one key/value injection, a float32 authored query scalar, and Batch/Sequence/head-mapped single-feature inputs. Generic diagonal readouts remain unchanged. BF16 query scaling and `query * bonus * key` retain authored BF16 multiplication before the FP32 contraction seam; FP32 inputs use FP32 arithmetic.
+
+Focused GPU checks on idle H20 GPU 6 passed: the private helper covered FP32/BF16, T=1/65/137, and prior/post recurrence; the public RWKV6 path covered grouped heads (2/1/2 -> 4) and T=63/64/65/130 final-State continuation. CPU RWKV6 checks passed (2 tests), and Ruff passed for all modified Python files.
+
+Observed smoke evidence is `benchmark_results/rwkv6_bonus_readout_smoke.json`: B=1, H=8, K=V=64, T=64/2048, all three contracts, warmup=3/repetitions=20, same process per workload. All six Meta records were oracle-valid. Runtime activity was 13 launches for one call and 27 for continuation; this change did not target recurrence launch fusion. Public CUDA-event medians were 0.388896 ms (T=64 output-only), 0.450032 ms (T=64 final-State), 0.864064 ms (T=64 continuation), 1.656256 ms (T=2048 output-only), 1.665056 ms (T=2048 final-State), and 1.729824 ms (T=2048 continuation). These are smoke measurements, not an A/B speedup claim; no before/after baseline was run for this change.
+The next bounded change increased only the private RWKV6 target tile from 2 to 4; generic diagonal readouts and typed eligibility are unchanged. The focused helper now covers T=1/3/65/137, retaining the authored FP32/BF16 arithmetic contract. A fixed `ca9349d` baseline with the prior 2-target wrapper and the optimized wrapper were both measured on idle H20 GPU 6 at B=1, H=8, K=V=64, T=64/2048, all three contracts, warmup=3/repetitions=20. Every record was oracle-valid. Public CUDA-event geometric mean decreased 8.85%, graph time 9.19%, and kernel time 9.94%; pointwise public reductions were 2.09%-14.01%. Runtime launch counts stayed 13 for one call and 27 for continuation. Peak allocated memory was not uniformly lower (final-State and continuation varied upward), so this change claims latency only, not a memory reduction. Raw measurements are `/tmp/rwkv6_two_targets.json` and `/tmp/rwkv6_four_targets.json`; the latter is also summarized in the ignored local artifact `benchmark_results/rwkv6_bonus_readout_four_target.json`.
+
 
 ## 原子提交
 本任务的有效代码、必要行为回归测试和观测证据一起提交。性能回退或错误实现不提交；明确记录失败，不缩小合同来宣称完成。共享文件由集成负责人修改；子代理不提交，不运行中途 build/lint/tests/formatters。GPU 验证由负责人检查空闲 GPU 与 workspace 风险后串行执行。

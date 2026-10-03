@@ -415,10 +415,116 @@ class ChunkedRecipe:
     identity_read: frozenset[str]
     readouts: tuple[tuple[Any, Any], ...]
     normalized_readout: tuple[Any, Any, Any, float] | None
+    bonus_readout: tuple[Any, Any, Any, float, Any, Any] | None
     rank_one: Any | None
     native_normalized: Any | None
     inputs: tuple[Any, ...]
     feature_order: tuple[Any, ...]
+
+
+def _product_terms(expression: Any) -> list[Any]:
+    from .stateful_operator import Multiply
+
+    if isinstance(expression, Multiply):
+        return _product_terms(expression.left) + _product_terms(expression.right)
+    return [expression]
+
+
+def _contains_expression(expression: Any, target: Any) -> bool:
+    if expression == target:
+        return True
+    children = []
+    if hasattr(expression, "left"):
+        children.extend((expression.left, expression.right))
+    elif hasattr(expression, "operand"):
+        children.append(expression.operand)
+    return any(_contains_expression(child, target) for child in children)
+
+
+def _bonus_readout(readout: Any, expression: Any, algorithm: Any):
+    """Prove the typed prior-State plus current-token bonus region."""
+    from .stateful_operator import (
+        Add, AxisScale, Batch, Constant, Contract, FeatureRole, HeadRole,
+        Input, Multiply, Sequence, StateTerm,
+    )
+
+    if not isinstance(expression, Add):
+        return None
+    branches = (expression.left, expression.right)
+    state_terms = [branch for branch in branches if isinstance(branch, StateTerm)]
+    if len(state_terms) != 1:
+        return None
+    state_term = state_terms[0]
+    if not state_term.prior or state_term.role is None:
+        return None
+    state = next((item for item in algorithm.states if item.name == state_term.state), None)
+    if state is None or state.rank != 2 or state_term.role != state.feature_roles[0]:
+        return None
+    other = branches[0] if branches[1] is state_term else branches[1]
+    if not isinstance(other, Multiply):
+        return None
+    contraction = next((item for item in (other.left, other.right)
+                        if isinstance(item, Contract)), None)
+    if contraction is None:
+        return None
+    value_expression = other.right if other.left is contraction else other.left
+    if not isinstance(value_expression, Input) or contraction.role != state.feature_roles[0]:
+        return None
+    if not isinstance(contraction.right, Constant) or contraction.right.value != 1.0:
+        return None
+    if not _contains_expression(contraction.left, state_term.operand):
+        return None
+    query_terms = _product_terms(state_term.operand)
+    if len(query_terms) != 2 or not any(isinstance(item, Constant) for item in query_terms):
+        return None
+    query_input = next((item for item in query_terms if isinstance(item, Input)), None)
+    query_constant = next((item for item in query_terms if isinstance(item, Constant)), None)
+    if query_input is None or query_constant is None or query_constant.dtype != torch.float32:
+        return None
+    query_scale = query_constant.value
+    remaining = _product_terms(contraction.left)
+    for term in query_terms:
+        try:
+            remaining.remove(term)
+        except ValueError:
+            return None
+    if len(remaining) != 2 or not all(isinstance(item, Input) for item in remaining):
+        return None
+    specs = {spec.name: spec for spec in algorithm.inputs}
+    transitions = {item.state: item for item in algorithm.transitions}
+    transition = transitions.get(state.name)
+    if transition is None or len(transition.injections) != 1:
+        return None
+    factors = transition.injections[0].factors
+    key_expression = next((factor.expression for factor in factors
+                           if factor.roles == (state.feature_roles[0],)), None)
+    value_transition = next((factor.expression for factor in factors
+                             if factor.roles == (state.feature_roles[1],)), None)
+    if not isinstance(key_expression, Input) or value_transition != value_expression:
+        return None
+    if key_expression not in remaining:
+        return None
+    bonus_expression = next(item for item in remaining if item != key_expression)
+    if not isinstance(bonus_expression, Input):
+        return None
+    if len(transition.propagations) != 1 or not isinstance(transition.propagations[0], AxisScale):
+        return None
+    if transition.propagations[0].roles != (state.feature_roles[0],):
+        return None
+    for name, feature in (
+        (query_input.name, state.feature_roles[0]),
+        (key_expression.name, state.feature_roles[0]),
+        (bonus_expression.name, state.feature_roles[0]),
+        (value_expression.name, state.feature_roles[1]),
+    ):
+        spec = specs[name]
+        if Batch not in spec.roles or Sequence not in spec.roles:
+            return None
+        if tuple(role for role in spec.roles if isinstance(role, FeatureRole)) != (feature,):
+            return None
+        if not any(isinstance(role, HeadRole) for role in spec.roles):
+            return None
+    return readout, state_term, query_input, query_scale, bonus_expression, key_expression
 
 
 def _normalized_readout(readout: Any, expression: Any, algorithm: Any):
@@ -484,6 +590,11 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         if len(readouts) == 1
         else None
     )
+    bonus = (
+        _bonus_readout(*readouts[0], algorithm)
+        if len(readouts) == 1
+        else None
+    )
     native = compile_native_normalized(algorithm, normalized)
     if native is not None:
         from ._stateful_readout_regions import readout_region_resources
@@ -503,6 +614,7 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
                   for term in (_contracted_terms(expression) or ()) if term.role is None),
         readouts,
         normalized,
+        bonus,
         compile_rank_one(algorithm),
         native,
         tuple(bindings),
@@ -706,7 +818,27 @@ def execute_chunked_states(
 
     expression_values: dict[Any, torch.Tensor] = {}
     fused_outputs: dict[str, torch.Tensor] = {}
-    if recipe.normalized_readout is not None:
+    if recipe.bonus_readout is not None:
+        from ._stateful_diagonal_block import diagonal_block_bonus_readout
+
+        (
+            readout, state_term, query_input, query_scale,
+            bonus_expression, key_expression,
+        ) = recipe.bonus_readout
+        prepared_state = prepare(state_term.state)
+        query = values[query_input.name].reshape(token_count, heads, -1).contiguous()
+        bonus = values[bonus_expression.name].reshape(token_count, heads, -1).contiguous()
+        current_key = values[key_expression.name].reshape(token_count, heads, -1).contiguous()
+        output = torch.empty(
+            token_count, heads, prepared_state[0].shape[-1],
+            device=device, dtype=torch.float32,
+        )
+        diagonal_block_bonus_readout(
+            prepared_state[0], prepared_state[1], query, bonus, current_key, output,
+            sequence_length=sequence_length, query_scale=query_scale,
+        )
+        fused_outputs[readout.name] = output.to(readout.output_dtype)
+    elif recipe.normalized_readout is not None:
         from ._stateful_readout_regions import fused_normalized_region
 
         readout, numerator_term, denominator_term, epsilon = recipe.normalized_readout

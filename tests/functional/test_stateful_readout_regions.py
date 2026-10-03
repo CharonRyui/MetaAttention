@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from attn_engine._stateful_diagonal_kernels import prepare_state, read_state
+from attn_engine._stateful_diagonal_block import diagonal_block_bonus_readout
 from attn_engine._stateful_readout_regions import (
     fused_normalized_region,
     fused_readout_region,
@@ -216,6 +217,65 @@ def test_parallel_diagonal_block_fp32_oracle(gpu_device, axes, prior, length):
         torch.testing.assert_close(continued.cpu(), expected, rtol=2e-4, atol=2e-5)
         torch.testing.assert_close(suffix_final.cpu(), expected_final, rtol=2e-4, atol=2e-5)
 
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("length", [1, 3, 65, 137])
+def test_diagonal_bonus_readout_matches_prior_recurrence(gpu_device, length, dtype):
+    host, data = _inputs(gpu_device, 19, 23, length=length, seed=97)
+    key, value, query, gr, _, initial = data
+    if dtype == torch.bfloat16:
+        key, value, query = key.to(dtype), value.to(dtype), query.to(dtype)
+    bonus = torch.randn(
+        key.shape, device=gpu_device, dtype=dtype,
+        generator=torch.Generator(device=gpu_device).manual_seed(101),
+    )
+    carry, final, factors = prepare_state(
+        rows_gate=gr.reshape(-1, key.shape[2], key.shape[3]),
+        columns_gate=None,
+        key=key.reshape(-1, key.shape[2], key.shape[3]),
+        value=value.reshape(-1, value.shape[2], value.shape[3]),
+        initial=initial,
+        sequence_length=length,
+        return_final_state=True,
+        identity=False,
+    )
+    output = torch.empty(
+        key.shape[0] * length, key.shape[2], value.shape[3],
+        device=gpu_device, dtype=torch.float32,
+    )
+    scale = 19**-0.5
+    diagonal_block_bonus_readout(
+        carry, factors, query.reshape(-1, query.shape[2], query.shape[3]),
+        bonus.reshape(-1, bonus.shape[2], bonus.shape[3]),
+        key.reshape(-1, key.shape[2], key.shape[3]), output,
+        sequence_length=length, query_scale=scale,
+    )
+
+    key_cpu, value_cpu, query_cpu, gr_cpu, initial_cpu = (
+        key.cpu(), value.cpu(), query.cpu(), gr.cpu(), initial.cpu()
+    )
+    bonus_cpu = bonus.cpu()
+    state = initial_cpu.clone()
+    expected = []
+    for token in range(length):
+        q = query_cpu[:, token]
+        b = bonus_cpu[:, token]
+        k = key_cpu[:, token]
+        v = value_cpu[:, token]
+        if dtype == torch.bfloat16:
+            scaled_q = (q * torch.tensor(scale, dtype=dtype)).to(dtype)
+            bonus_score = (scaled_q * b * k).float().sum(-1, keepdim=True)
+            state_term = torch.einsum("bhr,bhrc->bhc", scaled_q.float(), state)
+        else:
+            scaled_q = q * scale
+            bonus_score = (scaled_q * b * k).sum(-1, keepdim=True)
+            state_term = torch.einsum("bhr,bhrc->bhc", scaled_q, state)
+        expected.append(state_term + bonus_score * v.float())
+        state = state * gr_cpu[:, token].unsqueeze(-1) + k.float().unsqueeze(-1) * v.float().unsqueeze(-2)
+    expected = torch.stack(expected, dim=1)
+    torch.testing.assert_close(output.reshape_as(expected).cpu(), expected, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(final.cpu(), state, rtol=2e-4, atol=2e-5)
 
 @pytest.mark.parametrize("prior", [False, True])
 def test_diagonal_block_separated_product_features(gpu_device, prior):
