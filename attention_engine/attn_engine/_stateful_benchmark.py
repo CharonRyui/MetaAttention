@@ -6,16 +6,16 @@ import torch
 
 
 def invocation_factory(operator, compilation, base_executable, plans, device):
-    from ._stateful_plan import KernelConfig, _digest
+    from ._stateful_plan import KernelConfig, WorkspacePolicy, _digest
     from .stateful_operator import (
         Batch, Sequence, One, CompiledStatefulOperator, StatefulOperator, StateTuple,
     )
 
     roles = dict(compilation.role_sizes)
     states = tuple(operator.algorithm.states)
-    state = states[0]
 
     def build(candidate, config, workload):
+        from ._stateful_chunked import select_chunked_schedule
         from ._stateful_tuning import workload_lengths
 
         lengths = workload_lengths(workload)
@@ -30,10 +30,18 @@ def invocation_factory(operator, compilation, base_executable, plans, device):
             shapes[spec.name] = shape
         # Conservative live-buffer bound before allocating or launching a candidate.
         elements = sum(math.prod(shape) for shape in shapes.values())
-        rows, columns = base_executable.plan.feature_sizes
-        heads = roles[state.head_role]
-        required = sum(lengths) * heads * (rows * rows + columns * columns + rows * columns) * 64
+        estimate = dict(base_executable.plan.candidate_estimates)[candidate.identity]
+        workspace = WorkspacePolicy(
+            estimate.workspace_bytes_per_token, compilation.target.workspace_bytes,
+            aligned_bytes_per_token=estimate.aligned_workspace_bytes_per_token,
+            alignment_tokens=estimate.alignment_tokens,
+            bytes_per_chunk=estimate.workspace_bytes_per_chunk,
+        )
+        required = workspace.required_bytes(sum(lengths), sequence_count=len(lengths),
+                                            sequence_length=max(lengths))
         required += elements * 8
+        required += 8 * len(lengths) * sum(roles[spec.head_role] * math.prod(roles[role] for role in spec.feature_roles)
+                                         for spec in states)
         free, _ = torch.cuda.mem_get_info(device)
         if required > min(compilation.target.workspace_bytes, free // 2):
             raise RuntimeError("tuning workload exceeds safe resource envelope")
@@ -65,8 +73,9 @@ def invocation_factory(operator, compilation, base_executable, plans, device):
         )
         executable = replace(base_executable, plan=replace(
             base_executable.plan, candidate=candidate, mathematical_plan=selected,
-            kernel_config=kernel_config,
-        ), rank_one_factored=rank_one)
+            kernel_config=kernel_config, workspace=workspace,
+        ), rank_one_factored=rank_one,
+            chunked_recipe=select_chunked_schedule(base_executable.chunked_recipe, candidate.lowerer))
         # An isolated invocation owner avoids mutating a live user's specialization.
         owner = StatefulOperator(operator.algorithm)
         key = candidate.identity + kernel_config.identity

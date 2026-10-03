@@ -309,3 +309,129 @@ def test_diagonal_block_separated_product_features(gpu_device, prior):
     ], 1)
     torch.testing.assert_close(actual.reshape_as(expected).cpu(), expected, rtol=2e-4, atol=2e-5)
     torch.testing.assert_close(final.cpu(), expected_final, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("schedule", ["replay", "scores"])
+@pytest.mark.parametrize("prior", [False, True])
+def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule, prior):
+    from dataclasses import replace
+    from attn_engine import (
+        AlgorithmIR, AxisScale, Batch, FeatureRole, HeadMapping, HeadRole, Input,
+        ProductFactor, ProductInjection, Readout, Sequence, StateSpec, StateTerm,
+        StateTransition, StatefulOperator, StateTuple, Target, TensorInput,
+    )
+
+    row, column = FeatureRole("row"), FeatureRole("column")
+    source, heads = HeadRole("source"), HeadRole("heads")
+    specs = tuple(TensorInput(name, (Batch, source, Sequence, feature), torch.bfloat16)
+                  for name, feature in (("q", row), ("k", row), ("v", column)))
+    specs += (TensorInput("g", (Batch, heads, Sequence, row), torch.float32),)
+    term = StateTerm("memory", Input("q") * 0.5, row, prior=prior)
+    algorithm = AlgorithmIR(
+        inputs=specs, states=(StateSpec("memory", (Batch, heads, row, column)),),
+        transition=StateTransition("memory", propagations=(AxisScale(Input("g"), (row,)),),
+            injections=(ProductInjection((ProductFactor(Input("k") * 0.5, (row,)),
+                                          ProductFactor(Input("v"), (column,)))),)),
+        readouts=(Readout("output", term, torch.float32), Readout("rounded", term, torch.bfloat16)),
+        head_mapping=HeadMapping({source: heads, heads: heads}),
+    )
+    operator = StatefulOperator(algorithm)
+    compiled = operator.compile(role_sizes={source: 1, heads: 4, row: 13, column: 35},
+                                target=Target(), mode="dense")
+    executable = operator._plans[compiled.specialization]
+    if schedule == "scores":
+        candidate = next(c for c in executable.plan.lowered_candidates if c.lowerer.endswith("shared-scores"))
+        from attn_engine._stateful_chunked import select_chunked_schedule
+
+        operator._plans[compiled.specialization] = replace(
+            executable, plan=replace(executable.plan, candidate=candidate),
+            chunked_recipe=select_chunked_schedule(executable.chunked_recipe, candidate.lowerer),
+        )
+    generator = torch.Generator().manual_seed(173)
+    host = {spec.name: (torch.randn(2, 1 if spec.name != "g" else 4, 137,
+                                  35 if spec.name == "v" else 13, generator=generator) * 0.2).to(spec.dtype)
+            for spec in specs}
+    host["g"] = torch.rand(2, 4, 137, 13, generator=generator) * 1.5 - 0.5
+    host["g"][:, :, 63] = 0
+    host["g"][:, :, 64] = -0.5
+    initial = torch.randn(2, 4, 13, 35, generator=generator) * 0.1
+    values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
+    start = StateTuple(("memory",), (initial.to(gpu_device),))
+    state, expected = initial.clone(), []
+    for token in range(137):
+        query = (host["q"][:, :, token] * 0.5).float().expand(2, 4, 13)
+        key = (host["k"][:, :, token] * 0.5).float().expand(2, 4, 13)
+        value = host["v"][:, :, token].float().expand(2, 4, 35)
+        before = state
+        state = state * host["g"][:, :, token, :, None] + key[..., None] * value[..., None, :]
+        expected.append(torch.einsum("bhr,bhrc->bhc", query, before if prior else state))
+    expected = torch.stack(expected, 2)
+    full = compiled(**values, initial_state=start, return_final_state=True)
+    output_only = compiled(**values, initial_state=start)
+    split = 17
+    prefix = compiled(**{name: tensor[:, :, :split].contiguous() for name, tensor in values.items()},
+                      initial_state=start, return_final_state=True)
+    suffix = compiled(**{name: tensor[:, :, split:].contiguous() for name, tensor in values.items()},
+                      initial_state=prefix.final_state, return_final_state=True)
+    for name, dtype in (("output", torch.float32), ("rounded", torch.bfloat16)):
+        tolerance = dict(rtol=2e-4, atol=2e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-3)
+        torch.testing.assert_close(full.outputs[name].cpu(), expected.to(dtype), **tolerance)
+        torch.testing.assert_close(output_only.outputs[name].cpu(), expected.to(dtype), **tolerance)
+        torch.testing.assert_close(torch.cat((prefix.outputs[name], suffix.outputs[name]), 2).cpu(),
+                                   expected.to(dtype), **tolerance)
+    torch.testing.assert_close(full.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(suffix.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(start["memory"].cpu(), initial, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("schedule", ["fused", "cut"])
+@pytest.mark.parametrize("priors", [(False, False), (True, True), (False, True)])
+def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, priors):
+    from dataclasses import replace
+    from attn_engine import AlgorithmIR, Readout, Softmax, StateTerm, StatefulOperator, StateTuple, Target
+    from attn_engine._stateful_chunked import select_chunked_schedule
+    from examples.gated_slot_attention import gated_slot_attention, KEY, VALUE, QUERY_HEADS, KEY_HEADS, VALUE_HEADS, STATE_HEADS
+
+    base = gated_slot_attention(2, 2, 71, 13, 19, 11, dtype=torch.float32)
+    outer = base.algorithm.readouts[0].expression
+    inner = outer.operand.operand
+    expression = StateTerm(outer.state,
+                          Softmax(StateTerm(inner.state, inner.operand, inner.role, prior=priors[0]), outer.role),
+                          outer.role, prior=priors[1])
+    operator = StatefulOperator(AlgorithmIR(
+        inputs=base.algorithm.inputs, states=base.algorithm.states,
+        transition=base.algorithm.transitions, head_mapping=base.algorithm.head_mapping,
+        readouts=(Readout("output", expression, torch.float32),),
+    ))
+    sizes = {KEY: 13, VALUE: 11, outer.role: 19,
+             QUERY_HEADS: 2, KEY_HEADS: 2, VALUE_HEADS: 2, STATE_HEADS: 2}
+    compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense")
+    executable = operator._plans[compiled.specialization]
+    if schedule == "cut":
+        candidate = next(c for c in executable.plan.lowered_candidates if c.lowerer.endswith("readout-cut"))
+        operator._plans[compiled.specialization] = replace(
+            executable, plan=replace(executable.plan, candidate=candidate),
+            chunked_recipe=select_chunked_schedule(executable.chunked_recipe, candidate.lowerer),
+        )
+    generator = torch.Generator().manual_seed(179)
+    host = {name: torch.randn(2, 2, 71, width, generator=generator) * 0.2
+            for name, width in (("query", 13), ("key", 13), ("slot", 19), ("value", 11), ("gate", 19))}
+    host["gate"] = -host["gate"].abs()
+    host["gate"][:, :, 63] = float("-inf")
+    initial = {"key_slot": torch.randn(2, 2, 13, 19, generator=generator) * 0.1,
+               "slot_value": torch.randn(2, 2, 19, 11, generator=generator) * 0.1}
+    first, second, expected = initial["key_slot"].clone(), initial["slot_value"].clone(), []
+    for token in range(71):
+        before1, before2 = first, second
+        gate = host["gate"][:, :, token].exp()
+        first = first * gate[..., None, :] + host["key"][:, :, token, :, None] * host["slot"][:, :, token, None, :]
+        second = second * gate[..., None] + host["slot"][:, :, token, :, None] * host["value"][:, :, token, None, :]
+        query = host["query"][:, :, token] * (13 ** -0.5)
+        weight = torch.einsum("bhr,bhrm->bhm", query, before1 if priors[0] else first).softmax(-1)
+        expected.append(torch.einsum("bhm,bhmv->bhv", weight, before2 if priors[1] else second))
+    values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
+    start = StateTuple(tuple(initial), tuple(tensor.to(gpu_device) for tensor in initial.values()))
+    result = compiled(**values, initial_state=start, return_final_state=True)
+    torch.testing.assert_close(result.outputs["output"].cpu(), torch.stack(expected, 2), rtol=2e-4, atol=2e-5)
+    for name, final in (("key_slot", first), ("slot_value", second)):
+        torch.testing.assert_close(result.final_state[name].cpu(), final, rtol=2e-4, atol=2e-5)

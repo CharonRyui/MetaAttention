@@ -14,7 +14,7 @@ from attn_engine import (
 pytestmark = [pytest.mark.functional, pytest.mark.gpu]
 
 
-@pytest.mark.parametrize('length', [0, 1, 63, 64, 65, 130, 2048, 8192])
+@pytest.mark.parametrize('length', [0, 1, 63, 64, 65, 130, 2048, 4097, 8192])
 @pytest.mark.parametrize('mode', ['log', 'signed', 'identity'])
 def test_vector_state_tail_and_continuation(gpu_device, length, mode):
     feature = FeatureRole('vector')
@@ -85,3 +85,27 @@ def test_vector_state_tail_and_continuation(gpu_device, length, mode):
                                rtol=2e-2 if dtype == torch.bfloat16 else 2e-5,
                                atol=2e-3 if dtype == torch.bfloat16 else 2e-5)
     torch.testing.assert_close(second.final_state['hidden'].cpu(), state, rtol=2e-5, atol=2e-5)
+
+
+def test_vector_autotune_preserves_rank_one_state(gpu_device):
+    from examples.hgrn import hgrn
+    from testing.benchmark_stateful_plans import CASES, role_sizes_for
+    from dataclasses import replace
+
+    case = replace(next(case for case in CASES if case.name == 'hgrn'), heads=1, dim_value=11)
+    operator = hgrn(1, 1, 65, 11, dtype=torch.float32)
+    compiled = operator.compile(role_sizes=role_sizes_for(operator, case, 65),
+                                target=Target(), mode='dense', autotune=True)
+    generator = torch.Generator().manual_seed(947)
+    value = torch.randn(1, 1, 65, 11, generator=generator) * 0.1
+    gate = -torch.rand(1, 1, 65, 11, generator=generator)
+    initial = torch.randn(1, 1, 11, generator=generator) * 0.1
+    state, expected = initial.clone(), []
+    for token in range(65):
+        state = state * gate[:, :, token].exp() + value[:, :, token]
+        expected.append(state.clone())
+    result = compiled(value=value.to(gpu_device), gate=gate.to(gpu_device),
+                      initial_state=StateTuple(('hidden',), (initial.to(gpu_device),)),
+                      return_final_state=True)
+    torch.testing.assert_close(result.outputs['output'].cpu(), torch.stack(expected, 2), rtol=2e-5, atol=2e-5)
+    torch.testing.assert_close(result.final_state['hidden'].cpu(), state, rtol=2e-5, atol=2e-5)

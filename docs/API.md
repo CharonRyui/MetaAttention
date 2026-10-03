@@ -296,8 +296,9 @@ structures, packed programs, gradients, and unoptimized v2 programs.
 The rank-1 diagonal/identity-readout structure (including HGRN) uses raw BF16/FP32
 bindings and native vector affine scans. A sequence of at most 64 tokens uses
 one output kernel; longer sequences use summary, carry, and output kernels.
-Only three FP32 chunk vectors are scratch; no promoted matrix, dense query of
-ones, FP32 input copy, or token-sized State scratch is created. Output casting
+Three FP32 chunk vectors are scratch; beyond 64 chunks, recursive group summaries
+bound prefix depth and add smaller vector buffers. No promoted matrix, dense query
+of ones, FP32 input copy, or token-sized State scratch is created. Output casting
 and optional FP32 final-State writing occur in the output kernel. HeadMapping,
 nonzero initial State, tails, zero/signed gates and continuation are preserved.
 
@@ -312,6 +313,60 @@ T=64 output-only changed from 0.485 to 0.122 ms and CUDA activity count from
 performance baseline, and continuation includes two calls plus output concat.
 The headless FLA HGRN adapter rejects H>1; those rows compare Meta before/after
 only and do not establish a cross-framework speedup.
+
+Matrix diagonal inference now binds authored pointwise expressions directly to
+raw BF16/FP32 inputs. Row and column summary scales occupy separate vectors,
+not a broadcast matrix. Prefix composition uses multiplication/addition only,
+including zero or signed gates, and recursively groups long chunk sequences.
+One-chunk calls bypass summary/carry allocation; output-only calls omit the last
+summary because no following chunk or final State consumes it.
+
+Readout schedules are compiler-selected structural candidates: bounded chunk
+replay, shared score generation followed by block contractions when the column
+action is identity, and a two-State contraction/slot-softmax/contraction region
+with an explicit materialization-cut alternative. Scores are reused across equal
+State/query/prior/bonus expressions. Softmax reduces the typed Feature axis, not
+Sequence. Fusion eligibility uses the existing padded-axis/live-FP32 resource
+bound. Candidate feasibility, tuning allocation checks, and runtime workspace
+policy consume the same recipe-derived output and scratch estimates, including
+every output dtype and final-State allowance. Dynamic B/T do not select a new
+plan. Successful device constraints are cached per process/device/constraint;
+tensor binding, layout, alias, and shape checks still run on each invocation.
+
+Shared scores were slower than replay on the measured RWKV6 shape and are not
+enabled by default; fusion likewise remains a candidate, not a universal rule.
+The native replay/fused defaults passed independent CPU FP32 recurrences at
+`B=2,H=8,T={1,63,64,65,130,2048,8192}` for RWKV6, GSA, and HGRN, including nonzero
+initial States, output-only, all final States, and nonaligned continuation.
+Focused public-call regressions cover unequal Feature widths, shared heads,
+BF16 authored expression rounding, zero/signed gates, prior-State reads, shared
+scores, and the fused/cut softmax alternatives.
+Verification: 187 unit tests passed (3 GPU-marked tests skipped), 113 focused
+GPU tests passed, and the additional rank-1 autotune regression passed. RWKV6,
+GSA, and HGRN autotune invocations also passed output and
+final-State recurrence checks. At `B=2,H=8,T=8192`, allocator peaks for replay,
+shared-score, fused/cut, and vector paths all stayed below their compiled bounds.
+
+Final H20 measurements use BF16, `B=1`, output-only, five warmups and twenty
+samples. Public-call medians below include CPU dispatch; CUDA Graph replay does
+not. Full records: `benchmark_results/diagonal_native_final.json`.
+
+| Structure | H | T | Meta public ms | Meta Graph ms | FLA public ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| RWKV6 | 1 | 64 | 0.263 | 0.064 | 0.303 |
+| RWKV6 | 1 | 2048 | 0.355 | 0.084 | 0.312 |
+| RWKV6 | 8 | 64 | 0.266 | 0.065 | 0.362 |
+| RWKV6 | 8 | 2048 | 0.397 | 0.159 | 0.378 |
+| GSA | 1 | 64 | 0.332 | 0.123 | 0.562 |
+| GSA | 1 | 2048 | 0.501 | 0.137 | 0.505 |
+| GSA | 8 | 64 | 0.333 | 0.130 | 0.568 |
+| GSA | 8 | 2048 | 0.637 | 0.325 | 0.576 |
+| HGRN | 1 | 64 | 0.119 | 0.014 | 0.113 |
+| HGRN | 1 | 2048 | 0.175 | 0.020 | 0.115 |
+
+FLA remains faster on the longer RWKV6/H=8 GSA/HGRN calls. HGRN/H>1 still has no
+runnable FLA comparison. Profiler activity was unavailable in this final run;
+the records leave kernel time and launch counts null rather than infer them.
 
 ## Legacy Customized Linear Attention API
 

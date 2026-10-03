@@ -172,9 +172,26 @@ def execute_rank_one(recipe, inputs, initial, *, role_sizes, sequence_count,
         carry = torch.empty_like(scale)
         _scan[grid](gate, value, initial, scale, bias, carry, output, final,
                     SUMMARY=True, DIRECT=False, WRITE_FINAL=False, **common)
-        _carry[(sequence_count * heads, triton.cdiv(features, 128))](
-            scale, bias, initial, carry, features, chunks, 128,
-            num_warps=4, enable_fp_fusion=False)
+        # Keep the direct carry for small scans; long scans use grouped local
+        # summaries so the serial prefix depth stays bounded.  These reshapes
+        # are views over vector buffers (one row), not matrix state storage.
+        if chunks <= 64:
+            _carry[(sequence_count * heads, triton.cdiv(features, 128))](
+                scale, bias, initial, carry, features, chunks, 128,
+                num_warps=4, enable_fp_fusion=False)
+        else:
+            from ._stateful_diagonal_scan import hierarchical_carry
+
+            hierarchical_carry(
+                scale.reshape(sequence_count * heads, chunks, 1, features),
+                bias.reshape(sequence_count * heads, chunks, 1, features),
+                initial.reshape(sequence_count * heads, 1, features),
+                carry.reshape(sequence_count * heads, chunks, 1, features),
+                final.reshape(sequence_count * heads, 1, features),
+                identity=False,
+                write_final=False,
+            )
         _scan[grid](gate, value, initial, scale, bias, carry, output, final,
-                    SUMMARY=False, DIRECT=False, WRITE_FINAL=return_final_state, **common)
+                    SUMMARY=False, DIRECT=False,
+                    WRITE_FINAL=return_final_state, **common)
     return output, final if return_final_state else None

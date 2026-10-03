@@ -418,6 +418,7 @@ class ChunkedRecipe:
     bonus_readout: tuple[Any, Any, Any, float, Any, Any] | None
     rank_one: Any | None
     native_normalized: Any | None
+    native_diagonal: Any | None
     inputs: tuple[Any, ...]
     feature_order: tuple[Any, ...]
 
@@ -563,6 +564,7 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         return None
     from ._stateful_rank1 import compile_rank_one
     from ._stateful_native import compile_native_normalized
+    from ._stateful_diagonal_native import compile_native_diagonal
     from ._stateful_reference import feature_layout
     from .stateful_operator import Batch, FeatureRole, HeadRole, Sequence
 
@@ -617,15 +619,32 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         bonus,
         compile_rank_one(algorithm),
         native,
+        compile_native_diagonal(algorithm, readouts, bonus, role_sizes),
         tuple(bindings),
         feature_order,
     )
+
+
+def select_chunked_schedule(recipe, lowerer):
+    """Bind a compiler-selected schedule; runtime lengths never select a plan."""
+    if recipe is None or recipe.native_diagonal is None:
+        return recipe
+    from dataclasses import replace
+
+    native = recipe.native_diagonal
+    return replace(recipe, native_diagonal=replace(
+        native,
+        shared_scores=lowerer == "triton-chunked-shared-scores",
+        fused_softmax=native.fused_softmax and lowerer != "triton-chunked-readout-cut",
+    ))
 
 
 def bind_chunked_inputs(recipe: ChunkedRecipe, inputs, runtime):
     """Bind dense values without reference segments or per-call IR analysis."""
 
     if recipe.native_normalized is not None:
+        return inputs
+    if recipe.native_diagonal is not None:
         return inputs
 
     values = {}
@@ -688,6 +707,14 @@ def execute_chunked_states(
 
         return execute_native_normalized(
             recipe.native_normalized, values, initial_states, role_sizes=role_sizes,
+            sequence_count=token_count // sequence_length, sequence_length=sequence_length,
+            heads=heads, return_final_state=return_final_state,
+        )
+    if recipe.native_diagonal is not None:
+        from ._stateful_diagonal_native import execute_native_diagonal
+
+        return execute_native_diagonal(
+            recipe.native_diagonal, values, initial_states, role_sizes=role_sizes,
             sequence_count=token_count // sequence_length, sequence_length=sequence_length,
             heads=heads, return_final_state=return_final_state,
         )

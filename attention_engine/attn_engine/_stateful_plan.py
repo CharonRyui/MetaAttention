@@ -1,4 +1,4 @@
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from enum import Enum
 import fcntl
 import hashlib
@@ -171,6 +171,7 @@ class EstimationShape:
     chunked_states_chunk_bytes: int = 0
     factored_workspace: int = 0
     factored_chunk_bytes: int = 0
+    native_resources: Any | None = None
 
     @classmethod
     def of(
@@ -190,6 +191,7 @@ class EstimationShape:
         chunked_states_chunk_bytes: int = 0,
         factored_workspace: int = 0,
         factored_chunk_bytes: int = 0,
+        native_resources: Any | None = None,
     ) -> "EstimationShape":
         rows = feature_sizes[0]
         columns = feature_sizes[1] if len(feature_sizes) > 1 else 1
@@ -198,7 +200,7 @@ class EstimationShape:
             heads, rows, columns, dense_summary, state_count, total,
             dense_total_elements or total, live_state_elements or total,
             backward, chunked, chunked_states, chunked_states_workspace,
-            chunked_states_chunk_bytes, factored_workspace, factored_chunk_bytes,
+            chunked_states_chunk_bytes, factored_workspace, factored_chunk_bytes, native_resources,
         )
 
     @property
@@ -350,6 +352,23 @@ class CandidateLowerer:
             PlanRepresentation.PRODUCT_FEATURE_CHUNKED,
             PlanRepresentation.CHUNKED_STATEFUL,
         }:
+            if shape.native_resources is not None:
+                resources = shape.native_resources
+                token_bytes, chunk_bytes = resources.output_bytes, resources.chunk_bytes
+                launches = resources.launches
+                if self.name == "triton-chunked-shared-scores":
+                    chunk_bytes += resources.score_bytes
+                    launches += resources.score_launches
+                elif self.name == "triton-chunked-readout-cut":
+                    token_bytes += resources.cut_bytes
+                    launches += 2
+                elif resources.cut_bytes and not resources.fused_softmax:
+                    token_bytes += resources.cut_bytes
+                return CandidateEstimate(
+                    True, token_bytes + chunk_bytes // 64,
+                    3 * heads * shape.state_total_elements, launches,
+                    token_bytes, workspace_bytes_per_chunk=chunk_bytes,
+                )
             # The chunked schedule keeps boundary carries and contracted
             # outputs; it does not materialize a token-sized State history.
             return CandidateEstimate(
@@ -444,6 +463,16 @@ LOWERERS = (
     ),
     CandidateLowerer(
         "tilelang-chunked-stateful",
+        (PlanRepresentation.CHUNKED_STATEFUL,),
+        "chunked-stateful",
+    ),
+    CandidateLowerer(
+        "triton-chunked-shared-scores",
+        (PlanRepresentation.CHUNKED_STATEFUL,),
+        "chunked-stateful",
+    ),
+    CandidateLowerer(
+        "triton-chunked-readout-cut",
         (PlanRepresentation.CHUNKED_STATEFUL,),
         "chunked-stateful",
     ),
@@ -668,7 +697,7 @@ class TileLangPlan:
     binary_identity: str
     tuning_identity: str
     mode: str
-    feature_sizes: tuple[int, int]
+    feature_sizes: tuple[int, ...]
     context_contract: ContextContract
     workspace: WorkspacePolicy
     mathematical_plans: tuple[MathematicalPlan, ...] = ()
@@ -677,6 +706,7 @@ class TileLangPlan:
     backward_kernel_config: KernelConfig | None = None
     uses_parallel_summary: bool = True
     candidate_estimates: tuple[tuple[str, CandidateEstimate], ...] = ()
+    estimation_shape: EstimationShape | None = None
 
     @property
     def backend(self) -> str:
@@ -695,14 +725,14 @@ class TileLangExecutable:
     composition: Composition | None = None
     backward_binding: Any | None = None
     chunked_recipe: Any | None = None
+    _runtime_family: str = field(init=False, repr=False)
+
+    def __post_init__(self):
+        object.__setattr__(self, "_runtime_family", runtime_family_for(self.plan.candidate))
 
     @property
     def runtime_family(self) -> str:
-        return next(
-            lowerer.runtime_family
-            for lowerer in LOWERERS
-            if lowerer.name == self.plan.candidate.lowerer
-        )
+        return self._runtime_family
 
     def _validate_gradient_dispatch(self, *tensors: torch.Tensor) -> None:
         if not torch.is_grad_enabled() or not any(
@@ -855,7 +885,7 @@ def compile_plan(
     *,
     source_identity: str,
     mode: str,
-    feature_sizes: tuple[int, int],
+    feature_sizes: tuple[int, ...],
     target: Any,
     backward_ir: Any | None,
     dense_summary: bool,
@@ -957,9 +987,9 @@ def compile_plan(
     )
     if chunked_stateful and chunked_recipe.rank_one is not None:
         elements = fixed_sizes[state.head_role] * fixed_sizes[chunked_recipe.rank_one.feature]
-        # Native raw loads need output storage and three FP32 chunk vectors;
-        # the extra chunk in WorkspacePolicy conservatively covers final State.
-        state_workspace, state_chunk_bytes = 4 * elements, 12 * elements
+        # Three FP32 chunk vectors plus recursive groups; the extra chunk
+        # in WorkspacePolicy conservatively covers final State.
+        state_workspace, state_chunk_bytes = 4 * elements, 16 * elements
     if chunked_stateful and chunked_recipe.native_normalized is not None:
         native = chunked_recipe.native_normalized
         memory = next(spec for spec in operator.algorithm.states if spec.name == native.memory)
@@ -969,6 +999,15 @@ def compile_plan(
         # direct prefixes reuse storage; the extra boundary covers both finals.
         state_workspace = 4 * heads * columns
         state_chunk_bytes = 12 * heads * rows * (columns + 1)
+    native_resources = None
+    if chunked_stateful and chunked_recipe.native_diagonal is not None:
+        from ._stateful_diagonal_native import native_diagonal_resources
+
+        native_resources = native_diagonal_resources(
+            chunked_recipe.native_diagonal, fixed_sizes, fixed_sizes[state.head_role],
+        )
+        state_workspace = native_resources.output_bytes
+        state_chunk_bytes = native_resources.chunk_bytes
     factored_token_bytes = factored_chunk_bytes = 0
     if rank_one_factored is not None and mode == "dense" and backward_ir is None:
         heads = fixed_sizes[state.head_role]
@@ -1013,11 +1052,24 @@ def compile_plan(
         chunked_states_chunk_bytes=state_chunk_bytes if chunked_stateful else 0,
         factored_workspace=factored_token_bytes,
         factored_chunk_bytes=factored_chunk_bytes,
+        native_resources=native_resources,
     )
     candidate_list: list[LoweredCandidate] = []
     estimates: dict[LoweredCandidate, CandidateEstimate] = {}
     for item in mathematical_plans:
+        native_diagonal = None if chunked_recipe is None else chunked_recipe.native_diagonal
         for lowerer in LOWERERS:
+            if lowerer.name == "triton-chunked-shared-scores" and (
+                native_diagonal is None
+                or native_diagonal.softmax is not None
+                or not any(state.identity_columns for state in native_diagonal.states)
+            ):
+                continue
+            if lowerer.name == "triton-chunked-readout-cut" and (
+                native_diagonal is None or native_diagonal.softmax is None
+                or not native_diagonal.fused_softmax
+            ):
+                continue
             if lowerer.runtime_family == "vector-propagation" and (
                 mode != "dense"
                 or backward_ir is not None
@@ -1095,11 +1147,12 @@ def compile_plan(
             feature_sizes,
             ContextContract((), (), ()),
             WorkspacePolicy(
-                feature_sizes[0] * feature_sizes[1] * 4, target.workspace_bytes
+                shape.state_total_elements * shape.heads * 4, target.workspace_bytes
             ),
             mathematical_plans,
             candidates,
             candidate_estimates=candidate_estimates,
+            estimation_shape=shape,
         )
         provisional = TileLangExecutable(
             provisional_plan,
@@ -1219,6 +1272,7 @@ def compile_plan(
         backward_candidate,
         backward_kernel_config,
         candidate_estimates=candidate_estimates,
+        estimation_shape=shape,
     )
     composition = Composition(candidate, backward_candidate, context_contract)
     composition.validate()
@@ -1239,6 +1293,9 @@ def compile_plan(
                 asdict(backward_candidate),
                 layer="backward",
             )
+    from ._stateful_chunked import select_chunked_schedule
+
+    chunked_recipe = select_chunked_schedule(chunked_recipe, candidate.lowerer)
     return TileLangExecutable(
         plan=plan,
         backward_ir=backward_ir,
