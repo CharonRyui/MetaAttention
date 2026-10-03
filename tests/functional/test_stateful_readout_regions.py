@@ -384,6 +384,109 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
     torch.testing.assert_close(start["memory"].cpu(), initial, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("axes", ["identity", "row", "dual"])
+@pytest.mark.parametrize("injection_count", [2, 3])
+def test_native_multiple_injections_dynamic_workloads_and_continuation(gpu_device, axes, injection_count):
+    from attn_engine import (
+        AlgorithmIR, AxisScale, Batch, FeatureRole, HeadMapping, HeadRole, Input,
+        ProductFactor, ProductInjection, Readout, Sequence, StateSpec, StateTerm,
+        StateTransition, StatefulOperator, StateTuple, Target, TensorInput,
+    )
+
+    row, column = FeatureRole("row"), FeatureRole("column")
+    source, heads = HeadRole("source"), HeadRole("heads")
+    specs = tuple(TensorInput(name, (Batch, source, Sequence, feature), torch.bfloat16)
+                  for name, feature in (("q", row), ("q2", row), ("k", row),
+                                        ("k2", row), ("v", column), ("v2", column)))
+    specs += (TensorInput("weight", (Batch, Sequence), torch.float32),)
+    if axes != "identity":
+        specs += (TensorInput("gr", (Batch, heads, Sequence, row), torch.float32),)
+    if axes == "dual":
+        specs += (TensorInput("gc", (Batch, heads, Sequence, column), torch.float32),)
+    injections = (
+        ProductInjection((ProductFactor((Input("k") * 0.3) * 0.5, (row,)),
+                          ProductFactor(Input("v"), (column,)))),
+        ProductInjection((ProductFactor(Input("k2"), (row,)),
+                          ProductFactor(Input("v2") * Input("weight"), (column,)))),
+        ProductInjection((ProductFactor(Input("k") + Input("k2"), (row,)),
+                          ProductFactor(Input("v2") * 0.3, (column,)))),
+    )[:injection_count]
+    propagations = tuple(AxisScale(Input(name), (feature,)) for name, feature in
+                         (("gr", row), ("gc", column)) if any(spec.name == name for spec in specs))
+    operator = StatefulOperator(AlgorithmIR(
+        inputs=specs, states=(StateSpec("memory", (Batch, heads, row, column)),),
+        transition=StateTransition("memory", propagations=propagations, injections=injections),
+        readouts=(Readout("post", StateTerm("memory", Input("q"), row), torch.float32),
+                  Readout("prior", StateTerm("memory", Input("q2"), row, prior=True), torch.bfloat16)),
+        head_mapping=HeadMapping({source: heads, heads: heads}),
+    ))
+    sizes = {source: 2, heads: 4, row: 13, column: 35}
+    compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense")
+    generator = torch.Generator().manual_seed(179)
+    for batch, length in ((2, 1), (1, 63), (2, 64), (1, 65), (2, 137), (1, 4097)):
+        host = {}
+        for spec in specs:
+            shape = tuple(batch if role == Batch else length if role == Sequence else sizes[role]
+                          for role in spec.roles)
+            tensor = (torch.randn(shape, generator=generator) * 0.2).to(spec.dtype)
+            if spec.name in ("gr", "gc"):
+                tensor = tensor.abs() + 0.6
+                tensor[:, :, 63::64] = 0
+                tensor[:, :, 64::65] = -0.5
+            host[spec.name] = tensor
+        # Rebind fresh storage-offset views on the same compiled specialization.
+        values = {}
+        for name, tensor in host.items():
+            storage = torch.empty(tensor.numel() + 19, device=gpu_device, dtype=tensor.dtype)
+            values[name] = storage[19:].reshape(tensor.shape)
+            values[name].copy_(tensor)
+        initial = torch.randn(batch, 4, 13, 35, generator=generator) * 0.1
+        start = StateTuple(("memory",), (initial.to(gpu_device),))
+        state = initial.clone()
+        expected_post, expected_prior = [], []
+        for token in range(length):
+            q, q2, k, k2, v, v2 = (host[name][:, :, token].repeat_interleave(2, 1)
+                                   for name in ("q", "q2", "k", "k2", "v", "v2"))
+            expected_prior.append(torch.einsum("bhr,bhrc->bhc", q2.float(), state).bfloat16())
+            if axes != "identity":
+                state = state * host["gr"][:, :, token, :, None]
+            if axes == "dual":
+                state = state * host["gc"][:, :, token, None, :]
+            bias = ((k * 0.3) * 0.5).float()[..., None] * v.float()[..., None, :]
+            weighted_value = v2.float() * host["weight"][:, token, None, None]
+            bias = bias + k2.float()[..., None] * weighted_value[..., None, :]
+            if injection_count == 3:
+                bias = bias + (k + k2).float()[..., None] * (v2 * 0.3).float()[..., None, :]
+            state = state + bias
+            expected_post.append(torch.einsum("bhr,bhrc->bhc", q.float(), state))
+        expected = {
+            "post": torch.stack(expected_post, 2),
+            "prior": torch.stack(expected_prior, 2),
+        }
+        full = compiled(**values, initial_state=start, return_final_state=True)
+        output_only = compiled(**values, initial_state=start)
+        for name, oracle in expected.items():
+            tolerance = dict(rtol=2e-4, atol=2e-5) if name == "post" else dict(rtol=2e-2, atol=2e-3)
+            torch.testing.assert_close(full.outputs[name].cpu(), oracle, **tolerance)
+            torch.testing.assert_close(output_only.outputs[name].cpu(), oracle, **tolerance)
+        torch.testing.assert_close(full.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
+        torch.testing.assert_close(start["memory"].cpu(), initial, rtol=0, atol=0)
+        assert output_only.final_state is None
+        if length > 1:
+            split = min(17, length - 1)
+            prefix = compiled(**{spec.name: values[spec.name].narrow(spec.roles.index(Sequence), 0, split).contiguous()
+                                 for spec in specs},
+                              initial_state=start, return_final_state=True)
+            suffix = compiled(**{spec.name: values[spec.name].narrow(spec.roles.index(Sequence), split, length - split).contiguous()
+                                 for spec in specs},
+                              initial_state=prefix.final_state, return_final_state=True)
+            for name, oracle in expected.items():
+                tolerance = dict(rtol=2e-4, atol=2e-5) if name == "post" else dict(rtol=2e-2, atol=2e-3)
+                torch.testing.assert_close(torch.cat((prefix.outputs[name], suffix.outputs[name]), 2).cpu(),
+                                           oracle, **tolerance)
+            torch.testing.assert_close(suffix.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
+
+
 @pytest.mark.parametrize("schedule", ["fused", "cut"])
 @pytest.mark.parametrize("priors", [(False, False), (True, True), (False, True)])
 def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, priors):

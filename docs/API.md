@@ -306,6 +306,66 @@ candidate for semantic coverage, not claiming a speedup. Full raw records are
 in `benchmark_results/composition_profiles_final.json`; this artifact is local
 measurement evidence, not a tracked API contract.
 
+The subsequent multiple-injection pass admits matrix diagonal transitions with
+several disjoint row/column Product Injections when all factors and readouts have
+native raw-loader proofs. The compiler retains an ordered tuple of factor pairs;
+each replay token sums the FP32 injection products before adding them to propagated
+State. Authored expression association and BF16 node rounding remain in the loaders.
+Chunk summaries and all readouts share one State carry. No full token-sized State
+history, grouped-head expansion, or promoted input copies are materialized. The
+single-injection normalized and shared-score schedules are not used for this case;
+unsupported expressions, packed execution and gradients retain their existing paths.
+Eligibility and candidate pricing depend on typed structure and fixed Head/Feature
+sizes, including injection count, never input names or runtime B/T.
+The loader also preserves FP32 zero-dimensional constants through arithmetic,
+rounding the result at each BF16 expression node rather than first quantizing the
+constant to BF16. Non-binary constants such as `0.3` exercise this distinction.
+
+On an idle H20, the same-IR public-call comparison at `B=1,T=129`, four State heads,
+`(row,column)=(64,128)`, BF16 inputs and FP32 State used ten alternating batches,
+ten warmups and twenty samples per batch, with final State requested:
+
+| Path | CUDA-event ms | Wall ms | Peak incremental allocated bytes |
+| --- | ---: | ---: | ---: |
+| Generic (`optimized=False`) | 0.750024 | 0.774290 | 93,401,088 |
+| Multiple-injection chunked | 0.286528 | 0.304401 | 926,720 |
+
+This is 2.62x generic/chunked CUDA-event latency and 0.992% of generic's incremental
+allocation. The paired chunked/generic batch-median ratio has a bootstrap 95%
+interval of `[0.373,0.390]`. Records are in
+`benchmark_results/multiple_injections_after.json`; the separate earlier baseline
+in `benchmark_results/multiple_injections_before.json` is not mixed into the
+same-process speedup calculation. These are local measurement artifacts.
+
+Final-source verification passed 192 CPU tests (three skipped) and 162 focused H20
+tests. A single compiled handle per structure covered two and three injections,
+identity/row/dual propagation, unequal Features, grouped heads, a headless FP32
+factor, fresh storage-offset tensors, signed/zero gates, `T={1,63,64,65,137,4097}`,
+nonzero initial State, FP32 post-State and BF16 prior-State outputs, output-only,
+and continuation against an independent CPU recurrence without widening tolerance.
+Obsolete lowerer-name assertions were removed; the older dependent-readout fixture
+now invokes the public callable rather than passing normalized values to a raw
+executor.
+
+Fresh-process public and CUDA Graph smoke reused one handle across runtime workloads.
+Ten alternating batches with ten warmups and ten samples per batch gave these
+within-run comparisons; compilation was excluded:
+
+| B | T | Generic public ms | Chunked public ms | Generic / chunked | Chunked Graph ms |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1 | 0.691392 | 0.185408 | 3.73x | 0.058592 |
+| 2 | 65 | 0.726256 | 0.279312 | 2.60x | 0.107248 |
+| 1 | 129 | 0.686864 | 0.279768 | 2.46x | 0.107808 |
+| 2 | 257 | 1.026528 | 0.302328 | 3.40x | 0.140416 |
+
+All outputs, final States, output-only calls, continuation and Graph replay passed
+the independent oracle. Generic `B=2,T=512` and `T=2048` were rejected by its
+existing 1 GiB workspace envelope; native correctness passed before those generic
+measurements. No speedup ratio is assigned to those rejected calls. Evidence:
+`benchmark_results/multiple_injections_final.json` (local artifact).
+
+
+
 The follow-up dense-State pass also reuses identical broadcast value bindings
 across States; it changes no numerical path and is covered by the same focused
 GPU regression suite.

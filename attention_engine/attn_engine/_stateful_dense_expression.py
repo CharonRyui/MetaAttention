@@ -73,10 +73,6 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
             dtype = (rd if ls and not rs else ld if rs and not ls
                      else torch.promote_types(ld, rd))
             scalar = ls and rs
-            if ls and not rs and rd == torch.bfloat16:
-                left = f"{left}.to(tl.bfloat16).to(tl.float32)"
-            if rs and not ls and ld == torch.bfloat16:
-                right = f"{right}.to(tl.bfloat16).to(tl.float32)"
             symbol = "+" if isinstance(node, Add) else "*" if isinstance(node, Multiply) else "/"
             code = f"({left} {symbol} {right})"
             if dtype == torch.bfloat16:

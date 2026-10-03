@@ -291,7 +291,7 @@ def _expression_features(expression: Any, algorithm: Any) -> tuple[Any, ...] | N
 
 def chunked_states_eligible(algorithm: Any, *, packed: bool = False) -> bool:
     """Static proof for dense diagonal recurrence with dependent readout passes."""
-    from .stateful_operator import AxisScale, Identity
+    from .stateful_operator import AxisScale, Identity, ProductFeatureRole
 
     if packed:
         return False
@@ -319,7 +319,12 @@ def chunked_states_eligible(algorithm: Any, *, packed: bool = False) -> bool:
         transition = next(
             (item for item in algorithm.transitions if item.state == state.name), None
         )
-        if transition is None or len(transition.injections) != 1:
+        if transition is None or not transition.injections:
+            return False
+        multiple = len(transition.injections) > 1
+        if multiple and (state.rank != 2 or any(
+            isinstance(role, ProductFeatureRole) for role in state.feature_roles
+        )):
             return False
         for node in transition.propagations:
             if not isinstance(node, (AxisScale, Identity)):
@@ -334,25 +339,26 @@ def chunked_states_eligible(algorithm: Any, *, packed: bool = False) -> bool:
                     return False
                 if len(node.roles) > 1 and features:
                     return False
-        seen: set[Any] = set()
-        scalar_count = 0
-        for factor in transition.injections[0].factors:
-            roles = tuple(factor.roles)
-            scalar_count += not roles
-            if scalar_count > 1:
+        for injection in transition.injections:
+            seen: set[Any] = set()
+            scalar_count = 0
+            for factor in injection.factors:
+                roles = tuple(factor.roles)
+                scalar_count += not roles
+                if scalar_count > (0 if multiple else 1):
+                    return False
+                if len(roles) > 1 or any(
+                    role not in state.feature_roles or role in seen for role in roles
+                ):
+                    return False
+                if _contracted_terms(factor.expression) != []:
+                    return False
+                features = _expression_features(factor.expression, algorithm)
+                if features is None or (features and features != roles):
+                    return False
+                seen.update(roles)
+            if seen != set(state.feature_roles):
                 return False
-            if len(roles) > 1 or any(
-                role not in state.feature_roles or role in seen for role in roles
-            ):
-                return False
-            if _contracted_terms(factor.expression) != []:
-                return False
-            features = _expression_features(factor.expression, algorithm)
-            if features is None or (features and features != roles):
-                return False
-            seen.update(roles)
-        if seen != set(state.feature_roles):
-            return False
     return True
 
 
@@ -609,6 +615,11 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
             if not readout_region_resources((1, 1, rows, columns), (1, 1, rows, 1),
                                             softmax=False)["eligible"]:
                 native = None
+    diagonal = compile_native_diagonal(algorithm, readouts, bonus, role_sizes)
+    # The materialized-factor executor and normalized pair admit one injection.
+    # Multiple injections require the complete raw-loader/readout proof.
+    if diagonal is None and any(len(item.injections) > 1 for item in algorithm.transitions):
+        return None
     return ChunkedRecipe(
         MappingProxyType({state.name: state for state in algorithm.states}),
         MappingProxyType({transition.state: transition for transition in algorithm.transitions}),
@@ -619,7 +630,7 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         bonus,
         compile_rank_one(algorithm),
         native,
-        compile_native_diagonal(algorithm, readouts, bonus, role_sizes),
+        diagonal,
         tuple(bindings),
         feature_order,
     )

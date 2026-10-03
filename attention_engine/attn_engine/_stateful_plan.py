@@ -366,7 +366,7 @@ class CandidateLowerer:
                     token_bytes += resources.cut_bytes
                 return CandidateEstimate(
                     True, token_bytes + chunk_bytes // 64,
-                    3 * heads * shape.state_total_elements, launches,
+                    resources.flops_per_token, launches,
                     token_bytes, workspace_bytes_per_chunk=chunk_bytes,
                 )
             # The chunked schedule keeps boundary carries and contracted
@@ -1062,6 +1062,7 @@ def compile_plan(
             if lowerer.name == "triton-chunked-shared-scores" and (
                 native_diagonal is None
                 or native_diagonal.softmax is not None
+                or any(len(state.injections) != 1 for state in native_diagonal.states)
                 or not any(state.identity_columns for state in native_diagonal.states)
             ):
                 continue

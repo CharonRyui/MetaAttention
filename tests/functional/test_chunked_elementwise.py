@@ -237,9 +237,11 @@ def test_diagonal_typed_readout_tail_and_continuation(gpu_device, kind):
         StateSpec,
         StateTerm,
         StateTransition,
+        StatefulOperator,
+        StateTuple,
+        Target,
         TensorInput,
     )
-    from attn_engine._stateful_chunked import execute_chunked_states
 
     batch, heads, length, rows, columns = 2, 2, 67, 3, 5
     row, col = FeatureRole("r"), FeatureRole("c")
@@ -331,28 +333,22 @@ def test_diagonal_typed_readout_tail_and_continuation(gpu_device, kind):
         readouts=(Readout("out", expression, torch.float32),),
         head_mapping=HeadMapping({head: head}),
     )
+    operator = StatefulOperator(algorithm)
+    compiled = operator.compile(role_sizes={head: heads, row: rows, col: columns},
+                                target=Target(), mode="dense")
 
     def run(start, end, carry):
-        count = end - start
         values = {
-            name: tensor[:, start:end].reshape(batch * count, heads, -1)
+            name: tensor[:, start:end].contiguous()
             for name, tensor in {"k": key, "v": value, "q": query, "g": gate}.items()
         }
-        result = execute_chunked_states(
-            algorithm,
-            values=values,
-            initial_states=carry,
-            segment=torch.arange(batch, device=gpu_device).repeat_interleave(count),
-            role_sizes={row: rows, col: columns},
-            heads=heads,
-            token_count=batch * count,
-            device=torch.device(gpu_device),
+        names = tuple(state.name for state in algorithm.states)
+        result = compiled(
+            **values,
+            initial_state=StateTuple(names, tuple(carry[name] for name in names)),
             return_final_state=True,
-            sequence_length=count,
         )
-        assert result is not None
-        output, final = result
-        return output["out"].reshape(batch, count, heads, -1), final
+        return result.outputs["out"].permute(0, 2, 1, 3), result.final_state.as_dict()
 
     with torch.no_grad():
         actual, final = run(0, length, initial)

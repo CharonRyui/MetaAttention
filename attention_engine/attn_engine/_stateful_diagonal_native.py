@@ -18,8 +18,7 @@ class NativeStateRecipe:
     columns: Any
     row_gate: Any
     column_gate: Any
-    key: Any
-    value: Any
+    injections: tuple[tuple[Any, Any], ...]
     identity_rows: bool
     identity_columns: bool
 
@@ -40,6 +39,7 @@ class NativeDiagonalResources:
     output_bytes: int
     chunk_bytes: int
     launches: int
+    flops_per_token: int
     score_bytes: int
     score_launches: int
     cut_bytes: int
@@ -68,17 +68,24 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
             if node.roles not in ((rows,), (columns,)):
                 return None
             (column_gates if node.roles == (columns,) else row_gates).append(node.factor)
-        factors = {factor.roles: factor.expression for factor in transition.injections[0].factors}
-        key = compile_dense_expression(factors[(rows,)], specs, rows)
-        value = compile_dense_expression(factors[(columns,)], specs, columns,
-                                         factors=(factors[()],) if () in factors else ())
+        injections = []
+        for injection in transition.injections:
+            factors = {factor.roles: factor.expression for factor in injection.factors}
+            if (rows,) not in factors or (columns,) not in factors:
+                return None
+            key = compile_dense_expression(factors[(rows,)], specs, rows)
+            value = compile_dense_expression(factors[(columns,)], specs, columns,
+                                             factors=(factors[()],) if () in factors else ())
+            if key is None or value is None:
+                return None
+            injections.append((key, value))
         rg = compile_dense_expression(row_gates[0] if row_gates else Constant(1.0), specs, rows,
                                      factors=tuple(row_gates[1:]))
         cg = compile_dense_expression(column_gates[0] if column_gates else Constant(1.0), specs, columns,
                                      factors=tuple(column_gates[1:]))
-        if any(item is None for item in (key, value, rg, cg)):
+        if not injections or rg is None or cg is None:
             return None
-        states.append(NativeStateRecipe(state.name, rows, columns, rg, cg, key, value,
+        states.append(NativeStateRecipe(state.name, rows, columns, rg, cg, tuple(injections),
                                         not row_gates, not column_gates))
     native_reads = []
     softmax = None
@@ -166,10 +173,14 @@ def native_diagonal_resources(recipe, sizes, heads):
     chunk_bytes = sum(4 * heads * (3 * sizes[state.rows] * sizes[state.columns]
                                   + 2 * (sizes[state.rows] + sizes[state.columns]))
                       for state in recipe.states)
+    flops_per_token = 3 * heads * sum(
+        sizes[state.rows] * sizes[state.columns] * len(state.injections)
+        for state in recipe.states
+    )
     score_groups = {}
     for _, term, query, *bonus in reads:
         state = states[term.state]
-        if state.identity_columns:
+        if state.identity_columns and len(state.injections) == 1:
             key = _score_key(state.name, query, term.prior, bonus[0] if bonus else None)
             score_groups[key] = 4 * heads * (64 * 64 + 64 * sizes[state.rows] + (64 if bonus else 0))
     cut_bytes = live_bytes = 0
@@ -186,7 +197,7 @@ def native_diagonal_resources(recipe, sizes, heads):
         )
         live_bytes = resources["live_fp32_bytes"]
         launches += 1 if recipe.fused_softmax else 3
-    return NativeDiagonalResources(output_bytes, chunk_bytes, launches,
+    return NativeDiagonalResources(output_bytes, chunk_bytes, launches, flops_per_token,
                                    sum(score_groups.values()), len(score_groups), cut_bytes, live_bytes,
                                    recipe.fused_softmax)
 
@@ -219,15 +230,21 @@ def _summary(P, Row, Column, Bias, Initial, Final,
     cg = tl.where((local[:, None] < 63) & (t[:, None] + 1 < LENGTH), cg, 1.0)
     rs = tl.associative_scan(rg, 1, _multiply, reverse=True)
     cs = tl.associative_scan(cg, 0, _multiply, reverse=True)
-    key = _load(P, Strides, Groups, Loaders, 2, seq, head, t[None, :], r[:, None],
-                (t[None, :] < LENGTH) & (r[:, None] < ROWS), ROWS)
-    value = _load(P, Strides, Groups, Loaders, 3, seq, head, t[:, None], c[None, :],
-                  (t[:, None] < LENGTH) & (c[None, :] < COLS), COLS)
-    weighted_key = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f",
-                                            args=[key * rs], dtype=tl.float32, is_pure=False, pack=1)
-    weighted_value = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f",
-                                              args=[value * cs], dtype=tl.float32, is_pure=False, pack=1)
-    bias = tl.dot(weighted_key, weighted_value, input_precision="tf32x3")
+    bias = tl.full((32, 32), 0.0, tl.float32)
+    for injection in tl.static_range((len(Loaders) - 2) // 2):
+        key = _load(P, Strides, Groups, Loaders, 2 + 2 * injection, seq, head, t[None, :], r[:, None],
+                    (t[None, :] < LENGTH) & (r[:, None] < ROWS), ROWS)
+        value = _load(P, Strides, Groups, Loaders, 3 + 2 * injection, seq, head, t[:, None], c[None, :],
+                      (t[:, None] < LENGTH) & (c[None, :] < COLS), COLS)
+        weighted_key = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f",
+                                                args=[key * rs], dtype=tl.float32, is_pure=False, pack=1)
+        weighted_value = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f",
+                                                  args=[value * cs], dtype=tl.float32, is_pure=False, pack=1)
+        term = tl.dot(weighted_key, weighted_value, input_precision="tf32x3")
+        if injection == 0:
+            bias = term
+        else:
+            bias = bias + term
     ar = tl.sum(tl.where(local[None, :] == 0, rs, 0.0), 1)
     ac = tl.sum(tl.where(local[:, None] == 0, cs, 0.0), 0)
     ar *= _load(P, Strides, Groups, Loaders, 0, seq, head, chunk * 64, r, r < ROWS, ROWS)
@@ -346,16 +363,14 @@ def _replay(P, Q, Bonus, Carry, Output, Final,
         query = QL(Q, seq, head, t, r, (t < LENGTH) & (r < ROWS), ROWS, QS, QG)
         if PRIOR:
             result = tl.sum(query[:, None] * state, 0)
-        rg = _load(P, Strides, Groups, Loaders, 0, seq, head, t, r, (t < LENGTH) & (r < ROWS), ROWS)
-        cg = _load(P, Strides, Groups, Loaders, 1, seq, head, t, c, (t < LENGTH) & (c < COLS), COLS)
-        key = _load(P, Strides, Groups, Loaders, 2, seq, head, t, r, (t < LENGTH) & (r < ROWS), ROWS)
-        value = _load(P, Strides, Groups, Loaders, 3, seq, head, t, c, (t < LENGTH) & (c < COLS), COLS)
-        updated = state * rg[:, None] * cg[None, :] + key[:, None] * value[None, :]
-        state = tl.where(t < LENGTH, updated, state)
+        state = _advance_native(state, P, Strides, Groups, Loaders, seq, head, t, r, c,
+                                ROWS, COLS, t < LENGTH)
         if not PRIOR:
             result = tl.sum(query[:, None] * state, 0)
         if HAS_BONUS:
             b = BL(Bonus, seq, head, t, r, (t < LENGTH) & (r < ROWS), ROWS, BS, BG)
+            value = _load(P, Strides, Groups, Loaders, 3, seq, head, t, c,
+                          (t < LENGTH) & (c < COLS), COLS)
             result += tl.sum(b, 0) * value
         tl.store(Output + ((seq * LENGTH + t) * HEADS + head) * COLS + c, result,
                  (t < LENGTH) & (c < COLS))
@@ -371,9 +386,18 @@ def _advance_native(state, P, Strides: tl.constexpr, Groups: tl.constexpr,
                     ROWS: tl.constexpr, COLS: tl.constexpr, VALID):
     rg = _load(P, Strides, Groups, Loaders, 0, seq, head, t, r, VALID & (r < ROWS), ROWS)
     cg = _load(P, Strides, Groups, Loaders, 1, seq, head, t, c, VALID & (c < COLS), COLS)
-    key = _load(P, Strides, Groups, Loaders, 2, seq, head, t, r, VALID & (r < ROWS), ROWS)
-    value = _load(P, Strides, Groups, Loaders, 3, seq, head, t, c, VALID & (c < COLS), COLS)
-    updated = state * rg[:, None] * cg[None, :] + key[:, None] * value[None, :]
+    bias = tl.full((r.shape[0], c.shape[0]), 0.0, tl.float32)
+    for injection in tl.static_range((len(Loaders) - 2) // 2):
+        key = _load(P, Strides, Groups, Loaders, 2 + 2 * injection, seq, head, t, r,
+                    VALID & (r < ROWS), ROWS)
+        value = _load(P, Strides, Groups, Loaders, 3 + 2 * injection, seq, head, t, c,
+                      VALID & (c < COLS), COLS)
+        term = key[:, None] * value[None, :]
+        if injection == 0:
+            bias = term
+        else:
+            bias = bias + term
+    updated = state * rg[:, None] * cg[None, :] + bias
     return tl.where(VALID, updated, state)
 
 
@@ -444,8 +468,9 @@ def _read_softmax(recipe, first, second, bindings, query, *, inputs, batch, leng
 
 
 def _bind_state(recipe, inputs, heads):
-    bindings = tuple(expr.bind(inputs, heads)
-                     for expr in (recipe.row_gate, recipe.column_gate, recipe.key, recipe.value))
+    expressions = (recipe.row_gate, recipe.column_gate,
+                   *(expr for injection in recipe.injections for expr in injection))
+    bindings = tuple(expr.bind(inputs, heads) for expr in expressions)
     return (tuple(binding[1] for binding in bindings),
             dict(Strides=tuple(binding[2] for binding in bindings),
                  Groups=tuple(binding[3] for binding in bindings),

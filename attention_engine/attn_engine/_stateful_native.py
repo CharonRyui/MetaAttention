@@ -52,6 +52,8 @@ def compile_native_normalized(algorithm, normalized):
     value = None
     for name in (memory.name, normalizer.name):
         transition = next(item for item in algorithm.transitions if item.state == name)
+        if len(transition.injections) != 1:
+            return None
         if any(not isinstance(node, Identity) for node in transition.propagations):
             return None
         key = None

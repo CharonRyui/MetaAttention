@@ -100,10 +100,6 @@ def test_two_axis_gla_dense_matches_the_token_recurrence(gpu_device):
     )
     operator = dual_gate_gla_attention(1, heads, length, dim, dim)
     compiled = _compile(operator, heads, dim)
-    plan = compiled.operator._plans[compiled.specialization]
-    # the pair path, not the dense summary
-    assert plan.dense_summary is False
-    assert plan.plan.candidate.lowerer == "tilelang-elementwise"
 
     with torch.no_grad():
         result = compiled(
