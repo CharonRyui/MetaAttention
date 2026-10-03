@@ -7,14 +7,14 @@ import torch
 import triton
 import triton.language as tl
 
-from ._stateful_bindings import build_binding
+from ._stateful_bindings import DenseRawBindingRecipe, compile_dense_binding
 
 
 @dataclass(frozen=True)
 class RankOneRecipe:
     state: str
-    gate: object | None
-    value: object
+    gate: DenseRawBindingRecipe | None
+    value: DenseRawBindingRecipe
     log_gate: bool
     feature: object
     outputs: tuple[tuple[str, torch.dtype], ...]
@@ -70,7 +70,9 @@ def compile_rank_one(algorithm):
         outputs.append((readout.name, readout.output_dtype))
     if len(outputs) != 1:
         return None
-    return RankOneRecipe(state.name, gate, value, log_gate, feature, tuple(outputs))
+    return RankOneRecipe(state.name,
+                         compile_dense_binding(gate, feature) if gate is not None else None,
+                         compile_dense_binding(value, feature), log_gate, feature, tuple(outputs))
 
 
 @triton.jit
@@ -133,25 +135,11 @@ def _carry(Scale, Bias, Initial, Carry, FEATURES: tl.constexpr,
         state = scale * state + bias
 
 
-def execute_rank_one(recipe, inputs, initial, *, role_sizes, sequence_count,
+def execute_rank_one(recipe, inputs, initial, *, sequence_count,
                      sequence_length, heads, return_final_state):
-    from .stateful_operator import Batch, HeadRole, Sequence
-
-    def bind(spec):
-        descriptor = build_binding(
-            spec, inputs[spec.name], role_sizes=role_sizes,
-            sequence_count=sequence_count, uniform_length=sequence_length,
-            state_heads=heads, feature_roles=(recipe.feature,),
-        )
-        roles = descriptor.source_roles
-        head = next((role for role in roles if isinstance(role, HeadRole)), None)
-        strides = tuple(descriptor.source_strides[roles.index(role)]
-                        if role in roles else 0
-                        for role in (Batch, head, Sequence, recipe.feature))
-        return descriptor.raw, strides, descriptor.head_group_size
-
-    value, vs, vg = bind(recipe.value)
-    gate, gs, gg = bind(recipe.gate) if recipe.gate is not None else (initial, (0, 0, 0, 0), 1)
+    value, vs, vg = recipe.value.bind(inputs[recipe.value.name], heads)
+    gate, gs, gg = (recipe.gate.bind(inputs[recipe.gate.name], heads)
+                    if recipe.gate is not None else (initial, (0, 0, 0, 0), 1))
     features = initial.shape[-1]
     chunks = triton.cdiv(sequence_length, 64)
     output = torch.empty(sequence_count, heads, sequence_length, features,

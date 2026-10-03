@@ -368,6 +368,41 @@ FLA remains faster on the longer RWKV6/H=8 GSA/HGRN calls. HGRN/H>1 still has no
 runnable FLA comparison. Profiler activity was unavailable in this final run;
 the records leave kernel time and launch counts null rather than infer them.
 
+The subsequent host-overhead pass compiles each native dense input's
+`(Batch, Head, Sequence, Feature)` axis map once. Vector, normalized-pair, and
+matrix-diagonal loaders reuse that immutable recipe rather than constructing a
+full `BindingDescriptor` or searching logical roles on every call. The general
+descriptor/reference interface is unchanged. Recipes retain only input names
+and axis positions, never input tensors, pointers, strides, dynamic B/T, or
+cross-call validation results. Current tensor strides and head extents are read
+at each invocation, after the existing public runtime checks.
+
+Same-process H20 measurements, BF16, `B=H=1`, output-only, ten warmups and median
+of one hundred public-call samples; kernels and workspace policy are unchanged:
+
+| Structure | T | Before public ms | After public ms | After Graph ms |
+| --- | ---: | ---: | ---: | ---: |
+| HGRN | 64 | 0.118 | 0.088 | 0.013 |
+| HGRN | 2048 | 0.169 | 0.138 | 0.019 |
+| RWKV6 | 64 | 0.261 | 0.169 | 0.064 |
+| RWKV6 | 2048 | 0.355 | 0.248 | 0.083 |
+| GSA | 64 | 0.326 | 0.241 | 0.122 |
+| GSA | 2048 | 0.474 | 0.369 | 0.136 |
+| Normalized linear | 64 | 0.158 | 0.120 | 0.015 |
+| Normalized linear | 2048 | 0.227 | 0.175 | 0.025 |
+
+Graph replay times remain effectively unchanged. A 500-call HGRN host profile
+dropped from 227501 to 166501 function calls; full descriptor construction no
+longer appears on its raw-input path. Records:
+`benchmark_results/dense_raw_binding_final.json`. This removes repeated host
+structure work, not GPU arithmetic, and does not establish cross-device speedup.
+Verification: 330 unit/focused GPU tests passed. A fresh-process smoke reused one
+compiled handle per structure across `B/T={(1,1),(2,65),(1,130),(2,8192)}`, `H=8`,
+checking independent FP32 outputs, all final States, output-only, nonaligned
+continuation, and dtype rejection after warm calls. The permanent vector test
+also changes input storage offsets, uses a headless gate, and retains earlier
+outputs to catch stale pointers/strides or accidental output reuse.
+
 ## Legacy Customized Linear Attention API
 
 The modifier-based `LinearAttentionEngine` remains available with its existing

@@ -706,7 +706,7 @@ def execute_chunked_states(
         from ._stateful_native import execute_native_normalized
 
         return execute_native_normalized(
-            recipe.native_normalized, values, initial_states, role_sizes=role_sizes,
+            recipe.native_normalized, values, initial_states,
             sequence_count=token_count // sequence_length, sequence_length=sequence_length,
             heads=heads, return_final_state=return_final_state,
         )
@@ -714,7 +714,7 @@ def execute_chunked_states(
         from ._stateful_diagonal_native import execute_native_diagonal
 
         return execute_native_diagonal(
-            recipe.native_diagonal, values, initial_states, role_sizes=role_sizes,
+            recipe.native_diagonal, values, initial_states,
             sequence_count=token_count // sequence_length, sequence_length=sequence_length,
             heads=heads, return_final_state=return_final_state,
         )

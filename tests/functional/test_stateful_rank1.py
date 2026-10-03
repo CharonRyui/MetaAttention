@@ -109,3 +109,49 @@ def test_vector_autotune_preserves_rank_one_state(gpu_device):
                       return_final_state=True)
     torch.testing.assert_close(result.outputs['output'].cpu(), torch.stack(expected, 2), rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(result.final_state['hidden'].cpu(), state, rtol=2e-5, atol=2e-5)
+
+
+def test_one_compiled_vector_rebinds_dynamic_workloads_and_storage(gpu_device):
+    feature, source, heads = FeatureRole('vector'), HeadRole('source'), HeadRole('heads')
+    operator = StatefulOperator(AlgorithmIR(
+        inputs=(TensorInput('value', (Batch, Sequence, source, feature), torch.float32),
+                TensorInput('gate', (Batch, Sequence, feature), torch.float32)),
+        states=(StateSpec('hidden', (Batch, heads, feature)),),
+        transition=StateTransition('hidden', propagations=(AxisScale(Input('gate'), (feature,)),),
+            injections=(ProductInjection((ProductFactor(Input('value'), (feature,)),)),)),
+        readouts=(Readout('output', StateTerm('hidden', Constant(1.0), None), torch.float32),),
+        head_mapping=HeadMapping({source: heads}),
+    ))
+    compiled = operator.compile(role_sizes={source: 2, heads: 4, feature: 7},
+                                target=Target(), mode='dense')
+    generator = torch.Generator().manual_seed(953)
+    retained = []
+    for batch, length in ((1, 1), (2, 65), (1, 130), (3, 17)):
+        value = torch.randn(batch, length, 2, 7, generator=generator) * 0.1
+        gate = torch.rand(batch, length, 7, generator=generator) * 1.5 - 0.5
+        initial = torch.randn(batch, 4, 7, generator=generator) * 0.1
+        # Fresh contiguous tensors with nonzero offsets: a recipe must never
+        # retain old storage or compute strides from the previous B/T shape.
+        device_inputs = {}
+        for name, host in (('value', value), ('gate', gate)):
+            storage = torch.empty(host.numel() + 19, device=gpu_device)
+            tensor = storage[19:].reshape(host.shape)
+            tensor.copy_(host)
+            device_inputs[name] = tensor
+        state, expected = initial.clone(), []
+        for token in range(length):
+            state = state * gate[:, token, None, :] + value[:, token].repeat_interleave(2, dim=1)
+            expected.append(state.clone())
+        result = compiled(**device_inputs,
+                          initial_state=StateTuple(('hidden',), (initial.to(gpu_device),)),
+                          return_final_state=True)
+        expected = torch.stack(expected, 2)
+        torch.testing.assert_close(result.outputs['output'].cpu(), expected, rtol=2e-5, atol=2e-5)
+        torch.testing.assert_close(result.final_state['hidden'].cpu(), state, rtol=2e-5, atol=2e-5)
+        retained.append((result.outputs['output'], expected))
+        invalid = dict(device_inputs, gate=device_inputs['gate'].to(torch.bfloat16))
+        with pytest.raises(StatefulCompilationError) as error:
+            compiled(**invalid)
+        assert error.value.category == 'RUNTIME_DTYPE'
+    for actual, expected in retained:
+        torch.testing.assert_close(actual.cpu(), expected, rtol=2e-5, atol=2e-5)

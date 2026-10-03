@@ -1401,7 +1401,7 @@ class StatefulOperator:
 
             output, final = execute_rank_one(
                 recipe.rank_one, inputs, initial_states[recipe.rank_one.state],
-                role_sizes=role_sizes, sequence_count=runtime.sequence_count,
+                sequence_count=runtime.sequence_count,
                 sequence_length=runtime.uniform_length, heads=runtime.state_heads,
                 return_final_state=return_final_state,
             )

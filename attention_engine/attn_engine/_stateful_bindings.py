@@ -20,6 +20,38 @@ _PACKED_TOKEN = object()
 
 
 @dataclass(frozen=True)
+class DenseRawBindingRecipe:
+    """Fixed axis map for raw loads after public runtime validation.
+
+    Holds no tensor or workload dimensions. Each bind reads the current tensor's
+    strides/head extent; public shape/dtype/layout/alias checks remain mandatory.
+    """
+
+    name: str
+    axes: tuple[int | None, int | None, int | None, int | None]
+
+    def bind(self, tensor: torch.Tensor, heads: int):
+        batch, head, sequence, feature = self.axes
+        strides = tensor.stride()
+        return tensor, (
+            strides[batch] if batch is not None else 0,
+            strides[head] if head is not None else 0,
+            strides[sequence] if sequence is not None else 0,
+            strides[feature] if feature is not None else 0,
+        ), heads // tensor.shape[head] if head is not None else heads
+
+
+def compile_dense_binding(spec, feature):
+    """Resolve role positions once; dynamic extents and storage stay unbound."""
+    roles = spec.roles
+    head = next((role for role in roles if isinstance(role, HeadRole)), None)
+    return DenseRawBindingRecipe(spec.name, tuple(
+        roles.index(role) if role in roles else None
+        for role in (Batch, head, SequenceRole, feature)
+    ))
+
+
+@dataclass(frozen=True)
 class BindingDescriptor:
     """Metadata for one authored input, indexed by logical token/head/features."""
 

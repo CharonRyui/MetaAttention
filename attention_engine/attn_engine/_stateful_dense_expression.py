@@ -8,7 +8,7 @@ from typing import Any
 
 import torch
 
-from ._stateful_bindings import build_binding
+from ._stateful_bindings import DenseRawBindingRecipe, compile_dense_binding
 from ._stateful_native import _load_dense
 
 
@@ -17,24 +17,15 @@ class DenseExpression:
     loader: Any
     sources: tuple[Any, ...]
     feature: Any
+    bindings: tuple[DenseRawBindingRecipe, ...]
 
-    def bind(self, inputs, role_sizes, sequence_count, sequence_length, heads):
-        from .stateful_operator import Batch, HeadRole, Sequence
-
+    def bind(self, inputs, heads):
         pointers, strides, groups = [], [], []
-        for spec in self.sources:
-            descriptor = build_binding(
-                spec, inputs[spec.name], role_sizes=role_sizes,
-                sequence_count=sequence_count, uniform_length=sequence_length,
-                state_heads=heads, feature_roles=(self.feature,),
-            )
-            roles = descriptor.source_roles
-            head = next((role for role in roles if isinstance(role, HeadRole)), None)
-            pointers.append(descriptor.raw)
-            strides.extend(descriptor.source_strides[roles.index(role)]
-                           if role in roles else 0
-                           for role in (Batch, head, Sequence, self.feature))
-            groups.append(descriptor.head_group_size)
+        for binding in self.bindings:
+            raw, source_strides, group = binding.bind(inputs[binding.name], heads)
+            pointers.append(raw)
+            strides.extend(source_strides)
+            groups.append(group)
         return self.loader, tuple(pointers), tuple(strides), tuple(groups)
 
 
@@ -135,4 +126,5 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
     linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
     namespace = {"_load_dense": _load_dense}
     exec(compile(source, filename, "exec"), namespace)
-    return DenseExpression(namespace[name], tuple(sources), feature)
+    return DenseExpression(namespace[name], tuple(sources), feature,
+                           tuple(compile_dense_binding(spec, feature) for spec in sources))

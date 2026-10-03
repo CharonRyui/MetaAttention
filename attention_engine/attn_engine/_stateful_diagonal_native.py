@@ -422,12 +422,12 @@ def _softmax_region(P1, P2, Q, C1, C2, Output, F1, F2,
                      (m[:, None] < SLOTS) & (c[None, :] < COLS))
 
 
-def _read_softmax(recipe, first, second, bindings, query, *, inputs, sizes, batch, length, heads):
+def _read_softmax(recipe, first, second, bindings, query, *, inputs, batch, length, heads):
     c1, f1, direct = first
     c2, f2, _ = second
     rows, slots, columns = c1.shape[-2], c1.shape[-1], c2.shape[-1]
     readout, term1, term2, _ = recipe.softmax
-    ql, qp, qs, qg = query.bind(inputs, sizes, batch, length, heads)
+    ql, qp, qs, qg = query.bind(inputs, heads)
     output = torch.empty(batch * length, heads, columns, device=c1.device, dtype=readout.output_dtype)
     (p1, md1), (p2, md2) = bindings
     _softmax_region[(batch * heads, triton.cdiv(length, 64))](
@@ -443,8 +443,8 @@ def _read_softmax(recipe, first, second, bindings, query, *, inputs, sizes, batc
     return output
 
 
-def _bind_state(recipe, inputs, sizes, batch, length, heads):
-    bindings = tuple(expr.bind(inputs, sizes, batch, length, heads)
+def _bind_state(recipe, inputs, heads):
+    bindings = tuple(expr.bind(inputs, heads)
                      for expr in (recipe.row_gate, recipe.column_gate, recipe.key, recipe.value))
     return (tuple(binding[1] for binding in bindings),
             dict(Strides=tuple(binding[2] for binding in bindings),
@@ -475,14 +475,14 @@ def _prepare(recipe, bound, initial, *, length, heads, final_requested):
 
 
 def _read(recipe, bound, prepared, query, bonus, *, length, heads, output_dtype, prior,
-          inputs, sizes, final_requested, shared_scores=False, score_cache=None):
+          inputs, final_requested, shared_scores=False, score_cache=None):
     carry, final, direct = prepared
     batch_heads = carry.shape[0] * heads if direct else carry.shape[0]
     rows, columns = carry.shape[-2:]
     chunks = triton.cdiv(length, 64)
     batch = batch_heads // heads
-    ql, qp, qs, qg = query.bind(inputs, sizes, batch, length, heads)
-    bl, bp, bs, bg = (bonus or query).bind(inputs, sizes, batch, length, heads)
+    ql, qp, qs, qg = query.bind(inputs, heads)
+    bl, bp, bs, bg = (bonus or query).bind(inputs, heads)
     output = torch.empty(batch * length, heads, columns, device=carry.device, dtype=output_dtype)
     pointers, metadata = bound
     # Independent chunks are the only replay domain; never serialize a sequence.
@@ -520,7 +520,7 @@ def _read(recipe, bound, prepared, query, bonus, *, length, heads, output_dtype,
     return output
 
 
-def execute_native_diagonal(recipe, inputs, initial_states, *, role_sizes,
+def execute_native_diagonal(recipe, inputs, initial_states, *,
                             sequence_count, sequence_length, heads, return_final_state):
     states = {state.name: state for state in recipe.states}
     bound, prepared, outputs = {}, {}, {}
@@ -529,7 +529,7 @@ def execute_native_diagonal(recipe, inputs, initial_states, *, role_sizes,
     def prepare(name):
         if name not in prepared:
             state = states[name]
-            bound[name] = _bind_state(state, inputs, role_sizes, sequence_count, sequence_length, heads)
+            bound[name] = _bind_state(state, inputs, heads)
             prepared[name] = _prepare(state, bound[name], initial_states[name], length=sequence_length,
                                       heads=heads, final_requested=return_final_state)
         return prepared[name]
@@ -541,20 +541,20 @@ def execute_native_diagonal(recipe, inputs, initial_states, *, role_sizes,
         if recipe.fused_softmax:
             outputs[readout.name] = _read_softmax(
                 recipe, first, second, (bound[term1.state], bound[term2.state]), query,
-                inputs=inputs, sizes=role_sizes, batch=sequence_count,
+                inputs=inputs, batch=sequence_count,
                 length=sequence_length, heads=heads,
             )
         else:
             logits = _read(states[term1.state], bound[term1.state], first, query, None,
                            length=sequence_length, heads=heads, output_dtype=torch.float32,
-                           prior=term1.prior, inputs=inputs, sizes=role_sizes,
+                           prior=term1.prior, inputs=inputs,
                            final_requested=return_final_state)
             weight = logits.softmax(-1).reshape(sequence_count, sequence_length, heads, -1)
             weight_query = recipe.cut_query
             outputs[readout.name] = _read(
                 states[term2.state], bound[term2.state], second, weight_query, None,
                 length=sequence_length, heads=heads, output_dtype=readout.output_dtype,
-                prior=term2.prior, inputs={"contracted": weight}, sizes=role_sizes,
+                prior=term2.prior, inputs={"contracted": weight},
                 final_requested=return_final_state,
             )
         consumed.update((term1.state, term2.state))
@@ -568,7 +568,7 @@ def execute_native_diagonal(recipe, inputs, initial_states, *, role_sizes,
         state = prepare(term.state)
         outputs[readout.name] = _read(states[term.state], bound[term.state], state, query, bonus,
                                       length=sequence_length, heads=heads, output_dtype=readout.output_dtype,
-                                      prior=term.prior, inputs=inputs, sizes=role_sizes,
+                                      prior=term.prior, inputs=inputs,
                                       final_requested=return_final_state,
                                       shared_scores=recipe.shared_scores, score_cache=score_cache)
     finals = None

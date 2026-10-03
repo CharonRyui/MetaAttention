@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from ._stateful_bindings import build_binding
+from ._stateful_bindings import DenseRawBindingRecipe, compile_dense_binding
 
 
 @dataclass(frozen=True)
@@ -16,10 +16,10 @@ class NativeNormalizedRecipe:
     output_dtype: torch.dtype
     memory: str
     normalizer: str
-    query: object
-    key: object
-    denominator_key: object
-    value: object
+    query: DenseRawBindingRecipe
+    key: DenseRawBindingRecipe
+    denominator_key: DenseRawBindingRecipe
+    value: DenseRawBindingRecipe
     query_scale: float | None
     epsilon: float
     prior_memory: bool
@@ -77,7 +77,11 @@ def compile_native_normalized(algorithm, normalized):
             return None
     return NativeNormalizedRecipe(
         readout.name, readout.output_dtype, memory.name, normalizer.name,
-        query, keys[0], keys[1], value, scale, epsilon, numerator.prior, denominator.prior,
+        compile_dense_binding(query, memory.feature_roles[0]),
+        compile_dense_binding(keys[0], memory.feature_roles[0]),
+        compile_dense_binding(keys[1], memory.feature_roles[0]),
+        compile_dense_binding(value, memory.feature_roles[1]),
+        scale, epsilon, numerator.prior, denominator.prior,
     )
 
 
@@ -146,27 +150,16 @@ def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
     return carry, den_carry, final, den_final
 
 
-def execute_native_normalized(recipe, inputs, initial_states, *, role_sizes,
+def execute_native_normalized(recipe, inputs, initial_states, *,
                               sequence_count, sequence_length, heads, return_final_state):
-    from .stateful_operator import Batch, FeatureRole, HeadRole, Sequence
     from ._stateful_readout_regions import _identity_normalized_region
 
     bindings = {}
 
-    def bind(spec):
-        if spec.name not in bindings:
-            feature = next(role for role in spec.roles if isinstance(role, FeatureRole))
-            descriptor = build_binding(
-                spec, inputs[spec.name], role_sizes=role_sizes,
-                sequence_count=sequence_count, uniform_length=sequence_length,
-                state_heads=heads, feature_roles=(feature,),
-            )
-            roles = descriptor.source_roles
-            head = next((role for role in roles if isinstance(role, HeadRole)), None)
-            strides = tuple(descriptor.source_strides[roles.index(role)] if role in roles else 0
-                            for role in (Batch, head, Sequence, feature))
-            bindings[spec.name] = descriptor.raw, strides, descriptor.head_group_size
-        return bindings[spec.name]
+    def bind(binding):
+        if binding.name not in bindings:
+            bindings[binding.name] = binding.bind(inputs[binding.name], heads)
+        return bindings[binding.name]
 
     query, qs, qg = bind(recipe.query)
     key, ks, kg = bind(recipe.key)
