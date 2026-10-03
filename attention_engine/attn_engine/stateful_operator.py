@@ -784,12 +784,42 @@ class CompileOptions:
 
 
 @dataclass(frozen=True)
+class _InputValidation:
+    """Immutable declaration metadata used by every compiled invocation."""
+    name: str
+    roles: tuple[LogicalRole, ...]
+    dtype: torch.dtype
+    differentiable: bool
+    sequence_axis: int | None
+    packed_roles: tuple[LogicalRole, ...]
+
+
+
+@dataclass(frozen=True)
+class _StateValidation:
+    """Immutable State role metadata used by runtime shape validation."""
+    name: str
+    head_role: HeadRole
+    feature_roles: tuple[FeatureRole, ...]
+
+
+@dataclass(frozen=True)
+class _ValidationRecipe:
+    """Compiled structural contract; it contains no runtime tensor data."""
+    expected_input_names: tuple[str, ...]
+    inputs: tuple[_InputValidation, ...]
+    states: tuple[_StateValidation, ...]
+    reference_required: bool
+    head_mapping: tuple[tuple[HeadRole, HeadRole], ...]
+
+
+@dataclass(frozen=True)
 class _Compilation:
     role_sizes: tuple[tuple[LogicalRole, int], ...]
     target: Target
     mode: str
     options: CompileOptions
-
+    validation: _ValidationRecipe
 
 @dataclass(frozen=True)
 class _Runtime:
@@ -919,11 +949,13 @@ class StatefulOperator:
     ) -> ExecutionResult:
         from ._stateful_runtime_validation import validate_input_names
 
-        validate_input_names({item.name for item in self.algorithm.inputs}, inputs)
+        validation = compiled.compilation.validation
+        validate_input_names(validation.expected_input_names, inputs)
         runtime, role_sizes = self._validate_runtime(
             inputs,
             sequence_offsets,
             dict(compiled.compilation.role_sizes),
+            validation,
         )
         expected_packed = compiled.compilation.mode == "packed"
         if runtime.packed != expected_packed:
@@ -939,6 +971,7 @@ class StatefulOperator:
             initial_state,
             runtime,
             role_sizes,
+            validation,
             cache_default=not (runtime.token_count == 0 and return_final_state),
         )
         requires_grad_state = any(
@@ -965,7 +998,6 @@ class StatefulOperator:
             raise StatefulCompilationError(
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
-        from ._stateful_reference import requires_reference_lowering
         if (
             plan.runtime_family in ("chunked-stateful", "product-feature-chunked")
             and plan.chunked_recipe is not None
@@ -979,7 +1011,7 @@ class StatefulOperator:
                 runtime, role_sizes, inputs, initial_states, return_final_state,
                 plan.chunked_recipe,
             )
-        if requires_reference_lowering(self.algorithm):
+        if validation.reference_required:
             return self._execute_reference(
                 runtime, role_sizes, inputs, initial_states, return_final_state
             )
@@ -1112,10 +1144,38 @@ class StatefulOperator:
                     "COMPILE_ROLE_SIZE", "head_mapping", {"source": source}
                 )
         ordered = tuple(sorted(role_sizes.items(), key=lambda item: _identity(item[0])))
-        return _Compilation(ordered, target, mode, options)
+        validation = _ValidationRecipe(
+            expected_input_names=tuple(spec.name for spec in self.algorithm.inputs),
+            inputs=tuple(
+                _InputValidation(
+                    spec.name,
+                    spec.roles,
+                    spec.dtype,
+                    spec.differentiable,
+                    spec.roles.index(Sequence) if Sequence in spec.roles else None,
+                    tuple(role for role in spec.roles if role not in (Batch, Sequence)),
+                )
+                for spec in self.algorithm.inputs
+            ),
+            states=tuple(
+                _StateValidation(spec.name, spec.head_role, spec.feature_roles)
+                for spec in self.algorithm.states
+            ),
+            reference_required=requires_reference_lowering(self.algorithm),
+            head_mapping=self.algorithm.head_mapping.mappings,
+        )
+        return _Compilation(ordered, target, mode, options, validation)
 
     def _compilation_key(self, compilation: _Compilation) -> str:
-        return _canonical_identity((self._structural_identity, compilation))
+        return _canonical_identity(
+            (
+                self._structural_identity,
+                compilation.role_sizes,
+                compilation.target,
+                compilation.mode,
+                compilation.options,
+            )
+        )
 
     @staticmethod
     def _validate_fixed_roles(
@@ -1133,7 +1193,8 @@ class StatefulOperator:
         self,
         inputs: Mapping[str, torch.Tensor],
         offsets: torch.Tensor | None,
-        declared_roles: Mapping[LogicalRole, int] | None = None,
+        declared_roles: Mapping[LogicalRole, int],
+        validation: _ValidationRecipe,
     ) -> tuple[_Runtime, dict[str, int]]:
         packed = offsets is not None
         device: torch.device | None = None
@@ -1146,7 +1207,7 @@ class StatefulOperator:
         }
         token_count: int | None = None
         uniform_length: int | None = None
-        for spec in self.algorithm.inputs:
+        for spec in validation.inputs:
             tensor = inputs[spec.name]
             path = f"inputs.{spec.name}"
             if not isinstance(tensor, torch.Tensor):
@@ -1171,16 +1232,14 @@ class StatefulOperator:
                 device = tensor.device
             elif tensor.device != device:
                 raise StatefulCompilationError("RUNTIME_DEVICE", "inputs", {})
-            if packed and Sequence not in spec.roles:
+            if packed and spec.sequence_axis is None:
                 raise StatefulCompilationError(
                     "SPECIALIZATION",
                     path,
                     {"reason": "packed non-sequence inputs are not supported"},
                 )
-            if packed and Sequence in spec.roles:
-                physical_roles = tuple(
-                    role for role in spec.roles if role not in (Batch, Sequence)
-                )
+            if packed and spec.sequence_axis is not None:
+                physical_roles = spec.packed_roles
                 if tensor.ndim != len(physical_roles) + 1:
                     raise StatefulCompilationError(
                         "RUNTIME_SHAPE", path, {"mode": "packed"}
@@ -1197,8 +1256,8 @@ class StatefulOperator:
                         "RUNTIME_SHAPE", path, {"expected_ndim": len(spec.roles)}
                     )
                 dimensions = zip(spec.roles, tensor.shape)
-                if Sequence in spec.roles:
-                    length = tensor.shape[spec.roles.index(Sequence)]
+                if spec.sequence_axis is not None:
+                    length = tensor.shape[spec.sequence_axis]
                     uniform_length = (
                         length if uniform_length is None else uniform_length
                     )
@@ -1255,7 +1314,7 @@ class StatefulOperator:
                 )
             sequence_count = role_sizes[Batch]
             token_count = sequence_count * uniform_length
-        state_spec = self.algorithm.states[0]
+        state_spec = validation.states[0]
         try:
             state_heads = role_sizes[state_spec.head_role]
             feature_sizes = tuple(role_sizes[role] for role in state_spec.feature_roles)
@@ -1263,9 +1322,7 @@ class StatefulOperator:
             raise StatefulCompilationError(
                 "RUNTIME_SHAPE", "states[0].roles", {"missing_role": error.args[0]}
             ) from error
-        from ._stateful_reference import requires_reference_lowering as _v2
-
-        for spec in self.algorithm.states:
+        for spec in validation.states:
             try:
                 sizes = tuple(role_sizes[role] for role in spec.feature_roles)
             except KeyError as error:
@@ -1276,7 +1333,7 @@ class StatefulOperator:
                 ) from error
             if (
                 device.type == "cuda"
-                and not _v2(self.algorithm)
+                and not validation.reference_required
                 and any(size not in (64, 128) for size in sizes)
             ):
                 raise StatefulCompilationError(
@@ -1289,7 +1346,7 @@ class StatefulOperator:
                     },
                 )
         _verify_product_roles(role_sizes, "inputs")
-        for source, target in self.algorithm.head_mapping.mappings:
+        for source, target in validation.head_mapping:
             if target != state_spec.head_role or source not in role_sizes:
                 raise StatefulCompilationError(
                     "IR_TYPE", "head_mapping", {"source": source, "target": target}
@@ -1329,11 +1386,12 @@ class StatefulOperator:
         state: StateTuple | None,
         runtime: _Runtime,
         role_sizes: Mapping[LogicalRole, int],
+        validation: _ValidationRecipe,
         *,
         cache_default: bool,
     ) -> dict[str, torch.Tensor]:
         """Validate initial State for every declared State and return them by name."""
-        expected = tuple(spec.name for spec in self.algorithm.states)
+        expected = tuple(spec.name for spec in validation.states)
         if state is not None and (
             not isinstance(state, StateTuple) or state.names != expected
         ):
@@ -1341,7 +1399,7 @@ class StatefulOperator:
                 "RUNTIME_STATE", "initial_state", {"expected": list(expected)}
             )
         states: dict[str, torch.Tensor] = {}
-        for index, spec in enumerate(self.algorithm.states):
+        for index, spec in enumerate(validation.states):
             shape = (
                 runtime.sequence_count,
                 role_sizes[spec.head_role],

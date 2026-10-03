@@ -733,11 +733,20 @@ def test_analysis_derives_raw_dense_recipe_from_structure():
 def test_runtime_revalidates_metadata():
     operator = StatefulOperator(_accumulator_ir())
     compiled = _compile(operator)
-    invalid = _inputs()
+    valid = _inputs()
+    compiled(**valid)
+
+    invalid = dict(valid)
     invalid["query"] = invalid["query"].transpose(-1, -2)
     with pytest.raises(StatefulCompilationError) as captured:
         compiled(**invalid)
     assert captured.value.category in ("RUNTIME_LAYOUT", "RUNTIME_SHAPE")
+
+    invalid = dict(valid)
+    invalid["query"] = invalid["query"].to(torch.bfloat16)
+    with pytest.raises(StatefulCompilationError) as captured:
+        compiled(**invalid)
+    assert captured.value.category == "RUNTIME_DTYPE"
 
 
 def test_analysis_rejects_unmapped_incompatible_head_roles():

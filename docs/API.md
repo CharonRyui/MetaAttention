@@ -403,11 +403,28 @@ continuation, and dtype rejection after warm calls. The permanent vector test
 also changes input storage offsets, uses a headless gate, and retains earlier
 outputs to catch stale pointers/strides or accidental output reuse.
 
-## Legacy Customized Linear Attention API
+The next host-validation pass compiles immutable structural validation metadata
+with the specialization. It stores input names, declaration roles, dtype and
+differentiability, dense/packed Sequence positions, State role suffixes,
+HeadMapping, and the reference-lowering classification. Runtime validation still
+checks the current tensors, dynamic B/T or packed offsets, device, layout, dtype,
+gradient contract, aliases, fixed role sizes, state tensors, and workspace.
+No tensor, pointer, stride, offset value, or successful runtime validation result
+is retained.
 
+On the same H20 setup, BF16 `B=H=1,T=2048`, ten warmups and one hundred public
+samples, the current public medians were HGRN `0.116 ms`, RWKV6 `0.217 ms`, GSA
+`0.331 ms`, and normalized-linear `0.148 ms`; Graph medians were respectively
+`0.018`, `0.081`, `0.134`, and `0.024 ms`. A 500-call HGRN cProfile decreased
+from `175001` to `156001` function calls, with `_validate_runtime` cumulative
+time decreasing from `0.025 s` to `0.018 s`. These are host-structure measurements
+and do not imply a GPU arithmetic change.
+
+## Legacy Customized Linear Attention API
 The modifier-based `LinearAttentionEngine` remains available with its existing
 interface and behavior. It is outside the Stateful Operator compiler guarantee
 and is not routed through this compiler.
+
 
 ```py
 mod = LinearAttentionEngine(qkv_meta, q_mod=..., k_mod=..., v_mod=..., decay_mod=..., custom_io=...)

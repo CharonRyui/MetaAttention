@@ -42,10 +42,10 @@ def _validated_target_key(index: int, target):
 
 
 def validate_input_names(
-    expected_names: set[str], inputs: Mapping[str, torch.Tensor]
+    expected_names: tuple[str, ...], inputs: Mapping[str, torch.Tensor]
 ) -> None:
-    missing = expected_names - inputs.keys()
-    unknown = inputs.keys() - expected_names
+    missing = [name for name in expected_names if name not in inputs]
+    unknown = [name for name in inputs if name not in expected_names]
     if missing:
         raise StatefulCompilationError(
             "RUNTIME_BINDING", "inputs", {"missing": sorted(missing)}
@@ -54,7 +54,6 @@ def validate_input_names(
         raise StatefulCompilationError(
             "RUNTIME_BINDING", "inputs", {"unknown": sorted(unknown)}
         )
-
 
 def validate_target(device: torch.device, target) -> None:
     if device.type == "cpu" and os.environ.get("STATEFUL_OPERATOR_TEST_CPU") == "1":
