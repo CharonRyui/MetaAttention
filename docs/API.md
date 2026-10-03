@@ -231,6 +231,16 @@ No inverse gate or BF16 State approximation is used in inference. Existing
 single-readout backward execution retains its recorded-State reverse walk;
 unsupported gradient compositions retain the generic lowering.
 
+When every ordered propagation is a whole-State scalar scale or first-axis
+Rank-One update, at most four rank/injection events and dimensions at most 128
+use the compact WY triangular solve and block contractions. This path reads
+each FP32 factor through its binding strides; low-precision factors retain the
+existing FP32 promotion before the dot operands. It does not pack/copy operation
+buffers or stack multiple injection/readout factors.
+Zero/signed scalar gates, distinct left/right factors, nonzero initial States
+and continuation retain the same recurrence. Noncommuting row/column scales
+keep the existing affine-summary runtime; packed and backward paths are unchanged.
+
 The workspace envelope charges token factors and expression outputs separately
 from chunk carries: `B*T*bytes_per_token + B*(ceil(T/64)+1)*bytes_per_chunk`.
 The extra chunk allowance covers final States. The runtime checks this bound

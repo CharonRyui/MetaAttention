@@ -39,10 +39,21 @@ def chunk_tokens(event_count):
 
 
 @triton.jit
+def _load_factor(P, flat, feature, S0: tl.constexpr, S1: tl.constexpr,
+                 S2: tl.constexpr, HEADS: tl.constexpr, VALID):
+    return tl.load(
+        P + (flat // HEADS) * S0 + (flat % HEADS) * S1
+        + feature * S2, VALID, 0.0,
+    ).to(tl.float32)
+
+
+@triton.jit
 def _solve(
     L, R, C, IK, IV, U, W, V, Intervals, Prefix,
+    LS: tl.constexpr, RS: tl.constexpr, CS: tl.constexpr,
+    IKS: tl.constexpr, IVS: tl.constexpr,
     LENGTH: tl.constexpr, HEADS: tl.constexpr, ROWS: tl.constexpr,
-    COLS: tl.constexpr, CHUNKS: tl.constexpr, BATCH_HEADS: tl.constexpr,
+    COLS: tl.constexpr, CHUNKS: tl.constexpr,
     RANK_OPS: tl.constexpr, SCALE_OPS: tl.constexpr,
     INJECTIONS: tl.constexpr, EVENTS: tl.constexpr,
     CHUNK: tl.constexpr, N: tl.constexpr, BR: tl.constexpr, BC: tl.constexpr,
@@ -61,28 +72,35 @@ def _solve(
     r = tl.full((N, BR), 0.0, tl.float32)
     j = tl.full((N, BC), 0.0, tl.float32)
     for index in tl.static_range(len(RANK_OPS)):
-        op = RANK_OPS[index]
         mask = valid & (e % EVENTS == index)
-        coefficient = tl.load(C + op * LENGTH * BATCH_HEADS + flat, mask, 0.0)
-        left = tl.load(
-            L + (op * LENGTH * BATCH_HEADS + flat[:, None]) * ROWS + row[None, :],
-            mask[:, None] & (row[None, :] < ROWS), 0.0,
+        coefficient = _load_factor(
+            C[RANK_OPS[index]], flat, 0,
+            CS[RANK_OPS[index]][0], CS[RANK_OPS[index]][1], CS[RANK_OPS[index]][2],
+            HEADS, mask,
         )
-        right = tl.load(
-            R + (op * LENGTH * BATCH_HEADS + flat[:, None]) * ROWS + row[None, :],
-            mask[:, None] & (row[None, :] < ROWS), 0.0,
+        left = _load_factor(
+            L[index], flat[:, None], row[None, :],
+            LS[index][0], LS[index][1], LS[index][2], HEADS,
+            mask[:, None] & (row[None, :] < ROWS),
+        )
+        right = _load_factor(
+            R[index], flat[:, None], row[None, :],
+            RS[index][0], RS[index][1], RS[index][2], HEADS,
+            mask[:, None] & (row[None, :] < ROWS),
         )
         u += coefficient[:, None] * left
         r += right
     for index in tl.static_range(INJECTIONS):
         mask = valid & (e % EVENTS == len(RANK_OPS) + index)
-        u += tl.load(
-            IK + (index * LENGTH * BATCH_HEADS + flat[:, None]) * ROWS + row[None, :],
-            mask[:, None] & (row[None, :] < ROWS), 0.0,
+        u += _load_factor(
+            IK[index], flat[:, None], row[None, :],
+            IKS[index][0], IKS[index][1], IKS[index][2], HEADS,
+            mask[:, None] & (row[None, :] < ROWS),
         )
-        j += tl.load(
-            IV + (index * LENGTH * BATCH_HEADS + flat[:, None]) * COLS + col[None, :],
-            mask[:, None] & (col[None, :] < COLS), 0.0,
+        j += _load_factor(
+            IV[index], flat[:, None], col[None, :],
+            IVS[index][0], IVS[index][1], IVS[index][2], HEADS,
+            mask[:, None] & (col[None, :] < COLS),
         )
     t = tl.arange(0, CHUNK)
     intervals = tl.full((CHUNK, CHUNK), 1.0, tl.float32)
@@ -94,10 +112,12 @@ def _solve(
         scalar_flat = (seq * LENGTH + absolute) * HEADS + head
         gate = tl.full((), 1.0, tl.float32)
         for index in tl.static_range(len(SCALE_OPS)):
-            gate *= tl.load(
-                C + SCALE_OPS[index] * LENGTH * BATCH_HEADS + scalar_flat,
-                absolute < LENGTH, 1.0,
+            gate *= _load_factor(
+                C[SCALE_OPS[index]], scalar_flat, 0,
+                CS[SCALE_OPS[index]][0], CS[SCALE_OPS[index]][1], CS[SCALE_OPS[index]][2],
+                HEADS, absolute < LENGTH,
             )
+        gate = tl.where(absolute < LENGTH, gate, 1.0)
         prefix *= tl.where(step <= t, gate, 1.0)
         event_prefix *= tl.where(step <= local_token, gate, 1.0)
         intervals *= tl.where((step > t[None, :]) & (step <= t[:, None]), gate, 1.0)
@@ -171,7 +191,7 @@ def _carry(
 
 @triton.jit
 def _readouts(
-    Q, U, W, V, Intervals, Prefix, Carry, Output,
+    Q, U, W, V, Intervals, Prefix, Carry, Output, QS: tl.constexpr,
     LENGTH: tl.constexpr, HEADS: tl.constexpr, ROWS: tl.constexpr,
     COLS: tl.constexpr, CHUNKS: tl.constexpr, BATCH_HEADS: tl.constexpr,
     EVENTS: tl.constexpr, READOUTS: tl.constexpr,
@@ -201,9 +221,10 @@ def _readouts(
     # The compact response is shared by every authored readout.
     response = tl.dot(w, incoming, input_precision="tf32x3") + v
     for readout in tl.static_range(READOUTS):
-        q = tl.load(
-            Q + (readout * LENGTH * BATCH_HEADS + flat[:, None]) * ROWS + row[None, :],
-            (token[:, None] < LENGTH) & (row[None, :] < ROWS), 0.0,
+        q = _load_factor(
+            Q[readout], flat[:, None], row[None, :],
+            QS[readout][0], QS[readout][1], QS[readout][2], HEADS,
+            (token[:, None] < LENGTH) & (row[None, :] < ROWS),
         )
         h = tl.dot(q, u, input_precision="tf32x3") * decay
         output = gamma[:, None] * tl.dot(q, incoming, input_precision="tf32x3")
@@ -215,11 +236,11 @@ def _readouts(
 
 
 def execute(*, codes, left, right, coefficient, injection_left, injection_right,
-            query, injection_count, readout_count, initial_state, length,
-            output_dtypes):
+            query, initial_state, length, output_dtypes):
     batch, heads, rows, columns = initial_state.shape
     rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
     scale_ops = tuple(i for i, code in enumerate(codes) if code == 0)
+    injection_count, readout_count = len(injection_left), len(query)
     events = len(rank_ops) + injection_count
     chunk = chunk_tokens(events)
     n = triton.next_power_of_2(chunk * events)
@@ -236,7 +257,11 @@ def execute(*, codes, left, right, coefficient, injection_left, injection_right,
     output = torch.empty((readout_count, batch * length, heads, columns), device=device, dtype=torch.float32)
     _solve[(sh, chunks)](
         left, right, coefficient, injection_left, injection_right, u, w, v, intervals, prefix,
-        length, heads, rows, columns, chunks, sh, rank_ops, scale_ops,
+        tuple(part.stride() for part in left), tuple(part.stride() for part in right),
+        tuple(part.stride() for part in coefficient),
+        tuple(part.stride() for part in injection_left),
+        tuple(part.stride() for part in injection_right),
+        length, heads, rows, columns, chunks, rank_ops, scale_ops,
         injection_count, events, chunk, n,
         max(16, triton.next_power_of_2(rows)), max(16, triton.next_power_of_2(columns)),
         n.bit_length() - 1,
@@ -248,6 +273,7 @@ def execute(*, codes, left, right, coefficient, injection_left, injection_right,
     )
     _readouts[(sh, chunks, triton.cdiv(columns, 32))](
         query, u, w, v, intervals, prefix, carry, output,
+        tuple(part.stride() for part in query),
         length, heads, rows, columns, chunks, sh, events, readout_count,
         chunk, n, max(16, triton.next_power_of_2(rows)),
     )

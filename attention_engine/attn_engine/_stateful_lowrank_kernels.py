@@ -281,6 +281,28 @@ def execute(
             return part.reshape(1, 1, 1).expand(tokens, heads, size)
         return part.reshape(tokens, heads, -1).expand(tokens, heads, size)
 
+    from ._stateful_wy_kernels import eligible, execute as execute_wy
+
+    if eligible(tuple(operation_codes), len(injection_left), rows, columns):
+        # Keep FP32 dot operands; BF16 pointers change Triton's dot lowering.
+        rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
+
+        def wy_binding(part, size):
+            return binding(part.float(), size)
+
+        return execute_wy(
+            codes=codes,
+            left=tuple(wy_binding(left_factors[i], rows) for i in rank_ops),
+            right=tuple(wy_binding(right_factors[i], rows) for i in rank_ops),
+            coefficient=tuple(wy_binding(part, 1) for part in coefficients),
+            injection_left=tuple(wy_binding(part, rows) for part in injection_left),
+            injection_right=tuple(wy_binding(part, columns) for part in injection_right),
+            query=tuple(wy_binding(part, rows) for part in readouts),
+            initial_state=initial_state,
+            length=length,
+            output_dtypes=output_dtypes,
+        )
+
     # Only the operation-specific buffers that a static Triton branch reads need
     # the full packed shape. Unused pointers remain valid one-element tensors.
     def packed(shape, used):
@@ -314,24 +336,6 @@ def execute(
     ik = stack_or_bind(injection_left, rows)
     iv = stack_or_bind(injection_right, columns)
     query = stack_or_bind(readouts, rows)
-
-    from ._stateful_wy_kernels import eligible, execute as execute_wy
-
-    if eligible(tuple(operation_codes), len(injection_left), rows, columns):
-        return execute_wy(
-            codes=codes,
-            left=left,
-            right=right,
-            coefficient=coefficient,
-            injection_left=ik,
-            injection_right=iv,
-            query=query,
-            injection_count=len(injection_left),
-            readout_count=len(readouts),
-            initial_state=initial_state,
-            length=length,
-            output_dtypes=output_dtypes,
-        )
 
     transform = torch.empty(
         batch * heads, chunks, rows, rows, device=device, dtype=torch.float32

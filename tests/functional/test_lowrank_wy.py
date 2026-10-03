@@ -157,3 +157,52 @@ def test_single_rank_injection_and_readout_with_partial_chunk(gpu_device):
     expected, expected_final = _oracle(arguments, torch.float64)
     torch.testing.assert_close(output[0].cpu(), expected[0].float(), rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_wy_strided_factors_broadcast_heads_and_scalar_gates(gpu_device, dtype):
+    arguments = _case(gpu_device, 67, dtype)
+    arguments["output_dtypes"] = (torch.float32, torch.float32)
+    for name in ("left_factors", "right_factors", "injection_left", "injection_right", "readouts"):
+        parts = []
+        for tensor in arguments[name]:
+            storage = torch.empty(
+                *tensor.shape[:-1], 2 * tensor.shape[-1] + 1,
+                device=gpu_device, dtype=tensor.dtype,
+            )
+            view = storage[..., 1::2]
+            view.copy_(tensor)
+            if name == "right_factors":
+                view = view[:, :1].expand_as(view)
+            parts.append(view)
+        arguments[name] = parts
+    arguments["coefficients"][0] = arguments["coefficients"][0][:, :1].expand_as(
+        arguments["coefficients"][0]
+    )
+    constant = torch.tensor(0.97, device=gpu_device)
+    arguments["coefficients"][-1] = constant
+    oracle_arguments = dict(arguments)
+    oracle_arguments["coefficients"] = [
+        *arguments["coefficients"][:-1],
+        constant.expand_as(arguments["coefficients"][1]),
+    ]
+    expected, expected_final = _oracle(oracle_arguments, torch.float64)
+    initial = arguments["initial_state"].clone()
+    with torch.no_grad():
+        output, final = execute(**arguments)
+    for actual, reference in zip(output, expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(arguments["initial_state"], initial, rtol=0, atol=0)
+    prefix_args = _slice(oracle_arguments, 0, 33)
+    suffix_args = _slice(oracle_arguments, 33, 67)
+    with torch.no_grad():
+        prefix, prefix_final = execute(**prefix_args)
+        suffix_args["initial_state"] = prefix_final
+        suffix, suffix_final = execute(**suffix_args)
+    for first, last, reference in zip(prefix, suffix, expected, strict=True):
+        torch.testing.assert_close(
+            torch.cat((first, last), 2).cpu(), reference.float(),
+            rtol=2e-4, atol=2e-4,
+        )
+    torch.testing.assert_close(suffix_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
