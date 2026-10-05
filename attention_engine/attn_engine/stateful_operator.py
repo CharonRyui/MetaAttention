@@ -753,11 +753,11 @@ class AlgorithmIR:
         return self.transitions
 
     def _validate(self) -> None:
-        from ._stateful_ir_validation import (
+        from .stateful.analyse.validation import (
             validate_algorithm_structure,
             validate_transition_structure,
         )
-        from ._stateful_analysis import analyze_algorithm
+        from .stateful.analyse.algorithm import analyze_algorithm
 
         validate_algorithm_structure(self)
         object.__setattr__(self, "_analysis", analyze_algorithm(self))
@@ -898,7 +898,7 @@ class StatefulOperator:
     def _compile_specialization(self, specialization, compilation):
         if specialization in self._plans:
             return self._plans[specialization]
-        from ._stateful_tilelang import compile_plan
+        from .stateful.compile.plan import compile_plan
 
         state = self.algorithm.states[0]
         role_sizes = dict(compilation.role_sizes)
@@ -947,7 +947,7 @@ class StatefulOperator:
         return_final_state: bool = False,
         **inputs: torch.Tensor,
     ) -> ExecutionResult:
-        from ._stateful_runtime_validation import validate_input_names
+        from .stateful.runtime.validation import validate_input_names
 
         validation = compiled.compilation.validation
         validate_input_names(validation.expected_input_names, inputs)
@@ -1118,7 +1118,7 @@ class StatefulOperator:
         # The {64,128} pair is a capability of the specialized matrix kernels; a
         # v2 Program is executed by the reference lowering, which has no such
         # block constraint.
-        from ._stateful_reference import requires_reference_lowering
+        from .stateful.lowering.reference import requires_reference_lowering
 
         if (
             target.device_type == "cuda"
@@ -1371,13 +1371,13 @@ class StatefulOperator:
 
     @staticmethod
     def _validate_target(device: torch.device, target: Target) -> None:
-        from ._stateful_runtime_validation import validate_target
+        from .stateful.runtime.validation import validate_target
 
         validate_target(device, target)
 
     @staticmethod
     def _validate_aliases(inputs: Mapping[str, torch.Tensor]) -> None:
-        from ._stateful_runtime_validation import validate_aliases
+        from .stateful.runtime.validation import validate_aliases
 
         validate_aliases(inputs)
 
@@ -1451,11 +1451,11 @@ class StatefulOperator:
         recipe: Any,
     ) -> ExecutionResult:
         """Execute compiler-proven dense inference without reference plumbing."""
-        from ._stateful_chunked import bind_chunked_inputs, execute_chunked_states
+        from .stateful.lowering.chunked import bind_chunked_inputs, execute_chunked_states
 
         assert runtime.uniform_length is not None
         if recipe.rank_one is not None:
-            from ._stateful_rank1 import execute_rank_one
+            from .stateful.lowering.scan.rank1 import execute_rank_one
 
             output, final = execute_rank_one(
                 recipe.rank_one, inputs, initial_states[recipe.rank_one.state],
@@ -1503,7 +1503,7 @@ class StatefulOperator:
         return_final_state: bool,
     ) -> ExecutionResult:
         """Execute a schema-v2 Program through the reference lowering."""
-        from ._stateful_reference import execute_reference, normalize_inputs
+        from .stateful.lowering.reference import execute_reference, normalize_inputs
 
         algorithm = self.algorithm
         heads = runtime.state_heads
@@ -1719,7 +1719,7 @@ class StatefulOperator:
                 else None
             )
             return outputs, final
-        from ._stateful_structured import (
+        from .stateful.lowering.structured import (
             _axis_scale_summary,
             product_injection_terms,
             rank_one_summary,
@@ -2182,7 +2182,7 @@ class StatefulOperator:
         executable: Any,
     ) -> tuple[tuple[torch.Tensor, ...], StateTuple | None]:
         """Lower inference through chunks; retain the compiled backward path."""
-        from ._stateful_factored import factored_recurrence_chunked
+        from .stateful.lowering.lowrank.factored import factored_recurrence_chunked
 
         state_spec = self.algorithm.states[0]
         first_role, second_role = state_spec.feature_roles
@@ -2234,7 +2234,7 @@ class StatefulOperator:
             dtypes.append(readout.output_dtype)
         if runtime.packed:
             assert runtime.offsets is not None
-            from ._stateful_packed import execute_lowrank_packed
+            from .stateful.lowering.packed import execute_lowrank_packed
 
             outputs, final = execute_lowrank_packed(
                 operation_codes=tuple(codes),

@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_engine._stateful_packed import execute_lowrank_packed
+from attn_engine.stateful.lowering.packed import execute_lowrank_packed
 
 pytestmark = [pytest.mark.functional, pytest.mark.gpu, pytest.mark.usefixtures("gpu_device", "seed")]
 

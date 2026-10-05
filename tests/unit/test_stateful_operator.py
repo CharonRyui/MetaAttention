@@ -112,7 +112,7 @@ def test_backward_compilation_publishes_compiler_owned_backward_candidate():
 
 
 def test_context_contract_rejects_dtype_role_and_shape_mismatches():
-    from attn_engine._stateful_plan import ContextContract, ContextValue
+    from attn_engine.stateful.compile.plan import ContextContract, ContextValue
 
     produced = ContextValue(
         "inputs.query",
@@ -150,7 +150,7 @@ def test_context_contract_identity_separates_backward_behavior():
 
 
 def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallback():
-    from attn_engine._stateful_plan import (
+    from attn_engine.stateful.compile.plan import (
         EstimationShape,
         LOWERERS,
         LoweredCandidate,
@@ -182,7 +182,7 @@ def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallbac
 
 
 def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
-    from attn_engine._stateful_plan import WORKLOAD_POLICY, normalized_geometric_mean
+    from attn_engine.stateful.compile.plan import WORKLOAD_POLICY, normalized_geometric_mean
 
     assert {point.distribution for point in WORKLOAD_POLICY.points("packed")} >= {
         "uniform",
@@ -196,7 +196,7 @@ def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
 
 
 def test_successful_artifacts_publish_atomically_by_layer(tmp_path, monkeypatch):
-    from attn_engine._stateful_plan import publish_successful_artifact
+    from attn_engine.stateful.compile.plan import publish_successful_artifact
 
     monkeypatch.setenv("STATEFUL_OPERATOR_CACHE_DIR", str(tmp_path))
     destination = publish_successful_artifact("artifact", {"ok": True}, layer="plans")
@@ -207,7 +207,7 @@ def test_successful_artifacts_publish_atomically_by_layer(tmp_path, monkeypatch)
 
 
 def test_h20_evidence_remains_pending_until_idle_hardware_measurement():
-    from attn_engine._stateful_plan import H20_EVIDENCE, WORKLOAD_POLICY
+    from attn_engine.stateful.compile.plan import H20_EVIDENCE, WORKLOAD_POLICY
 
     assert H20_EVIDENCE.target == "NVIDIA H20"
     assert H20_EVIDENCE.workload_policy == WORKLOAD_POLICY.version
@@ -266,8 +266,8 @@ def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
 
 
 def test_candidate_tuning_removes_failed_specialized_candidate_and_keeps_generic():
-    from attn_engine._stateful_plan import LoweredCandidate
-    from attn_engine._stateful_tuning import WorkloadPoint, tune_candidates
+    from attn_engine.stateful.compile.plan import LoweredCandidate
+    from attn_engine.stateful.compile.tuning import WorkloadPoint, tune_candidates
 
     generic = LoweredCandidate("generic", "plan-g", "tilelang-generic", "forward")
     specialized = LoweredCandidate(
@@ -296,8 +296,8 @@ def test_candidate_tuning_removes_failed_specialized_candidate_and_keeps_generic
 
 
 def test_candidate_tuning_disabled_uses_static_default_without_factory():
-    from attn_engine._stateful_plan import LoweredCandidate
-    from attn_engine._stateful_tuning import WorkloadPoint, tune_candidates
+    from attn_engine.stateful.compile.plan import LoweredCandidate
+    from attn_engine.stateful.compile.tuning import WorkloadPoint, tune_candidates
 
     generic = LoweredCandidate("generic", "plan-g", "tilelang-generic", "forward")
     calls = []
@@ -440,7 +440,7 @@ def test_constant_bits_and_commutative_identity_are_canonical():
 
 
 def test_mandatory_simplification_removes_safe_zero_and_one_constants():
-    from attn_engine._stateful_analysis import simplify_expression
+    from attn_engine.stateful.analyse.algorithm import simplify_expression
 
     x = Input("x")
     assert simplify_expression(x + Constant(0.0)) == x
@@ -449,7 +449,7 @@ def test_mandatory_simplification_removes_safe_zero_and_one_constants():
 
 
 def test_simplification_preserves_authored_association():
-    from attn_engine._stateful_analysis import simplify_expression
+    from attn_engine.stateful.analyse.algorithm import simplify_expression
 
     x, y, z = Input("x"), Input("y"), Input("z")
     assert simplify_expression((x + y) + z) != simplify_expression(x + (y + z))
@@ -664,7 +664,7 @@ def test_optimization_disabled_enumerates_only_generic_plan():
 
 
 def test_lowerer_registry_allows_multiple_implementations_per_plan():
-    from attn_engine._stateful_plan import (
+    from attn_engine.stateful.compile.plan import (
         CandidateLowerer,
         EstimationShape,
         MathematicalPlan,

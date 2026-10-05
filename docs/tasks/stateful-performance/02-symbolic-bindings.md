@@ -7,7 +7,7 @@
 01
 
 ## 文件归属
-stateful_operator.py; _stateful_reference.py; lowerer bindings
+stateful_operator.py; stateful/lowering/reference.py; lowerer bindings
 
 ## 实现合同
 保留逻辑 roles、物理 strides、broadcast 与 head mapping；kernel 原布局加载 BF16 后 FP32 运算，不提前 head repeat/完整 FP32 copy；operation codes 编译期绑定；保持公共 contiguous contract。

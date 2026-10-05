@@ -165,7 +165,7 @@ def test_chunked_entry_runs_a_rank_one_state_beside_a_dense_one():
     """
     import torch
 
-    from attn_engine._stateful_chunked import chunked_elementwise_dense
+    from attn_engine.stateful.lowering.chunked import chunked_elementwise_dense
 
     torch.manual_seed(0)
     device = torch.device("cuda")

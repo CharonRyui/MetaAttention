@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_engine._stateful_lowrank_kernels import execute
+from attn_engine.stateful.lowering.lowrank.lowrank_kernels import execute
 
 pytestmark = pytest.mark.gpu
 

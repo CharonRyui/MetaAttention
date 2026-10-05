@@ -7,7 +7,7 @@
 01,03,04,05
 
 ## 文件归属
-_stateful_backward.py; _stateful_factored.py; private reverse chunk kernels
+stateful/lowering/backward.py; stateful/lowering/lowrank/factored.py; private reverse chunk kernels
 
 ## 实现合同
 forward 保存 FP32 chunk checkpoints；chunk-local replay 恢复状态后 VJP；反向 summary/prefix 传播 adjoint；所有 input/State/readout gradients；deterministic head reductions；不保存完整 BF16 token States、不逆 recurrence。

@@ -7,7 +7,7 @@
 00
 
 ## 文件归属
-_stateful_diagonal_kernels.py; _stateful_chunked.py integration owner
+stateful/lowering/diagonal/diagonal_kernels.py; stateful/lowering/chunked.py integration owner
 
 ## 实现合同
 AxisScale + separated injection + contraction 使用稳定 chunk-local decay 与 masked block contraction；保持两个轴因子；短序列 streaming carry，长序列 segmented hierarchical prefix；禁止通过 inverse gate 恢复。
@@ -16,7 +16,7 @@ AxisScale + separated injection + contraction 使用稳定 chunk-local decay 与
 scalar/row/column/dual gate，零 gate、strong decay、tails、prior、多个 batch 正确；实测降低 serial replay 成本。
 
 ## 当前实现与成本
-`_stateful_diagonal_block.py` 按 32×32 State tile 执行 summary：对 shifted row/column gates 分别做 reverse associative forward-product scan，再以 TF32x3 weighted-key/value GEMM 得到 bias。readout 按 `(batch×head, 2-target-token tile, column-tile)` 并行；同 tile 共享源 gate/key/value/State loads，直接 FP32 multiply/reduce 得到 scores、incoming-State contraction 与 weighted-value contraction，不复制 query 成 16 行 dot。prior 的终点是 `t-1`，不对零 gate 求逆、不使用 log-prefix subtraction；row/column 因子仍在 contraction 前分离，column suffix 在 row loop 完成后生成以缩短 register live range。summary、FP32 carry、named finals 与 workspace 收费不变；最后的 target tile masked，不启动整块无消费者 tail CTAs。
+`stateful/lowering/diagonal/diagonal_block.py` 按 32×32 State tile 执行 summary：对 shifted row/column gates 分别做 reverse associative forward-product scan，再以 TF32x3 weighted-key/value GEMM 得到 bias。readout 按 `(batch×head, 2-target-token tile, column-tile)` 并行；同 tile 共享源 gate/key/value/State loads，直接 FP32 multiply/reduce 得到 scores、incoming-State contraction 与 weighted-value contraction，不复制 query 成 16 行 dot。prior 的终点是 `t-1`，不对零 gate 求逆、不使用 log-prefix subtraction；row/column 因子仍在 contraction 前分离，column suffix 在 row loop 完成后生成以缩短 register live range。summary、FP32 carry、named finals 与 workspace 收费不变；最后的 target tile masked，不启动整块无消费者 tail CTAs。
 
 令 `N=B×H`，`C=ceil(T/64)`，`R`/`D` 是两个 State 轴。summary/carry 的 global FP32 workspace 为 `3×4×N×C×R×D` bytes（scale、bias、carry），另加可选 final `4×N×R×D` bytes。分层 scan 每个递归层额外分配 `3×4×N×ceil(C/32)×R×D` bytes，直到 chunks≤64。readout 只分配 `4×B×T×H×D` output bytes；没有 token-sized matrix States 或 decay 矩阵。上述不含输入 `.float().contiguous()` 的 dtype/layout 转换。
 

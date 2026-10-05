@@ -7,7 +7,7 @@
 00
 
 ## 文件归属
-_stateful_diagonal_kernels.py product regions; new private product kernels
+stateful/lowering/diagonal/diagonal_kernels.py product regions; new private product kernels
 
 ## 实现合同
 从 typed Outer/Contract 证明 (a⊗b)·(c⊗d)=(a·c)(b·d)；chunk-local scores 使用基础 feature GEMM；inter-chunk 保持显式 State；共享 numerator/denominator；默认保持线性 T 复杂度。

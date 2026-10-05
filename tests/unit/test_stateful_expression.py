@@ -4,12 +4,12 @@ import pytest
 import torch
 
 from attn_engine import Batch, Constant, FeatureRole, HeadRole, Input, Sequence, StateTerm, TensorInput
-from attn_engine._stateful_expression import compile_expression
+from attn_engine.stateful.lowering.expression.expression import compile_expression
 
 
 @pytest.fixture
 def isolated_expression_kernel_cache(monkeypatch):
-    from attn_engine import _stateful_expression_kernels as kernels
+    from attn_engine.stateful.lowering.expression import expression_kernels as kernels
 
     cache: dict[tuple[object, ...], object] = {}
     monkeypatch.setattr(kernels, "_CACHE", cache)
@@ -113,7 +113,7 @@ def test_cuda_expression_cache_distinguishes_descriptor_address_formulas(
 ):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    from attn_engine._stateful_bindings import build_binding
+    from attn_engine.stateful.runtime.bindings import build_binding
 
     feature = FeatureRole("feature")
     first_head = HeadRole("first_head")

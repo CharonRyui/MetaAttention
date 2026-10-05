@@ -10,9 +10,9 @@ import pytest
 import torch
 
 from attn_engine import ProductFeatureRole
-from attn_engine._stateful_chunked import execute_chunked_states
-from attn_engine._stateful_diagonal_kernels import prepare_state
-from attn_engine._stateful_product_kernels import product_chunk_scores, read_product_state
+from attn_engine.stateful.lowering.chunked import execute_chunked_states
+from attn_engine.stateful.lowering.diagonal.diagonal_kernels import prepare_state
+from attn_engine.stateful.lowering.readout.product_kernels import product_chunk_scores, read_product_state
 from examples.based_attention import based_attention
 from examples.rebased_attention import rebased_attention
 

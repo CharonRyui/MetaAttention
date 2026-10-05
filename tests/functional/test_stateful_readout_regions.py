@@ -4,9 +4,9 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_engine._stateful_diagonal_kernels import prepare_state, read_state
-from attn_engine._stateful_diagonal_block import diagonal_block_bonus_readout
-from attn_engine._stateful_readout_regions import (
+from attn_engine.stateful.lowering.diagonal.diagonal_kernels import prepare_state, read_state
+from attn_engine.stateful.lowering.diagonal.diagonal_block import diagonal_block_bonus_readout
+from attn_engine.stateful.lowering.readout.readout_regions import (
     fused_normalized_region,
     fused_readout_region,
     fused_shared_readouts,
@@ -341,7 +341,7 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
     executable = operator._plans[compiled.specialization]
     if schedule == "scores":
         candidate = next(c for c in executable.plan.lowered_candidates if c.lowerer.endswith("shared-scores"))
-        from attn_engine._stateful_chunked import select_chunked_schedule
+        from attn_engine.stateful.lowering.chunked import select_chunked_schedule
 
         operator._plans[compiled.specialization] = replace(
             executable, plan=replace(executable.plan, candidate=candidate),
@@ -492,7 +492,7 @@ def test_native_multiple_injections_dynamic_workloads_and_continuation(gpu_devic
 def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, priors):
     from dataclasses import replace
     from attn_engine import AlgorithmIR, Readout, Softmax, StateTerm, StatefulOperator, StateTuple, Target
-    from attn_engine._stateful_chunked import select_chunked_schedule
+    from attn_engine.stateful.lowering.chunked import select_chunked_schedule
     from examples.gated_slot_attention import gated_slot_attention, KEY, VALUE, QUERY_HEADS, KEY_HEADS, VALUE_HEADS, STATE_HEADS
 
     base = gated_slot_attention(2, 2, 71, 13, 19, 11, dtype=torch.float32)

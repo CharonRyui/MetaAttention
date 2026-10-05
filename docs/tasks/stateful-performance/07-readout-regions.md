@@ -7,7 +7,7 @@ normalized shared-query readout 已接入编译期 recipe 与主执行路径，�
 01,04,06
 
 ## 文件归属
-_stateful_chunked.py; private fused readout kernels
+stateful/lowering/chunked.py; private fused readout kernels
 
 ## 实现合同
 按 typed DAG fusion region；独立 contractions 共享 State replay；arithmetic epilogue fusion；StateTerm→Softmax→StateTerm 依赖保持方向和 reduction；资源成本约束，避免 all-in-one 寄存器爆炸。
@@ -16,7 +16,7 @@ _stateful_chunked.py; private fused readout kernels
 GSA、normalized、prior readouts、多个输出独立 oracle；launch/peak memory 与 latency 改善，非法 fusion 不改变 semantics。
 
 ## Kernel interface 与资源边界
-`_stateful_readout_regions.py` 提供 `fused_readout_region(first, second, query, *, sequence_length, prior_first=False, prior_second=False, output_dtype=torch.float32)`，其中 prepared State 为 `(carry, factors, identity)`。要求 `first.columns == second.rows`；一 CTA 持有两个 FP32 State，执行 first row contraction→first columns softmax→second row contraction，两个 prior flag 分别选择更新前 State。softmax reduction 不沿 token 或 second columns；没有 global logits/softmax tensors。无法合法融合时返回 `None`，调用者执行现有 DAG materialization cut。
+`stateful/lowering/readout/readout_regions.py` 提供 `fused_readout_region(first, second, query, *, sequence_length, prior_first=False, prior_second=False, output_dtype=torch.float32)`，其中 prepared State 为 `(carry, factors, identity)`。要求 `first.columns == second.rows`；一 CTA 持有两个 FP32 State，执行 first row contraction→first columns softmax→second row contraction，两个 prior flag 分别选择更新前 State。softmax reduction 不沿 token 或 second columns；没有 global logits/softmax tensors。无法合法融合时返回 `None`，调用者执行现有 DAG materialization cut。
 
 `fused_normalized_region` 增加 `epsilon=0.0`，要求 rows 相同与 denominator.columns=1，融合两个 contraction、authored epsilon 加法、scalar division 与最终 cast；默认 0 保持裸除法，normalized-linear recipe 传递表达式 `Constant(EPS)` 的值（`EPS=1e-10`），不插入 clamp。identity prepared States 使用 64-token chunk GEMM，将 shared query/key scores、memory carry contraction、key_sum carry contraction 与 epilogue 保留在同一个 output kernel；独立 keys/两个 prior flag 仍合法。diagonal States 保留 resource-bounded replay。`fused_shared_readouts(prepared, queries, *, sequence_length, priors=None, output_dtypes=None, epilogue=None)` 对同一 State 的 2–4 个 contractions 共享一次 replay；返回 outputs tuple，或资源不满足时 `None`。`epilogue` 可为 `add`/`multiply`/`divide`，要求两个 queries，只输出一个 tensor；`None` 保留独立的多个输出与独立 dtype。
 
@@ -28,7 +28,7 @@ GSA、normalized、prior readouts、多个输出独立 oracle；launch/peak memo
 
 ### Normalized shared-query 实测（2026-10-02）
 
-基线 `097b7e8` 的 `_stateful_chunked.py` 在独立模块加载，前后仅替换 recipe/executor，使用同一 operator、同一输入、同一 public validation/target；编译与 warmup 不计时。H20 GPU 6，B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，output-only/final-state/continuation，共 108 点；3 次 warmup，20 次 repetitions，public 交错测量，Graph、CUPTI activity、单调用 allocator peak。peak 在 Graph capture 前采样、删除返回值，避免 graph pool 混入。矩阵前后均使用 `Target(workspace_bytes=4<<30)` 覆盖默认 1 GiB 保守 estimate 拒绝的高 B/H 长序列；生产默认和 estimate 未变。最大实测 peak 613 MiB，远低于空闲卡安全余量。原始记录 `benchmark_results/normalized_readout_ab.json`。
+基线 `097b7e8` 的 `stateful/lowering/chunked.py` 在独立模块加载，前后仅替换 recipe/executor，使用同一 operator、同一输入、同一 public validation/target；编译与 warmup 不计时。H20 GPU 6，B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，output-only/final-state/continuation，共 108 点；3 次 warmup，20 次 repetitions，public 交错测量，Graph、CUPTI activity、单调用 allocator peak。peak 在 Graph capture 前采样、删除返回值，避免 graph pool 混入。矩阵前后均使用 `Target(workspace_bytes=4<<30)` 覆盖默认 1 GiB 保守 estimate 拒绝的高 B/H 长序列；生产默认和 estimate 未变。最大实测 peak 613 MiB，远低于空闲卡安全余量。原始记录 `benchmark_results/normalized_readout_ab.json`。
 
 | contract | 点数 | public 几何平均下降 | Graph 几何平均下降 | peak allocated 几何平均下降 | peak incremental 几何平均下降 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -46,7 +46,7 @@ GSA、normalized、prior readouts、多个输出独立 oracle；launch/peak memo
 
 ### 原输入 symbolic binding 与 staging 消除实测（2026-10-02）
 
-`_stateful_native.py` 从 typed IR 证明两个 identity States、原输入 key/value 和共享 Input 或 scalar-scaled Input query；编译 recipe 在资源允许时启用，其他结构保留通用路径。summary/readout 直接按 BindingDescriptor 的 B/H/T/Feature strides 与 grouped HeadMapping load 原 BF16/FP32，不生成 FP32 copy、query multiply 或常量 fill tensor。query scale 保留 CUDA scalar 转换及 authored BF16 rounding；单位 denominator value、epsilon 在 kernel 内合成。memory/key_sum 仍各自 summary/carry，final States 与 continuation 不变；未做跨 State 合并或 tile autotuning。
+`stateful/lowering/readout/native.py` 从 typed IR 证明两个 identity States、原输入 key/value 和共享 Input 或 scalar-scaled Input query；编译 recipe 在资源允许时启用，其他结构保留通用路径。summary/readout 直接按 BindingDescriptor 的 B/H/T/Feature strides 与 grouped HeadMapping load 原 BF16/FP32，不生成 FP32 copy、query multiply 或常量 fill tensor。query scale 保留 CUDA scalar 转换及 authored BF16 rounding；单位 denominator value、epsilon 在 kernel 内合成。memory/key_sum 仍各自 summary/carry，final States 与 continuation 不变；未做跨 State 合并或 tile autotuning。
 
 基线 `895d0ea` recipe、binding、executor、summary/readout helpers 独立加载，使用同一 operator、输入、public validation 和 target。H20 GPU 6，B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，三个 contracts 共 108 点，warmup=3，repetitions=20；public 交错采样，peak 在 Graph capture 前测量。两侧均用 4 GiB cap 以排除基线 estimate 拒绝，生产默认仍为 1 GiB。原始记录 `benchmark_results/normalized_native_ab.json`。
 
@@ -68,7 +68,7 @@ workspace 按实际 output 与独立 summary/carry、递归 group buffers 收费
 
 ### 双 State summary/carry 共调度（2026-10-02）
 
-`_stateful_native.py::_prepare_normalized_pair` 隐藏两个独立 identity States 的 summary/carry 调度和 scratch 生命周期；`execute_native_normalized` 只消费两个 carries 与按需两个 finals，readout 指针布局及数学不变。summary 使用互不重叠的 CTA tile 区间，复用通用 identity summary JIT body，保持 32×32 tiles、64-token chunk、`tf32x3` 与 denominator 的单位 value dot；不合并数学 State、不共享 key load，也不改 native eligibility、EPS、grouped heads、BF16 seam 或默认 1 GiB cap。
+`stateful/lowering/readout/native.py::_prepare_normalized_pair` 隐藏两个独立 identity States 的 summary/carry 调度和 scratch 生命周期；`execute_native_normalized` 只消费两个 carries 与按需两个 finals，readout 指针布局及数学不变。summary 使用互不重叠的 CTA tile 区间，复用通用 identity summary JIT body，保持 32×32 tiles、64-token chunk、`tf32x3` 与 denominator 的单位 value dot；不合并数学 State、不共享 key load，也不改 native eligibility、EPS、grouped heads、BF16 seam 或默认 1 GiB cap。
 
 direct carry 在读取当前 summary 后原地写 exclusive carry，对最多 64 chunks 完全展开，只暴露独立地址的调度，不改 chunk 累加先后；通用 affine caller 保持原 loop。`chunks>64` 仍用 GROUP=32 的 local/group-prefix/apply recursion，各层配对。identity group_scale 从未读取，不分配；group summaries 在 direct recursion 中复用为 carries。长 apply 使用独立 destinations，并在 private prepare 返回前释放所有已消费 summaries/group scratch，随后才分配 output。finals 独立于 initials，output-only 不写 initials；workspace 保留现有保守收费 `4*H*V` bytes/token 和 `12*H*K*(V+1)` bytes/chunk/sequence。
 

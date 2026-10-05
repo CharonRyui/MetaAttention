@@ -7,7 +7,7 @@
 00
 
 ## 文件归属
-_stateful_chunked.py; new private expression compiler
+stateful/lowering/chunked.py; new private expression compiler
 
 ## 实现合同
 将现有表达式树编译成共享 typed DAG；跨 State/input/readout CSE，不改变 FP association；kernel prologue/epilogue 执行 elementwise chains；reduction 和多消费者决定 materialization cut；消除 token-sized 常量。
@@ -17,7 +17,7 @@ _stateful_chunked.py; new private expression compiler
 
 ## CUDA kernel-cache identity 修复（2026-10-02）
 
-`_stateful_expression_kernels.py` 原 key 仅含 node count、outputs count、dtype 与 logical shape；同进程先执行 `x+y` 再执行 `x*y` 时，后者错误复用加法 kernel。修复以 `CompiledExpression` 构造时预计算的 exact immutable DAG identity（node kind、expression、children、roots）区分 authored operators、constants 与输出顺序；descriptor 的 role order、feature extents、target/grouped heads、mode、sequence length、storage offset 一并进入 key。tensor identity/data pointer 不进入 key，strides 仍作为 runtime launch 参数，不改变 arithmetic、dtype rounding 或 public layout 合同。
+`stateful/lowering/expression/expression_kernels.py` 原 key 仅含 node count、outputs count、dtype 与 logical shape；同进程先执行 `x+y` 再执行 `x*y` 时，后者错误复用加法 kernel。修复以 `CompiledExpression` 构造时预计算的 exact immutable DAG identity（node kind、expression、children、roots）区分 authored operators、constants 与输出顺序；descriptor 的 role order、feature extents、target/grouped heads、mode、sequence length、storage offset 一并进入 key。tensor identity/data pointer 不进入 key，strides 仍作为 runtime launch 参数，不改变 arithmetic、dtype rounding 或 public layout 合同。
 
 CUDA 消费者 smoke 实际返回 addition `[4,6]`、multiplication `[3,8]`、division `[0.3333333432674408,0.5]`。永久回归覆盖不同 operators/constants/root order、相同 logical shape 的不同 descriptor 地址公式及同公式的 dynamic strides；expected 由独立 tensor indexing/arithmetic 构造，global cache 隔离。最终实际执行 `--run-gpu` 的 expression/readout/hierarchical GPU suite 76 passed；CPU expression/v2/v3/binding/workspace/selection 47 passed、4 deselected。相关 Ruff 通过；这些验证不代表整个 DAG performance 任务已完成。
 

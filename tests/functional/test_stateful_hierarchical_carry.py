@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_engine._stateful_diagonal_scan import hierarchical_carry
+from attn_engine.stateful.lowering.diagonal.diagonal_scan import hierarchical_carry
 
 pytestmark = [pytest.mark.functional, pytest.mark.gpu]
 

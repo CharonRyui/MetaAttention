@@ -7,7 +7,7 @@
 00
 
 ## 文件归属
-_stateful_scalar.py; private scalar chunk kernels; planner integration by owner
+stateful/lowering/scalar/scalar.py; private scalar chunk kernels; planner integration by owner
 
 ## 实现合同
 实现原输入加载的 sequence-parallel summary/prefix/readout；保留短序列高 B*H fused streaming；长序列低 B*H 使用 chunk grid；支持 tails 与 nonzero State；候选选择不用模型名。
@@ -17,9 +17,9 @@ T=63/64/65/130/2048，B=1/2，FP32 final-State 与 continuation oracle；public/
 
 ### Rank-1 实测验收
 
-`_stateful_rank1.py` 按 typed IR 匹配单 rank-1 State、一个原输入 vector injection、可选 vector gate/Exp gate、一个 post-State identity readout。原输入 symbolic binding 保留 HeadMapping 和 strides；T≤64 单 kernel，T>64 三 kernel：64-token vector affine summary、exclusive carry、replay/output。组合不使用逆递推；FMA fusion 关闭。输出 dtype cast 与可选 FP32 final-State 写出在 replay kernel 内完成。
+`stateful/lowering/scan/rank1.py` 按 typed IR 匹配单 rank-1 State、一个原输入 vector injection、可选 vector gate/Exp gate、一个 post-State identity readout。原输入 symbolic binding 保留 HeadMapping 和 strides；T≤64 单 kernel，T>64 三 kernel：64-token vector affine summary、exclusive carry、replay/output。组合不使用逆递推；FMA fusion 关闭。输出 dtype cast 与可选 FP32 final-State 写出在 replay kernel 内完成。
 
-`stateful_operator.py` 的 `_execute_chunked_stateful` 使用 `_stateful_plan.py` 编译期保存的 recipe，跳过 reference segment/normalization plumbing；其他 chunked State 使用预绑定布局。reference executor 不再尝试 chunked inference。public validation、contiguous 输入合同、packed/grad fallback、dense 空序列拒绝保持不变。
+`stateful_operator.py` 的 `_execute_chunked_stateful` 使用 `stateful/compile/plan.py` 编译期保存的 recipe，跳过 reference segment/normalization plumbing；其他 chunked State 使用预绑定布局。reference executor 不再尝试 chunked inference。public validation、contiguous 输入合同、packed/grad fallback、dense 空序列拒绝保持不变。
 
 H20 GPU 3：B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，output-only/final-state/continuation，共 108 records。三次 warmup、五次 repetitions、e2e 与 Graph。产物 `/tmp/meta-rank1-before/`、`/tmp/meta-rank1-after/`。106 个可配对 workload 无 public latency 回退；各 contract public latency 几何平均分别下降 82.5%、82.2%、80.2%。单调用 CUDA activity 为 1（T≤64）或 3（T>64）；continuation 为 3 或 7，包含两次调用和输出 concat。旧 resource estimate 拒绝的 B=2/H=16/T=8192 output-only/final-state 新路径可运行。H>1 的 FLA headless adapter 失败，因此这些 workload 仅比较 Meta 修改前后，不声称跨框架 speedup。
 

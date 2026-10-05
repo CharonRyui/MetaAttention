@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from attn_engine import Batch, FeatureRole, HeadRole, Sequence, TensorInput
-from attn_engine._stateful_bindings import build_binding
+from attn_engine.stateful.runtime.bindings import build_binding
 
 
 def test_dense_binding_preserves_strides_and_grouped_head_mapping_without_expansion():

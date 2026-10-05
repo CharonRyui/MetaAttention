@@ -7,7 +7,7 @@
 00,01,03,04,05,06,07,08,09
 
 ## 文件归属
-_stateful_plan.py; _stateful_tuning.py; _stateful_benchmark.py
+stateful/compile/plan.py; stateful/compile/tuning.py; stateful/compile/benchmark.py
 
 ## 实现合同
 按 region 组合数学计划，估计实际 DAG bytes/flops/launch/live workspace；探索有效 chunk/tile/schedule configs；修复 candidate benchmark bindings；动态 B/T 不重新 Mathematical Plan；权衡 public/Graph/memory，不按例子名。

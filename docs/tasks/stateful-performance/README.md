@@ -2,6 +2,13 @@
 
 起点：`c0e1fd7`。任务按 typed IR 结构匹配，不按 FLA 家族 dispatch。
 
+当前文件归属以 `attention_engine/attn_engine/` 为根：`stateful/analyse/`、
+`stateful/compile/`、`stateful/runtime/` 按阶段分类；`stateful/lowering/` 内按
+expression、diagonal、scalar、lowrank、scan、readout 保持功能 locality。
+公开 interface 仍在 `stateful_operator.py`；lowering recipe 与执行不因目录迁移拆开。
+下文源码引用使用当前路径；历史提交中的同一实现可能仍位于旧 `_stateful_*` 路径。
+
+
 - [P0 公平性能评测合同](00-measurement-contract.md)；依赖 无。
 - [P1-A 表达式 DAG 与 kernel 融合](01-expression-dag.md)；依赖 00。
 - [P1-B 符号化布局与 HeadMapping](02-symbolic-bindings.md)；依赖 01。

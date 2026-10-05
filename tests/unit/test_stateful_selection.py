@@ -155,7 +155,7 @@ def test_estimates_are_inspectable_with_all_three_components():
 def test_infeasible_candidate_leaves_a_lower_ranked_plan():
     # an envelope below one candidate's per-token buffer removes it before
     # ranking while the remaining candidates still lower
-    from attn_engine._stateful_plan import (
+    from attn_engine.stateful.compile.plan import (
         EstimationShape,
         LOWERERS,
         MathematicalPlan,

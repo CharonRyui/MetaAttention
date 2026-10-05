@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_engine._stateful_checkpoint import CHUNK_SIZE, backward, forward
-from attn_engine._stateful_factored import factored_recurrence_backward, factored_recurrence_dense
+from attn_engine.stateful.lowering.lowrank.checkpoint import CHUNK_SIZE, backward, forward
+from attn_engine.stateful.lowering.lowrank.factored import factored_recurrence_backward, factored_recurrence_dense
 
 pytestmark = [pytest.mark.functional, pytest.mark.gpu, pytest.mark.usefixtures("gpu_device", "seed")]
 

@@ -99,7 +99,7 @@ def test_fused_scalar_plan_charges_chunk_scratch_at_long_sequences():
 
 
 def test_chunk_workspace_counts_tail_and_batch_before_rejecting():
-    from attn_engine._stateful_plan import WorkspacePolicy
+    from attn_engine.stateful.compile.plan import WorkspacePolicy
 
     workspace = WorkspacePolicy(
         bytes_per_token=2, maximum_bytes=500, bytes_per_chunk=100

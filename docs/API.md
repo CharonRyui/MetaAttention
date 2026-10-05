@@ -87,6 +87,28 @@ optimization, autotuning, and backward choices. It never accepts example
 Tensors. Batch size, dense Sequence length, packed logical-sequence count,
 packed token count, and offsets remain dynamic at invocation.
 
+### Implementation directories
+
+The public interface remains in `attn_engine/stateful_operator.py`, with the
+existing exports from `attn_engine`. Private implementation modules live under
+`attn_engine/stateful/`:
+
+| Directory | Responsibility |
+| --- | --- |
+| `analyse/` | Algorithm IR structural validation, typing, simplification, Scanable proofs, and Backward IR derivation |
+| `compile/` | Mathematical plans, Lowered candidates, workspace estimates, selection, tuning, and benchmark workloads |
+| `runtime/` | Invocation validation and logical-role/physical-tensor bindings |
+| `lowering/` | Structured proofs, recipes, schedules, execution, and backward transport |
+| `lowering/{expression,diagonal,scalar,lowrank,scan,readout}/` | Function-local lowering implementations and kernels |
+
+Lowering-specific recipe compilation and execution stay together for locality;
+the directory move does not split their interface or introduce a new seam or
+adapter. The old private `_stateful_*` import paths and the forwarding
+`_stateful_tilelang` module are removed without compatibility aliases. Kernel
+arithmetic and compiler-owned cache identities are unchanged; backend JIT
+artifacts may be regenerated under the relocated module names.
+
+
 ```py
 from attn_engine import StatefulOperator, Target
 
@@ -187,7 +209,7 @@ families need (`docs/adr/0003-product-features-and-prior-state-readouts.md`):
   constant `+1` Injection expresses a token count.
 
 Schema-v2 Programs enter the reference lowering in
-`attention_engine/attn_engine/_stateful_reference.py`. Dense inference whose
+`attention_engine/attn_engine/stateful/lowering/reference.py`. Dense inference whose
 typed transitions are diagonal, with disjoint injection factors and supported
 expression readouts, uses FP32 chunk summaries, boundary carries and independent
 64-token replay. Identity propagation uses tiled GEMMs; Product Feature operands

@@ -7,7 +7,7 @@ scalar scale + ordered rank-one 的 compact WY 已接入；本轮完成 FP32 fac
 00
 
 ## 文件归属
-_stateful_lowrank_kernels.py; _stateful_wy_kernels.py
+stateful/lowering/lowrank/lowrank_kernels.py; stateful/lowering/lowrank/wy_kernels.py
 
 ## 实现合同
 对 ordered RankOnePropagation 链推导 compact WY/triangular form；summary、injection、intra-chunk output 使用 block GEMM；支持 left!=right、多 injection/readout；仅对有证明的 scale region 应用；其他结构现有 lowering。
@@ -17,7 +17,7 @@ _stateful_lowrank_kernels.py; _stateful_wy_kernels.py
 
 ## FP32 factor 直接绑定优化（2026-10-03）
 
-固定基线 `4152413`。eligible WY 在 `_stateful_lowrank_kernels.execute` 的 packing 前分流：rank factors、coefficients、injections、queries 以 tensor tuples 与各自 strides 送入同一 triangular solve/readout。广播 head、标量、非连续 Feature/storage offset 都按绑定读取；原 FP32 promotion 保留，避免 BF16 指针改变 Triton dot lowering。操作顺序、chunk 长度、zero/signed gate、FP32 carry/final、output cast、eligibility 均不变。非交换 row/column scales、packed、backward 与保守 workspace 收费不改。
+固定基线 `4152413`。eligible WY 在 `stateful.lowering.lowrank.lowrank_kernels.execute` 的 packing 前分流：rank factors、coefficients、injections、queries 以 tensor tuples 与各自 strides 送入同一 triangular solve/readout。广播 head、标量、非连续 Feature/storage offset 都按绑定读取；原 FP32 promotion 保留，避免 BF16 指针改变 Triton dot lowering。操作顺序、chunk 长度、zero/signed gate、FP32 carry/final、output cast、eligibility 均不变。非交换 row/column scales、packed、backward 与保守 workspace 收费不改。
 
 H20 GPU 6，`B={1,2}`、`H={1,8,16}`、`T={63,64,65,130,2048,8192}`、K=V=64、output-only/final-state/continuation，108 点交错 A/B。两侧用 4 GiB cap 比较原 1 GiB 估计拒绝的七点；生产默认 cap 不变。warmup=3、repetitions=20；逐点交替 before/after，同一输入与非零 initial；峰值在 capture 前测量；每次 Graph 使用 fresh pool。原始证据、源码 SHA256、probe 源码、失败、资源与所有复测保存在 `benchmark_results/lowrank_wy_binding_ab.json`。
 
@@ -34,7 +34,7 @@ H20 GPU 6，`B={1,2}`、`H={1,8,16}`、`T={63,64,65,130,2048,8192}`、K=V=64、o
 
 独立 warmed private T67 活动：FP32 14→3（删除 8 次 DtoD 和 3 次 stack/cat）；BF16 19→15，保留 promotion 和 output conversion。public profiler 有 cached expression 与漏捕 `_solve`，只保留 raw activity，不把不完整计数作为精确 launch gate。public solve/carry/readout 资源分别仍为 255/190–241/255 registers；solve 70 spills、carry 0、readout 236–260 spills；共享内存 solve 65536、carry 16384–98816、readout 16384 bytes。本轮不宣称解决 spills。
 
-CPU selection/measurement/workspace/operator：77 passed，1 expected tuning warning；修改文件 Ruff 通过。GPU `test_lowrank_wy.py`：10 passed、1 pre-existing BF16 T67 oracle-boundary failure。GPU `test_gdn_h20.py`：10 passed、1 unrelated pre-existing `_stateful_checkpoint._local_vjp` Triton branch merge failure：`dl` fp32[16] 与 fp32[128] 类型不一致；checkpoint/factored/backward 文件与基线字节相同。不修改这些测试或容差，不宣称全 suite 通过。
+CPU selection/measurement/workspace/operator：77 passed，1 expected tuning warning；修改文件 Ruff 通过。GPU `test_lowrank_wy.py`：10 passed、1 pre-existing BF16 T67 oracle-boundary failure。GPU `test_gdn_h20.py`：10 passed、1 unrelated pre-existing `stateful.lowering.lowrank.checkpoint._local_vjp` Triton branch merge failure：`dl` fp32[16] 与 fp32[128] 类型不一致；checkpoint/factored/backward 文件与基线字节相同。不修改这些测试或容差，不宣称全 suite 通过。
 
 拒绝的实验：直接 BF16 指针、load 时转 FP32，T2048 before/after 出现 2/393216 元素超原容差，最大 0.00048828125。回退到原 FP32 promotion 后，8 场景 differential output/final max_abs 全为 0；不保留改变数值的版本。
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 import torch
 
 from attn_engine import AxisScale, Exp, FeatureRole, HeadRole, Input, Target
-from attn_engine._stateful_plan import LoweredCandidate, backward_context_family
+from attn_engine.stateful.compile.plan import LoweredCandidate, backward_context_family
 from attn_engine.stateful_operator import _evaluate
 from examples.linear_attention import dual_gate_gla_attention
 
@@ -24,7 +24,7 @@ class _State:
 
 
 def _summary(propagations, values):
-    from attn_engine._stateful_structured import _axis_scale_summary
+    from attn_engine.stateful.lowering.structured import _axis_scale_summary
 
     key_role, value_role = FeatureRole("key_dim"), FeatureRole("value_dim")
     return _axis_scale_summary(
