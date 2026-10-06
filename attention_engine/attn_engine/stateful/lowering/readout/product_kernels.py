@@ -1,217 +1,236 @@
-"""Identity ProductFeature readouts with chunk-local base-Feature GEMMs.
+"""TileLang ProductFeature readouts with chunk-local base-Feature GEMMs.
 
-Only the inter-chunk State contraction uses the expanded product axis. Local
-scores use (q_left @ k_left.T) * (q_right @ k_right.T), with an optional reusable
-64-token score tile for readouts sharing the same typed Outer operands. All
-bindings are contiguous FP32 token-major tensors; the product axis is flattened
-left-major/right-minor, exactly as the authored Outer expression.
+ProductFeature axes stay factored at runtime. The local score kernel computes
+the product of the left and right base-feature contractions, while the
+readout kernel contracts the factored query against the incoming chunk State
+and adds the causal local value contribution. Both kernels use FP32
+accumulation and preserve the public token-major ABI.
 """
 
-from __future__ import annotations
+
+from functools import lru_cache
 
 import torch
-import triton
-import triton.language as tl
 
-CHUNK = tl.constexpr(64)
+from ..diagonal.identity import fp32_gemm_macro
 
 
-@triton.jit
-def _local_scores(
-    KL,
-    KR,
-    QL,
-    QR,
-    seq,
-    head,
-    chunk,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    LEFT: tl.constexpr,
-    RIGHT: tl.constexpr,
-    PRIOR: tl.constexpr,
-):
-    token = chunk * CHUNK + tl.arange(0, CHUNK)
-    feature = tl.arange(0, 32)
-    left = tl.full((CHUNK, CHUNK), 0.0, tl.float32)
-    right = tl.full((CHUNK, CHUNK), 0.0, tl.float32)
-    for block in range(tl.cdiv(LEFT, 32)):
-        f = block * 32 + feature
-        q = tl.load(
-            QL + ((seq * LENGTH + token[:, None]) * HEADS + head) * LEFT + f[None, :],
-            (token[:, None] < LENGTH) & (f[None, :] < LEFT),
-            0.0,
-        )
-        k = tl.load(
-            KL + ((seq * LENGTH + token[None, :]) * HEADS + head) * LEFT + f[:, None],
-            (token[None, :] < LENGTH) & (f[:, None] < LEFT),
-            0.0,
-        )
-        left += tl.dot(q, k, input_precision="tf32x3")
-    for block in range(tl.cdiv(RIGHT, 32)):
-        f = block * 32 + feature
-        q = tl.load(
-            QR + ((seq * LENGTH + token[:, None]) * HEADS + head) * RIGHT + f[None, :],
-            (token[:, None] < LENGTH) & (f[None, :] < RIGHT),
-            0.0,
-        )
-        k = tl.load(
-            KR + ((seq * LENGTH + token[None, :]) * HEADS + head) * RIGHT + f[:, None],
-            (token[None, :] < LENGTH) & (f[:, None] < RIGHT),
-            0.0,
-        )
-        right += tl.dot(q, k, input_precision="tf32x3")
-    causal = token[None, :] < token[:, None] if PRIOR else token[None, :] <= token[:, None]
-    return tl.where(causal, left * right, 0.0)
+CHUNK = 64
+_BLOCK = 32
 
 
-@triton.jit
-def _scores(
-    KL,
-    KR,
-    QL,
-    QR,
-    Scores,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    LEFT: tl.constexpr,
-    RIGHT: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    PRIOR: tl.constexpr,
-):
-    sh, chunk = tl.program_id(0), tl.program_id(1)
-    scores = _local_scores(
-        KL, KR, QL, QR, sh // HEADS, sh % HEADS, chunk,
-        LENGTH, HEADS, LEFT, RIGHT, PRIOR,
-    )
-    row = tl.arange(0, CHUNK)
-    col = tl.arange(0, CHUNK)
-    tl.store(
-        Scores + (sh * CHUNKS + chunk) * CHUNK * CHUNK + row[:, None] * CHUNK + col[None, :],
-        scores,
-    )
+def _metadata(tensor):
+    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
 
 
-@triton.jit
-def _readout(
-    KL,
-    KR,
-    QL,
-    QR,
-    V,
-    Carry,
-    Scores,
-    Output,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    LEFT: tl.constexpr,
-    RIGHT: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    PRIOR: tl.constexpr,
-    REUSE_SCORES: tl.constexpr,
-):
-    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    token = chunk * CHUNK + tl.arange(0, CHUNK)
-    col = block * 32 + tl.arange(0, 32)
-    if REUSE_SCORES:
-        index = tl.arange(0, CHUNK)
-        scores = tl.load(
-            Scores + (sh * CHUNKS + chunk) * CHUNK * CHUNK
-            + index[:, None] * CHUNK + index[None, :]
-        )
-    else:
-        scores = _local_scores(
-            KL, KR, QL, QR, seq, head, chunk,
-            LENGTH, HEADS, LEFT, RIGHT, PRIOR,
-        )
-    out = tl.full((CHUNK, 32), 0.0, tl.float32)
-    feature = tl.arange(0, 32)
-    for rb in range(tl.cdiv(LEFT * RIGHT, 32)):
-        row = rb * 32 + feature
-        q = tl.load(
-            QL + ((seq * LENGTH + token[:, None]) * HEADS + head) * LEFT
-            + row[None, :] // RIGHT,
-            (token[:, None] < LENGTH) & (row[None, :] < LEFT * RIGHT),
-            0.0,
-        )
-        q *= tl.load(
-            QR + ((seq * LENGTH + token[:, None]) * HEADS + head) * RIGHT
-            + row[None, :] % RIGHT,
-            (token[:, None] < LENGTH) & (row[None, :] < LEFT * RIGHT),
-            0.0,
-        )
-        state = tl.load(
-            Carry + ((sh * CHUNKS + chunk) * LEFT * RIGHT + row[:, None]) * COLS
-            + col[None, :],
-            (row[:, None] < LEFT * RIGHT) & (col[None, :] < COLS),
-            0.0,
-        )
-        out += tl.dot(q, state, input_precision="tf32x3")
-    value = tl.load(
-        V + ((seq * LENGTH + token[:, None]) * HEADS + head) * COLS + col[None, :],
-        (token[:, None] < LENGTH) & (col[None, :] < COLS),
-        0.0,
-    )
-    out += tl.dot(scores, value, input_precision="tf32x3")
-    tl.store(
-        Output + ((seq * LENGTH + token[:, None]) * HEADS + head) * COLS + col[None, :],
-        out,
-        (token[:, None] < LENGTH) & (col[None, :] < COLS),
-    )
+@lru_cache(maxsize=None)
+def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_meta, scores_meta, *, length, heads, left, right, prior, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    gemm = fp32_gemm_macro(T)
+    batch = key_left_meta[0][0] // length
+    chunks = scores_meta[0][1]
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(
+            KeyLeft: T.StridedTensor(*key_left_meta),
+            KeyRight: T.StridedTensor(*key_right_meta),
+            QueryLeft: T.StridedTensor(*query_left_meta),
+            QueryRight: T.StridedTensor(*query_right_meta),
+            Scores: T.StridedTensor(*scores_meta),
+        ):
+            with T.Kernel(batch * heads, chunks, threads=128) as (batch_head, chunk):
+                sequence = batch_head // heads
+                head = batch_head % heads
+                left_scores = T.alloc_fragment((CHUNK, CHUNK), "float32")
+                right_scores = T.alloc_fragment((CHUNK, CHUNK), "float32")
+                query_shared = T.alloc_shared((CHUNK, _BLOCK), "float32")
+                key_shared = T.alloc_shared((_BLOCK, CHUNK), "float32")
+                T.clear(left_scores)
+                T.clear(right_scores)
+                for block in T.serial(T.ceildiv(left, _BLOCK)):
+                    for token, feature in T.Parallel(CHUNK, _BLOCK):
+                        index = chunk * CHUNK + token
+                        coordinate = block * _BLOCK + feature
+                        query_shared[token, feature] = T.if_then_else(
+                            (index < length) & (coordinate < left),
+                            T.cast(QueryLeft[sequence * length + index, head, coordinate], "float32"),
+                            0.0,
+                        )
+                    for feature, token in T.Parallel(_BLOCK, CHUNK):
+                        index = chunk * CHUNK + token
+                        coordinate = block * _BLOCK + feature
+                        key_shared[feature, token] = T.if_then_else(
+                            (index < length) & (coordinate < left),
+                            T.cast(KeyLeft[sequence * length + index, head, coordinate], "float32"),
+                            0.0,
+                        )
+                    gemm(query_shared, key_shared, left_scores)
+                for block in T.serial(T.ceildiv(right, _BLOCK)):
+                    for token, feature in T.Parallel(CHUNK, _BLOCK):
+                        index = chunk * CHUNK + token
+                        coordinate = block * _BLOCK + feature
+                        query_shared[token, feature] = T.if_then_else(
+                            (index < length) & (coordinate < right),
+                            T.cast(QueryRight[sequence * length + index, head, coordinate], "float32"),
+                            0.0,
+                        )
+                    for feature, token in T.Parallel(_BLOCK, CHUNK):
+                        index = chunk * CHUNK + token
+                        coordinate = block * _BLOCK + feature
+                        key_shared[feature, token] = T.if_then_else(
+                            (index < length) & (coordinate < right),
+                            T.cast(KeyRight[sequence * length + index, head, coordinate], "float32"),
+                            0.0,
+                        )
+                    gemm(query_shared, key_shared, right_scores)
+                for token, source in T.Parallel(CHUNK, CHUNK):
+                    target = chunk * CHUNK + token
+                    position = chunk * CHUNK + source
+                    causal = (position < target) if prior else (position <= target)
+                    Scores[batch_head, chunk, token, source] = T.if_then_else(
+                        (target < length) & (position < length) & causal,
+                        left_scores[token, source] * right_scores[token, source],
+                        0.0,
+                    )
+        return kernel
+
+    return build_kernel()
 
 
 def product_chunk_scores(key, query, *, sequence_length, prior=False):
-    """Build reusable local scores, never a full-sequence attention matrix.
-
-    ``key`` and ``query`` are normalized ``(left, right)`` FP32 tensors of shape
-    ``[batch * sequence_length, heads, feature]``. Their respective left and
-    right extents must agree. The return shape is
-    ``[batch * heads, ceil(sequence_length / 64), 64, 64]``. Reuse is valid only
-    for the same factors, sequence length and prior/post-State read convention.
-    """
-    left, right = key
+    """Return causal local ProductFeature scores in ``[BH, chunks, 64, 64]``."""
+    key_left, key_right = key
     query_left, query_right = query
-    heads = left.shape[1]
-    batch = left.shape[0] // sequence_length
-    chunks = triton.cdiv(sequence_length, CHUNK)
+    if key_left.shape[-1] != query_left.shape[-1] or key_right.shape[-1] != query_right.shape[-1]:
+        raise ValueError("ProductFeature key and query factors must have matching dimensions")
+    if key_left.shape[0] % sequence_length:
+        raise ValueError("token-major ProductFeature factors require a uniform sequence length")
+    heads = key_left.shape[1]
+    chunks = (sequence_length + CHUNK - 1) // CHUNK
     scores = torch.empty(
-        batch * heads, chunks, CHUNK, CHUNK, device=left.device, dtype=torch.float32
+        key_left.shape[0] // sequence_length * heads,
+        chunks,
+        CHUNK,
+        CHUNK,
+        device=key_left.device,
+        dtype=torch.float32,
     )
-    _scores[(batch * heads, chunks)](
-        left, right, query_left, query_right, scores,
-        sequence_length, heads, left.shape[-1], right.shape[-1], chunks, prior,
-    )
+    _compile_scores(
+        _metadata(key_left), _metadata(key_right), _metadata(query_left),
+        _metadata(query_right), _metadata(scores), length=sequence_length,
+        heads=heads, left=key_left.shape[-1], right=key_right.shape[-1],
+        prior=prior, device_index=key_left.device.index,
+    )(key_left, key_right, query_left, query_right, scores)
     return scores
+
+
+@lru_cache(maxsize=None)
+def _compile_readout(
+    query_left_meta, query_right_meta, value_meta, carry_meta, scores_meta, output_meta,
+    *, length, heads, left, right, columns, device_index,
+):
+    import tilelang
+    import tilelang.language as T
+    gemm = fp32_gemm_macro(T)
+    batch = query_left_meta[0][0] // length
+    chunks = carry_meta[0][1]
+    product = left * right
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(
+            QueryLeft: T.StridedTensor(*query_left_meta),
+            QueryRight: T.StridedTensor(*query_right_meta),
+            Value: T.StridedTensor(*value_meta),
+            Carry: T.StridedTensor(*carry_meta),
+            Scores: T.StridedTensor(*scores_meta),
+            Output: T.StridedTensor(*output_meta),
+        ):
+            with T.Kernel(
+                batch * heads, chunks, T.ceildiv(columns, _BLOCK), threads=128
+            ) as (batch_head, chunk, column_block):
+                sequence = batch_head // heads
+                head = batch_head % heads
+                output = T.alloc_fragment((CHUNK, _BLOCK), "float32")
+                query_product = T.alloc_fragment((CHUNK, _BLOCK), "float32")
+                state_shared = T.alloc_shared((_BLOCK, _BLOCK), "float32")
+                scores_shared = T.alloc_shared((CHUNK, CHUNK), "float32")
+                value_shared = T.alloc_shared((CHUNK, _BLOCK), "float32")
+                T.clear(output)
+                for product_block in T.serial(T.ceildiv(product, _BLOCK)):
+                    for token, feature in T.Parallel(CHUNK, _BLOCK):
+                        index = chunk * CHUNK + token
+                        product_index = product_block * _BLOCK + feature
+                        valid = (index < length) & (product_index < product)
+                        query_product[token, feature] = T.if_then_else(
+                            valid,
+                            T.cast(
+                                QueryLeft[sequence * length + index, head, product_index // right],
+                                "float32",
+                            ) * T.cast(
+                                QueryRight[sequence * length + index, head, product_index % right],
+                                "float32",
+                            ),
+                            0.0,
+                        )
+                    for feature, column in T.Parallel(_BLOCK, _BLOCK):
+                        product_index = product_block * _BLOCK + feature
+                        column_index = column_block * _BLOCK + column
+                        state_shared[feature, column] = T.if_then_else(
+                            (product_index < product) & (column_index < columns),
+                            T.cast(
+                                Carry[batch_head, chunk, product_index, column_index],
+                                "float32",
+                            ),
+                            0.0,
+                        )
+                    gemm(query_product, state_shared, output)
+                for token, source in T.Parallel(CHUNK, CHUNK):
+                    scores_shared[token, source] = Scores[batch_head, chunk, token, source]
+                for token, column in T.Parallel(CHUNK, _BLOCK):
+                    index = chunk * CHUNK + token
+                    column_index = column_block * _BLOCK + column
+                    value_shared[token, column] = T.if_then_else(
+                        (index < length) & (column_index < columns),
+                        T.cast(Value[sequence * length + index, head, column_index], "float32"),
+                        0.0,
+                    )
+                gemm(scores_shared, value_shared, output)
+                for token, column in T.Parallel(CHUNK, _BLOCK):
+                    index = chunk * CHUNK + token
+                    column_index = column_block * _BLOCK + column
+                    if (index < length) & (column_index < columns):
+                        Output[sequence * length + index, head, column_index] = output[token, column]
+        return kernel
+
+    return build_kernel()
 
 
 def read_product_state(
     carry, key, query, value, *, sequence_length, prior=False, scores=None
 ):
-    """Contract an identity product State without expanded chunk-local Q/K.
-
-    Factors use the normalized token-major layout of ``product_chunk_scores``;
-    ``value`` is ``[batch * sequence_length, heads, columns]``. ``carry`` contains
-    each chunk's incoming FP32 State in shape
-    ``[batch * heads, chunks, left * right, columns]``. Returns FP32 token-major
-    ``[batch * sequence_length, heads, columns]``. If ``scores`` is omitted,
-    base-Feature GEMMs and their product are fused into the readout kernel; a
-    shared score tile can instead serve numerator and denominator readouts.
-    Work and optional score storage are linear in sequence length at fixed chunk
-    size. No State reconstruction, recurrence inversion or final-State mutation
-    occurs here; prepare_state remains responsible for explicit chunk carries.
-    """
-    left, right = key
+    """Contract ProductFeature State using TileLang FP32 GEMMs."""
+    key_left, key_right = key
     query_left, query_right = query
-    batch_heads, chunks, _, columns = carry.shape
-    heads = left.shape[1]
+    if scores is None:
+        scores = product_chunk_scores(key, query, sequence_length=sequence_length, prior=prior)
+    batch_heads, chunks, product, columns = carry.shape
+    heads = key_left.shape[1]
+    if product != key_left.shape[-1] * key_right.shape[-1]:
+        raise ValueError("ProductFeature carry has an incompatible product dimension")
     output = torch.empty(
-        left.shape[0], heads, columns, device=left.device, dtype=torch.float32
+        key_left.shape[0], heads, columns, device=key_left.device, dtype=torch.float32
     )
-    _readout[(batch_heads, chunks, triton.cdiv(columns, 32))](
-        left, right, query_left, query_right, value, carry, scores, output,
-        sequence_length, heads, left.shape[-1], right.shape[-1], columns,
-        chunks, prior, scores is not None,
-    )
+    _compile_readout(
+        _metadata(query_left), _metadata(query_right), _metadata(value),
+        _metadata(carry), _metadata(scores), _metadata(output),
+        length=sequence_length, heads=heads, left=key_left.shape[-1],
+        right=key_right.shape[-1], columns=columns,
+        device_index=key_left.device.index,
+    )(query_left, query_right, value, carry, scores, output)
     return output

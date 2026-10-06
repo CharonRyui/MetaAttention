@@ -100,10 +100,22 @@ The dependency declaration and lock now select released `tilelang==0.1.15` from 
 
 - [`diagonal/identity.py`](../attention_engine/attn_engine/stateful/lowering/diagonal/identity.py): identity chunk summaries and contractions, including ProductFeature key factors. Paired numerator/normalizer summaries share a launch. FP32 GEMMs split operands into high/residual TF32 terms and use three products rather than a single precision-losing TF32 product.
 - [`diagonal/identity_scan.py`](../attention_engine/attn_engine/stateful/lowering/diagonal/identity_scan.py): exclusive FP32 prefixes. Direct prefixes cover up to 64 chunks; longer sequences use 32-chunk recursive groups. The normalized pair shares each scan launch and reuses consumed summaries at direct levels; long applies keep source/output separate. Unrequested finals do not overwrite initial States.
-- [`readout/identity.py`](../attention_engine/attn_engine/stateful/lowering/readout/identity.py) and [`readout/native.py`](../attention_engine/attn_engine/stateful/lowering/readout/native.py): the native normalized identity path executes TileLang summaries, carries and readout end-to-end. Input views retain authored BHT/BTH strides and grouped-head mappings; numerator/denominator keys and prior flags may differ. The authored scalar is rounded to the query dtype before multiplication and FP32 contraction. A single chunk uses initial States directly as carries; requested final States have separate storage.
- - [`diagonal/diagonal_kernels.py`](../attention_engine/attn_engine/stateful/lowering/diagonal/diagonal_kernels.py), [`diagonal/diagonal_scan.py`](../attention_engine/attn_engine/stateful/lowering/diagonal/diagonal_scan.py): identity and nonidentity affine carry dispatch to TileLang; the obsolete generic Triton carry kernel was removed. Weighted general-diagonal summary/readout and specialized ProductFeature/readout kernels remain Triton.
+- [`readout/product_kernels.py`](../attention_engine/attn_engine/stateful/lowering/readout/product_kernels.py): ProductFeature score and State contractions use TileLang FP32 GEMMs. The identity normalized readout experiment was not retained because the long-sequence performance gate failed.
+- The ProductFeature path preserves factored left-major/right-minor indexing, reusable chunk score ABI, explicit carry ownership, independent prior flags, and FP32 output accumulation.
 
-This is **not** a full Stateful backend cutover. In particular, `diagonal_native.py` may still be selected for single-State linear attention, ProductFeature readouts remain Triton, and packed/training paths were not migrated. The new carry and identity kernels preserve Python shape specialization; this change does not introduce one dynamic Batch/Sequence binary. No comparative latency or speedup claim is made.
+This remains a staged Stateful backend cutover. General diagonal weighted summaries/readouts, identity-normalized/softmax/shared readout regions, low-rank, optimized scalar, rank-one scan, generated expression, packed, and training paths still use their existing implementations.
+
+Verification for the retained ProductFeature slice:
+
+- `tests/functional/test_product_contraction.py`: **6 passed** on TileLang 0.1.15.
+- Same-shape H20 benchmark against the previous Triton implementation: `B=2,H=2,T=131,left=35,right=7,C=35` measured TileLang **0.0707 ms** vs Triton **0.0997 ms** (**1.41x**); `B=1,H=8,T=2048,left=32,right=32,C=64` measured TileLang **0.3741 ms** vs Triton **0.8614 ms** (**2.30x**).
+- ProductFeature benchmark correctness differences were bounded by FP32/TF32 accumulation order: maximum absolute output difference `0.00031` on the short case and `0.00185` on the long case; denominator differences were `0.00014` and `0.00114` respectively. Independent authored-order correctness tests still passed.
+- The attempted normalized TileLang path was rolled back after the H20 `B=1,H=8,T=2048,rows=columns=64` comparison measured **0.1881 ms** vs Triton **0.0881 ms** (**0.468x**).
+
+The previous summary below remains historical context for the identity/affine slice.
+
+This is **not** a full Stateful backend cutover. The new carry and identity kernels preserve Python shape specialization; this change does not introduce one dynamic Batch/Sequence binary. No general performance claim is made beyond the listed ProductFeature cases.
+
 
  - `tests/functional/test_stateful_readout_regions.py -k test_parallel_diagonal_block_fp32_oracle`: **40 passed** with scalar/row/column/dual gates, lengths 1/63/64/65/137 and both prior choices.
  - Long affine carry smoke at `T=4161` (**66 chunks**) with signed/zero row and column gates: **passed** against an independent FP32 recurrence; final State and all chunk carries matched.
