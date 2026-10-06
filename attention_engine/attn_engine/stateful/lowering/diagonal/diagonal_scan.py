@@ -1,173 +1,181 @@
-"""Work-efficient hierarchical affine prefix over diagonal chunk summaries."""
-from __future__ import annotations
+"""TileLang hierarchical affine prefixes for diagonal chunk summaries."""
+from functools import lru_cache
 
 import torch
-import triton
-import triton.language as tl
 
 
-@triton.jit
-def _local_body(Scale, Bias, GroupScale, GroupBias, sh, group, block,
-                ELEMENTS: tl.constexpr, CHUNKS: tl.constexpr, GROUPS: tl.constexpr,
-                IDENTITY: tl.constexpr, GROUP: tl.constexpr, BLOCK: tl.constexpr):
-    x = block * BLOCK + tl.arange(0, BLOCK)
-    a = tl.full((BLOCK,), 1.0, tl.float32)
-    b = tl.full((BLOCK,), 0.0, tl.float32)
-    for step in range(GROUP):
-        chunk = group * GROUP + step
-        address = (sh * CHUNKS + chunk) * ELEMENTS + x
-        scale = tl.full((BLOCK,), 1.0, tl.float32)
-        if not IDENTITY:
-            scale = tl.load(Scale + address, (chunk < CHUNKS) & (x < ELEMENTS), 1.0)
-        bias = tl.load(Bias + address, (chunk < CHUNKS) & (x < ELEMENTS), 0.0)
-        b = scale * b + bias
-        a = scale * a
-    address = (sh * GROUPS + group) * ELEMENTS + x
-    if GroupScale is not None:
-        tl.store(GroupScale + address, a, x < ELEMENTS)
-    tl.store(GroupBias + address, b, x < ELEMENTS)
+_BLOCK = 256
+_GROUP = 32
 
 
-@triton.jit
-def _local(Scale, Bias, GroupScale, GroupBias,
-           ELEMENTS: tl.constexpr, CHUNKS: tl.constexpr, GROUPS: tl.constexpr,
-           IDENTITY: tl.constexpr, GROUP: tl.constexpr, BLOCK: tl.constexpr):
-    _local_body(Scale, Bias, GroupScale, GroupBias,
-                tl.program_id(0), tl.program_id(1), tl.program_id(2),
-                ELEMENTS, CHUNKS, GROUPS, IDENTITY, GROUP, BLOCK)
+def _metadata(tensor):
+    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
 
 
-@triton.jit
-def _apply_body(Scale, LocalBias, GroupCarry, Carry, Final, sh, group, block,
-                ELEMENTS: tl.constexpr, CHUNKS: tl.constexpr, GROUPS: tl.constexpr,
-                IDENTITY: tl.constexpr, WRITE_FINAL: tl.constexpr,
-                GROUP: tl.constexpr, BLOCK: tl.constexpr):
-    x = block * BLOCK + tl.arange(0, BLOCK)
-    state = tl.load(GroupCarry + (sh * GROUPS + group) * ELEMENTS + x,
-                    x < ELEMENTS, 0.0)
-    for step in range(GROUP):
-        chunk = group * GROUP + step
-        address = (sh * CHUNKS + chunk) * ELEMENTS + x
-        scale = tl.full((BLOCK,), 1.0, tl.float32)
-        if not IDENTITY:
-            scale = tl.load(Scale + address, (chunk < CHUNKS) & (x < ELEMENTS), 1.0)
-        bias = tl.load(LocalBias + address, (chunk < CHUNKS) & (x < ELEMENTS), 0.0)
-        tl.store(Carry + address, state, (chunk < CHUNKS) & (x < ELEMENTS))
-        state = scale * state + bias
-    if WRITE_FINAL:
-        if group == GROUPS - 1:
-            tl.store(Final + sh * ELEMENTS + x, state, x < ELEMENTS)
+def _state_view(state):
+    """Expose a vector State as a one-group 4-D view without copying."""
+    if state.ndim == 3:
+        return torch.as_strided(
+            state,
+            (state.shape[0], 1, *state.shape[-2:]),
+            (state.stride(0), *state.stride()),
+        )
+    return state
 
 
-@triton.jit
-def _apply(Scale, LocalBias, GroupCarry, Carry, Final,
-           ELEMENTS: tl.constexpr, CHUNKS: tl.constexpr, GROUPS: tl.constexpr,
-           IDENTITY: tl.constexpr, WRITE_FINAL: tl.constexpr,
-           GROUP: tl.constexpr, BLOCK: tl.constexpr):
-    _apply_body(Scale, LocalBias, GroupCarry, Carry, Final,
-                tl.program_id(0), tl.program_id(1), tl.program_id(2),
-                ELEMENTS, CHUNKS, GROUPS, IDENTITY, WRITE_FINAL, GROUP, BLOCK)
+@lru_cache(maxsize=None)
+def _compile_affine_scan(
+    scale_meta, bias_meta, initial_meta, carry_meta, final_meta,
+    mode: str, write_final: bool, device_index: int,
+):
+    import tilelang
+    import tilelang.language as T
+
+    bh, chunks, rows, columns = bias_meta[0]
+    elements = rows * columns
+    blocks = (elements + _BLOCK - 1) // _BLOCK
+    groups = (chunks + _GROUP - 1) // _GROUP if mode != "direct" else 1
+    steps = chunks if mode == "direct" else _GROUP
+
+    @T.macro
+    def scan(Scale, Bias, Initial, Carry, Final, sh, group, block):
+        if mode == "local":
+            group_scale = T.alloc_fragment((_BLOCK,), "float32")
+            group_bias = T.alloc_fragment((_BLOCK,), "float32")
+            for lane in T.Parallel(_BLOCK):
+                group_scale[lane] = 1.0
+                group_bias[lane] = 0.0
+            for step in T.serial(steps):
+                chunk = group * _GROUP + step
+                for lane in T.Parallel(_BLOCK):
+                    x = block * _BLOCK + lane
+                    valid = (chunk < chunks) & (x < elements)
+                    scale = T.if_then_else(
+                        valid, Scale[sh, chunk, x // columns, x % columns], 1.0
+                    )
+                    bias = T.if_then_else(
+                        valid, Bias[sh, chunk, x // columns, x % columns], 0.0
+                    )
+                    group_bias[lane] = scale * group_bias[lane] + bias
+                    group_scale[lane] = scale * group_scale[lane]
+            for lane in T.Parallel(_BLOCK):
+                x = block * _BLOCK + lane
+                if x < elements:
+                    Carry[sh, group, x // columns, x % columns] = group_scale[lane]
+                    Final[sh, group, x // columns, x % columns] = group_bias[lane]
+            return
+
+        state = T.alloc_fragment((_BLOCK,), "float32")
+        for lane in T.Parallel(_BLOCK):
+            x = block * _BLOCK + lane
+            if mode == "direct":
+                state[lane] = T.if_then_else(
+                    x < elements,
+                    Initial[sh // Initial.shape[1], sh % Initial.shape[1],
+                            x // columns, x % columns],
+                    0.0,
+                )
+            else:
+                state[lane] = T.if_then_else(
+                    x < elements,
+                    Initial[sh, group, x // columns, x % columns],
+                    0.0,
+                )
+        for step in T.serial(steps):
+            chunk = step if mode == "direct" else group * _GROUP + step
+            for lane in T.Parallel(_BLOCK):
+                x = block * _BLOCK + lane
+                valid = (chunk < chunks) & (x < elements)
+                scale = T.if_then_else(
+                    valid, Scale[sh, chunk, x // columns, x % columns], 1.0
+                )
+                bias = T.if_then_else(
+                    valid, Bias[sh, chunk, x // columns, x % columns], 0.0
+                )
+                if valid:
+                    Carry[sh, chunk, x // columns, x % columns] = state[lane]
+                state[lane] = scale * state[lane] + bias
+        if write_final:
+            for lane in T.Parallel(_BLOCK):
+                x = block * _BLOCK + lane
+                if x < elements and (mode == "direct" or group == groups - 1):
+                    Final[sh // Final.shape[1], sh % Final.shape[1],
+                          x // columns, x % columns] = state[lane]
+
+    scale_shape, scale_strides, scale_dtype = scale_meta
+    bias_shape, bias_strides, bias_dtype = bias_meta
+    initial_shape, initial_strides, initial_dtype = initial_meta
+    carry_shape, carry_strides, carry_dtype = carry_meta
+    final_shape, final_strides, final_dtype = final_meta
+    @tilelang.jit
+    def build_kernel():
+        if mode == "local":
+            @T.prim_func
+            def kernel(
+                Scale: T.StridedTensor(scale_shape, scale_strides, scale_dtype),
+                Bias: T.StridedTensor(bias_shape, bias_strides, bias_dtype),
+                GroupScale: T.StridedTensor(initial_shape, initial_strides, initial_dtype),
+                GroupBias: T.StridedTensor(carry_shape, carry_strides, carry_dtype),
+            ):
+                with T.Kernel(bh, groups, blocks, threads=128) as (sh, group, block):
+                    scan(Scale, Bias, None, GroupScale, GroupBias, sh, group, block)
+        else:
+            @T.prim_func
+            def kernel(
+                Scale: T.StridedTensor(scale_shape, scale_strides, scale_dtype),
+                Bias: T.StridedTensor(bias_shape, bias_strides, bias_dtype),
+                Initial: T.StridedTensor(initial_shape, initial_strides, initial_dtype),
+                Carry: T.StridedTensor(carry_shape, carry_strides, carry_dtype),
+                Final: T.StridedTensor(final_shape, final_strides, final_dtype),
+            ):
+                with T.Kernel(bh, groups, blocks, threads=128) as (sh, group, block):
+                    scan(Scale, Bias, Initial, Carry, Final, sh, group, block)
+        return kernel
+
+    return build_kernel()
 
 
-@triton.jit
-def _identity_local_pair(Bias, DenBias, GroupBias, DenGroupBias,
-                         ELEMENTS: tl.constexpr, DEN_ELEMENTS: tl.constexpr,
-                         CHUNKS: tl.constexpr, GROUPS: tl.constexpr,
-                         BLOCKS: tl.constexpr):
-    sh, group, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if block < BLOCKS:
-        _local_body(None, Bias, None, GroupBias, sh, group, block,
-                    ELEMENTS, CHUNKS, GROUPS, True, 32, 256)
-    else:
-        _local_body(None, DenBias, None, DenGroupBias, sh, group, block - BLOCKS,
-                    DEN_ELEMENTS, CHUNKS, GROUPS, True, 32, 256)
-
-
-@triton.jit
-def _identity_apply_pair(Bias, DenBias, GroupCarry, DenGroupCarry,
-                         Carry, DenCarry, Final, DenFinal,
-                         ELEMENTS: tl.constexpr, DEN_ELEMENTS: tl.constexpr,
-                         CHUNKS: tl.constexpr, GROUPS: tl.constexpr,
-                         BLOCKS: tl.constexpr, WRITE_FINAL: tl.constexpr):
-    sh, group, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    if block < BLOCKS:
-        _apply_body(None, Bias, GroupCarry, Carry, Final, sh, group, block,
-                    ELEMENTS, CHUNKS, GROUPS, True, WRITE_FINAL, 32, 256)
-    else:
-        _apply_body(None, DenBias, DenGroupCarry, DenCarry, DenFinal,
-                    sh, group, block - BLOCKS,
-                    DEN_ELEMENTS, CHUNKS, GROUPS, True, WRITE_FINAL, 32, 256)
+def _launch(mode, scale, bias, initial, carry, final, *, write_final):
+    initial = _state_view(initial) if mode != "apply" else initial
+    final = _state_view(final) if final is not None else initial
+    device_index = bias.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    if mode == "local":
+        kernel = _compile_affine_scan(
+            _metadata(scale), _metadata(bias), _metadata(initial),
+            _metadata(carry), _metadata(carry), mode, write_final, device_index,
+        )
+        kernel(scale, bias, initial, carry)
+        return
+    kernel = _compile_affine_scan(
+        _metadata(scale), _metadata(bias), _metadata(initial),
+        _metadata(carry), _metadata(final), mode, write_final, device_index,
+    )
+    kernel(scale, bias, initial, carry, final)
 
 
 def hierarchical_carry(scale, bias, initial, carry, final, *, identity, write_final):
-    """Prefix chunks in groups; recursive summaries bound the serial critical path.
+    """Prefix affine chunk summaries without division or inverse reconstruction."""
+    if identity:
+        from .identity_scan import identity_hierarchical_carry
 
-    No division or inversion is used, including zero diagonal factors. The
-    original summaries are immutable, so recursion needs only group buffers.
-    """
-    from .diagonal_kernels import _carry
-
-    bh, chunks, rows, columns = bias.shape
-    elements = rows * columns
-    if chunks <= 64:
-        _carry[(bh, triton.cdiv(elements, 256))](
-            scale, bias, initial, carry, final, rows, columns, chunks,
-            identity, write_final,
+        return identity_hierarchical_carry(
+            bias, initial, carry, final, write_final=write_final,
         )
+    _, chunks, rows, columns = bias.shape
+    if chunks <= 64:
+        _launch("direct", scale, bias, initial, carry, final, write_final=write_final)
         return
-    groups = triton.cdiv(chunks, 32)
-    shape = (bh, groups, rows, columns)
-    group_scale = torch.empty(shape, device=bias.device, dtype=torch.float32)
+    groups = (chunks + _GROUP - 1) // _GROUP
+    group_scale = torch.empty(
+        (bias.shape[0], groups, rows, columns), device=bias.device, dtype=torch.float32,
+    )
     group_bias = torch.empty_like(group_scale)
     group_carry = torch.empty_like(group_scale)
-    # Only group summaries are materialized; _apply writes exclusive carries.
-    _local[(bh, groups, triton.cdiv(elements, 256))](
-        scale, bias, group_scale, group_bias,
-        elements, chunks, groups, identity, 32, 256,
+    _launch("local", scale, bias, group_scale, group_bias, group_bias, write_final=False)
+    hierarchical_carry(
+        group_scale, group_bias, initial, group_carry, final,
+        identity=False, write_final=False,
     )
-    hierarchical_carry(group_scale, group_bias, initial, group_carry, final,
-                       identity=identity, write_final=False)
-    _apply[(bh, groups, triton.cdiv(elements, 256))](
-        scale, bias, group_carry, carry, final, elements, chunks, groups,
-        identity, write_final, 32, 256,
-    )
-
-
-def _hierarchical_carry_pair(bias, den_bias, initial, den_initial, final, den_final,
-                             *, write_final):
-    """Pair each scan level; direct prefixes reuse summaries, long apply does not."""
-    from .diagonal_kernels import _identity_carry_pair
-
-    bh, chunks, rows, columns = bias.shape
-    elements, den_elements = rows * columns, rows
-    blocks = triton.cdiv(elements, 256)
-    grid_blocks = blocks + triton.cdiv(den_elements, 256)
-    if chunks <= 64:
-        _identity_carry_pair[(bh, grid_blocks)](
-            bias, den_bias, initial, den_initial, final, den_final,
-            rows, columns, chunks, blocks, write_final,
-        )
-        return bias, den_bias
-    groups = triton.cdiv(chunks, 32)
-    group_bias = torch.empty((bh, groups, rows, columns),
-                            device=bias.device, dtype=torch.float32)
-    den_group_bias = torch.empty((bh, groups, rows, 1),
-                                device=den_bias.device, dtype=torch.float32)
-    # Group summaries consume original biases before direct recursion reuses
-    # them. Long apply uses separate destinations to avoid serial alias stalls.
-    _identity_local_pair[(bh, groups, grid_blocks)](
-        bias, den_bias, group_bias, den_group_bias,
-        elements, den_elements, chunks, groups, blocks,
-    )
-    group_carry, den_group_carry = _hierarchical_carry_pair(
-        group_bias, den_group_bias, initial, den_initial,
-        final, den_final, write_final=False,
-    )
-    carry = torch.empty_like(bias)
-    den_carry = torch.empty_like(den_bias)
-    _identity_apply_pair[(bh, groups, grid_blocks)](
-        bias, den_bias, group_carry, den_group_carry,
-        carry, den_carry, final, den_final,
-        elements, den_elements, chunks, groups, blocks, write_final,
-    )
-    return carry, den_carry
+    _launch("apply", scale, bias, group_carry, carry, final, write_final=write_final)

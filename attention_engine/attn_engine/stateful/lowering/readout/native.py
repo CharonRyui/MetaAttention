@@ -110,11 +110,11 @@ def _load_dense(P, seq, head, t, x, SIZE: tl.constexpr, STRIDES: tl.constexpr,
 
 
 def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
-                             *, sequence_length, heads, ks, kg, dks, dkg, vs, vg,
+                             *, sequence_length, heads,
                              return_final_state):
     """Own paired summaries/carries and release recursive scratch before readout."""
-    from ..diagonal.diagonal_kernels import _identity_pairs_native_pair
-    from ..diagonal.diagonal_scan import _hierarchical_carry_pair
+    from ..diagonal.identity import identity_summary_pair
+    from ..diagonal.identity_scan import identity_hierarchical_carry_pair
 
     rows, columns = initial.shape[-2:]
     bh = initial.shape[0] * heads
@@ -123,15 +123,11 @@ def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
         # The only exclusive carry is the initial State; no scratch is consumed.
         if not return_final_state:
             return initial, den_initial, None, None
-        from ..diagonal.diagonal_kernels import _identity_final_native_pair
-
+        # A single chunk adds its summary directly to the requested final.
         final, den_final = torch.empty_like(initial), torch.empty_like(den_initial)
-        tiles = triton.cdiv(rows, 32) * triton.cdiv(columns, 32)
-        _identity_final_native_pair[(bh, tiles + triton.cdiv(rows, 32))](
-            key, den_key, value, initial, den_initial, final, den_final,
-            sequence_length, heads, rows, columns, tiles,
-            ks, kg, dks, dkg, vs, vg, enable_fp_fusion=False,
-        )
+        identity_summary_pair(key, den_key, value, final, den_final,
+                              sequence_length=sequence_length, heads=heads,
+                              initial=initial, den_initial=den_initial)
         return initial, den_initial, final, den_final
     carry = torch.empty((bh, chunks, rows, columns),
                         device=initial.device, dtype=torch.float32)
@@ -139,13 +135,9 @@ def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
                             device=den_initial.device, dtype=torch.float32)
     final = torch.empty_like(initial) if return_final_state else initial
     den_final = torch.empty_like(den_initial) if return_final_state else den_initial
-    tiles = triton.cdiv(rows, 32) * triton.cdiv(columns, 32)
-    _identity_pairs_native_pair[(bh, chunks, tiles + triton.cdiv(rows, 32))](
-        key, den_key, value, carry, den_carry,
-        sequence_length, heads, rows, columns, chunks, tiles,
-        ks, kg, dks, dkg, vs, vg,
-    )
-    carry, den_carry = _hierarchical_carry_pair(
+    identity_summary_pair(key, den_key, value, carry, den_carry,
+                          sequence_length=sequence_length, heads=heads)
+    carry, den_carry = identity_hierarchical_carry_pair(
         carry, den_carry, initial, den_initial, final, den_final,
         write_final=return_final_state,
     )
@@ -154,7 +146,8 @@ def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
 
 def execute_native_normalized(recipe, inputs, initial_states, *,
                               sequence_count, sequence_length, heads, return_final_state):
-    from .readout_regions import _identity_normalized_region
+    from ..diagonal.identity import native_vector_view
+    from .identity import native_identity_normalized_readout
 
     bindings = {}
 
@@ -170,23 +163,24 @@ def execute_native_normalized(recipe, inputs, initial_states, *,
     initial_memory = initial_states[recipe.memory]
     initial_normalizer = initial_states[recipe.normalizer].unsqueeze(-1)
     rows, columns = initial_memory.shape[-2:]
-    chunks = triton.cdiv(sequence_length, 64)
+    query = native_vector_view(query, sequence_count, heads, sequence_length, rows, qs, qg)
+    key = native_vector_view(key, sequence_count, heads, sequence_length, rows, ks, kg)
+    den_key = native_vector_view(den_key, sequence_count, heads, sequence_length, rows, dks, dkg)
+    value = native_vector_view(value, sequence_count, heads, sequence_length, columns, vs, vg)
 
     memory, normalizer, final_memory, final_normalizer = _prepare_normalized_pair(
         key, den_key, value, initial_memory, initial_normalizer,
         sequence_length=sequence_length, heads=heads,
-        ks=ks, kg=kg, dks=dks, dkg=dkg, vs=vs, vg=vg,
         return_final_state=return_final_state,
     )
     output = torch.empty(sequence_count * sequence_length, heads, columns,
                          device=query.device, dtype=recipe.output_dtype)
-    _identity_normalized_region[(sequence_count * heads, chunks, triton.cdiv(columns, 32))](
-        memory, key, key, value, normalizer, den_key, den_key, value, query, query, output,
-        sequence_length, heads, chunks, rows, columns, rows, 0, rows, 0, rows, 0,
-        recipe.prior_memory, recipe.prior_normalizer,
-        recipe.key.name == recipe.denominator_key.name, recipe.epsilon,
-        NATIVE=True, KS=ks, KG=kg, DKS=dks, DKG=dkg, VS=vs, VG=vg, QS=qs, QG=qg,
-        QUERY_SCALE=recipe.query_scale, num_warps=4, enable_fp_fusion=False,
+    native_identity_normalized_readout(
+        memory, key, value, normalizer, den_key, query, output,
+        sequence_length=sequence_length, heads=heads,
+        prior_memory=recipe.prior_memory, prior_normalizer=recipe.prior_normalizer,
+        shared_key=recipe.key.name == recipe.denominator_key.name,
+        epsilon=recipe.epsilon, query_scale=recipe.query_scale,
     )
     finals = ({recipe.memory: final_memory, recipe.normalizer: final_normalizer.squeeze(-1)}
               if return_final_state else None)

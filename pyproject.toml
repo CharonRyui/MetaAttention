@@ -12,7 +12,7 @@ dependencies = [
   "numpy<2",
   "sympy",
   "termcolor",
-  "tilelang",
+  "tilelang==0.1.15",
   "torch",
 ]
 
@@ -36,7 +36,11 @@ explicit = true
 
 [tool.uv.sources]
 torch = [{ index = "pytorch-cu128" }]
-tilelang = { git = "https://github.com/tile-ai/tilelang.git", rev = "61f968b6c5c00c8986b9331d599f95dfee7a60cd" }
+
+# TileLang v0.1.15 is the latest released API used by the Stateful migration audit.
+# Keep the source on PyPI so the lock records the release rather than an old git snapshot.
+# The explicit PyTorch index remains independently controlled above.
+
 
 [dependency-groups]
 dev = [

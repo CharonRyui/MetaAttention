@@ -10,7 +10,6 @@ import torch
 import triton
 import triton.language as tl
 
-from .native import _load_dense
 
 
 @triton.jit
@@ -129,12 +128,6 @@ def _identity_normalized_region(
     QL: tl.constexpr, QR: tl.constexpr,
     PRIOR1: tl.constexpr, PRIOR2: tl.constexpr,
     SHARED_KEY: tl.constexpr, EPSILON: tl.constexpr,
-    NATIVE: tl.constexpr = False,
-    KS: tl.constexpr = (), KG: tl.constexpr = 1,
-    DKS: tl.constexpr = (), DKG: tl.constexpr = 1,
-    VS: tl.constexpr = (), VG: tl.constexpr = 1,
-    QS: tl.constexpr = (), QG: tl.constexpr = 1,
-    QUERY_SCALE: tl.constexpr = None,
 ):
     sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     seq, head = sh // HEADS, sh % HEADS
@@ -151,16 +144,10 @@ def _identity_normalized_region(
     denominator = tl.full((64,), 0.0, tl.float32)
     for rb in range(tl.cdiv(ROWS, 32)):
         r = rb * 32 + rr
-        if NATIVE:
-            q = _load_dense(Q, seq, head, t[:, None], r[None, :], ROWS, QS, QG,
-                            t[:, None] < LENGTH, QUERY_SCALE)
-            k = _load_dense(K1, seq, head, src[None, :], r[:, None], ROWS, KS, KG,
-                            src[None, :] < LENGTH)
-        else:
-            q = _vector(Q, Q2, flat[:, None], r[None, :], ROWS, QL, QR,
-                        t[:, None] < LENGTH)
-            k = _vector(K1, K12, src_flat[None, :], r[:, None], ROWS, KL1, KR1,
-                        src[None, :] < LENGTH)
+        q = _vector(Q, Q2, flat[:, None], r[None, :], ROWS, QL, QR,
+                    t[:, None] < LENGTH)
+        k = _vector(K1, K12, src_flat[None, :], r[:, None], ROWS, KL1, KR1,
+                    src[None, :] < LENGTH)
         memory = tl.load(
             C1 + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
             (r[:, None] < ROWS) & (c[None, :] < COLS), 0.0,
@@ -170,12 +157,8 @@ def _identity_normalized_region(
         numerator += tl.dot(q, memory, input_precision="tf32x3")
         denominator += tl.sum(q * key_sum[None, :], 1)
         if not SHARED_KEY:
-            if NATIVE:
-                k2 = _load_dense(K2, seq, head, src[None, :], r[:, None], ROWS, DKS, DKG,
-                                 src[None, :] < LENGTH)
-            else:
-                k2 = _vector(K2, K22, src_flat[None, :], r[:, None], ROWS, KL2, KR2,
-                             src[None, :] < LENGTH)
+            k2 = _vector(K2, K22, src_flat[None, :], r[:, None], ROWS, KL2, KR2,
+                         src[None, :] < LENGTH)
             den_scores += tl.dot(q, k2, input_precision="tf32x3")
     if SHARED_KEY:
         den_scores = scores
@@ -183,14 +166,9 @@ def _identity_normalized_region(
     causal2 = src[None, :] < t[:, None] if PRIOR2 else src[None, :] <= t[:, None]
     scores = tl.where(causal1, scores, 0.0)
     den_scores = tl.where(causal2, den_scores, 0.0)
-    if NATIVE:
-        value = _load_dense(V1, seq, head, src[:, None], c[None, :], COLS, VS, VG,
-                            src[:, None] < LENGTH)
-        den_value = tl.where(src < LENGTH, 1.0, 0.0)
-    else:
-        value = tl.load(V1 + src_flat[:, None] * COLS + c[None, :],
-                        (src[:, None] < LENGTH) & (c[None, :] < COLS), 0.0)
-        den_value = tl.load(V2 + src_flat, src < LENGTH, 0.0)
+    value = tl.load(V1 + src_flat[:, None] * COLS + c[None, :],
+                    (src[:, None] < LENGTH) & (c[None, :] < COLS), 0.0)
+    den_value = tl.load(V2 + src_flat, src < LENGTH, 0.0)
     numerator += tl.dot(scores, value, input_precision="tf32x3")
     denominator += tl.sum(den_scores * den_value[None, :], 1)
     output = numerator / (denominator[:, None] + EPSILON)

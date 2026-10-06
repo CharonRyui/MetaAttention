@@ -1188,7 +1188,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'" },
     { name = "sympy" },
     { name = "termcolor" },
-    { name = "tilelang", git = "https://github.com/tile-ai/tilelang.git?rev=61f968b6c5c00c8986b9331d599f95dfee7a60cd" },
+    { name = "tilelang", specifier = "==0.1.15" },
     { name = "torch", index = "https://download.pytorch.org/whl/cu128" },
     { name = "transformers", marker = "extra == 'bench'", specifier = "==4.45.0" },
 ]
@@ -2334,8 +2334,8 @@ wheels = [
 
 [[package]]
 name = "tilelang"
-version = "0.1.12+cuda.git61f968b6"
-source = { git = "https://github.com/tile-ai/tilelang.git?rev=61f968b6c5c00c8986b9331d599f95dfee7a60cd#61f968b6c5c00c8986b9331d599f95dfee7a60cd" }
+version = "0.1.15"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "cloudpickle" },
@@ -2349,6 +2349,12 @@ dependencies = [
     { name = "tqdm" },
     { name = "typing-extensions" },
     { name = "z3-solver" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/2c/2b/0a1f8fcacf5c99c95ccec5878b51a5adbf2d3299b5d7c5feb2d84fc5abf3/tilelang-0.1.15-cp39-abi3-macosx_11_0_arm64.whl", hash = "sha256:dcffc9aa8d4cd086dd93090f5afeeaa38aa621d2bb80998c4e5f5ee07be116aa", size = 33667284, upload-time = "2026-09-30T00:52:46.227Z" },
+    { url = "https://files.pythonhosted.org/packages/87/7c/eeda90666b629bc92e8a775ea219f91b8696d8592d7a5c7dff7067dd2642/tilelang-0.1.15-cp39-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:ca021a3450ad84b8fe7deb1b659c8d3d2e4b0855fdb59e2992a5349acf019881", size = 49554040, upload-time = "2026-09-30T00:52:52.493Z" },
+    { url = "https://files.pythonhosted.org/packages/b2/cc/74b077cfd53ca589c76e9f4dfb02016a83c8683b17c93b120da480ab51d4/tilelang-0.1.15-cp39-abi3-manylinux_2_34_aarch64.whl", hash = "sha256:77343b47643eaab07d8c1f8314c6c33e4992cb07883207796c900b719626524f", size = 44775917, upload-time = "2026-09-30T00:52:56.713Z" },
+    { url = "https://files.pythonhosted.org/packages/09/28/53f6e47fefe7dc18882745bac4db86a4b5ad5c3a52b89f652e278d75f3d3/tilelang-0.1.15-cp39-abi3-win_amd64.whl", hash = "sha256:398086288ae3fabb01120a1834e7ac7143d3a10d592154e789b535d874e4754f", size = 29504125, upload-time = "2026-09-30T00:53:01.978Z" },
 ]
 
 [[package]]
