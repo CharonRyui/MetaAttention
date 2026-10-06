@@ -86,11 +86,6 @@ class BindingDescriptor:
     def is_broadcast_head(self) -> bool:
         return self.source_heads == 1 and self.target_heads > 1
 
-    @property
-    def triton_descriptor(self) -> tuple[int, tuple[int, ...], tuple[int, ...]]:
-        """``(storage_offset, shape, strides)`` in elements for a raw loader."""
-        return self.storage_offset, self.source_shape, self.source_strides
-
     def sequence_for_token(self, token: int) -> int:
         if token < 0 or token >= self.token_count:
             raise IndexError(f"token {token} outside [0, {self.token_count})")

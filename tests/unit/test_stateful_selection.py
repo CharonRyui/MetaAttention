@@ -123,7 +123,7 @@ def test_rank_one_identity_readout_uses_chunked_stateful_candidate():
     assert plan.candidate.lowerer == "tilelang-chunked-stateful"
     assert plan.candidate.lowerer not in DENSE_SCAN
 @pytest.mark.parametrize("name", ["rwkv6", "gsa", "normalized-linear"])
-def test_reference_hotspots_select_chunked_stateful_candidate(name):
+def test_reference_hotspots_select_non_dense_chunked_candidate(name):
     from testing.benchmark_stateful_plans import CASES, role_sizes_for
 
     case = next(case for case in CASES if case.name == name)
@@ -135,7 +135,7 @@ def test_reference_hotspots_select_chunked_stateful_candidate(name):
         optimized=True,
     )
     plan = compiled.operator._plans[compiled.specialization].plan
-    assert plan.candidate.lowerer == "tilelang-chunked-stateful"
+    assert plan.candidate.lowerer not in DENSE_SCAN
     assert plan.mathematical_plan.representation == "chunked-stateful"
 
 

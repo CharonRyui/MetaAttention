@@ -150,3 +150,48 @@ def test_cuda_expression_cache_distinguishes_descriptor_address_formulas(
     strided_expected = strided_raw[0].reshape(4, 2, 2)[:, torch.arange(4, device="cuda") // 2]
     torch.cuda.synchronize()
     torch.testing.assert_close(strided_actual, strided_expected)
+
+
+@pytest.mark.gpu
+def test_cuda_expression_preserves_bf16_nodes_and_fp32_unary_outputs(gpu_device):
+    value = torch.tensor([1.003, 0.125, -0.75], device=gpu_device, dtype=torch.bfloat16)
+    expression = compile_expression({
+        "rounded": (Input("x") + Constant(0.1, torch.bfloat16)) * Constant(1.0001),
+        "promoted": Input("x").exp(),
+    })
+    actual = expression({"x": value})
+    expected = (value + torch.tensor(0.1, dtype=torch.bfloat16, device=gpu_device)) * 1.0001
+    assert actual["rounded"].dtype == torch.bfloat16
+    assert actual["promoted"].dtype == torch.float32
+    torch.testing.assert_close(actual["rounded"], expected, rtol=0, atol=0)
+    torch.testing.assert_close(actual["promoted"], value.float().exp())
+
+
+@pytest.mark.gpu
+def test_cuda_packed_expression_uses_token_index_and_sliced_storage(gpu_device):
+    from attn_engine.stateful.runtime.bindings import build_binding
+
+    feature, source = FeatureRole("feature"), HeadRole("source")
+    spec = TensorInput("x", (Batch, Sequence, source, feature), torch.float32)
+    storage = torch.arange(70, device=gpu_device, dtype=torch.float32).reshape(5, 2, 7)
+    expression = compile_expression(Input("x") + 0.5)
+    for start in (0, 1):
+        raw = storage[..., start:start + 6:2]
+        binding = build_binding(
+            spec, raw, role_sizes={source: 4, feature: 3}, mode="packed",
+            state_heads=4, sequence_offsets=(0, 0, 2, 2, 5), feature_roles=(feature,),
+        )
+        actual = expression({"x": binding})
+        expected = raw[:, torch.arange(4, device=gpu_device) // 2] + 0.5
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.gpu
+def test_cuda_expression_state_leaf_broadcast_and_strides(gpu_device):
+    term = StateTerm("memory", Input("query"), FeatureRole("key"))
+    storage = torch.arange(30, device=gpu_device, dtype=torch.bfloat16).reshape(3, 10)
+    state = storage[:, 1:7:2]
+    bias = torch.tensor([[0.5, 1.0, 2.0]], device=gpu_device)
+    actual = compile_expression(term + Input("bias"))({"bias": bias}, {term: state})
+    torch.testing.assert_close(actual, state.float() + bias)
+    assert actual.dtype == torch.float32

@@ -1,188 +1,160 @@
-"""Resource-bounded fused readout kernels over chunk-boundary States.
+"""TileLang chunk-local normalized, softmax, and shared State contractions."""
 
-Only chunk carries and final outputs are global tensors. Softmax reduces first
-State columns (second State rows), never tokens. Unsupported resources return
-None for the typed DAG executor's existing materialization cut.
-"""
-from __future__ import annotations
+from functools import lru_cache
+import hashlib
+import linecache
 
 import torch
-import triton
-import triton.language as tl
 
 
-
-@triton.jit
-def _vector(P, P2, flat, x, SIZE: tl.constexpr, LEFT: tl.constexpr,
-            RIGHT: tl.constexpr, VALID):
-    if RIGHT:
-        result = tl.load(P + flat * LEFT + x // RIGHT, VALID & (x < SIZE), 0.0)
-        result *= tl.load(P2 + flat * RIGHT + x % RIGHT, VALID & (x < SIZE), 0.0)
-    else:
-        result = tl.load(P + flat * SIZE + x, VALID & (x < SIZE), 0.0)
-    return result
+CHUNK = 64
 
 
-@triton.jit
-def _advance(S, GR, GC, K, K2, V, flat, r, c,
-             ROWS: tl.constexpr, COLS: tl.constexpr,
-             KL: tl.constexpr, KR: tl.constexpr,
-             UNIT_ROWS: tl.constexpr, UNIT_COLS: tl.constexpr, VALID):
-    rg = tl.full(r.shape, 1.0, tl.float32)
-    cg = tl.full(c.shape, 1.0, tl.float32)
-    if not UNIT_ROWS:
-        rg = tl.load(GR + flat * ROWS + r, VALID & (r < ROWS), 1.0)
-    if not UNIT_COLS:
-        cg = tl.load(GC + flat * COLS + c, VALID & (c < COLS), 1.0)
-    k = _vector(K, K2, flat, r, ROWS, KL, KR, VALID)
-    v = tl.load(V + flat * COLS + c, VALID & (c < COLS), 0.0)
-    return S * rg[:, None] * cg[None, :] + k[:, None] * v[None, :]
+def _next_power_of_two(value):
+    return 1 if value <= 1 else 1 << (value - 1).bit_length()
 
 
-@triton.jit
-def _two_state_region(
-    C1, GR1, GC1, K1, K12, V1, C2, GR2, GC2, K2, K22, V2,
-    Q, Q2, Output,
-    LENGTH: tl.constexpr, HEADS: tl.constexpr, CHUNKS: tl.constexpr,
-    R1: tl.constexpr, D1: tl.constexpr, R2: tl.constexpr, D2: tl.constexpr,
-    BR1: tl.constexpr, BD1: tl.constexpr, BR2: tl.constexpr, BD2: tl.constexpr,
-    KL1: tl.constexpr, KR1: tl.constexpr, KL2: tl.constexpr, KR2: tl.constexpr,
-    QL: tl.constexpr, QR: tl.constexpr,
-    UR1: tl.constexpr, UC1: tl.constexpr, UR2: tl.constexpr, UC2: tl.constexpr,
-    PRIOR1: tl.constexpr, PRIOR2: tl.constexpr, SOFTMAX: tl.constexpr,
-    EPSILON: tl.constexpr,
-):
-    sh, chunk = tl.program_id(0), tl.program_id(1)
-    seq, head = sh // HEADS, sh % HEADS
-    r1, d1 = tl.arange(0, BR1), tl.arange(0, BD1)
-    r2, d2 = tl.arange(0, BR2), tl.arange(0, BD2)
-    s1 = tl.load(C1 + ((sh * CHUNKS + chunk) * R1 + r1[:, None]) * D1 + d1[None, :],
-                 (r1[:, None] < R1) & (d1[None, :] < D1), 0.0)
-    s2 = tl.load(C2 + ((sh * CHUNKS + chunk) * R2 + r2[:, None]) * D2 + d2[None, :],
-                 (r2[:, None] < R2) & (d2[None, :] < D2), 0.0)
-    for step in range(64):
-        t = chunk * 64 + step
-        flat = (seq * LENGTH + t) * HEADS + head
-        q = _vector(Q, Q2, flat, r1, R1, QL, QR, t < LENGTH)
-        if PRIOR1:
-            first = tl.sum(s1 * q[:, None], 0)
-        s1 = _advance(s1, GR1, GC1, K1, K12, V1, flat, r1, d1,
-                      R1, D1, KL1, KR1, UR1, UC1, t < LENGTH)
-        if not PRIOR1:
-            first = tl.sum(s1 * q[:, None], 0)
-        if SOFTMAX:
-            logits = tl.where(d1 < D1, first, float("-inf"))
-            weight = tl.exp(logits - tl.max(logits, 0))
-            weight = weight / tl.sum(weight, 0)
-            if PRIOR2:
-                out = tl.sum(s2 * weight[:, None], 0)
-            s2 = _advance(s2, GR2, GC2, K2, K22, V2, flat, r2, d2,
-                          R2, D2, KL2, KR2, UR2, UC2, t < LENGTH)
-            if not PRIOR2:
-                out = tl.sum(s2 * weight[:, None], 0)
-        else:
-            if PRIOR2:
-                denominator = tl.sum(s2 * q[:, None], 0)
-            s2 = _advance(s2, GR2, GC2, K2, K22, V2, flat, r2, d2,
-                          R2, D2, KL2, KR2, UR2, UC2, t < LENGTH)
-            if not PRIOR2:
-                denominator = tl.sum(s2 * q[:, None], 0)
-            out = first / (tl.sum(denominator, 0) + EPSILON)
-        if SOFTMAX:
-            tl.store(Output + flat * D2 + d2, out, (t < LENGTH) & (d2 < D2))
-        else:
-            tl.store(Output + flat * D1 + d1, out, (t < LENGTH) & (d1 < D1))
+def _metadata(tensor):
+    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
 
 
 def _query_parts(query, tokens, heads, rows):
     if isinstance(query, tuple):
-        q, q2 = (part.reshape(tokens, heads, -1).float().contiguous() for part in query)
+        q, q2 = (part.reshape(tokens, heads, -1) for part in query)
         if q.shape[-1] * q2.shape[-1] != rows:
             return None
         return q, q2, q.shape[-1], q2.shape[-1]
-    q = query.reshape(tokens, heads, rows).float().contiguous()
+    q = query.reshape(tokens, heads, rows)
     return q, q, rows, 0
 
 
 def readout_region_resources(first_shape, second_shape, *, softmax=True):
-    """Conservative live FP32 elements/CTA, capped at 16384 with eight warps.
-
-    Counts both States, one live update temporary, gate/key/value/query vectors,
-    contraction and softmax scratch. Padded dimensions must be at most 256.
-    This is a structural bound, not a measured compiler register count.
-    """
+    """Conservative live FP32 element bound for the two-State region."""
     _, _, r1, d1 = first_shape
     _, _, r2, d2 = second_shape
-    a, b, c, d = map(triton.next_power_of_2, (r1, d1, r2, d2))
+    a, b, c, d = map(_next_power_of_two, (r1, d1, r2, d2))
     live = a * b + c * d + max(a * b, c * d) + 4 * (a + b + c + d) + (3 * b if softmax else b)
     return {"live_fp32_elements": live, "live_fp32_bytes": 4 * live,
             "eligible": max(a, b, c, d) <= 256 and live <= 16384}
 
 
-@triton.jit
-def _identity_normalized_region(
-    C1, K1, K12, V1, C2, K2, K22, V2, Q, Q2, Output,
-    LENGTH: tl.constexpr, HEADS: tl.constexpr, CHUNKS: tl.constexpr,
-    ROWS: tl.constexpr, COLS: tl.constexpr,
-    KL1: tl.constexpr, KR1: tl.constexpr, KL2: tl.constexpr, KR2: tl.constexpr,
-    QL: tl.constexpr, QR: tl.constexpr,
-    PRIOR1: tl.constexpr, PRIOR2: tl.constexpr,
-    SHARED_KEY: tl.constexpr, EPSILON: tl.constexpr,
-):
-    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    t = chunk * 64 + tl.arange(0, 64)
-    src = chunk * 64 + tl.arange(0, 64)
-    flat = (seq * LENGTH + t) * HEADS + head
-    src_flat = (seq * LENGTH + src) * HEADS + head
-    c = block * 32 + tl.arange(0, 32)
-    rr = tl.arange(0, 32)
-    scores = tl.full((64, 64), 0.0, tl.float32)
-    if not SHARED_KEY:
-        den_scores = tl.full((64, 64), 0.0, tl.float32)
-    numerator = tl.full((64, 32), 0.0, tl.float32)
-    denominator = tl.full((64,), 0.0, tl.float32)
-    for rb in range(tl.cdiv(ROWS, 32)):
-        r = rb * 32 + rr
-        q = _vector(Q, Q2, flat[:, None], r[None, :], ROWS, QL, QR,
-                    t[:, None] < LENGTH)
-        k = _vector(K1, K12, src_flat[None, :], r[:, None], ROWS, KL1, KR1,
-                    src[None, :] < LENGTH)
-        memory = tl.load(
-            C1 + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
-            (r[:, None] < ROWS) & (c[None, :] < COLS), 0.0,
-        )
-        key_sum = tl.load(C2 + (sh * CHUNKS + chunk) * ROWS + r, r < ROWS, 0.0)
-        scores += tl.dot(q, k, input_precision="tf32x3")
-        numerator += tl.dot(q, memory, input_precision="tf32x3")
-        denominator += tl.sum(q * key_sum[None, :], 1)
-        if not SHARED_KEY:
-            k2 = _vector(K2, K22, src_flat[None, :], r[:, None], ROWS, KL2, KR2,
-                         src[None, :] < LENGTH)
-            den_scores += tl.dot(q, k2, input_precision="tf32x3")
-    if SHARED_KEY:
-        den_scores = scores
-    causal1 = src[None, :] < t[:, None] if PRIOR1 else src[None, :] <= t[:, None]
-    causal2 = src[None, :] < t[:, None] if PRIOR2 else src[None, :] <= t[:, None]
-    scores = tl.where(causal1, scores, 0.0)
-    den_scores = tl.where(causal2, den_scores, 0.0)
-    value = tl.load(V1 + src_flat[:, None] * COLS + c[None, :],
-                    (src[:, None] < LENGTH) & (c[None, :] < COLS), 0.0)
-    den_value = tl.load(V2 + src_flat, src < LENGTH, 0.0)
-    numerator += tl.dot(scores, value, input_precision="tf32x3")
-    denominator += tl.sum(den_scores * den_value[None, :], 1)
-    output = numerator / (denominator[:, None] + EPSILON)
-    tl.store(Output + flat[:, None] * COLS + c[None, :], output,
-             (t[:, None] < LENGTH) & (c[None, :] < COLS))
+def _factor(T, key, key2, flat, head, r, kr):
+    if kr:
+        return T.cast(key[flat, head, r // kr], "float32") * T.cast(key2[flat, head, r % kr], "float32")
+    return T.cast(key[flat, head, r], "float32")
 
 
-def _region(first, second, query, sequence_length, prior_first, prior_second,
-            output_dtype, *, softmax, epsilon=0.0):
+def _advance_macro(T, rows, columns, kr, unit_row, unit_column):
+    @T.macro
+    def advance(State, Row, Column, Key, Key2, Value, flat, head):
+        for r, c in T.Parallel(rows, columns):
+            rg = 1.0 if unit_row else T.cast(Row[flat, head, r], "float32")
+            cg = 1.0 if unit_column else T.cast(Column[flat, head, c], "float32")
+            key = _factor(T, Key, Key2, flat, head, r, kr)
+            State[r, c] = (rg * cg) * State[r, c] + key * T.cast(Value[flat, head, c], "float32")
+        T.sync_threads()
+    return advance
+
+
+@lru_cache(maxsize=None)
+def _compile_region(metas, length, heads, kr1, kr2, qr, unit1, unit2,
+                    prior1, prior2, softmax, epsilon, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    c1m, r1m, d1m, k1m, k12m, v1m, c2m, r2m, d2m, k2m, k22m, v2m, qm, q2m, om = metas
+    bh, chunks, r1, d1 = c1m[0]
+    _, _, r2, d2 = c2m[0]
+    advance1 = _advance_macro(T, r1, d1, kr1, *unit1)
+    advance2 = _advance_macro(T, r2, d2, kr2, *unit2)
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build():
+        @T.prim_func
+        def kernel(C1: T.StridedTensor(*c1m), R1: T.StridedTensor(*r1m), D1: T.StridedTensor(*d1m),
+                   K1: T.StridedTensor(*k1m), K12: T.StridedTensor(*k12m), V1: T.StridedTensor(*v1m),
+                   C2: T.StridedTensor(*c2m), R2: T.StridedTensor(*r2m), D2: T.StridedTensor(*d2m),
+                   K2: T.StridedTensor(*k2m), K22: T.StridedTensor(*k22m), V2: T.StridedTensor(*v2m),
+                   Q: T.StridedTensor(*qm), Q2: T.StridedTensor(*q2m), Output: T.StridedTensor(*om)):
+            with T.Kernel(bh, chunks, threads=128) as (sh, chunk):
+                seq, head = sh // heads, sh % heads
+                s1 = T.alloc_shared((r1, d1), "float32")
+                s2 = T.alloc_shared((r2, d2), "float32")
+                first = T.alloc_shared((d1,), "float32")
+                second = T.alloc_shared((d2,), "float32")
+                normalizer = T.alloc_shared((2,), "float32")
+                for r, c in T.Parallel(r1, d1):
+                    s1[r, c] = T.cast(C1[sh, chunk, r, c], "float32")
+                for r, c in T.Parallel(r2, d2):
+                    s2[r, c] = T.cast(C2[sh, chunk, r, c], "float32")
+                T.sync_threads()
+                for step in T.serial(CHUNK):
+                    t = chunk * CHUNK + step
+                    if t < length:
+                        flat = seq * length + t
+                        if not prior1:
+                            advance1(s1, R1, D1, K1, K12, V1, flat, head)
+                        if not prior2:
+                            advance2(s2, R2, D2, K2, K22, V2, flat, head)
+                        for c in T.Parallel(d1):
+                            total = T.alloc_local((1,), "float32")
+                            total[0] = 0.0
+                            for r in T.serial(r1):
+                                q = _factor(T, Q, Q2, flat, head, r, qr)
+                                total[0] += q * s1[r, c]
+                            first[c] = total[0]
+                        T.sync_threads()
+                        if softmax:
+                            if T.get_thread_binding() == 0:
+                                maximum = T.alloc_local((1,), "float32")
+                                denominator = T.alloc_local((1,), "float32")
+                                maximum[0], denominator[0] = -3.402823466e38, 0.0
+                                for slot in T.serial(d1):
+                                    maximum[0] = T.max(maximum[0], first[slot])
+                                for slot in T.serial(d1):
+                                    denominator[0] += T.exp(first[slot] - maximum[0])
+                                normalizer[0], normalizer[1] = maximum[0], denominator[0]
+                            T.sync_threads()
+                            for slot in T.Parallel(d1):
+                                first[slot] = T.exp(first[slot] - normalizer[0]) / normalizer[1]
+                            T.sync_threads()
+                        for c in T.Parallel(d2):
+                            total = T.alloc_local((1,), "float32")
+                            total[0] = 0.0
+                            for r in T.serial(r2):
+                                if softmax:
+                                    q = first[r]
+                                else:
+                                    q = _factor(T, Q, Q2, flat, head, r, qr)
+                                total[0] += q * s2[r, c]
+                            second[c] = total[0]
+                        T.sync_threads()
+                        if softmax:
+                            for c in T.Parallel(d2):
+                                Output[flat, head, c] = second[c]
+                        else:
+                            for c in T.Parallel(d1):
+                                Output[flat, head, c] = first[c] / (second[0] + epsilon)
+                        if prior1:
+                            advance1(s1, R1, D1, K1, K12, V1, flat, head)
+                        if prior2:
+                            advance2(s2, R2, D2, K2, K22, V2, flat, head)
+                        T.sync_threads()
+        return kernel
+    return build()
+
+
+def _bound_factors(factors):
+    row, column, key, key2, value, kl, kr = factors
+    return (key if row is None else row, value if column is None else column,
+            key, key if not kr else key2, value), (row is None, column is None), kr
+
+
+def _region(first, second, query, length, prior_first, prior_second, output_dtype,
+            *, softmax, epsilon=0.0):
     c1, f1, _ = first
     c2, f2, _ = second
-    if sequence_length <= 0:
-        return None
-    if c1.shape[:2] != c2.shape[:2]:
+    if length <= 0 or c1.shape[:2] != c2.shape[:2]:
         return None
     bh, chunks, r1, d1 = c1.shape
     _, _, r2, d2 = c2.shape
@@ -190,50 +162,25 @@ def _region(first, second, query, sequence_length, prior_first, prior_second,
         return None
     if not readout_region_resources(c1.shape, c2.shape, softmax=softmax)["eligible"]:
         return None
-    gr1, gc1, k1, k12, v1, kl1, kr1 = f1
-    gr2, gc2, k2, k22, v2, kl2, kr2 = f2
-    tokens, heads = k1.shape[:2]
-    if k2.shape[:2] != (tokens, heads) or bh != tokens // sequence_length * heads:
-        return None
-    if tokens % sequence_length or chunks != triton.cdiv(sequence_length, 64):
+    tokens, heads = f1[2].shape[:2]
+    if f2[2].shape[:2] != (tokens, heads) or tokens % length or bh != tokens // length * heads or chunks != (length + 63) // 64:
         return None
     parts = _query_parts(query, tokens, heads, r1)
     if parts is None:
         return None
-    q, q2, ql, qr = parts
+    q, q2, _, qr = parts
+    bound1, unit1, kr1 = _bound_factors(f1)
+    bound2, unit2, kr2 = _bound_factors(f2)
     output = torch.empty(tokens, heads, d2 if softmax else d1, device=c1.device, dtype=output_dtype)
-    if not softmax and first[2] and second[2]:
-        shared_key = (k1.data_ptr() == k2.data_ptr() and k12.data_ptr() == k22.data_ptr()
-                      and (kl1, kr1) == (kl2, kr2))
-        _identity_normalized_region[(bh, chunks, triton.cdiv(d1, 32))](
-            c1, k1, k12, v1, c2, k2, k22, v2, q, q2, output,
-            sequence_length, heads, chunks, r1, d1,
-            kl1, kr1, kl2, kr2, ql, qr,
-            prior_first, prior_second, shared_key, epsilon,
-            num_warps=4, enable_fp_fusion=False,
-        )
-        return output
-    _two_state_region[(bh, chunks)](
-        c1, gr1, gc1, k1, k12, v1, c2, gr2, gc2, k2, k22, v2,
-        q, q2, output, sequence_length, heads, chunks, r1, d1, r2, d2,
-        triton.next_power_of_2(r1), triton.next_power_of_2(d1),
-        triton.next_power_of_2(r2), triton.next_power_of_2(d2),
-        kl1, kr1, kl2, kr2, ql, qr,
-        gr1 is None, gc1 is None, gr2 is None, gc2 is None,
-        prior_first, prior_second, softmax, epsilon, num_warps=8, enable_fp_fusion=False,
-    )
+    args = (c1, *bound1, c2, *bound2, q, q2, output)
+    _compile_region(tuple(_metadata(t) for t in args), length, heads, kr1, kr2, qr,
+                    unit1, unit2, prior_first, prior_second, softmax, epsilon,
+                    c1.device.index)(*args)
     return output
 
 
 def fused_readout_region(first, second, query, *, sequence_length,
                          prior_first=False, prior_second=False, output_dtype=torch.float32):
-    """Fuse ``(query @ first).softmax(columns) @ second`` or return None.
-
-    Prepared inputs are ``(carry, factors, identity)``. A successful call
-    launches one kernel and allocates only tokens*heads*second.columns*dtype
-    bytes, plus FP32 query conversion if needed. No softmax/State sequence is
-    stored. Prior flags select each State independently before its update.
-    """
     return _region(first, second, query, sequence_length, prior_first, prior_second,
                    output_dtype, softmax=True)
 
@@ -241,107 +188,98 @@ def fused_readout_region(first, second, query, *, sequence_length,
 def fused_normalized_region(first, second, query, *, sequence_length,
                             prior_first=False, prior_second=False,
                             output_dtype=torch.float32, epsilon=0.0):
-    """Fuse numerator/denominator with a scalar-column denominator.
-
-    ``epsilon`` is an authored FP32 epilogue constant.  The default preserves
-    the historical bare-division helper; normalized-linear supplies its
-    expression's ``EPS`` explicitly.
-    """
     return _region(first, second, query, sequence_length, prior_first, prior_second,
                    output_dtype, softmax=False, epsilon=epsilon)
 
 
-@triton.jit
-def _shared_region(Carry, GR, GC, K, K2, V, Queries, Queries2, Outputs,
-                   LENGTH: tl.constexpr, HEADS: tl.constexpr, CHUNKS: tl.constexpr,
-                   ROWS: tl.constexpr, COLS: tl.constexpr,
-                   BR: tl.constexpr, BC: tl.constexpr,
-                   KL: tl.constexpr, KR: tl.constexpr,
-                   QLS: tl.constexpr, QRS: tl.constexpr, PRIORS: tl.constexpr,
-                   UNIT_ROWS: tl.constexpr, UNIT_COLS: tl.constexpr,
-                   COUNT: tl.constexpr, EPILOGUE: tl.constexpr):
-    sh, chunk = tl.program_id(0), tl.program_id(1)
-    seq, head = sh // HEADS, sh % HEADS
-    r, c = tl.arange(0, BR), tl.arange(0, BC)
-    state = tl.load(Carry + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
-                    (r[:, None] < ROWS) & (c[None, :] < COLS), 0.0)
-    for step in range(64):
-        t = chunk * 64 + step
-        flat = (seq * LENGTH + t) * HEADS + head
-        prior_values = ()
-        for i in tl.static_range(COUNT):
-            q = _vector(Queries[i], Queries2[i], flat, r, ROWS, QLS[i], QRS[i], t < LENGTH)
-            if PRIORS[i]:
-                value = tl.sum(state * q[:, None], 0)
-            else:
-                value = tl.full((BC,), 0.0, tl.float32)
-            prior_values += (value,)
-        state = _advance(state, GR, GC, K, K2, V, flat, r, c,
-                         ROWS, COLS, KL, KR, UNIT_ROWS, UNIT_COLS, t < LENGTH)
-        results = ()
-        for i in tl.static_range(COUNT):
-            if PRIORS[i]:
-                value = prior_values[i]
-            else:
-                q = _vector(Queries[i], Queries2[i], flat, r, ROWS, QLS[i], QRS[i], t < LENGTH)
-                value = tl.sum(state * q[:, None], 0)
-            results += (value,)
-        if EPILOGUE == "add":
-            value = results[0] + results[1]
-        elif EPILOGUE == "multiply":
-            value = results[0] * results[1]
-        elif EPILOGUE == "divide":
-            value = results[0] / results[1]
-        if EPILOGUE != "none":
-            tl.store(Outputs[0] + flat * COLS + c, value, (t < LENGTH) & (c < COLS))
-        else:
-            for i in tl.static_range(COUNT):
-                tl.store(Outputs[i] + flat * COLS + c, results[i], (t < LENGTH) & (c < COLS))
+@lru_cache(maxsize=None)
+def _compile_shared(metas, count, qrs, length, heads, kr, unit, priors, epilogue, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    bh, chunks, rows, columns = metas[0][0]
+    names = ["Carry", "Row", "Column", "Key", "Key2", "Value"]
+    names += [name for i in range(count) for name in (f"Q{i}", f"Q2_{i}")]
+    outputs = 1 if epilogue else count
+    names += [f"O{i}" for i in range(outputs)]
+    annotations = ", ".join(f"{name}: T.StridedTensor(*metas[{i}])" for i, name in enumerate(names))
+    body = []
+    for i in range(count):
+        body.append(f"                result{i} = T.alloc_shared(({columns},), 'float32')")
+    body.extend([
+        "                for step in T.serial(64):",
+        "                    t = chunk * 64 + step",
+        f"                    if t < {length}:",
+        f"                        flat = seq * {length} + t",
+    ])
+    for post in (False, True):
+        if post:
+            body.append("                        advance(state, Row, Column, Key, Key2, Value, flat, head)")
+        for i in range(count):
+            if (not priors[i]) != post:
+                continue
+            body.extend([
+                f"                        for c in T.Parallel({columns}):",
+                "                            total = T.alloc_local((1,), 'float32')",
+                "                            total[0] = 0.0",
+                f"                            for r in T.serial({rows}):",
+                f"                                q = _factor(T, Q{i}, Q2_{i}, flat, head, r, {qrs[i]})",
+                "                                total[0] += q * state[r, c]",
+                f"                            result{i}[c] = total[0]",
+                "                        T.sync_threads()",
+            ])
+    body.append(f"                        for c in T.Parallel({columns}):")
+    if epilogue:
+        symbol = {"add": "+", "multiply": "*", "divide": "/"}[epilogue]
+        body.append(f"                            O0[flat, head, c] = result0[c] {symbol} result1[c]")
+    else:
+        body.extend(f"                            O{i}[flat, head, c] = result{i}[c]" for i in range(count))
+    body.append("                        T.sync_threads()")
+    source = ("@tilelang.jit(compile_flags=['-fmad=false'])\n"
+              "def build():\n"
+              "    @T.prim_func\n"
+              f"    def kernel({annotations}):\n"
+              f"        with T.Kernel({bh}, {chunks}, threads=128) as (sh, chunk):\n"
+              f"                seq, head = sh // {heads}, sh % {heads}\n"
+              f"                state = T.alloc_shared(({rows}, {columns}), 'float32')\n"
+              f"                for r, c in T.Parallel({rows}, {columns}):\n"
+              "                    state[r, c] = T.cast(Carry[sh, chunk, r, c], 'float32')\n"
+              "                T.sync_threads()\n"
+              + "\n".join(body) + "\n    return kernel\n")
+    filename = f"<stateful-shared-readout-{hashlib.sha256(source.encode()).hexdigest()}>"
+    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
+    namespace = {"tilelang": tilelang, "T": T, "metas": metas, "_factor": _factor,
+                 "advance": _advance_macro(T, rows, columns, kr, *unit)}
+    exec(compile(source, filename, "exec"), namespace)
+    return namespace["build"]()
 
 
 def fused_shared_readouts(prepared, queries, *, sequence_length, priors=None,
                           output_dtypes=None, epilogue=None):
-    """Share one replay across 2--4 contractions, optionally fuse binary arithmetic.
-
-    Return a tuple of outputs, or None for the existing executor fallback.
-    ``epilogue`` is None, "add", "multiply", or "divide"; a binary epilogue
-    takes two queries and emits one output. Output casts happen only after
-    FP32 contraction/arithmetic. Independent outputs may have different dtypes.
-    """
+    """Replay once for 2--4 independent contractions or one binary epilogue."""
     carry, factors, _ = prepared
     bh, chunks, rows, columns = carry.shape
     count = len(queries)
-    if count < 2 or count > 4:
+    if count < 2 or count > 4 or epilogue not in (None, "add", "multiply", "divide") or (epilogue and count != 2):
         return None
-    if epilogue not in (None, "add", "multiply", "divide") or (epilogue and count != 2):
-        return None
-    br, bc = triton.next_power_of_2(rows), triton.next_power_of_2(columns)
+    br, bc = _next_power_of_two(rows), _next_power_of_two(columns)
     live = 2 * br * bc + 4 * (br + bc) + count * (br + 2 * bc)
     if max(br, bc) > 256 or live > 16384:
         return None
-    gr, gc, key, key2, value, kl, kr = factors
-    tokens, heads = key.shape[:2]
-    if sequence_length <= 0 or tokens % sequence_length:
-        return None
-    if bh != tokens // sequence_length * heads or chunks != triton.cdiv(sequence_length, 64):
+    tokens, heads = factors[2].shape[:2]
+    if sequence_length <= 0 or tokens % sequence_length or bh != tokens // sequence_length * heads or chunks != (sequence_length + 63) // 64:
         return None
     priors = (False,) * count if priors is None else tuple(priors)
-    outputs_count = 1 if epilogue else count
-    output_dtypes = ((torch.float32,) * outputs_count if output_dtypes is None
-                     else tuple(output_dtypes))
-    if len(priors) != count or len(output_dtypes) != outputs_count:
+    output_count = 1 if epilogue else count
+    output_dtypes = (torch.float32,) * output_count if output_dtypes is None else tuple(output_dtypes)
+    if len(priors) != count or len(output_dtypes) != output_count:
         return None
     parts = tuple(_query_parts(query, tokens, heads, rows) for query in queries)
     if any(part is None for part in parts):
         return None
-    outputs = tuple(torch.empty(tokens, heads, columns, device=carry.device, dtype=dtype)
-                    for dtype in output_dtypes)
-    _shared_region[(bh, chunks)](
-        carry, gr, gc, key, key2, value,
-        tuple(part[0] for part in parts), tuple(part[1] for part in parts), outputs,
-        sequence_length, heads, chunks, rows, columns, br, bc, kl, kr,
-        tuple(part[2] for part in parts), tuple(part[3] for part in parts), priors,
-        gr is None, gc is None, count, epilogue or "none",
-        num_warps=8, enable_fp_fusion=False,
-    )
+    bound, unit, kr = _bound_factors(factors)
+    outputs = tuple(torch.empty(tokens, heads, columns, device=carry.device, dtype=dtype) for dtype in output_dtypes)
+    args = (carry, *bound, *(t for part in parts for t in part[:2]), *outputs)
+    _compile_shared(tuple(_metadata(t) for t in args), count, tuple(part[3] for part in parts),
+                    sequence_length, heads, kr, unit, priors, epilogue, carry.device.index)(*args)
     return outputs

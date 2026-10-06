@@ -36,7 +36,7 @@ uv pip install --no-deps -e .
 ```
 
 This installs MetaAttention itself from the local checkout. PyTorch is intentionally host-selected so CUDA, ROCm, and CPU environments can provide their own compatible build, and `--no-deps` avoids replacing that choice during editable install.
-The project pins the released TileLang `0.1.15` API in `pyproject.toml` and `uv.lock`. Stateful identity summaries/carries and ProductFeature contractions now use TileLang's lazy `@tilelang.jit`/`@T.prim_func` interface. Identity-normalized readout remains on Triton because the long-sequence benchmark showed a regression at larger State shapes. General diagonal, softmax/shared readout regions, low-rank, optimized scalar, rank-one scan, generated expression, packed, and training paths remain on their existing implementations until independently validated. See the [migration research and verification record](docs/tilelang-stateful-operator-research.md) for APIs, compatibility constraints, selected dispatch, fallback boundaries, and exact verification evidence.
+The project pins the released TileLang `0.1.15` API in `pyproject.toml` and `uv.lock`. All Stateful lowering families now use TileLang `@tilelang.jit`/`@T.prim_func` kernels, including diagonal summaries/carries/readouts, low-rank/WY/checkpoint and backward paths, scalar and rank-one scans, generated expression loaders, and packed execution. Stateful source has no Triton dependency; the separate FLA and legacy attention baselines may still use their own Triton caches. See the [migration research and verification record](docs/tilelang-stateful-operator-research.md) for APIs, compatibility constraints, selected dispatch, and exact verification evidence.
 
 ### Verify the installation
 ```bash

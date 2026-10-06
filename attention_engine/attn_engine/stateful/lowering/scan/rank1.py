@@ -1,13 +1,14 @@
-"""Raw-input vector affine scans; no promoted matrices or token State scratch."""
-from __future__ import annotations
+"""TileLang lowering for vector affine scans over raw inputs."""
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import torch
-import triton
-import triton.language as tl
 
 from ...runtime.bindings import DenseRawBindingRecipe, compile_dense_binding
+
+
+CHUNK = 64
 
 
 @dataclass(frozen=True)
@@ -55,12 +56,11 @@ def compile_rank_one(algorithm):
         return None
     value = specs[factors[0].expression.name]
     if any(Batch not in spec.roles or Sequence not in spec.roles
-           for spec in (value, *((gate,) if gate is not None else ()))):
+           for spec in ((value, gate) if gate is not None else (value,))):
         return None
-    # Independent named outputs retain their existing storage ownership.
     outputs = []
     for readout in algorithm.readouts:
-        term = getattr(readout, 'expression', None)
+        term = getattr(readout, "expression", None)
         if not isinstance(term, StateTerm) or term.state != state.name or term.prior:
             return None
         if term.role is not None or not isinstance(term.operand, Constant):
@@ -70,116 +70,169 @@ def compile_rank_one(algorithm):
         outputs.append((readout.name, readout.output_dtype))
     if len(outputs) != 1:
         return None
-    return RankOneRecipe(state.name,
-                         compile_dense_binding(gate, feature) if gate is not None else None,
-                         compile_dense_binding(value, feature), log_gate, feature, tuple(outputs))
+    return RankOneRecipe(
+        state.name,
+        compile_dense_binding(gate, feature) if gate is not None else None,
+        compile_dense_binding(value, feature),
+        log_gate,
+        feature,
+        tuple(outputs),
+    )
 
 
-@triton.jit
-def _compose(a1, b1, a2, b2):
-    return a2 * a1, a2 * b1 + b2
+def _storage_view(tensor: torch.Tensor):
+    element_size = tensor.element_size()
+    storage_elements = tensor.untyped_storage().nbytes() // element_size
+    return tensor.as_strided((storage_elements - tensor.storage_offset(),), (1,), tensor.storage_offset())
 
 
-@triton.jit
-def _scan(Gate, Value, Initial, Scale, Bias, Carry, Output, Final,
-          LENGTH: tl.constexpr, HEADS: tl.constexpr, FEATURES: tl.constexpr,
-          CHUNKS: tl.constexpr, GS: tl.constexpr, VS: tl.constexpr,
-          GG: tl.constexpr, VG: tl.constexpr, LOG: tl.constexpr,
-          IDENTITY: tl.constexpr, SUMMARY: tl.constexpr, DIRECT: tl.constexpr,
-          WRITE_FINAL: tl.constexpr, BLOCK: tl.constexpr):
-    sh, chunk, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    t = chunk * 64 + tl.arange(0, 64)
-    f = tile * BLOCK + tl.arange(0, BLOCK)
-    valid = (t[:, None] < LENGTH) & (f[None, :] < FEATURES)
-    x = tl.load(Value + seq * VS[0] + (head // VG) * VS[1]
-                + t[:, None] * VS[2] + f[None, :] * VS[3], valid, 0).to(tl.float32)
-    a = tl.full((64, BLOCK), 1.0, tl.float32)
-    if not IDENTITY:
-        a = tl.load(Gate + seq * GS[0] + (head // GG) * GS[1]
-                    + t[:, None] * GS[2] + f[None, :] * GS[3], valid, 0 if LOG else 1).to(tl.float32)
-        if LOG:
-            a = tl.exp(a)
-    a, b = tl.associative_scan((a, x), 0, _compose)
-    boundary = (sh * CHUNKS + chunk) * FEATURES + f
-    if SUMMARY:
-        last_a = tl.sum(tl.where(tl.arange(0, 64)[:, None] == 63, a, 0), 0)
-        last_b = tl.sum(tl.where(tl.arange(0, 64)[:, None] == 63, b, 0), 0)
-        tl.store(Scale + boundary, last_a, f < FEATURES)
-        tl.store(Bias + boundary, last_b, f < FEATURES)
-    else:
-        if DIRECT:
-            initial = tl.load(Initial + sh * FEATURES + f, f < FEATURES, 0)
-        else:
-            initial = tl.load(Carry + boundary, f < FEATURES, 0)
-        result = a * initial[None, :] + b
-        address = ((sh * LENGTH + t[:, None]) * FEATURES + f[None, :])
-        tl.store(Output + address, result, valid)
-        if WRITE_FINAL:
-            if chunk == CHUNKS - 1:
-                last = tl.sum(tl.where(t[:, None] == LENGTH - 1, result, 0), 0)
-                tl.store(Final + sh * FEATURES + f, last, f < FEATURES)
+def _metadata(tensor: torch.Tensor):
+    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
 
 
-@triton.jit
-def _carry(Scale, Bias, Initial, Carry, FEATURES: tl.constexpr,
-           CHUNKS: tl.constexpr, BLOCK: tl.constexpr):
-    sh, tile = tl.program_id(0), tl.program_id(1)
-    f = tile * BLOCK + tl.arange(0, BLOCK)
-    state = tl.load(Initial + sh * FEATURES + f, f < FEATURES, 0)
-    for chunk in range(CHUNKS):
-        offset = (sh * CHUNKS + chunk) * FEATURES + f
-        tl.store(Carry + offset, state, f < FEATURES)
-        scale = tl.load(Scale + offset, f < FEATURES, 1)
-        bias = tl.load(Bias + offset, f < FEATURES, 0)
-        state = scale * state + bias
+@lru_cache(maxsize=None)
+def _compile_summary(value_meta, gate_meta, scale_meta, bias_meta, *, batch, length, heads,
+                     features, value_strides, gate_strides, value_group, gate_group, log_gate,
+                     identity, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    chunks = tilelang.cdiv(length, CHUNK)
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(Value: T.StridedTensor(*value_meta), Gate: T.StridedTensor(*gate_meta),
+                   Scale: T.StridedTensor(*scale_meta), Bias: T.StridedTensor(*bias_meta)):
+            with T.Kernel(batch * heads, chunks, T.ceildiv(features, 128), threads=128) as (sh, chunk, block):
+                sequence = sh // heads
+                head = sh % heads
+                scale = T.alloc_fragment((128,), "float32")
+                bias = T.alloc_fragment((128,), "float32")
+                for feature in T.Parallel(128):
+                    x = block * 128 + feature
+                    scale[feature] = 1.0
+                    bias[feature] = 0.0
+                    for token in T.serial(CHUNK):
+                        logical = chunk * CHUNK + token
+                        if logical < length and x < features:
+                            value = T.cast(
+                                Value[sequence * value_strides[0] + (head // value_group) * value_strides[1]
+                                      + logical * value_strides[2] + x * value_strides[3]], "float32"
+                            )
+                            if identity:
+                                gate = 1.0
+                            else:
+                                gate = T.cast(
+                                    Gate[sequence * gate_strides[0] + (head // gate_group) * gate_strides[1]
+                                         + logical * gate_strides[2] + x * gate_strides[3]], "float32"
+                                )
+                                if log_gate:
+                                    gate = T.exp(gate)
+                            bias[feature] = gate * bias[feature] + value
+                            scale[feature] = gate * scale[feature]
+                for feature in T.Parallel(128):
+                    x = block * 128 + feature
+                    if x < features:
+                        Scale[sh, chunk, x] = scale[feature]
+                        Bias[sh, chunk, x] = bias[feature]
+        return kernel
+
+    return build_kernel()
 
 
-def execute_rank_one(recipe, inputs, initial, *, sequence_count,
-                     sequence_length, heads, return_final_state):
+@lru_cache(maxsize=None)
+def _compile_apply(value_meta, gate_meta, initial_meta, output_meta, final_meta, carry_meta,
+                   *, batch, length, heads, features, value_strides, gate_strides, value_group,
+                   gate_group, log_gate, identity, chunks, write_final, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(Value: T.StridedTensor(*value_meta), Gate: T.StridedTensor(*gate_meta),
+                   Initial: T.StridedTensor(*initial_meta), Carry: T.StridedTensor(*carry_meta),
+                   Output: T.StridedTensor(*output_meta), Final: T.StridedTensor(*final_meta)):
+            with T.Kernel(batch * heads, chunks, T.ceildiv(features, 128), threads=128) as (sh, chunk, block):
+                sequence = sh // heads
+                head = sh % heads
+                state = T.alloc_fragment((128,), "float32")
+                for feature in T.Parallel(128):
+                    x = block * 128 + feature
+                    if x < features:
+                        state[feature] = T.cast(Carry[sh, chunk, x], "float32")
+                        for token in T.serial(CHUNK):
+                            logical = chunk * CHUNK + token
+                            if logical < length:
+                                value = T.cast(
+                                    Value[sequence * value_strides[0] + (head // value_group) * value_strides[1]
+                                          + logical * value_strides[2] + x * value_strides[3]], "float32"
+                                )
+                                if identity:
+                                    gate = 1.0
+                                else:
+                                    gate = T.cast(
+                                        Gate[sequence * gate_strides[0] + (head // gate_group) * gate_strides[1]
+                                             + logical * gate_strides[2] + x * gate_strides[3]], "float32"
+                                    )
+                                    if log_gate:
+                                        gate = T.exp(gate)
+                                state[feature] = gate * state[feature] + value
+                                Output[sequence, head, logical, x] = state[feature]
+                        if write_final and chunk == chunks - 1:
+                            Final[sequence, head, x] = state[feature]
+        return kernel
+
+    return build_kernel()
+
+
+def execute_rank_one(recipe, inputs, initial, *, sequence_count, sequence_length, heads,
+                     return_final_state):
     value, vs, vg = recipe.value.bind(inputs[recipe.value.name], heads)
-    gate, gs, gg = (recipe.gate.bind(inputs[recipe.gate.name], heads)
-                    if recipe.gate is not None else (initial, (0, 0, 0, 0), 1))
-    features = initial.shape[-1]
-    chunks = triton.cdiv(sequence_length, 64)
-    output = torch.empty(sequence_count, heads, sequence_length, features,
-                         device=initial.device, dtype=recipe.outputs[0][1])
-    final = torch.empty_like(initial) if return_final_state else initial
-    common = dict(LENGTH=sequence_length, HEADS=heads, FEATURES=features,
-                  CHUNKS=chunks, GS=gs, VS=vs, GG=gg, VG=vg,
-                  LOG=recipe.log_gate, IDENTITY=recipe.gate is None,
-                  BLOCK=32, num_warps=4, enable_fp_fusion=False)
-    grid = (sequence_count * heads, chunks, triton.cdiv(features, 32))
-    if chunks == 1:
-        _scan[grid](gate, value, initial, initial, initial, initial, output, final,
-                    SUMMARY=False, DIRECT=True, WRITE_FINAL=return_final_state, **common)
+    value = _storage_view(value)
+    if recipe.gate is None:
+        gate, gs, gg = _storage_view(initial), (0, 0, 0, 0), 1
+        identity = True
     else:
-        shape = (sequence_count * heads, chunks, features)
-        scale = torch.empty(shape, device=initial.device, dtype=torch.float32)
-        bias = torch.empty_like(scale)
-        carry = torch.empty_like(scale)
-        _scan[grid](gate, value, initial, scale, bias, carry, output, final,
-                    SUMMARY=True, DIRECT=False, WRITE_FINAL=False, **common)
-        # Keep the direct carry for small scans; long scans use grouped local
-        # summaries so the serial prefix depth stays bounded.  These reshapes
-        # are views over vector buffers (one row), not matrix state storage.
-        if chunks <= 64:
-            _carry[(sequence_count * heads, triton.cdiv(features, 128))](
-                scale, bias, initial, carry, features, chunks, 128,
-                num_warps=4, enable_fp_fusion=False)
-        else:
-            from ..diagonal.diagonal_scan import hierarchical_carry
-
-            hierarchical_carry(
-                scale.reshape(sequence_count * heads, chunks, 1, features),
-                bias.reshape(sequence_count * heads, chunks, 1, features),
-                initial.reshape(sequence_count * heads, 1, features),
-                carry.reshape(sequence_count * heads, chunks, 1, features),
-                final.reshape(sequence_count * heads, 1, features),
-                identity=False,
-                write_final=False,
-            )
-        _scan[grid](gate, value, initial, scale, bias, carry, output, final,
-                    SUMMARY=False, DIRECT=False,
-                    WRITE_FINAL=return_final_state, **common)
+        gate, gs, gg = recipe.gate.bind(inputs[recipe.gate.name], heads)
+        gate = _storage_view(gate)
+        identity = False
+    features = initial.shape[-1]
+    chunks = (sequence_length + CHUNK - 1) // CHUNK
+    output = torch.empty(
+        sequence_count, heads, sequence_length, features,
+        device=initial.device, dtype=recipe.outputs[0][1],
+    )
+    if sequence_length == 0:
+        return output, initial.clone() if return_final_state else None
+    final = torch.empty_like(initial) if return_final_state else initial
+    shape = (sequence_count * heads, chunks, features)
+    scale = torch.empty(shape, device=initial.device, dtype=torch.float32)
+    bias = torch.empty_like(scale)
+    carry = torch.empty_like(scale)
+    device_index = initial.device.index if initial.device.index is not None else torch.cuda.current_device()
+    _compile_summary(
+        _metadata(value), _metadata(gate), _metadata(scale), _metadata(bias),
+        batch=sequence_count, length=sequence_length, heads=heads, features=features,
+        value_strides=vs, gate_strides=gs, value_group=vg, gate_group=gg,
+        log_gate=recipe.log_gate, identity=identity, device_index=device_index,
+    )(value, gate, scale, bias)
+    from ..diagonal.diagonal_scan import hierarchical_carry
+    hierarchical_carry(
+        scale.reshape(sequence_count * heads, chunks, 1, features),
+        bias.reshape(sequence_count * heads, chunks, 1, features),
+        initial.reshape(sequence_count * heads, 1, features),
+        carry.reshape(sequence_count * heads, chunks, 1, features),
+        final.reshape(sequence_count * heads, 1, features),
+        identity=False,
+        write_final=False,
+    )
+    _compile_apply(
+        _metadata(value), _metadata(gate), _metadata(initial), _metadata(output), _metadata(final),
+        _metadata(carry), batch=sequence_count, length=sequence_length, heads=heads,
+        features=features, value_strides=vs, gate_strides=gs, value_group=vg, gate_group=gg,
+        log_gate=recipe.log_gate, identity=identity, chunks=chunks,
+        write_final=return_final_state, device_index=device_index,
+    )(value, gate, initial, carry, output, final)
     return output, final if return_final_state else None

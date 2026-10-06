@@ -59,11 +59,14 @@
 
 ### 2.3 Stateful TileLang 迁移范围
 
-依赖已从旧 git snapshot 更新到发布版 `tilelang==0.1.15`。Identity 的 chunk summary、exclusive hierarchical carry helper，以及 native normalized identity dense inference 的 summary/carry/readout 已改为 TileLang；general affine chunk carry 也已改为 TileLang。保留 FP32 State、BF16 authored query rounding、独立 denominator key/prior、grouped heads 和 BHT/BTH 输入布局。
+依赖已从旧 git snapshot 更新到发布版 `tilelang==0.1.15`。Stateful 的 identity/general diagonal summary、hierarchical carry、native readout、softmax/shared readout、low-rank/WY/checkpoint、optimized scalar、rank-one scan、generated expression、packed 和 backward kernels 均已改为 TileLang；保留 FP32 State、BF16 authored arithmetic rounding、独立 denominator key/prior、grouped heads、BHT/BTH 输入布局和 final-State ownership。
 
-Affine carry 使用 direct（不超过 64 chunks）和 32-chunk recursive hierarchy，支持 zero/negative scale、tail chunk、continuation 和 final-State ownership；weighted general-diagonal summary/readout 仍由 Triton 提供。
+所有上述 lowerer 仍采用 shape-specialized 的 `@tilelang.jit`/`@T.prim_func` ABI；本次没有声称引入单个动态 Batch/Sequence binary。TileLang kernel 的数值验证使用独立 token recurrence、VJP oracle、continuation、tail、zero/signed gate、BF16、strided/broadcast binding 和 CUDA Graph smoke。
 
-这不是全后端切换：general diagonal/native single-State 的 summary/readout、ProductFeature/softmax/shared readout、optimized scalar、rank-one scan、lowrank 和 generated expression 仍有 Triton kernels；packed/training 没有迁移。详细来源、边界与实测验证见 [TileLang 迁移调研](tilelang-stateful-operator-research.md)。
+这已是 Stateful backend 的完整 Triton→TileLang cutover。`LinearAttentionEngine`、FLA 对照和其他非-Stateful attention 路径仍是独立兼容面，不属于该 lowerer cutover。
+
+本轮 correctness-first 集成验证：Stateful 综合 GPU 回归 **215 passed**、WY **12 passed**、GDN/组合压力 **11 passed**、rank-one/FLA 对照 **56 passed**；CPU unit **192 passed, 6 skipped**。实际执行 smoke 覆盖独立 FP32/FP64 recurrence、全部 operand VJP、BF16 rounding、prior/post、continuation 和 CUDA Graph；packed Graph 还验证同一 binary 内修改 device offsets 与空序列位置。这里不保证迁移后性能，旧 benchmark 数字不代表新 schedule。
+
 
 ## 3. 心智模型：用一个固定大小 State 表示线性递推
 

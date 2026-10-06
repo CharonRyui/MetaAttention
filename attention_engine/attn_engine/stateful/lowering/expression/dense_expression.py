@@ -1,20 +1,29 @@
-"""Authored pointwise expressions loaded directly from dense input bindings."""
+"""Authored pointwise expressions represented for TileLang lowering."""
 from __future__ import annotations
-
 from dataclasses import dataclass
 import hashlib
-import linecache
 from typing import Any
-
 import torch
-
 from ...runtime.bindings import DenseRawBindingRecipe, compile_dense_binding
-from ..readout.native import _load_dense
+
+
+@dataclass(frozen=True)
+class DenseLoader:
+    """Immutable expression IR consumed by native TileLang macros.
+
+    ``nodes`` contains operation records in topological order.  Keeping the IR
+    rather than dynamically generating source preserves authored node rounding
+    and lets each lowering select its own TileLang load primitive.
+    """
+    nodes: tuple[tuple[Any, ...], ...]
+    root: int
+    feature: Any
+    cache_key: str
 
 
 @dataclass(frozen=True)
 class DenseExpression:
-    loader: Any
+    loader: DenseLoader
     sources: tuple[Any, ...]
     feature: Any
     bindings: tuple[DenseRawBindingRecipe, ...]
@@ -30,23 +39,15 @@ class DenseExpression:
 
 
 def compile_dense_expression(expression, specs, feature, *, factors=()):
-    """Return a raw loader, or None for an expression requiring a reduction cut.
-
-    Arithmetic rounds at every authored node. Extra factors are multiplied at
-    the FP32 transition seam, not reassociated into the authored expression.
-    """
-    from ....stateful_operator import (
-        Add, Clamp, Constant, Divide, Exp, Input, Log, Multiply, Negate,
-        Reciprocal, Sigmoid, Sqrt,
-    )
-
-    sources, lines, nodes = [], [], {}
+    from ....stateful_operator import Add, Clamp, Constant, Divide, Exp, Input, Log, Multiply, Negate, Reciprocal, Sigmoid, Sqrt
+    sources, records, nodes = [], [], {}
 
     def visit(node):
         if node in nodes:
-            return nodes[node]
-        index = len(nodes)
-        # Reserve before visiting children so the emitted name is unique.
+            value = nodes[node]
+            if value is None:
+                raise ValueError("cyclic expression")
+            return value
         nodes[node] = None
         if isinstance(node, Input):
             spec = specs[node.name]
@@ -55,72 +56,47 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
                 raise ValueError("expression carries a different Feature")
             if spec not in sources:
                 sources.append(spec)
-            source = sources.index(spec)
-            dtype, scalar = spec.dtype, False
-            stride = ", ".join(f"STRIDES[{source * 4 + axis}]" for axis in range(4))
-            lines.append(f"    s{source}: tl.constexpr = ({stride})")
-            lines.append(f"    g{source}: tl.constexpr = GROUPS[{source}]")
-            code = (f"_load_dense(P[{source}], seq, head, t, x, SIZE, "
-                    f"s{source}, g{source}, VALID)")
+            records.append(("input", node.name))
+            index = len(records) - 1
+            result = (index, spec.dtype, False)
         elif isinstance(node, Constant):
-            dtype, scalar = node.dtype, True
-            code = f"tl.full((), {node.value!r}, tl.float32)"
-            if dtype == torch.bfloat16:
-                code += ".to(tl.bfloat16).to(tl.float32)"
+            records.append(("constant", node.value, node.dtype))
+            index = len(records) - 1
+            result = (index, node.dtype, True)
         elif isinstance(node, (Add, Multiply, Divide)):
             left, ld, ls = visit(node.left)
             right, rd, rs = visit(node.right)
-            dtype = (rd if ls and not rs else ld if rs and not ls
-                     else torch.promote_types(ld, rd))
-            scalar = ls and rs
+            dtype = rd if ls and not rs else ld if rs and not ls else torch.promote_types(ld, rd)
             symbol = "+" if isinstance(node, Add) else "*" if isinstance(node, Multiply) else "/"
-            code = f"({left} {symbol} {right})"
-            if dtype == torch.bfloat16:
-                code += ".to(tl.bfloat16).to(tl.float32)"
+            records.append(("binary", left, right, dtype, symbol))
+            index = len(records) - 1
+            result = (index, dtype, ls and rs)
         elif isinstance(node, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
             operand, dtype, scalar = visit(node.operand)
             if isinstance(node, Negate):
-                code = f"(-{operand})"
+                records.append(("unary", operand, "neg"))
+                index = len(records) - 1
+                result = (index, dtype, scalar)
             else:
-                dtype = torch.float32
-                if isinstance(node, Exp):
-                    code = f"tl.exp({operand})"
-                elif isinstance(node, Log):
-                    code = f"tl.log({operand})"
-                elif isinstance(node, Sigmoid):
-                    code = f"(1.0 / (1.0 + tl.exp(-{operand})))"
-                elif isinstance(node, Sqrt):
-                    code = f"tl.sqrt({operand})"
-                elif isinstance(node, Reciprocal):
-                    code = f"(1.0 / {operand})"
-                else:
-                    code = f"tl.maximum(tl.minimum({operand}, {node.maximum!r}), {node.minimum!r})"
+                kind = {Exp: "exp", Log: "log", Sigmoid: "sigmoid", Sqrt: "sqrt", Reciprocal: "reciprocal", Clamp: "clamp"}[type(node)]
+                records.append(("unary", operand, kind, getattr(node, "minimum", None), getattr(node, "maximum", None)))
+                index = len(records) - 1
+                result = (index, torch.float32, scalar)
         else:
             raise ValueError("expression requires a materialization cut")
-        name = f"v{index}"
-        lines.append(f"    {name} = {code}")
-        nodes[node] = name, dtype, scalar
-        return nodes[node]
+        nodes[node] = result
+        return result
 
     try:
         root, _, _ = visit(expression)
+        root_index = root
         for factor in factors:
             other, _, _ = visit(factor)
-            name = f"f{len(lines)}"
-            lines.append(f"    {name} = {root} * {other}")
-            root = name
+            records.append(("factor", root_index, other))
+            root_index = len(records) - 1
     except ValueError:
         return None
-    source = ("import triton\nimport triton.language as tl\n"
-              "@triton.jit\n"
-              "def load(P, seq, head, t, x, VALID, SIZE: tl.constexpr, "
-              "STRIDES: tl.constexpr, GROUPS: tl.constexpr):\n"
-              + "\n".join(lines) + f"\n    return tl.where(VALID & (x < SIZE), {root}, 0.0)\n")
-    name = "load_" + hashlib.sha256(source.encode()).hexdigest()
-    source = source.replace("def load(", f"def {name}(")
-    filename = f"<stateful-dense-load-{hashlib.sha256(source.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source), None, source.splitlines(True), filename)
-    namespace = {"_load_dense": _load_dense}
-    exec(compile(source, filename, "exec"), namespace)
-    return DenseExpression(namespace[name], tuple(sources), feature,
+    digest = hashlib.sha256(repr((records, root_index, feature)).encode()).hexdigest()
+    loader = DenseLoader(tuple(records), root_index, feature, digest)
+    return DenseExpression(loader, tuple(sources), feature,
                            tuple(compile_dense_binding(spec, feature) for spec in sources))

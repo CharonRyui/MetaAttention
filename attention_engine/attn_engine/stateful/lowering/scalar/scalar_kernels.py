@@ -1,289 +1,139 @@
-"""Raw-input scalar affine summaries, chunk carries and parallel readout.
+"""TileLang chunked lowering for raw-input scalar affine operators.
 
-Only FP32 chunk-boundary States and one scalar per chunk reach global scratch.
-Gate products are formed forwards: zero and signed scalar gates do not need an
-inverse, and a log gate is exponentiated before it enters a product.
+The kernel keeps the state tile resident while processing 64-token chunks.  All
+products are formed forwards (rather than reconstructed from prefix ratios), so
+signed and zero gates have the same semantics as the reference recurrence.
 """
 
-from __future__ import annotations
-
+from functools import lru_cache
 from typing import Any
 
 import torch
-import triton
-import triton.language as tl
+
 
 CHUNK_TOKENS = 64
-_CHUNK = tl.constexpr(CHUNK_TOKENS)
 
 
-@triton.jit
-def _multiply(left, right):
-    return left * right
+def _metadata(tensor: torch.Tensor):
+    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
 
 
-@triton.jit
-def _load_expression(
-    pointer,
-    offset,
-    mask,
-    OPERATION: tl.constexpr,
-    SCALE: tl.constexpr,
-    LOG_SCALE: tl.constexpr,
-    NEUTRAL: tl.constexpr,
+@lru_cache(maxsize=None)
+def _compile_chunked(
+    propagation_meta,
+    left_meta,
+    right_meta,
+    readout_meta,
+    initial_meta,
+    output_meta,
+    final_meta,
+    *,
+    sequence_count: int,
+    sequence_length: int,
+    heads: int,
+    rows: int,
+    columns: int,
+    propagation_heads: int,
+    left_heads: int,
+    right_heads: int,
+    readout_heads: int,
+    identity: bool,
+    propagation_operation: str,
+    left_operation: str,
+    right_operation: str,
+    readout_operation: str,
+    propagation_scale: float,
+    left_scale: float,
+    right_scale: float,
+    readout_scale: float,
+    propagation_log: bool,
+    left_log: bool,
+    right_log: bool,
+    readout_log: bool,
+    write_final: bool,
+    threads: int,
+    device_index: int,
 ):
-    value = tl.load(pointer + offset, mask, 0).to(tl.float32)
-    if OPERATION == "exp":
-        value = tl.exp(value)
-    value *= SCALE
-    if LOG_SCALE:
-        value = tl.exp(value)
-    return tl.where(mask, value, NEUTRAL)
+    import tilelang
+    import tilelang.language as T
 
+    chunks = tilelang.cdiv(sequence_length, CHUNK_TOKENS)
+    block_columns = threads
 
-@triton.jit
-def _chunk_summary(
-    Propagation,
-    Left,
-    Right,
-    Scale,
-    Bias,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    PROPAGATION_HEADS: tl.constexpr,
-    LEFT_HEADS: tl.constexpr,
-    RIGHT_HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLUMNS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    IDENTITY: tl.constexpr,
-    PROPAGATION_OPERATION: tl.constexpr,
-    LEFT_OPERATION: tl.constexpr,
-    RIGHT_OPERATION: tl.constexpr,
-    PROPAGATION_SCALE: tl.constexpr,
-    LEFT_SCALE: tl.constexpr,
-    RIGHT_SCALE: tl.constexpr,
-    PROPAGATION_LOG: tl.constexpr,
-    LEFT_LOG: tl.constexpr,
-    RIGHT_LOG: tl.constexpr,
-):
-    sequence_head, chunk, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    sequence, head = sequence_head // HEADS, sequence_head % HEADS
-    row = tile // tl.cdiv(COLUMNS, 32) * 32 + tl.arange(0, 32)
-    column = tile % tl.cdiv(COLUMNS, 32) * 32 + tl.arange(0, 32)
-    step = tl.arange(0, _CHUNK)
-    token = chunk * _CHUNK + step
-    left_head = head // (HEADS // LEFT_HEADS)
-    right_head = head // (HEADS // RIGHT_HEADS)
-    key = _load_expression(
-        Left,
-        ((sequence * LEFT_HEADS + left_head) * LENGTH + token[None, :]) * ROWS
-        + row[:, None],
-        (token[None, :] < LENGTH) & (row[:, None] < ROWS),
-        LEFT_OPERATION,
-        LEFT_SCALE,
-        LEFT_LOG,
-        0.0,
-    )
-    value = _load_expression(
-        Right,
-        ((sequence * RIGHT_HEADS + right_head) * LENGTH + token[:, None]) * COLUMNS
-        + column[None, :],
-        (token[:, None] < LENGTH) & (column[None, :] < COLUMNS),
-        RIGHT_OPERATION,
-        RIGHT_SCALE,
-        RIGHT_LOG,
-        0.0,
-    )
-    if not IDENTITY:
-        propagation_head = head // (HEADS // PROPAGATION_HEADS)
-        propagation_base = (sequence * PROPAGATION_HEADS + propagation_head) * LENGTH
-        # An injection at step i is multiplied only by gates i+1 through end.
-        next_gate = _load_expression(
-            Propagation,
-            propagation_base + token + 1,
-            (step + 1 < _CHUNK) & (token + 1 < LENGTH),
-            PROPAGATION_OPERATION,
-            PROPAGATION_SCALE,
-            PROPAGATION_LOG,
-            1.0,
-        )
-        suffix = tl.associative_scan(next_gate, 0, _multiply, reverse=True)
-        key *= suffix[None, :]
-        if tile == 0:
-            first_gate = _load_expression(
-                Propagation,
-                propagation_base + chunk * _CHUNK,
-                chunk * _CHUNK < LENGTH,
-                PROPAGATION_OPERATION,
-                PROPAGATION_SCALE,
-                PROPAGATION_LOG,
-                1.0,
-            )
-            chunk_scale = first_gate * tl.sum(tl.where(step == 0, suffix, 0.0), 0)
-            tl.store(Scale + sequence_head * CHUNKS + chunk, chunk_scale)
-    bias = tl.dot(key, value, input_precision="tf32x3")
-    tl.store(
-        Bias
-        + ((sequence_head * CHUNKS + chunk) * ROWS + row[:, None]) * COLUMNS
-        + column[None, :],
-        bias,
-        (row[:, None] < ROWS) & (column[None, :] < COLUMNS),
-    )
+    def transform(value, operation, scale, is_log):
+        if operation == "exp":
+            value = T.exp(value)
+        value = value * scale
+        if is_log:
+            value = T.exp(value)
+        return value
 
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(
+            Propagation: T.StridedTensor(*propagation_meta),
+            Left: T.StridedTensor(*left_meta),
+            Right: T.StridedTensor(*right_meta),
+            Readout: T.StridedTensor(*readout_meta),
+            Initial: T.StridedTensor(*initial_meta),
+            Output: T.StridedTensor(*output_meta),
+            Final: T.StridedTensor(*final_meta),
+        ):
+            with T.Kernel(
+                sequence_count * heads,
+                T.ceildiv(columns, block_columns),
+                threads=threads,
+            ) as (sequence_head, column_block):
+                sequence = sequence_head // heads
+                head = sequence_head % heads
+                left_head = head // (heads // left_heads)
+                right_head = head // (heads // right_heads)
+                readout_head = head // (heads // readout_heads)
+                propagation_head = head // (heads // propagation_heads) if not identity else 0
+                column_start = column_block * block_columns
 
-@triton.jit
-def _chunk_prefix(
-    Scale,
-    Bias,
-    Initial,
-    Carry,
-    Final,
-    ROWS: tl.constexpr,
-    COLUMNS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    IDENTITY: tl.constexpr,
-    WRITE_FINAL: tl.constexpr,
-):
-    sequence_head, block = tl.program_id(0), tl.program_id(1)
-    element = block * 256 + tl.arange(0, 256)
-    mask = element < ROWS * COLUMNS
-    state = tl.load(Initial + sequence_head * ROWS * COLUMNS + element, mask, 0)
-    for chunk in range(CHUNKS):
-        offset = (sequence_head * CHUNKS + chunk) * ROWS * COLUMNS + element
-        # Readout needs the prior chunk's State, not its terminal State.
-        tl.store(Carry + offset, state, mask)
-        bias = tl.load(Bias + offset, mask, 0)
-        if IDENTITY:
-            state += bias
-        else:
-            scale = tl.load(Scale + sequence_head * CHUNKS + chunk)
-            state = scale * state + bias
-    if WRITE_FINAL:
-        tl.store(Final + sequence_head * ROWS * COLUMNS + element, state, mask)
+                column = column_start + T.get_thread_binding()
+                state = T.alloc_local((rows,), "float32")
+                result = T.alloc_local((1,), "float32")
+                if column < columns:
+                    for row in T.serial(rows):
+                        state[row] = T.cast(Initial[sequence, head, row, column], "float32")
+                    for chunk in T.serial(chunks):
+                        for token in T.serial(CHUNK_TOKENS):
+                            logical_token = chunk * CHUNK_TOKENS + token
+                            if logical_token < sequence_length:
+                                if identity:
+                                    gate = 1.0
+                                else:
+                                    gate = transform(
+                                        T.cast(Propagation[sequence, propagation_head, logical_token], "float32"),
+                                        propagation_operation, propagation_scale, propagation_log,
+                                    )
+                                value = transform(
+                                    T.cast(Right[sequence, right_head, logical_token, column], "float32"),
+                                    right_operation, right_scale, right_log,
+                                )
+                                result[0] = 0.0
+                                for row in T.serial(rows):
+                                    key = transform(
+                                        T.cast(Left[sequence, left_head, logical_token, row], "float32"),
+                                        left_operation, left_scale, left_log,
+                                    )
+                                    query = transform(
+                                        T.cast(Readout[sequence, readout_head, logical_token, row], "float32"),
+                                        readout_operation, readout_scale, readout_log,
+                                    )
+                                    state[row] = gate * state[row] + key * value
+                                    result[0] += query * state[row]
+                                Output[sequence, head, logical_token, column] = result[0]
+                    if write_final:
+                        for row in T.serial(rows):
+                            Final[sequence, head, row, column] = state[row]
 
+        return kernel
 
-@triton.jit
-def _chunk_readout(
-    Propagation,
-    Left,
-    Right,
-    Readout,
-    Carry,
-    Output,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    PROPAGATION_HEADS: tl.constexpr,
-    LEFT_HEADS: tl.constexpr,
-    RIGHT_HEADS: tl.constexpr,
-    READOUT_HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLUMNS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    IDENTITY: tl.constexpr,
-    PROPAGATION_OPERATION: tl.constexpr,
-    LEFT_OPERATION: tl.constexpr,
-    RIGHT_OPERATION: tl.constexpr,
-    READOUT_OPERATION: tl.constexpr,
-    PROPAGATION_SCALE: tl.constexpr,
-    LEFT_SCALE: tl.constexpr,
-    RIGHT_SCALE: tl.constexpr,
-    READOUT_SCALE: tl.constexpr,
-    PROPAGATION_LOG: tl.constexpr,
-    LEFT_LOG: tl.constexpr,
-    RIGHT_LOG: tl.constexpr,
-    READOUT_LOG: tl.constexpr,
-):
-    sequence_head, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    sequence, head = sequence_head // HEADS, sequence_head % HEADS
-    step = tl.arange(0, _CHUNK)
-    token = chunk * _CHUNK + step
-    column = block * 32 + tl.arange(0, 32)
-    row_lane = tl.arange(0, 32)
-    left_head = head // (HEADS // LEFT_HEADS)
-    right_head = head // (HEADS // RIGHT_HEADS)
-    readout_head = head // (HEADS // READOUT_HEADS)
-    scores = tl.full((_CHUNK, _CHUNK), 0.0, tl.float32)
-    output = tl.full((_CHUNK, 32), 0.0, tl.float32)
-    for row_block in range(tl.cdiv(ROWS, 32)):
-        row = row_block * 32 + row_lane
-        query = _load_expression(
-            Readout,
-            ((sequence * READOUT_HEADS + readout_head) * LENGTH + token[:, None])
-            * ROWS
-            + row[None, :],
-            (token[:, None] < LENGTH) & (row[None, :] < ROWS),
-            READOUT_OPERATION,
-            READOUT_SCALE,
-            READOUT_LOG,
-            0.0,
-        )
-        key = _load_expression(
-            Left,
-            ((sequence * LEFT_HEADS + left_head) * LENGTH + token[None, :]) * ROWS
-            + row[:, None],
-            (token[None, :] < LENGTH) & (row[:, None] < ROWS),
-            LEFT_OPERATION,
-            LEFT_SCALE,
-            LEFT_LOG,
-            0.0,
-        )
-        state = tl.load(
-            Carry
-            + ((sequence_head * CHUNKS + chunk) * ROWS + row[:, None]) * COLUMNS
-            + column[None, :],
-            (row[:, None] < ROWS) & (column[None, :] < COLUMNS),
-            0,
-        )
-        scores += tl.dot(query, key, input_precision="tf32x3")
-        output += tl.dot(query, state, input_precision="tf32x3")
-    if not IDENTITY:
-        propagation_head = head // (HEADS // PROPAGATION_HEADS)
-        propagation_base = (sequence * PROPAGATION_HEADS + propagation_head) * LENGTH
-        gate = _load_expression(
-            Propagation,
-            propagation_base + token,
-            token < LENGTH,
-            PROPAGATION_OPERATION,
-            PROPAGATION_SCALE,
-            PROPAGATION_LOG,
-            1.0,
-        )
-        prefix = tl.associative_scan(gate, 0, _multiply)
-        output *= prefix[:, None]
-        next_gate = _load_expression(
-            Propagation,
-            propagation_base + token + 1,
-            (step + 1 < _CHUNK) & (token + 1 < LENGTH),
-            PROPAGATION_OPERATION,
-            PROPAGATION_SCALE,
-            PROPAGATION_LOG,
-            1.0,
-        )
-        # One forward product per destination/source pair. Unlike prefix ratios,
-        # this remains defined after an exactly-zero gate and for signed gates.
-        factors = tl.where(step[None, :] < step[:, None], next_gate[None, :], 1.0)
-        weights = tl.associative_scan(factors, 1, _multiply, reverse=True)
-        scores *= weights
-    scores = tl.where(step[None, :] <= step[:, None], scores, 0.0)
-    value = _load_expression(
-        Right,
-        ((sequence * RIGHT_HEADS + right_head) * LENGTH + token[:, None]) * COLUMNS
-        + column[None, :],
-        (token[:, None] < LENGTH) & (column[None, :] < COLUMNS),
-        RIGHT_OPERATION,
-        RIGHT_SCALE,
-        RIGHT_LOG,
-        0.0,
-    )
-    output += tl.dot(scores, value, input_precision="tf32x3")
-    tl.store(
-        Output
-        + ((sequence * HEADS + head) * LENGTH + token[:, None]) * COLUMNS
-        + column[None, :],
-        output,
-        (token[:, None] < LENGTH) & (column[None, :] < COLUMNS),
-    )
+    return build_kernel()
 
 
 def scalar_chunked_dense_raw(
@@ -301,52 +151,29 @@ def scalar_chunked_dense_raw(
     return_final_state: bool,
     threads: int,
 ) -> None:
+    """Launch the chunked TileLang scalar path using the established raw ABI."""
     sequences, heads, rows, columns = initial.shape
-    chunks = triton.cdiv(sequence_length, CHUNK_TOKENS)
-    bias = torch.empty(
-        sequences, heads, chunks, rows, columns, device=initial.device, dtype=torch.float32
+    propagation_heads = heads if identity_propagation else propagation.shape[1]
+    kernel = _compile_chunked(
+        _metadata(propagation), _metadata(left), _metadata(right), _metadata(readout),
+        _metadata(initial), _metadata(output), _metadata(final),
+        sequence_count=sequences, sequence_length=sequence_length, heads=heads,
+        rows=rows, columns=columns, propagation_heads=propagation_heads,
+        left_heads=left.shape[1], right_heads=right.shape[1], readout_heads=readout.shape[1],
+        identity=identity_propagation,
+        propagation_operation=expressions[0].operation,
+        left_operation=expressions[1].operation,
+        right_operation=expressions[2].operation,
+        readout_operation=expressions[3].operation,
+        propagation_scale=expressions[0].scale,
+        left_scale=expressions[1].scale,
+        right_scale=expressions[2].scale,
+        readout_scale=expressions[3].scale,
+        propagation_log=expressions[0].is_log_scale,
+        left_log=expressions[1].is_log_scale,
+        right_log=expressions[2].is_log_scale,
+        readout_log=expressions[3].is_log_scale,
+        write_final=return_final_state, threads=threads,
+        device_index=initial.device.index if initial.device.index is not None else torch.cuda.current_device(),
     )
-    carry = torch.empty_like(bias)
-    # Identity never reads Scale. An already-live pointer avoids dummy scratch.
-    scale = initial if identity_propagation else torch.empty(
-        sequences, heads, chunks, device=initial.device, dtype=torch.float32
-    )
-    common = dict(
-        LENGTH=sequence_length,
-        HEADS=heads,
-        PROPAGATION_HEADS=heads if identity_propagation else propagation.shape[1],
-        LEFT_HEADS=left.shape[1],
-        RIGHT_HEADS=right.shape[1],
-        ROWS=rows,
-        COLUMNS=columns,
-        CHUNKS=chunks,
-        IDENTITY=identity_propagation,
-        PROPAGATION_OPERATION=expressions[0].operation,
-        LEFT_OPERATION=expressions[1].operation,
-        RIGHT_OPERATION=expressions[2].operation,
-        PROPAGATION_SCALE=expressions[0].scale,
-        LEFT_SCALE=expressions[1].scale,
-        RIGHT_SCALE=expressions[2].scale,
-        PROPAGATION_LOG=expressions[0].is_log_scale,
-        LEFT_LOG=expressions[1].is_log_scale,
-        RIGHT_LOG=expressions[2].is_log_scale,
-    )
-    num_warps = max(4, threads // 32)
-    _chunk_summary[(sequences * heads, chunks, triton.cdiv(rows, 32) * triton.cdiv(columns, 32))](
-        propagation, left, right, scale, bias, **common,
-        num_warps=num_warps, enable_fp_fusion=False,
-    )
-    _chunk_prefix[(sequences * heads, triton.cdiv(rows * columns, 256))](
-        scale, bias, initial, carry, final,
-        ROWS=rows, COLUMNS=columns, CHUNKS=chunks,
-        IDENTITY=identity_propagation, WRITE_FINAL=return_final_state,
-        num_warps=4, enable_fp_fusion=False,
-    )
-    _chunk_readout[(sequences * heads, chunks, triton.cdiv(columns, 32))](
-        propagation, left, right, readout, carry, output, **common,
-        READOUT_HEADS=readout.shape[1],
-        READOUT_OPERATION=expressions[3].operation,
-        READOUT_SCALE=expressions[3].scale,
-        READOUT_LOG=expressions[3].is_log_scale,
-        num_warps=num_warps, enable_fp_fusion=False,
-    )
+    kernel(propagation, left, right, readout, initial, output, final)

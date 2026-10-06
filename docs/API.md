@@ -108,6 +108,14 @@ adapter. The old private `_stateful_*` import paths and the forwarding
 arithmetic and compiler-owned cache identities are unchanged; backend JIT
 artifacts may be regenerated under the relocated module names.
 
+All Stateful kernel families now use released TileLang `0.1.15`, including
+generated expressions, diagonal/native readouts, scalar/vector scans, low-rank
+WY, and dense/packed checkpoint forward/backward. FLA and legacy attention are
+separate backend surfaces. Kernel binaries remain shape-specialized; dynamic
+public invocation sizes do not imply one symbolic Batch/Sequence binary.
+This correctness-first cutover does not promise the historical timings below.
+See `docs/tilelang-stateful-operator-research.md` for verification and constraints.
+
 
 ```py
 from attn_engine import StatefulOperator, Target
@@ -245,23 +253,21 @@ typed structures retain the generic lowering; selection does not inspect model
 or example names.
 
 Ordered first-axis Rank-One propagations with row, column or whole-State scales
-use affine chunk summaries `S_out = P @ S_in @ diag(d) + b`, an FP32 boundary
-carry pass and independent chunk replay. Operation order is preserved inside
-each chunk; replay reads the incoming carry, not the outgoing summary. Multiple
-injections and independent first-axis contractions share the same replay.
-No inverse gate or BF16 State approximation is used in inference. Existing
-single-readout backward execution retains its recorded-State reverse walk;
-unsupported gradient compositions retain the generic lowering.
+use an FP32 TileLang recurrence, preserving authored operation order, multiple
+injections, independent first-axis contractions, and final-State ownership.
+Dense/packed training uses chunk summaries, boundary carries, replay, local VJPs
+and deterministic reductions in the checkpoint lowerer. Unsupported gradient
+compositions retain the generic lowering.
 
 When every ordered propagation is a whole-State scalar scale or first-axis
 Rank-One update, at most four rank/injection events and dimensions at most 128
-use the compact WY triangular solve and block contractions. This path reads
-each FP32 factor through its binding strides; low-precision factors retain the
-existing FP32 promotion before the dot operands. It does not pack/copy operation
-buffers or stack multiple injection/readout factors.
-Zero/signed scalar gates, distinct left/right factors, nonzero initial States
-and continuation retain the same recurrence. Noncommuting row/column scales
-keep the existing affine-summary runtime; packed and backward paths are unchanged.
+use the compact TileLang WY triangular solve and event replay. Factors are
+bound through their strides and packed into FP32 operation-kind buffers;
+multiple injection/readout factors are stacked. This changes preparation cost
+relative to the previous Triton schedule. Zero/signed gates use direct interval
+products, not prefix inverses. Distinct left/right factors, nonzero initial
+States and continuation retain the same recurrence. Noncommuting row/column
+scales use the ordered recurrence; packed and backward use checkpoint kernels.
 
 The workspace envelope charges token factors and expression outputs separately
 from chunk carries: `B*T*bytes_per_token + B*(ceil(T/64)+1)*bytes_per_chunk`.
@@ -297,8 +303,8 @@ After results pass an independent FP32 token recurrence for outputs and every
 final State at lengths 65, 512 and 2048 with nonzero initial States, plus batched
 continuation split across nonaligned chunks.
 
-The follow-up packing pass reuses single injection/readout bindings and leaves
-unused Triton operation buffers at one element. On the same H20 workload, the
+The historical follow-up Triton packing pass reused single injection/readout
+bindings and left unused operation buffers at one element. On that H20 workload, the
 `T=2048` graph timings changed from `0.792` to `0.712 ms` for Based and from
 `0.600` to `0.566 ms` for ReBased; profiler-attributed auxiliary launches fell
 

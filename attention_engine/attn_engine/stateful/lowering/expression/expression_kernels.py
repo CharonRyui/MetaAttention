@@ -1,255 +1,247 @@
-"""Private Triton lowering for pointwise Stateful expression DAGs.
+"""TileLang lowering for pointwise Stateful expression DAGs.
 
-The generated kernel keeps the expression association authored by the IR and loads
-BindingDescriptor storage directly.  Metadata is passed as scalar launch arguments;
-no expanded/head-repeated input is created.  This module is intentionally private:
-its stable seam is ``launch_expression`` used by the sibling ``expression`` module.
+Authored arithmetic rounds at each node. Raw storage views retain descriptor
+strides, grouped heads, and offsets without materializing expanded inputs.
 """
 from __future__ import annotations
-from typing import Any, Mapping, Sequence
 
 import hashlib
 import linecache
+from typing import Any, Mapping
 
 import torch
+
 from ....stateful_operator import Batch, HeadRole, Sequence as SequenceRole
 from ...runtime.bindings import _PACKED_TOKEN
 
-try:  # Keep CPU/import-only environments usable.
-    import triton
-    import triton.language as tl
-except ImportError:  # pragma: no cover - exercised only without Triton installed
-    triton = None
-    tl = None
-
-
 _CACHE: dict[tuple[Any, ...], Any] = {}
-
-
-def _descriptor_cache_key(source: Any) -> tuple[Any, ...]:
-    """Return metadata that changes a descriptor's generated address formula.
-
-    Runtime strides remain launch arguments, so they deliberately do not belong
-    in the key.  The role order, extents, grouping, and other values below are
-    embedded in the generated source and therefore must distinguish kernels.
-    """
-    if not _descriptor(source):
-        return ("tensor",)
-    return (
-        "descriptor",
-        tuple(source.source_roles),
-        tuple(source.feature_roles),
-        tuple(int(extent) for extent in source.source_shape),
-        int(source.target_heads),
-        int(source.head_group_size),
-        source.mode,
-        None if source.sequence_length is None else int(source.sequence_length),
-        int(source.storage_offset),
-    )
-
-
-def _kernel_cache_key(
-    compiled: Any,
-    sources: Sequence[Any],
-    outputs: Sequence[torch.Tensor],
-    block: int,
-) -> tuple[Any, ...]:
-    """Identify generated source without retaining tensor identities.
-
-    Node expressions are frozen/hashable IR values.  Keeping the expressions,
-    node edges, and roots in the key distinguishes operators, constants, and
-    output ordering even when their node counts and shapes happen to match.
-    """
-    expression, roots = compiled._kernel_identity
-    return (
-        expression,
-        roots,
-        tuple(t.dtype for t in (s.tensor if _descriptor(s) else s for s in sources)),
-        tuple(o.dtype for o in outputs),
-        tuple(_logical_shape(s) for s in sources),
-        tuple(_descriptor_cache_key(s) for s in sources),
-        int(block),
-    )
 
 
 def _descriptor(source: Any) -> bool:
     return hasattr(source, "source_roles") and hasattr(source, "source_strides")
 
 
+def _tensor(source):
+    return source.tensor if _descriptor(source) else source
+
+
 def _logical_shape(source: Any) -> tuple[int, ...]:
-    if _descriptor(source):
-        roles = tuple(source.feature_roles)
-        extents = []
-        for role in roles:
-            if role in source.source_roles:
-                extents.append(int(source.source_shape[source.source_roles.index(role)]))
-            else:
-                extents.append(1)
-        return (int(source.token_count), int(source.target_heads), *extents)
-    return tuple(source.shape)
+    if not _descriptor(source):
+        return tuple(source.shape)
+    roles = tuple(source.source_roles)
+    extents = tuple(
+        int(source.source_shape[roles.index(role)]) if role in roles else 1
+        for role in source.feature_roles
+    )
+    return (int(source.token_count), int(source.target_heads), *extents)
 
 
-def _op_source(nodes: Sequence[Any], roots: Sequence[int], inputs: Sequence[str], constants: Sequence[str]) -> str:
-    """Emit a scalar-free vector program; all values are tl vectors."""
-    lines: list[str] = []
-    for i, node in enumerate(nodes):
+def _storage_view(source):
+    tensor = _tensor(source)
+    # The address formula includes the storage offset, so the pointer starts at
+    # the storage base rather than at the first element of a sliced tensor.
+    size = tensor.untyped_storage().nbytes() // tensor.element_size()
+    return torch.as_strided(tensor, (size,), (1,), storage_offset=0)
+
+
+def _source_key(source):
+    tensor = _tensor(source)
+    raw = (tuple(tensor.shape), tuple(tensor.stride()), tensor.storage_offset(),
+           tensor.dtype, tensor.untyped_storage().nbytes() // tensor.element_size())
+    if not _descriptor(source):
+        return ("tensor", *raw)
+    return ("descriptor", *raw, tuple(source.source_roles), tuple(source.feature_roles),
+            tuple(source.source_shape), tuple(source.source_strides), source.storage_offset,
+            source.target_heads, source.head_group_size, source.mode, source.sequence_length,
+            source.token_count)
+
+
+def _coordinates(shape):
+    remainder = "p"
+    coordinates = []
+    for extent in reversed(shape):
+        coordinates.append(f"(({remainder}) % {max(1, extent)})")
+        remainder = f"(({remainder}) // {max(1, extent)})"
+    return tuple(reversed(coordinates))
+
+
+def _address(source, shape):
+    logical = _logical_shape(source)
+    coords = _coordinates(shape)[len(shape) - len(logical):]
+    coords = tuple("0" if extent == 1 else coordinate
+                   for extent, coordinate in zip(logical, coords, strict=True))
+    tensor = _tensor(source)
+    if not _descriptor(source):
+        return " + ".join((str(tensor.storage_offset()), *(
+            f"({coordinate}) * {stride}"
+            for coordinate, stride in zip(coords, tensor.stride(), strict=True)
+        )))
+    token, head, *features = coords
+    length = max(1, int(source.sequence_length or 1))
+    feature_indices = dict(zip(source.feature_roles, features, strict=True))
+    terms = [str(source.storage_offset)]
+    for role, extent, stride in zip(source.source_roles, source.source_shape,
+                                    source.source_strides, strict=True):
+        if extent == 1:
+            index = "0"
+        elif role is _PACKED_TOKEN:
+            index = token
+        elif role is Batch:
+            index = f"({token}) // {length}"
+        elif role is SequenceRole:
+            index = f"({token}) % {length}"
+        elif isinstance(role, HeadRole):
+            index = f"({head}) // {source.head_group_size}"
+        else:
+            index = feature_indices.get(role, "0")
+        terms.append(f"({index}) * {stride}")
+    return " + ".join(terms)
+
+
+def _node_types(compiled, leaves):
+    types = []
+    scalars = []
+    for node in compiled._nodes:
+        if node.kind in ("input", "state"):
+            source = leaves[node.expression]
+            dtype = torch.float32 if node.kind == "state" else _tensor(source).dtype
+            scalar = not _logical_shape(source)
+        elif node.kind == "constant":
+            dtype, scalar = node.expression.dtype, True
+        elif node.kind in ("add", "multiply", "divide"):
+            left, right = node.children
+            scalar = scalars[left] and scalars[right]
+            dtype = (types[right] if scalars[left] and not scalars[right] else
+                     types[left] if scalars[right] and not scalars[left] else
+                     torch.promote_types(types[left], types[right]))
+        elif node.kind == "negate":
+            dtype, scalar = types[node.children[0]], scalars[node.children[0]]
+        else:
+            dtype, scalar = torch.float32, scalars[node.children[0]]
+        types.append(dtype)
+        scalars.append(scalar)
+    return tuple(types)
+
+
+def _cast(value, dtype):
+    name = str(dtype).removeprefix("torch.")
+    return f"T.cast(T.cast({value}, {name!r}), 'float32')"
+
+
+def _make_kernel(compiled, sources, shape, node_types, output_dtypes, block):
+    import tilelang
+    import tilelang.language as T
+
+    total = 1
+    for extent in shape:
+        total *= extent
+    annotations = []
+    for index, source in enumerate(sources):
+        tensor = _tensor(source)
+        size = tensor.untyped_storage().nbytes() // tensor.element_size()
+        annotations.append(f"X{index}: T.Tensor(({size},), {str(tensor.dtype).removeprefix('torch.')!r})")
+    annotations.extend(f"O{index}: T.Tensor(({total},), {str(dtype).removeprefix('torch.')!r})"
+                       for index, dtype in enumerate(output_dtypes))
+    lines = []
+    leaf = 0
+    for index, node in enumerate(compiled._nodes):
         kind = node.kind
-        if kind == "input":
-            lines.append(f"    v{i} = load_{inputs.index(node.expression.name)}()")
+        if kind in ("input", "state"):
+            value = f"T.cast(X{leaf}[{_address(sources[leaf], shape)}], 'float32')"
+            leaf += 1
         elif kind == "constant":
-            dtype = "tl.bfloat16" if node.expression.dtype == torch.bfloat16 else "tl.float32"
-            lines.append(f"    v{i} = tl.full((BLOCK,), {node.expression.value!r}, {dtype})")
-        elif kind == "state":
-            lines.append(f"    v{i} = load_state_{i}()")
-        elif kind == "add":
-            lines.append(f"    v{i} = v{node.children[0]} + v{node.children[1]}")
-        elif kind == "multiply":
-            lines.append(f"    v{i} = v{node.children[0]} * v{node.children[1]}")
-        elif kind == "divide":
-            lines.append(f"    v{i} = v{node.children[0]} / v{node.children[1]}")
-        elif kind == "outer":
-            raise NotImplementedError("Outer requires a feature-axis tile and is lowered by chunked readout")
-        elif kind == "contract":
-            raise NotImplementedError("Contract is a reduction and is a materialization cut")
-        elif kind == "shift":
-            raise NotImplementedError("Shift requires sequence metadata and is lowered by chunked readout")
-        elif kind == "softmax":
-            raise NotImplementedError("Softmax is a reduction and is a materialization cut")
-        elif kind == "negate":
-            lines.append(f"    v{i} = -v{node.children[0]}")
-        elif kind == "exp":
-            lines.append(f"    v{i} = tl.exp(v{node.children[0]}.to(tl.float32))")
-        elif kind == "log":
-            lines.append(f"    v{i} = tl.log(v{node.children[0]}.to(tl.float32))")
-        elif kind == "sigmoid":
-            lines.append(f"    x{i} = v{node.children[0]}.to(tl.float32); v{i} = 1.0 / (1.0 + tl.exp(-x{i}))")
-        elif kind == "sqrt":
-            lines.append(f"    v{i} = tl.sqrt(v{node.children[0]}.to(tl.float32))")
-        elif kind == "reciprocal":
-            lines.append(f"    v{i} = 1.0 / v{node.children[0]}.to(tl.float32)")
-        elif kind == "clamp":
-            lines.append(f"    v{i} = tl.maximum(tl.minimum(v{node.children[0]}.to(tl.float32), {node.expression.maximum!r}), {node.expression.minimum!r})")
+            value = repr(torch.tensor(node.expression.value, dtype=node.expression.dtype).item())
+        elif kind in ("add", "multiply", "divide"):
+            left, right = (f"v{child}" for child in node.children)
+            # Torch wrapped scalar operands convert to the vector computation
+            # dtype before arithmetic, including BF16 scalar constants.
+            operands = []
+            for child, operand in zip(node.children, (left, right), strict=True):
+                expression = compiled._nodes[child].expression
+                if compiled._nodes[child].kind == "constant":
+                    # TVM folds nested constant casts through BF16. Convert the
+                    # authored scalar before embedding it in device source.
+                    operand = repr(torch.tensor(expression.value, dtype=expression.dtype)
+                                   .to(node_types[index]).item())
+                operands.append(_cast(operand, node_types[index]))
+            left, right = operands
+            symbol = {"add": "+", "multiply": "*", "divide": "/"}[kind]
+            value = f"({left} {symbol} {right})"
         else:
-            raise NotImplementedError(f"unsupported fused node {kind}")
-    for out, root in enumerate(roots):
-        lines.append(f"    tl.store(O{out} + p, v{root}, mask=mask)")
-    return "\n".join(lines)
-
-
-def _make_kernel(compiled: Any, sources: Sequence[Any], states: Sequence[Any], roots: Sequence[int], out_dtypes: Sequence[torch.dtype], block: int):
-    if triton is None:
-        return None
-    input_nodes = [n for n in compiled._nodes if n.kind == "input"]
-    args = ["O" + str(i) for i in range(len(roots))]
-    args += ["TOTAL", "BLOCK: tl.constexpr"]
-    defs: list[str] = []
-    body = _op_source(compiled._nodes, roots, [n.expression.name for n in input_nodes], [])
-    for i, source in enumerate(sources):
-        args.append(f"X{i}")
-        if _descriptor(source):
-            for axis in range(len(source.source_strides)):
-                args.append(f"X{i}_s{axis}")
-            roles = tuple(source.source_roles)
-            feature_extents = [
-                int(source.source_shape[roles.index(role)]) if role in roles else 1
-                for role in source.feature_roles
-            ]
-            q = "p"
-            terms: list[str] = []
-            for feature, extent in reversed(tuple(zip(source.feature_roles, feature_extents))):
-                idx = f"(({q}) % {extent})"
-                if feature in roles:
-                    terms.append(f"({idx}) * X{i}_s{roles.index(feature)}")
-                q = f"(({q}) // {extent})"
-            head = f"(({q}) % {int(source.target_heads)})"
-            q = f"(({q}) // {int(source.target_heads)})"
-            head_role = next((r for r in roles if isinstance(r, HeadRole)), None)
-            if head_role is not None:
-                axis = roles.index(head_role)
-                terms.append(f"(({head}) // {int(source.head_group_size)}) * X{i}_s{axis}")
-            if source.mode == "dense":
-                length = int(source.sequence_length or 1)
-                local, batch = f"(({q}) % {length})", f"(({q}) // {length})"
-                if SequenceRole in roles:
-                    terms.append(f"{local} * X{i}_s{roles.index(SequenceRole)}")
-                if Batch in roles:
-                    terms.append(f"{batch} * X{i}_s{roles.index(Batch)}")
+            operand = f"v{node.children[0]}"
+            if kind == "negate":
+                value = f"(-{operand})"
+            elif kind in ("exp", "log", "sqrt"):
+                value = f"T.{kind}({operand})"
+            elif kind == "sigmoid":
+                value = f"(1.0 / (1.0 + T.exp(-{operand})))"
+            elif kind == "reciprocal":
+                value = f"(1.0 / {operand})"
+            elif kind == "clamp":
+                value = f"T.max(T.min({operand}, {node.expression.maximum!r}), {node.expression.minimum!r})"
             else:
-                token_axis = roles.index(_PACKED_TOKEN)
-                terms.append(f"p * X{i}_s{token_axis}")
-            offset = str(int(source.storage_offset))
-            if terms:
-                offset += " + " + " + ".join(terms)
-            defs.append(f"    vload{i} = tl.load(X{i} + {offset}, mask=mask, other=0)")
-        else:
-            defs.append(f"    vload{i} = tl.load(X{i} + p, mask=mask, other=0)")
-        body = body.replace(f"load_{i}()", f"vload{i}")
-    signature = ", ".join(args)
-    source_text = f"""import triton
-import triton.language as tl
-@triton.jit
-def fused({signature}):
-    p = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    mask = p < TOTAL
-{chr(10).join(defs)}
-{body}
-"""
-    namespace: dict[str, Any] = {}
-    filename = f"<stateful-expression-{hashlib.sha1(source_text.encode()).hexdigest()}>"
-    linecache.cache[filename] = (len(source_text), None, source_text.splitlines(True), filename)
-    code = compile(source_text, filename, "exec")
-    exec(code, namespace)
-    return namespace["fused"]
+                raise RuntimeError(f"unsupported CUDA expression node {kind}")
+        lines.append(f"                    v{index} = {_cast(value, node_types[index])}")
+    lines.extend(f"                    O{index}[p] = v{root}"
+                 for index, root in enumerate(compiled._roots))
+    text = ("@tilelang.jit(compile_flags=['-fmad=false'])\n"
+            "def build():\n"
+            "    @T.prim_func\n"
+            f"    def fused({', '.join(annotations)}):\n"
+            f"        with T.Kernel({(total + block - 1) // block}, threads={block}) as bx:\n"
+            f"            for lane in T.Parallel({block}):\n"
+            f"                p = bx * {block} + lane\n"
+            f"                if p < {total}:\n"
+            + "\n".join(lines) + "\n    return fused\n")
+    filename = f"<stateful-expression-{hashlib.sha256(text.encode()).hexdigest()}>"
+    linecache.cache[filename] = (len(text), None, text.splitlines(True), filename)
+    namespace = {"tilelang": tilelang, "T": T}
+    exec(compile(text, filename, "exec"), namespace)
+    return namespace["build"]()
 
 
-def launch_expression(compiled: Any, bindings: Mapping[str, Any], states: Mapping[Any, Any], output_dtype: torch.dtype | None = None) -> Any:
-    """Launch one generated Triton kernel for eligible descriptor pointwise DAGs.
+def launch_expression(compiled: Any, bindings: Mapping[str, Any], states: Mapping[Any, Any],
+                      output_dtype: torch.dtype | None = None) -> Any:
+    """Execute one TileLang kernel, or return None for CPU-only evaluation.
 
-    Returns ``None`` when the invocation is not CUDA or includes a reduction/cut;
-    callers must then use their explicit CPU/reference path.  CUDA callers are
-    never silently routed through Torch: unsupported CUDA graphs raise.
+    Reduction/sequence cuts belong to the enclosing Stateful lowering and must
+    not silently route a CUDA graph to the reference evaluator.
     """
-    sources = []
+    if any(node.kind in ("outer", "contract", "shift", "softmax") for node in compiled._nodes):
+        raise RuntimeError("CUDA expression DAG contains a materialization cut; use the lowering that owns the cut")
+    sources, leaves = [], {}
     for node in compiled._nodes:
         if node.kind == "input":
             source = bindings[node.expression.name]
-            if not isinstance(source, torch.Tensor) and not _descriptor(source):
-                raise TypeError("unsupported expression binding")
-            sources.append(source)
-    if not sources:
+        elif node.kind == "state":
+            source = states.get(node.expression, states.get(node.expression.state))
+            if source is None:
+                raise KeyError(f"missing materialized StateTerm binding for {node.expression.state!r}")
+        else:
+            continue
+        if not isinstance(source, torch.Tensor) and not _descriptor(source):
+            raise TypeError("unsupported expression binding")
+        sources.append(source)
+        leaves[node.expression] = source
+    if not sources or not any(_tensor(source).is_cuda for source in sources):
         return None
-    tensors = [s if isinstance(s, torch.Tensor) else s.tensor for s in sources]
-    if not any(t.is_cuda for t in tensors):
-        return None
-    if any(node.kind in ("outer", "contract", "shift", "softmax") for node in compiled._nodes):
-        raise RuntimeError("CUDA expression DAG contains a materialization cut; use the lowering that owns the cut")
-    if not all(t.is_cuda for t in tensors):
+    device = _tensor(sources[0]).device
+    if not all(_tensor(source).device == device for source in sources) or device.type != "cuda":
         raise RuntimeError("CUDA expression bindings must share a device")
-    shape = _logical_shape(sources[0])
-    for source in sources[1:]:
-        source_tensor = source.tensor if _descriptor(source) else source
-        if _logical_shape(source) != shape and source_tensor.numel() != 1:
-            raise ValueError("fused expression inputs must have matching logical shapes")
-    total = 1
-    for n in shape:
-        total *= int(n)
-    device = tensors[0].device
-    result_dtype = output_dtype or (sources[0].dtype if hasattr(sources[0], "dtype") else tensors[0].dtype)
-    outputs = [torch.empty(shape, device=device, dtype=result_dtype) for _ in compiled._roots]
-    key = _kernel_cache_key(compiled, sources, outputs, 128)
+    shape = tuple(torch.broadcast_shapes(*(_logical_shape(source) for source in sources)))
+    node_types = _node_types(compiled, leaves)
+    output_dtypes = tuple(output_dtype or node_types[root] for root in compiled._roots)
+    outputs = tuple(torch.empty(shape, device=device, dtype=dtype) for dtype in output_dtypes)
+    if any(extent == 0 for extent in shape):
+        return outputs[0] if len(outputs) == 1 else outputs
+    key = (compiled._kernel_identity, tuple(_source_key(source) for source in sources),
+           shape, node_types, output_dtypes, device.index)
     kernel = _CACHE.get(key)
     if kernel is None:
-        kernel = _make_kernel(compiled, sources, (), compiled._roots, [o.dtype for o in outputs], 128)
+        kernel = _make_kernel(compiled, sources, shape, node_types, output_dtypes, 128)
         _CACHE[key] = kernel
-    if kernel is None:
-        raise RuntimeError("Triton is unavailable for CUDA expression lowering")
-    kwargs = {f"O{i}": output for i, output in enumerate(outputs)}
-    kwargs.update({f"X{i}": source.tensor if _descriptor(source) else source for i, source in enumerate(sources)})
-    for i, source in enumerate(sources):
-        if _descriptor(source):
-            kwargs.update({f"X{i}_s{axis}": int(stride) for axis, stride in enumerate(source.source_strides)})
-    kernel[(triton.cdiv(total, 128),)](**kwargs, TOTAL=total, BLOCK=128)
-    return outputs[0] if len(outputs) == 1 else tuple(outputs)
+    kernel(*(_storage_view(source) for source in sources), *(output.view(-1) for output in outputs))
+    return outputs[0] if len(outputs) == 1 else outputs
 
 
 __all__ = ["launch_expression"]

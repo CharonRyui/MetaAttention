@@ -10,7 +10,7 @@ caller and are never re-evaluated here.
 The reference implementation uses native Torch elementwise operations.  This is
 important for CPU, autograd, arbitrary strides, and for preserving Torch's dtype
 rounding at every authored node.  CUDA lowerers can replace the private execution
-adapter with a Triton launch without changing this interface; no intermediate
+adapter with a TileLang launch without changing this interface; no intermediate
 expression tensor is required by the evaluator itself.
 """
 from __future__ import annotations
@@ -181,7 +181,7 @@ class CompiledExpression:
     def fused(self) -> bool:
         """Whether this DAG has no reduction/materialization node.
 
-        All nodes accepted here are pointwise and can be emitted as one Triton
+        All nodes accepted here are pointwise and can be emitted as one TileLang
         elementwise chain by a CUDA adapter.  State terms are leaves, not cuts.
         """
         return True

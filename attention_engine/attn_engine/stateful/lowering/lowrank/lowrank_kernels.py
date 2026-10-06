@@ -1,280 +1,117 @@
-"""Ordered low-rank affine chunk summaries, FP32 carries and parallel replay."""
+"""TileLang lowering for ordered low-rank affine recurrences.
 
-from __future__ import annotations
+The kernel intentionally uses a simple one-program-per-(sequence,head,column
+block) schedule.  All state updates and contractions are FP32 and the Python
+ABI remains the historical token-major ABI.
+"""
 
+from functools import lru_cache
 import torch
-import triton
-import triton.language as tl
 
-CHUNK = tl.constexpr(64)
+_BLOCK = 32
 
 
-@triton.jit
-def _pairs(
-    L,
-    R,
-    C,
-    G,
-    IK,
-    IV,
-    P,
-    D,
-    Bias,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    BR: tl.constexpr,
-    OPS: tl.constexpr,
-    INJECTIONS: tl.constexpr,
+def _meta(x):
+    return tuple(x.shape), tuple(x.stride()), str(x.dtype).removeprefix("torch.")
+
+
+@lru_cache(maxsize=None)
+def _compile(
+    left_meta, right_meta, coeff_meta, gate_meta, inj_l_meta, inj_r_meta,
+    query_meta, initial_meta, output_meta, final_meta,
+    *, batch, heads, rows, columns, tokens, ops, injections, readouts,
+    device_index,
 ):
-    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    r = tl.arange(0, BR)
-    c = block * 32 + tl.arange(0, 32)
-    # P and additive bias are replayed together; only bias sees column decay.
-    is_transform = c < ROWS
-    vcol = c - ROWS
-    matrix = tl.where((r[:, None] == c[None, :]) & is_transform[None, :], 1.0, 0.0)
-    column_scale = tl.full((32,), 1.0, tl.float32)
-    for step in range(CHUNK):
-        token = chunk * CHUNK + step
-        flat = (seq * LENGTH + token) * HEADS + head
-        for op in tl.static_range(len(OPS)):
-            if OPS[op] == 0:
-                factor = tl.load(
-                    C + op * LENGTH * tl.num_programs(0) + flat, token < LENGTH, 1.0
-                )
-                matrix *= factor
-            elif OPS[op] == 1:
-                factor = tl.load(
-                    L + (op * LENGTH * tl.num_programs(0) + flat) * ROWS + r,
-                    (token < LENGTH) & (r < ROWS),
-                    1.0,
-                )
-                matrix *= factor[:, None]
-            elif OPS[op] == 3:
-                factor = tl.load(
-                    G + (op * LENGTH * tl.num_programs(0) + flat) * COLS + vcol,
-                    (token < LENGTH) & (~is_transform) & (vcol < COLS),
-                    1.0,
-                )
-                matrix *= factor[None, :]
-                column_scale *= factor
-            else:
-                left = tl.load(
-                    L + (op * LENGTH * tl.num_programs(0) + flat) * ROWS + r,
-                    (token < LENGTH) & (r < ROWS),
-                    0.0,
-                )
-                right = tl.load(
-                    R + (op * LENGTH * tl.num_programs(0) + flat) * ROWS + r,
-                    (token < LENGTH) & (r < ROWS),
-                    0.0,
-                )
-                coefficient = tl.load(
-                    C + op * LENGTH * tl.num_programs(0) + flat, token < LENGTH, 0.0
-                )
-                dot = tl.sum(matrix * right[:, None], 0)
-                matrix += coefficient * left[:, None] * dot[None, :]
-        for injection in tl.static_range(INJECTIONS):
-            key = tl.load(
-                IK + (injection * LENGTH * tl.num_programs(0) + flat) * ROWS + r,
-                (token < LENGTH) & (r < ROWS),
-                0.0,
-            )
-            value = tl.load(
-                IV + (injection * LENGTH * tl.num_programs(0) + flat) * COLS + vcol,
-                (token < LENGTH) & (~is_transform) & (vcol < COLS),
-                0.0,
-            )
-            matrix += key[:, None] * value[None, :]
-    tl.store(
-        P + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * ROWS + c[None, :],
-        matrix,
-        (r[:, None] < ROWS) & is_transform[None, :],
-    )
-    tl.store(
-        Bias + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + vcol[None, :],
-        matrix,
-        (r[:, None] < ROWS) & (~is_transform[None, :]) & (vcol[None, :] < COLS),
-    )
-    tl.store(
-        D + (sh * CHUNKS + chunk) * COLS + vcol,
-        column_scale,
-        (~is_transform) & (vcol < COLS),
-    )
+    import tilelang
+    import tilelang.language as T
+
+    col_blocks = (columns + _BLOCK - 1) // _BLOCK
+    length = tokens // batch
+    opcodes = tuple(ops)
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build():
+        @T.prim_func
+        def kernel(
+            Left: T.StridedTensor(*left_meta), Right: T.StridedTensor(*right_meta),
+            Coeff: T.StridedTensor(*coeff_meta), Gate: T.StridedTensor(*gate_meta),
+            InjectionLeft: T.StridedTensor(*inj_l_meta), InjectionRight: T.StridedTensor(*inj_r_meta),
+            Query: T.StridedTensor(*query_meta), Initial: T.StridedTensor(*initial_meta),
+            Output: T.StridedTensor(*output_meta), Final: T.StridedTensor(*final_meta),
+        ):
+            with T.Kernel(batch * heads, col_blocks, threads=128) as (sh, cb):
+                sequence = sh // heads
+                head = sh % heads
+                state = T.alloc_shared((rows, _BLOCK), "float32")
+                for r, c in T.Parallel(rows, _BLOCK):
+                    state[r, c] = T.if_then_else(
+                        c + cb * _BLOCK < columns,
+                        T.cast(Initial[sequence, head, r, c + cb * _BLOCK], "float32"), 0.0,
+                    )
+                T.sync_threads()
+                for token in T.serial(length):
+                    flat = sequence * length + token
+                    # Authored operation order is retained exactly.
+                    for op, code in enumerate(opcodes):
+                        if code == 0:
+                            factor = T.cast(Coeff[op, flat, head], "float32")
+                            for r, c in T.Parallel(rows, _BLOCK):
+                                state[r, c] = state[r, c] * factor
+                        elif code == 1:
+                            for r, c in T.Parallel(rows, _BLOCK):
+                                factor = T.if_then_else(r < rows, T.cast(Left[op, flat, head, r], "float32"), 1.0)
+                                state[r, c] = state[r, c] * factor
+                        elif code == 3:
+                            for r, c in T.Parallel(rows, _BLOCK):
+                                factor = T.if_then_else(c + cb * _BLOCK < columns, T.cast(Gate[op, flat, head, c + cb * _BLOCK], "float32"), 1.0)
+                                state[r, c] = state[r, c] * factor
+                        else:
+                            projection = T.alloc_shared((_BLOCK,), "float32")
+                            for c in T.Parallel(_BLOCK):
+                                projection[c] = 0.0
+                            T.sync_threads()
+                            for r in T.serial(rows):
+                                for c in T.Parallel(_BLOCK):
+                                    projection[c] += state[r, c] * T.cast(Right[op, flat, head, r], "float32")
+                            T.sync_threads()
+                            coefficient = T.cast(Coeff[op, flat, head], "float32")
+                            for r, c in T.Parallel(rows, _BLOCK):
+                                state[r, c] = state[r, c] + coefficient * T.cast(Left[op, flat, head, r], "float32") * projection[c]
+                            T.sync_threads()
+                    for inj in range(injections):
+                        for r, c in T.Parallel(rows, _BLOCK):
+                            if c + cb * _BLOCK < columns:
+                                state[r, c] = state[r, c] + T.cast(InjectionLeft[inj, flat, head, r], "float32") * T.cast(InjectionRight[inj, flat, head, c + cb * _BLOCK], "float32")
+                        T.sync_threads()
+                    for readout in range(readouts):
+                        projection = T.alloc_shared((_BLOCK,), "float32")
+                        for c in T.Parallel(_BLOCK):
+                            projection[c] = 0.0
+                        T.sync_threads()
+                        for r in T.serial(rows):
+                            query = T.cast(Query[readout, flat, head, r], "float32")
+                            for c in T.Parallel(_BLOCK):
+                                projection[c] += query * state[r, c]
+                        T.sync_threads()
+                        for c in T.Parallel(_BLOCK):
+                            if c + cb * _BLOCK < columns:
+                                Output[readout, flat, head, c + cb * _BLOCK] = projection[c]
+                for r, c in T.Parallel(rows, _BLOCK):
+                    if c + cb * _BLOCK < columns:
+                        Final[sequence, head, r, c + cb * _BLOCK] = state[r, c]
+        return kernel
+    return build()
 
 
-@triton.jit
-def _carry(
-    P,
-    D,
-    Bias,
-    Initial,
-    Carry,
-    Final,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    BR: tl.constexpr,
-):
-    sh, block = tl.program_id(0), tl.program_id(1)
-    r = tl.arange(0, BR)
-    c = block * 32 + tl.arange(0, 32)
-    state = tl.load(
-        Initial + (sh * ROWS + r[:, None]) * COLS + c[None, :],
-        (r[:, None] < ROWS) & (c[None, :] < COLS),
-        0.0,
-    )
-    for chunk in range(CHUNKS):
-        base = (sh * CHUNKS + chunk) * ROWS * COLS
-        tl.store(
-            Carry + base + r[:, None] * COLS + c[None, :],
-            state,
-            (r[:, None] < ROWS) & (c[None, :] < COLS),
-        )
-        transform = tl.load(
-            P + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * ROWS + r[None, :],
-            (r[:, None] < ROWS) & (r[None, :] < ROWS),
-            0.0,
-        )
-        decay = tl.load(D + (sh * CHUNKS + chunk) * COLS + c, c < COLS, 1.0)
-        bias = tl.load(
-            Bias + base + r[:, None] * COLS + c[None, :],
-            (r[:, None] < ROWS) & (c[None, :] < COLS),
-            0.0,
-        )
-        state = (
-            tl.dot(transform, state, input_precision="tf32x3") * decay[None, :] + bias
-        )
-    tl.store(
-        Final + (sh * ROWS + r[:, None]) * COLS + c[None, :],
-        state,
-        (r[:, None] < ROWS) & (c[None, :] < COLS),
-    )
-
-
-@triton.jit
-def _replay(
-    L,
-    R,
-    C,
-    G,
-    IK,
-    IV,
-    Q,
-    Carry,
-    Output,
-    LENGTH: tl.constexpr,
-    HEADS: tl.constexpr,
-    ROWS: tl.constexpr,
-    COLS: tl.constexpr,
-    CHUNKS: tl.constexpr,
-    BR: tl.constexpr,
-    BATCH_HEADS: tl.constexpr,
-    OPS: tl.constexpr,
-    INJECTIONS: tl.constexpr,
-    READOUTS: tl.constexpr,
-):
-    sh, chunk, block = tl.program_id(0), tl.program_id(1), tl.program_id(2)
-    seq, head = sh // HEADS, sh % HEADS
-    r = tl.arange(0, BR)
-    c = block * 16 + tl.arange(0, 16)
-    state = tl.load(
-        Carry + ((sh * CHUNKS + chunk) * ROWS + r[:, None]) * COLS + c[None, :],
-        (r[:, None] < ROWS) & (c[None, :] < COLS),
-        0.0,
-    )
-    for step in range(CHUNK):
-        token = chunk * CHUNK + step
-        flat = (seq * LENGTH + token) * HEADS + head
-        for op in tl.static_range(len(OPS)):
-            if OPS[op] == 0:
-                state *= tl.load(
-                    C + op * LENGTH * BATCH_HEADS + flat, token < LENGTH, 1.0
-                )
-            elif OPS[op] == 1:
-                factor = tl.load(
-                    L + (op * LENGTH * BATCH_HEADS + flat) * ROWS + r,
-                    (token < LENGTH) & (r < ROWS),
-                    1.0,
-                )
-                state *= factor[:, None]
-            elif OPS[op] == 3:
-                factor = tl.load(
-                    G + (op * LENGTH * BATCH_HEADS + flat) * COLS + c,
-                    (token < LENGTH) & (c < COLS),
-                    1.0,
-                )
-                state *= factor[None, :]
-            else:
-                left = tl.load(
-                    L + (op * LENGTH * BATCH_HEADS + flat) * ROWS + r,
-                    (token < LENGTH) & (r < ROWS),
-                    0.0,
-                )
-                right = tl.load(
-                    R + (op * LENGTH * BATCH_HEADS + flat) * ROWS + r,
-                    (token < LENGTH) & (r < ROWS),
-                    0.0,
-                )
-                coefficient = tl.load(
-                    C + op * LENGTH * BATCH_HEADS + flat, token < LENGTH, 0.0
-                )
-                state += (
-                    coefficient
-                    * left[:, None]
-                    * tl.sum(state * right[:, None], 0)[None, :]
-                )
-        for injection in tl.static_range(INJECTIONS):
-            key = tl.load(
-                IK + (injection * LENGTH * BATCH_HEADS + flat) * ROWS + r,
-                (token < LENGTH) & (r < ROWS),
-                0.0,
-            )
-            value = tl.load(
-                IV + (injection * LENGTH * BATCH_HEADS + flat) * COLS + c,
-                (token < LENGTH) & (c < COLS),
-                0.0,
-            )
-            state += key[:, None] * value[None, :]
-        for readout in tl.static_range(READOUTS):
-            query = tl.load(
-                Q + (readout * LENGTH * BATCH_HEADS + flat) * ROWS + r,
-                (token < LENGTH) & (r < ROWS),
-                0.0,
-            )
-            out = tl.sum(state * query[:, None], 0)
-            tl.store(
-                Output + (readout * LENGTH * BATCH_HEADS + flat) * COLS + c,
-                out,
-                (token < LENGTH) & (c < COLS),
-            )
-
-
-def execute(
-    *,
-    operation_codes,
-    left_factors,
-    right_factors,
-    coefficients,
-    injection_left,
-    injection_right,
-    readouts,
-    initial_state,
-    output_dtypes,
-):
+def execute(*, operation_codes, left_factors, right_factors, coefficients,
+            injection_left, injection_right, readouts, initial_state, output_dtypes):
     batch, heads, rows, columns = initial_state.shape
     tokens = readouts[0].shape[0]
+    if tokens % batch:
+        raise ValueError("low-rank token count must divide the State batch")
     length = tokens // batch
-    chunks = triton.cdiv(length, 64)
     device = initial_state.device
-    codes = tuple(
-        {"scale": 0, "row-scale": 1, "rank-one": 2, "column-scale": 3}[code]
-        for code in operation_codes
-    )
+    codes = tuple({"scale": 0, "row-scale": 1, "rank-one": 2, "column-scale": 3}[x] for x in operation_codes)
 
     def binding(part, size):
         if part.numel() == 1:
@@ -284,126 +121,50 @@ def execute(
     from .wy_kernels import eligible, execute as execute_wy
 
     if eligible(tuple(operation_codes), len(injection_left), rows, columns):
-        # Keep FP32 dot operands; BF16 pointers change Triton's dot lowering.
         rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
-
-        def wy_binding(part, size):
-            return binding(part.float(), size)
-
         return execute_wy(
             codes=codes,
-            left=tuple(wy_binding(left_factors[i], rows) for i in rank_ops),
-            right=tuple(wy_binding(right_factors[i], rows) for i in rank_ops),
-            coefficient=tuple(wy_binding(part, 1) for part in coefficients),
-            injection_left=tuple(wy_binding(part, rows) for part in injection_left),
-            injection_right=tuple(wy_binding(part, columns) for part in injection_right),
-            query=tuple(wy_binding(part, rows) for part in readouts),
+            left=tuple(left_factors[i] for i in rank_ops),
+            right=tuple(right_factors[i] for i in rank_ops),
+            coefficient=coefficients,
+            injection_left=injection_left,
+            injection_right=injection_right,
+            query=readouts,
             initial_state=initial_state,
             length=length,
             output_dtypes=output_dtypes,
         )
 
-    # Only the operation-specific buffers that a static Triton branch reads need
-    # the full packed shape. Unused pointers remain valid one-element tensors.
-    def packed(shape, used):
-        return torch.empty(shape if used else (1,), device=device, dtype=torch.float32)
-
-    left_used = any(code in (1, 2) for code in codes)
-    right_used = any(code == 2 for code in codes)
-    coefficient_used = any(code in (0, 2) for code in codes)
-    gate_used = any(code == 3 for code in codes)
-    left = packed((len(codes), tokens, heads, rows), left_used)
-    right = packed((len(codes), tokens, heads, rows), right_used)
-    coefficient = packed((len(codes), tokens, heads), coefficient_used)
-    gate = packed((len(codes), tokens, heads, columns), gate_used)
+    # Static branches only read slots populated for their operation kind.
+    left = torch.empty((len(codes), tokens, heads, rows), device=device, dtype=torch.float32)
+    right = torch.empty((len(codes), tokens, heads, rows), device=device, dtype=torch.float32)
+    coeff = torch.empty((len(codes), tokens, heads), device=device, dtype=torch.float32)
+    gate = torch.empty((len(codes), tokens, heads, columns), device=device, dtype=torch.float32)
     for i, code in enumerate(codes):
         if code in (1, 2):
             left[i].copy_(binding(left_factors[i], rows))
+        if code == 3:
+            gate[i].copy_(binding(left_factors[i], columns))
         if code == 2:
             right[i].copy_(binding(right_factors[i], rows))
         if code in (0, 2):
-            coefficient[i].copy_(binding(coefficients[i], 1).squeeze(-1))
-        if code == 3:
-            gate[i].copy_(binding(left_factors[i], columns))
+            coeff[i].copy_(binding(coefficients[i], 1).squeeze(-1))
 
-    def stack_or_bind(parts, size):
-        if len(parts) == 1:
-            return binding(parts[0], size).float().contiguous()
-        return torch.stack([binding(part, size) for part in parts]).float().contiguous()
-
-    # The common single-injection/single-readout case now reuses an already
-    # contiguous FP32 binding instead of allocating a one-leading-axis stack.
-    ik = stack_or_bind(injection_left, rows)
-    iv = stack_or_bind(injection_right, columns)
-    query = stack_or_bind(readouts, rows)
-
-    transform = torch.empty(
-        batch * heads, chunks, rows, rows, device=device, dtype=torch.float32
+    def stack(parts, size):
+        if not parts:
+            return torch.zeros((1, tokens, heads, size), device=device, dtype=torch.float32)
+        return torch.stack([binding(x, size) for x in parts]).float().contiguous()
+    il = stack(injection_left, rows)
+    ir = stack(injection_right, columns)
+    query = stack(readouts, rows)
+    output = torch.empty((len(readouts), tokens, heads, columns), device=device, dtype=torch.float32)
+    final = torch.empty_like(initial_state, dtype=torch.float32)
+    kernel = _compile(
+        _meta(left), _meta(right), _meta(coeff), _meta(gate), _meta(il), _meta(ir),
+        _meta(query), _meta(initial_state), _meta(output), _meta(final),
+        batch=batch, heads=heads, rows=rows, columns=columns, tokens=tokens,
+        ops=codes, injections=len(injection_left), readouts=len(readouts),
+        device_index=device.index,
     )
-    decay = torch.empty(
-        batch * heads, chunks, columns, device=device, dtype=torch.float32
-    )
-    bias = torch.empty(
-        batch * heads, chunks, rows, columns, device=device, dtype=torch.float32
-    )
-    carry = torch.empty_like(bias)
-    final = torch.empty_like(initial_state)
-    output = torch.empty(
-        len(readouts), tokens, heads, columns, device=device, dtype=torch.float32
-    )
-    _pairs[(batch * heads, chunks, triton.cdiv(rows + columns, 32))](
-        left,
-        right,
-        coefficient,
-        gate,
-        ik,
-        iv,
-        transform,
-        decay,
-        bias,
-        length,
-        heads,
-        rows,
-        columns,
-        chunks,
-        triton.next_power_of_2(rows),
-        codes,
-        len(injection_left),
-    )
-    _carry[(batch * heads, triton.cdiv(columns, 32))](
-        transform,
-        decay,
-        bias,
-        initial_state,
-        carry,
-        final,
-        rows,
-        columns,
-        chunks,
-        triton.next_power_of_2(rows),
-    )
-    _replay[(batch * heads, chunks, triton.cdiv(columns, 16))](
-        left,
-        right,
-        coefficient,
-        gate,
-        ik,
-        iv,
-        query,
-        carry,
-        output,
-        length,
-        heads,
-        rows,
-        columns,
-        chunks,
-        triton.next_power_of_2(rows),
-        batch * heads,
-        codes,
-        len(injection_left),
-        len(readouts),
-    )
-    return tuple(
-        output[i].reshape(batch, length, heads, columns).permute(0, 2, 1, 3).to(dtype)
-        for i, dtype in enumerate(output_dtypes)
-    ), final
+    kernel(left, right, coeff, gate, il, ir, query, initial_state, output, final)
+    return tuple(output[i].reshape(batch, length, heads, columns).permute(0, 2, 1, 3).to(dtype) for i, dtype in enumerate(output_dtypes)), final.to(initial_state.dtype)

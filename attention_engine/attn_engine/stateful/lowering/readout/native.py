@@ -4,8 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import torch
-import triton
-import triton.language as tl
 
 from ...runtime.bindings import DenseRawBindingRecipe, compile_dense_binding
 
@@ -87,26 +85,6 @@ def compile_native_normalized(algorithm, normalized):
     )
 
 
-@triton.jit
-def _load_dense(P, seq, head, t, x, SIZE: tl.constexpr, STRIDES: tl.constexpr,
-                GROUP: tl.constexpr, VALID, SCALE: tl.constexpr = None):
-    dtype: tl.constexpr = P.dtype.element_ty
-    result = tl.load(P + seq * STRIDES[0] + (head // GROUP) * STRIDES[1]
-                     + t * STRIDES[2] + x * STRIDES[3], VALID & (x < SIZE), 0).to(tl.float32)
-    if SCALE is not None:
-        # CUDA TensorIterator converts scalar to the vector computation dtype,
-        # then rounds the authored multiply before the FP32 contraction seam.
-        scalar = tl.full((), SCALE, tl.float32).to(dtype).to(tl.float32)
-        result = (result * scalar).to(dtype).to(tl.float32)
-    if dtype == tl.bfloat16:
-        # Stop Triton's source-bitwidth analysis at the FP32 contraction seam.
-        # Otherwise a BF16 load selects kWidth=2 instead of the staged FP32
-        # kWidth=1 and reorders the summary accumulation. This bitwise move
-        # is non-pure only to keep that analysis from walking through it.
-        result = tl.inline_asm_elementwise("mov.b32 $0, $1;", constraints="=f,f",
-                                         args=[result], dtype=tl.float32,
-                                         is_pure=False, pack=1)
-    return tl.where(VALID & (x < SIZE), result, 0.0)
 
 
 def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
@@ -118,7 +96,7 @@ def _prepare_normalized_pair(key, den_key, value, initial, den_initial,
 
     rows, columns = initial.shape[-2:]
     bh = initial.shape[0] * heads
-    chunks = triton.cdiv(sequence_length, 64)
+    chunks = (sequence_length + 63) // 64
     if chunks == 1:
         # The only exclusive carry is the initial State; no scratch is consumed.
         if not return_final_state:

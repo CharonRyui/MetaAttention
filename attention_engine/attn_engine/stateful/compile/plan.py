@@ -356,10 +356,10 @@ class CandidateLowerer:
                 resources = shape.native_resources
                 token_bytes, chunk_bytes = resources.output_bytes, resources.chunk_bytes
                 launches = resources.launches
-                if self.name == "triton-chunked-shared-scores":
+                if self.name == "tilelang-chunked-shared-scores":
                     chunk_bytes += resources.score_bytes
                     launches += resources.score_launches
-                elif self.name == "triton-chunked-readout-cut":
+                elif self.name == "tilelang-chunked-readout-cut":
                     token_bytes += resources.cut_bytes
                     launches += 2
                 elif resources.cut_bytes and not resources.fused_softmax:
@@ -467,12 +467,12 @@ LOWERERS = (
         "chunked-stateful",
     ),
     CandidateLowerer(
-        "triton-chunked-shared-scores",
+        "tilelang-chunked-shared-scores",
         (PlanRepresentation.CHUNKED_STATEFUL,),
         "chunked-stateful",
     ),
     CandidateLowerer(
-        "triton-chunked-readout-cut",
+        "tilelang-chunked-readout-cut",
         (PlanRepresentation.CHUNKED_STATEFUL,),
         "chunked-stateful",
     ),
@@ -1059,14 +1059,14 @@ def compile_plan(
     for item in mathematical_plans:
         native_diagonal = None if chunked_recipe is None else chunked_recipe.native_diagonal
         for lowerer in LOWERERS:
-            if lowerer.name == "triton-chunked-shared-scores" and (
+            if lowerer.name == "tilelang-chunked-shared-scores" and (
                 native_diagonal is None
                 or native_diagonal.softmax is not None
                 or any(len(state.injections) != 1 for state in native_diagonal.states)
                 or not any(state.identity_columns for state in native_diagonal.states)
             ):
                 continue
-            if lowerer.name == "triton-chunked-readout-cut" and (
+            if lowerer.name == "tilelang-chunked-readout-cut" and (
                 native_diagonal is None or native_diagonal.softmax is None
                 or not native_diagonal.fused_softmax
             ):
@@ -1348,6 +1348,7 @@ def _toolchain_fingerprint() -> tuple[str, ...]:
         torch.__version__,
         str(torch.version.cuda),
         tilelang_version,
+        "stateful-lowering/tilelang-1",
     )
 
 

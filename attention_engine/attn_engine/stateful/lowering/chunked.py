@@ -645,8 +645,8 @@ def select_chunked_schedule(recipe, lowerer):
     native = recipe.native_diagonal
     return replace(recipe, native_diagonal=replace(
         native,
-        shared_scores=lowerer == "triton-chunked-shared-scores",
-        fused_softmax=native.fused_softmax and lowerer != "triton-chunked-readout-cut",
+        shared_scores=lowerer == "tilelang-chunked-shared-scores",
+        fused_softmax=native.fused_softmax and lowerer != "tilelang-chunked-readout-cut",
     ))
 
 

@@ -7,7 +7,7 @@ import torch
 
 from attn_engine.stateful.lowering.lowrank.lowrank_kernels import execute
 
-pytestmark = pytest.mark.gpu
+pytestmark = [pytest.mark.functional, pytest.mark.gpu]
 
 
 def _case(device, length, dtype, *, vector_scale=False):
@@ -92,15 +92,31 @@ def _slice(arguments, start, stop):
 @pytest.mark.parametrize("length", [1, 17, 67])
 def test_wy_ordered_two_rank_updates_multiple_terms_and_continuation(gpu_device, dtype, length):
     arguments = _case(gpu_device, length, dtype)
+    # Verify BF16 input arithmetic independently of output quantization.
+    arguments["output_dtypes"] = (torch.float32, torch.float32)
     with torch.no_grad():
-        output, final = execute(**arguments)
+        full_precision, full_precision_final = execute(**arguments)
     for precision in (torch.float64, torch.float32):
         expected, expected_final = _oracle(arguments, precision)
-        for actual, reference in zip(output, expected, strict=True):
-            # Output storage conversion is the only low-precision rounding here.
-            reference = reference.to(dtype).float()
-            torch.testing.assert_close(actual.cpu().float(), reference, rtol=2e-4, atol=2e-4)
-        torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+        for actual, reference in zip(full_precision, expected, strict=True):
+            torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(full_precision_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    arguments["output_dtypes"] = (dtype, dtype)
+    with torch.no_grad():
+        output, final = execute(**arguments)
+    for actual, reference in zip(output, expected, strict=True):
+        if dtype == torch.bfloat16:
+            # Tiny FP32 errors can cross a BF16 midpoint. Bound error against
+            # the unrounded oracle, not one arbitrarily selected rounded side.
+            rounded = reference.to(dtype)
+            above = torch.nextafter(rounded, torch.full_like(rounded, float("inf")))
+            below = torch.nextafter(rounded, torch.full_like(rounded, float("-inf")))
+            ulp = torch.maximum(above.float() - rounded.float(), rounded.float() - below.float())
+            bound = ulp.double() * 0.5 + 2e-6 + reference.abs() * 2e-5
+            assert torch.all((actual.cpu().double() - reference).abs() <= bound)
+        else:
+            torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
     assert final.dtype == torch.float32
     if length > 1:
         split = length // 2
@@ -111,7 +127,15 @@ def test_wy_ordered_two_rank_updates_multiple_terms_and_continuation(gpu_device,
             suffix_args["initial_state"] = prefix_final
             suffix, suffix_final = execute(**suffix_args)
         for actual, first, last in zip(output, prefix, suffix, strict=True):
-            torch.testing.assert_close(torch.cat((first, last), 2), actual, rtol=2e-4, atol=2e-4)
+            if dtype == torch.bfloat16:
+                # Each partition may round to either side of a midpoint.
+                joined = torch.cat((first, last), 2)
+                above = torch.nextafter(actual, torch.full_like(actual, float("inf")))
+                below = torch.nextafter(actual, torch.full_like(actual, float("-inf")))
+                ulp = torch.maximum(above.float() - actual.float(), actual.float() - below.float())
+                assert torch.all((joined.float() - actual.float()).abs() <= ulp + 2e-6)
+            else:
+                torch.testing.assert_close(torch.cat((first, last), 2), actual, rtol=2e-4, atol=2e-4)
         torch.testing.assert_close(suffix_final, final, rtol=2e-4, atol=2e-4)
 
 
@@ -157,6 +181,23 @@ def test_single_rank_injection_and_readout_with_partial_chunk(gpu_device):
     expected, expected_final = _oracle(arguments, torch.float64)
     torch.testing.assert_close(output[0].cpu(), expected[0].float(), rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+
+
+def test_rank_only_transition_without_injections(gpu_device):
+    arguments = _case(gpu_device, 35, torch.float32)
+    arguments["operation_codes"] = ("rank-one",)
+    for name in ("left_factors", "right_factors", "coefficients"):
+        arguments[name] = arguments[name][:1]
+    arguments["injection_left"] = []
+    arguments["injection_right"] = []
+    initial = arguments["initial_state"].clone()
+    with torch.no_grad():
+        output, final = execute(**arguments)
+    expected, expected_final = _oracle(arguments, torch.float64)
+    for actual, reference in zip(output, expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(arguments["initial_state"], initial, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
