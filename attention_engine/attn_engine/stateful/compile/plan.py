@@ -485,6 +485,21 @@ LOWERERS = (
     ),
 )
 
+def _backward_configuration(
+    forward_values: tuple[tuple[str, int], ...],
+    family: str,
+    profile: DeviceProfile,
+) -> tuple[tuple[str, int], ...]:
+    """Reuse the selected forward launch width when backward uses that knob."""
+    name = "block_tokens" if family == "elementwise" else "threads"
+    values = dict(forward_values)
+    fallback = (
+        profile.default_block_tokens[0]
+        if name == "block_tokens"
+        else profile.default_threads[0]
+    )
+    return ((name, int(values.get(name, fallback))),)
+
 
 def backward_context_family(
     algorithm: Any, candidate: LoweredCandidate, dense_summary: bool
@@ -1208,11 +1223,7 @@ def compile_plan(
         from ..lowering.backward import bind_backward
 
         family = backward_context_family(operator.algorithm, candidate, dense_summary)
-        backward_values = (
-            (("threads", 128),)
-            if family in {"dense", "factored"}
-            else (("block_tokens", 128),)
-        )
+        backward_values = _backward_configuration(values, family, device_profile)
         backward_binding = bind_backward(backward_ir, family, backward_values)
     context_values = (
         tuple(ContextValue(*value) for value in backward_binding.context_values)

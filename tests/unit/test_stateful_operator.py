@@ -110,6 +110,12 @@ def test_backward_compilation_publishes_compiler_owned_backward_candidate():
         == executable.plan.context_contract.produced
     )
 
+def test_backward_binding_reuses_selected_forward_schedule():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator, backward=True)
+    executable = operator._plans[compiled.specialization]
+    assert executable.plan.backward_kernel_config.values == executable.plan.kernel_config.values
+
 
 def test_context_contract_rejects_dtype_role_and_shape_mismatches():
     from attn_engine.stateful.compile.plan import ContextContract, ContextValue

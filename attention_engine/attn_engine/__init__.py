@@ -45,3 +45,4 @@ from .stateful_operator import (
     Target as Target,
     TensorInput as TensorInput,
 )
+from .stateful.compile.device import DeviceProfile as DeviceProfile, ScheduleConfig as ScheduleConfig
