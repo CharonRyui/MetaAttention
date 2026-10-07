@@ -466,3 +466,84 @@ No tolerance was relaxed and no candidate arithmetic entered the repository.
 Raw rounds and memory observations:
 `benchmark_results/stateful_tilelang015_native_cache_followup.json`.
 
+### Composed-IR generality matrix (2026-10-07)
+
+Tested the committed `3e491e4` implementation on idle H20 GPU 0 with four
+model-independent compositions from `testing/stateful_composition_profiles.py`:
+dual-axis scaling (control), two product injections with two independent queries,
+rank-one propagation with two queries, and ordered row-scale → rank-one →
+column-scale with two injections and two queries. Dual-axis scaling and the base
+rank-one algebra exist in FLA; “no direct adapter” for the composed interfaces
+does **not** establish that FLA cannot express them by composition. These results
+compare the same IR with `optimized=True/False`, not Meta versus FLA.
+
+All inputs and outputs are FP32. Three B/H/source-head/K/V/T shapes were
+`1/4/2/13/19/65`, `2/8/2/35/67/257`, and `1/8/2/64/128/2048`; four renamed-input
+and renamed-role cases repeat the middle shape. Sixteen cases author
+`Readout(StateTerm(...))`; four `1/4/2/64/128/129` cases author the legacy
+`StateContraction` ABI. Its existing specialization rejects odd feature sizes;
+the expression ABI accepts them. This ABI distinction is a measured boundary,
+not a migrated or relaxed validation rule.
+
+The main matrix records **15 VALID / 20 total**, two resource-envelope failures,
+and three invalid-baseline comparisons. Every VALID case passes an independent
+authored-order CPU FP32 token oracle, nonzero initial-State, split-at-17
+continuation, and exact initial-State immutability. Non-reference optimized
+paths also pass changed-query CUDA Graph replay. Tolerances remain
+`rtol=2e-4, atol=2e-5`; FP32 input standard deviation is 0.01, gates are negative
+absolute values, and coefficients remain signed. This is not an adversarial
+numerical-stability sweep, nor BF16, packed, backward, or multi-State coverage.
+
+Public-call timings exclude compilation and use ten alternating rounds, each
+with three warmed CUDA-event samples. Peak incremental allocation is measured
+before Graph capture and includes returned outputs/final-State.
+
+| Composition / authored ABI | K×V / T | Actual baseline | Optimized public ms | Baseline public ms | Public speedup |
+| --- | --- | --- | ---: | ---: | ---: |
+| Dual-axis control / expression | 13×19 / 65 | reference-stateful | 0.2850 | 0.9263 | 3.25× |
+| Dual-axis control / expression | 35×67 / 257 | reference-stateful | 0.3964 | 1.1092 | 2.80× |
+| Dual-axis control / expression | 64×128 / 2048 | reference-stateful | 0.5829 | 4.9395 | 8.47× |
+| Two injections, two queries / expression | 13×19 / 65 | reference-stateful | 0.4225 | 1.1007 | 2.61× |
+| Two injections, two queries / expression | 35×67 / 257 | reference-stateful | 0.4393 | 1.2630 | 2.88× |
+| Two injections, two queries / expression | 64×128 / 2048 | reference-stateful | 0.6053 | 5.5306 | 9.14× |
+| Two injections, two queries / contraction | 64×128 / 129 | tilelang-generic | 0.4139 | 0.7166 | 1.73× |
+
+The injection contraction comparison also measures Graph replay
+`0.10864 vs 0.17621 ms` (1.62×), and peak incremental allocation
+`1.754 vs 89.452 MiB`. The long expression injection case allocates
+`40.25 vs 2072.15 MiB`. These are different baseline implementations and must
+not be combined into one kernel speedup claim. Renamed axis/injection cases
+retain `tilelang-chunked-stateful` and pass correctness; their public ratios
+are 2.76×/2.86× against reference-stateful.
+
+Important limits exposed by the matrix:
+
+- Expression rank-one/mixed cases select `reference-stateful` even when
+  optimized. Smaller shapes and renamed variants pass, but both flags run the
+  same fallback (approximately 1×), not a demonstrated structured optimization.
+  Both long cases fail the 4 GiB compiled resource envelope before execution;
+  no GPU OOM was observed or attempted.
+- Initial reference-path Graph capture failed; subsequent reference Graph
+  timings are explicitly unavailable, not silently approximated by events.
+- The axis/rank-one/mixed contraction comparisons fail **only the
+  `tilelang-generic` baseline**. Per-lowerer isolation passes optimized outputs
+  and final-State (maximum error across these cases `1.26e-8`); baseline maximum
+  output errors are `6.22e-5`, `8.07e-5`, and `5.86e-5`, respectively. No valid
+  speedup is claimed for those comparisons, no tolerance is relaxed, and the
+  generic-path numerical cause is not established by this investigation.
+
+The three optimized contraction paths also pass a separate continuation,
+initial-State immutability and changed-query Graph smoke; saved baseline failure
+evidence is reused without rerunning the invalid baseline. Standalone warmed
+public/Graph timings are axis `0.27470/0.07438 ms`, rank-one
+`81.09063/80.26430 ms`, and mixed `1.08630/0.50688 ms`. The rank-one result
+exposes a severe latency risk in this selected factored schedule; its cause
+is not diagnosed here. Correctness does not establish acceptable performance.
+Those timings are not paired comparisons and carry no speedup ratios.
+See `optimized_contracts/records.json` and `conclusions.json`.
+
+Raw rounds, memory, boundaries and per-lowerer attribution are retained in
+`benchmark_results/stateful_generality_20261007/`, including the original
+failed matrix rather than replacing it with a passing subset. No runtime code
+or eligibility rule changed during this investigation.
+
