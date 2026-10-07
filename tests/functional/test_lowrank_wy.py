@@ -139,14 +139,36 @@ def test_wy_ordered_two_rank_updates_multiple_terms_and_continuation(gpu_device,
         torch.testing.assert_close(suffix_final, final, rtol=2e-4, atol=2e-4)
 
 
-def test_noncommuting_row_scale_keeps_existing_runtime(gpu_device):
-    arguments = _case(gpu_device, 19, torch.float32, vector_scale=True)
+@pytest.mark.parametrize("length", [1, 19, 65, 130])
+def test_noncommuting_row_scale_output_continuation_and_graph(gpu_device, length):
+    arguments = _case(gpu_device, length, torch.float32, vector_scale=True)
+    initial_before = arguments["initial_state"].clone()
     with torch.no_grad():
         output, final = execute(**arguments)
     expected, expected_final = _oracle(arguments, torch.float64)
     for actual, reference in zip(output, expected, strict=True):
         torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(arguments["initial_state"], initial_before, rtol=0, atol=0)
+    if length > 1:
+        split = min(63, length - 1)
+        prefix_args = _slice(arguments, 0, split)
+        suffix_args = _slice(arguments, split, length)
+        with torch.no_grad():
+            prefix, carried = execute(**prefix_args)
+            suffix_args["initial_state"] = carried
+            suffix, split_final = execute(**suffix_args)
+        for first, last, reference in zip(prefix, suffix, expected, strict=True):
+            torch.testing.assert_close(torch.cat((first, last), 2).cpu(), reference.float(),
+                                       rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(split_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    graph = torch.cuda.CUDAGraph()
+    with torch.no_grad(), torch.cuda.graph(graph):
+        captured, captured_final = execute(**arguments)
+    graph.replay()
+    for actual, reference in zip(captured, expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(captured_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
 
 
 def test_reversing_two_arbitrary_rank_updates_changes_outputs(gpu_device):
@@ -247,3 +269,19 @@ def test_wy_strided_factors_broadcast_heads_and_scalar_gates(gpu_device, dtype):
             rtol=2e-4, atol=2e-4,
         )
     torch.testing.assert_close(suffix_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+
+
+def test_wy_three_event_padding_with_partial_feature_tiles(gpu_device):
+    arguments = _case(gpu_device, 67, torch.float32)
+    # Two rank events plus one injection require 48 real events in a 64 tile.
+    arguments["injection_left"] = arguments["injection_left"][:1]
+    arguments["injection_right"] = arguments["injection_right"][:1]
+    for name in ("left_factors", "right_factors", "injection_left", "readouts"):
+        arguments[name] = [tensor[..., :31] for tensor in arguments[name]]
+    arguments["initial_state"] = arguments["initial_state"][..., :31, :]
+    with torch.no_grad():
+        output, final = execute(**arguments)
+    expected, expected_final = _oracle(arguments, torch.float64)
+    for actual, reference in zip(output, expected, strict=True):
+        torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)

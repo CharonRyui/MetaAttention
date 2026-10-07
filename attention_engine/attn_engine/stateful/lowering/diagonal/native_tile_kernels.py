@@ -5,6 +5,10 @@ This module is deliberately independent from :mod:`diagonal_native`.  It lowers
 path it never materializes an authored expression with Python/Torch indexing.
 All arithmetic is authored as FP32, with an explicit BF16 round trip at every
 DenseLoader BF16 node.
+
+Replay retains one carry tile per independent chunk in row/column fragments.
+State transitions remain token-ordered; only the Feature-axis contraction is
+distributed across the CTA instead of serialized inside each column lane.
 """
 import hashlib
 import linecache
@@ -306,30 +310,36 @@ def _replay_kernel(sources, maps, loaders, row_gate, column_gate, injections, qu
     else:
         query_load = _expr_ref(query_expression, sources, maps, loaders, token="flat", head="head", feature="r", length=length)
     chunks = (length + _CHUNK - 1) // _CHUNK
-    body = f"""        with T.Kernel({batch * heads * chunks}, T.ceildiv({columns}, {_TILE}), threads={_TILE}) as (shc, block):
-            tid = T.get_thread_binding()
-            c = block * {_TILE} + tid
+    padded = 1 << (rows - 1).bit_length()
+    body = f"""        with T.Kernel({batch * heads * chunks}, T.ceildiv({columns}, {_TILE}), threads=128) as (shc, block):
             seq_head = shc // {chunks}
             chunk = shc % {chunks}
             seq = seq_head // {heads}
             head = seq_head % {heads}
-            state = T.alloc_local(({rows},), 'float32')
-            result = T.alloc_local((1,), 'float32')
-            if c < {columns}:
-                for r in T.serial({rows}):
-                    state[r] = T.cast(Carry[seq_head, chunk, r, c], 'float32')
-                for step in T.serial({_CHUNK}):
-                    token = chunk * {_CHUNK} + step
-                    if token < {length}:
-                        flat = seq * {length} + token
-                        result[0] = 0.0
-                        for r in T.serial({rows}):
+            state = T.alloc_fragment(({padded}, {_TILE}), 'float32')
+            products = T.alloc_fragment(({padded}, {_TILE}), 'float32')
+            result = T.alloc_fragment(({_TILE},), 'float32')
+            for r, lane in T.Parallel({padded}, {_TILE}):
+                c = block * {_TILE} + lane
+                state[r, lane] = T.if_then_else((r < {rows}) & (c < {columns}), T.cast(Carry[seq_head, chunk, r, c], 'float32'), 0.0)
+            for step in T.serial({_CHUNK}):
+                token = chunk * {_CHUNK} + step
+                if token < {length}:
+                    flat = seq * {length} + token
+                    for r, lane in T.Parallel({padded}, {_TILE}):
+                        c = block * {_TILE} + lane
+                        products[r, lane] = 0.0
+                        if (r < {rows}) & (c < {columns}):
                             if not {bool(prior)}:
-                                state[r] = state[r] * ({rg}) * ({cg}) + ({terms})
-                            result[0] += ({query_load}) * state[r]
+                                state[r, lane] = state[r, lane] * ({rg}) * ({cg}) + ({terms})
+                            products[r, lane] = ({query_load}) * state[r, lane]
                             if {bool(prior)}:
-                                state[r] = state[r] * ({rg}) * ({cg}) + ({terms})
-                        Output[flat, head, c] = result[0]"""
+                                state[r, lane] = state[r, lane] * ({rg}) * ({cg}) + ({terms})
+                    T.reduce_sum(products, result, dim=0)
+                    for lane in T.Parallel({_TILE}):
+                        c = block * {_TILE} + lane
+                        if c < {columns}:
+                            Output[flat, head, c] = result[lane]"""
     annotations = _annotation_sources(sources)
     if annotations:
         annotations += ", "

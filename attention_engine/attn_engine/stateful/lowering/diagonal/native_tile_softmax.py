@@ -1,8 +1,10 @@
 """Native diagonal readout regions lowered entirely to TileLang.
 
-Shared scores are a chunk-local cut, not a materialized input expansion. The
-softmax cut is FP32 and uses a maximum subtraction. Authored pointwise loaders
-are supplied by native_tile_kernels, including their BF16 node boundaries.
+Replay CTAs retain one independent chunk's State in cooperative row/column
+fragments, advancing each element once per token. Shared scores use inverse-free
+reverse gate recurrences and a weighted-query cut reused by column consumers.
+The softmax cut is FP32 and uses maximum subtraction. Authored pointwise loaders
+retain their BF16 node boundaries through native_tile_kernels.
 """
 
 import hashlib
@@ -105,39 +107,61 @@ def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
     if dense_query:
         annotations.append(_annotation("Query", query))
         arguments.append(query)
-    tiles = (columns + 127) // 128
-    body = [f"tile = block % {tiles}", f"target = (block // {tiles}) % {length}",
-            f"sh = block // {tiles * length}", f"head = sh % {heads}",
-            f"sequence = sh // {heads}", f"chunk = target // {_CHUNK}",
-            f"token = sequence * {length} + target",
-            "for lane in T.Parallel(128):", "    c = tile * 128 + lane",
-            f"    if c < {columns}:",
-            "        result = T.alloc_local((1,), 'float32')",
-            "        element = T.alloc_local((1,), 'float32')",
-            "        result[0] = 0.0", f"        for r in T.serial({rows}):",
-            "            element[0] = T.cast(Carry[sh, chunk, r, c], 'float32')",
-            f"            for step in T.serial({_CHUNK}):",
-            f"                local_t = chunk * {_CHUNK} + step",
-            f"                if local_t < target + {0 if prior else 1}:",
-            f"                    source = sequence * {length} + local_t"]
-    _advance(body, "                    ", context, state, "element[0]", "source", "r", "c", "replay")
+    # Match the original Triton replay domain: a CTA owns a chunk and a
+    # column tile, while rows cooperate in the contraction. Each State element
+    # advances once per token, not once per future target in the same chunk.
+    width = 32
+    padded_rows = 1 << (rows - 1).bit_length()
+    tiles = (columns + width - 1) // width
+    body = [f"tile = block % {tiles}", f"chunk = (block // {tiles}) % {chunks}",
+            f"sh = block // {tiles * chunks}", f"head = sh % {heads}",
+            f"sequence = sh // {heads}",
+            f"memory = T.alloc_fragment(({padded_rows}, {width}), 'float32')",
+            f"products = T.alloc_fragment(({padded_rows}, {width}), 'float32')",
+            f"result = T.alloc_fragment(({width},), 'float32')",
+            f"for r, lane in T.Parallel({padded_rows}, {width}):",
+            f"    c = tile * {width} + lane",
+            f"    memory[r, lane] = T.if_then_else((r < {rows}) & (c < {columns}), Carry[sh, chunk, r, c], 0.0)",
+            f"for step in T.serial({_CHUNK}):",
+            f"    target = chunk * {_CHUNK} + step", f"    if target < {length}:",
+            f"        token = sequence * {length} + target"]
+
+    def advance():
+        body.extend([f"        for r, lane in T.Parallel({padded_rows}, {width}):",
+                     f"            c = tile * {width} + lane",
+                     f"            if (r < {rows}) & (c < {columns}):"])
+        _advance(body, "                ", context, state, "memory[r, lane]", "token", "r", "c", "replay")
+
+    if not prior:
+        advance()
+    body.extend([f"        for r, lane in T.Parallel({padded_rows}, {width}):",
+                 f"            c = tile * {width} + lane", "            products[r, lane] = 0.0",
+                 f"            if (r < {rows}) & (c < {columns}):"])
     if dense_query:
         q = "T.cast(Query[token, head, r], 'float32')"
     else:
         lines, q = _load(context, query, "token", "r", "query")
-        _append(body, "            ", lines)
-    body.append(f"            result[0] = result[0] + {q} * element[0]")
+        _append(body, "                ", lines)
+    body += [f"                products[r, lane] = {q} * memory[r, lane]",
+             "        T.reduce_sum(products, result, dim=0)"]
     if bonus is not None:
-        body += ["        extra = T.alloc_local((1,), 'float32')", "        extra[0] = 0.0",
-                 f"        for r in T.serial({rows}):"]
+        body += [f"        extra = T.alloc_fragment(({padded_rows},), 'float32')",
+                 "        bonus_sum = T.alloc_fragment((1,), 'float32')",
+                 f"        for r in T.Parallel({padded_rows}):", "            extra[r] = 0.0",
+                 f"            if r < {rows}:"]
         lines, b = _load(context, bonus, "token", "r", "bonus")
-        _append(body, "            ", lines)
-        body.append(f"            extra[0] = extra[0] + {b}")
+        _append(body, "                ", lines)
+        body += [f"                extra[r] = {b}", "        T.reduce_sum(extra, bonus_sum, dim=0)"]
+    body += [f"        for lane in T.Parallel({width}):", f"            c = tile * {width} + lane",
+             f"            if c < {columns}:"]
+    if bonus is not None:
         lines, v = _load(context, state.injections[0][1], "token", "c", "bonusvalue")
-        _append(body, "        ", lines)
-        body.append(f"        result[0] = result[0] + extra[0] * {v}")
-    body.append("        Output[token, head, c] = result[0]")
-    _compile(annotations, body, batch_heads * length * tiles)(*arguments)
+        _append(body, "                ", lines)
+        body.append(f"                result[lane] = result[lane] + bonus_sum[0] * {v}")
+    body.append("                Output[token, head, c] = result[lane]")
+    if prior:
+        advance()
+    _compile(annotations, body, batch_heads * chunks * tiles)(*arguments)
     return output
 
 
@@ -196,148 +220,164 @@ def softmax_readout(first_state, first_carry, second_state, second_carry,
 
 def _fused_softmax(first, carry1, second, carry2, query, inputs, length, heads,
                    prior1, prior2, output_dtype):
-    batch_heads, _, rows, features = carry1.shape
+    # Retain both State matrices for one independent chunk. Parallel feature
+    # reductions replace the migrated target x row x replay nesting.
+    batch_heads, chunks, rows, features = carry1.shape
     columns = carry2.shape[-1]
-    padded = 1 << (features - 1).bit_length()
+    pr, pm, pc = (1 << (size - 1).bit_length() for size in (rows, features, columns))
     context = _context(_state_expressions(first) + _state_expressions(second) + (query,),
                        inputs, heads, length)
     output = torch.empty((batch_heads // heads * length, heads, columns),
                          device=carry1.device, dtype=output_dtype)
-    body = [f"target = block % {length}", f"sh = block // {length}",
+    body = [f"chunk = block % {chunks}", f"sh = block // {chunks}",
             f"head = sh % {heads}", f"sequence = sh // {heads}",
-            f"chunk = target // {_CHUNK}", f"token = sequence * {length} + target",
-            f"scores = T.alloc_fragment(({padded},), 'float32')",
-            f"weights = T.alloc_shared(({padded},), 'float32')",
+            f"memory1 = T.alloc_fragment(({pr}, {pm}), 'float32')",
+            f"memory2 = T.alloc_fragment(({pm}, {pc}), 'float32')",
+            f"products1 = T.alloc_fragment(({pr}, {pm}), 'float32')",
+            f"products2 = T.alloc_fragment(({pm}, {pc}), 'float32')",
+            f"scores = T.alloc_fragment(({pm},), 'float32')",
+            f"result = T.alloc_fragment(({pc},), 'float32')",
+            f"weights = T.alloc_shared(({pm},), 'float32')",
             "maximum = T.alloc_fragment((1,), 'float32')",
             "denominator = T.alloc_fragment((1,), 'float32')",
-            f"for c in T.Parallel({padded}):",
-            "    total = T.alloc_local((1,), 'float32')",
-            "    element = T.alloc_local((1,), 'float32')",
-            "    total[0] = 0.0", f"    if c < {features}:",
-            f"        for r in T.serial({rows}):",
-            "            element[0] = T.cast(Carry1[sh, chunk, r, c], 'float32')",
-            f"            for step in T.serial({_CHUNK}):",
-            f"                local_t = chunk * {_CHUNK} + step",
-            f"                if local_t < target + {0 if prior1 else 1}:",
-            f"                    source = sequence * {length} + local_t"]
-    _advance(body, "                    ", context, first, "element[0]", "source", "r", "c", "first")
+            f"for r, c in T.Parallel({pr}, {pm}):",
+            f"    memory1[r, c] = T.if_then_else((r < {rows}) & (c < {features}), Carry1[sh, chunk, r, c], 0.0)",
+            f"for r, c in T.Parallel({pm}, {pc}):",
+            f"    memory2[r, c] = T.if_then_else((r < {features}) & (c < {columns}), Carry2[sh, chunk, r, c], 0.0)",
+            f"for step in T.serial({_CHUNK}):",
+            f"    target = chunk * {_CHUNK} + step", f"    if target < {length}:",
+            f"        token = sequence * {length} + target"]
+
+    def advance(state, variable, nrows, ncolumns, padded_r, padded_c, prefix):
+        body.extend([f"        for r, c in T.Parallel({padded_r}, {padded_c}):",
+                     f"            if (r < {nrows}) & (c < {ncolumns}):"])
+        _advance(body, "                ", context, state, f"{variable}[r, c]", "token", "r", "c", prefix)
+
+    if not prior1:
+        advance(first, "memory1", rows, features, pr, pm, "first")
+    body += [f"        for r, c in T.Parallel({pr}, {pm}):",
+             "            products1[r, c] = 0.0",
+             f"            if (r < {rows}) & (c < {features}):"]
     lines, q = _load(context, query, "token", "r", "query")
-    _append(body, "            ", lines)
-    body += [f"            total[0] = total[0] + {q} * element[0]",
-             f"    scores[c] = T.if_then_else(c < {features}, total[0], -T.infinity('float32'))",
-             "T.reduce_max(scores, maximum, dim=0)",
-             f"for c in T.Parallel({padded}):",
-             "    scores[c] = T.exp(scores[c] - maximum[0])",
-             "T.reduce_sum(scores, denominator, dim=0)",
-             f"for c in T.Parallel({padded}):",
-             "    weights[c] = scores[c] / denominator[0]", "T.sync_threads()",
-             f"for c in T.Parallel({columns}):",
-             "    total2 = T.alloc_local((1,), 'float32')",
-             "    element2 = T.alloc_local((1,), 'float32')",
-             "    total2[0] = 0.0", f"    for r in T.serial({features}):",
-             "        element2[0] = T.cast(Carry2[sh, chunk, r, c], 'float32')",
-             f"        for step in T.serial({_CHUNK}):",
-             f"            local_t = chunk * {_CHUNK} + step",
-             f"            if local_t < target + {0 if prior2 else 1}:",
-             f"                source = sequence * {length} + local_t"]
-    _advance(body, "                ", context, second, "element2[0]", "source", "r", "c", "second")
-    body += ["        total2[0] = total2[0] + weights[r] * element2[0]",
-             "    Output[token, head, c] = total2[0]"]
+    _append(body, "                ", lines)
+    body += [f"                products1[r, c] = {q} * memory1[r, c]",
+             "        T.reduce_sum(products1, scores, dim=0)",
+             f"        for c in T.Parallel({pm}):",
+             f"            scores[c] = T.if_then_else(c < {features}, scores[c], -T.infinity('float32'))",
+             "        T.reduce_max(scores, maximum, dim=0)",
+             f"        for c in T.Parallel({pm}):",
+             "            scores[c] = T.exp(scores[c] - maximum[0])",
+             "        T.reduce_sum(scores, denominator, dim=0)",
+             f"        for c in T.Parallel({pm}):",
+             "            weights[c] = scores[c] / denominator[0]", "        T.sync_threads()"]
+    if not prior2:
+        advance(second, "memory2", features, columns, pm, pc, "second")
+    body += [f"        for r, c in T.Parallel({pm}, {pc}):",
+             "            products2[r, c] = weights[r] * memory2[r, c]",
+             "        T.reduce_sum(products2, result, dim=0)",
+             f"        for c in T.Parallel({pc}):", f"            if c < {columns}:",
+             "                Output[token, head, c] = result[c]"]
+    if prior1:
+        advance(first, "memory1", rows, features, pr, pm, "first")
+    if prior2:
+        advance(second, "memory2", features, columns, pm, pc, "second")
+    body.append("        T.sync_threads()")
     annotations = list(context.annotations) + [_annotation("Carry1", carry1),
                                               _annotation("Carry2", carry2),
                                               _annotation("Output", output)]
-    _compile(annotations, body, batch_heads * length)(*context.pointers, carry1, carry2, output)
+    _compile(annotations, body, batch_heads * chunks, threads=256)(*context.pointers, carry1, carry2, output)
     return output
 
 
 def _shared_scores(state, carry, query, inputs, length, heads, prior):
+    """Reverse multiply recurrence; no prefix division at zero/signed gates."""
     batch_heads, _, rows, _ = carry.shape
     count = len(state.injections)
+    padded = 1 << (rows - 1).bit_length()
     context = _context((state.row_gate, query, *(pair[0] for pair in state.injections)),
                        inputs, heads, length)
     scores = torch.empty((batch_heads, length, _CHUNK, count),
                          device=carry.device, dtype=torch.float32)
+    weighted = torch.empty((batch_heads, length, rows), device=carry.device, dtype=torch.float32)
     body = [f"target = block % {length}", f"sh = block // {length}",
             f"head = sh % {heads}", f"sequence = sh // {heads}",
             f"start = (target // {_CHUNK}) * {_CHUNK}",
             f"token = sequence * {length} + target",
-            f"for slot in T.Parallel({_CHUNK}):", "    local_j = start + slot",
-            f"    source_j = sequence * {length} + local_j"]
+            f"weight = T.alloc_fragment(({padded},), 'float32')",
+            f"products = T.alloc_fragment(({padded},), 'float32')",
+            "total = T.alloc_fragment((1,), 'float32')",
+            f"for r in T.Parallel({padded}):", "    weight[r] = 0.0", f"    if r < {rows}:"]
+    lines, q = _load(context, query, "token", "r", "query")
+    _append(body, "        ", lines)
+    body += [f"        weight[r] = {q}", f"for reverse in T.serial({_CHUNK}):",
+             f"    slot = {_CHUNK - 1} - reverse", "    local_j = start + slot",
+             f"    if local_j < target + {0 if prior else 1}:",
+             f"        source_j = sequence * {length} + local_j"]
     for injection, (key, _) in enumerate(state.injections):
-        body += [f"    total{injection} = T.alloc_local((1,), 'float32')",
-                 f"    factor{injection} = T.alloc_local((1,), 'float32')",
-                 f"    total{injection}[0] = 0.0",
-                 f"    if local_j < target + {0 if prior else 1}:",
-                 f"        for r in T.serial({rows}):",
-                 f"            factor{injection}[0] = 1.0",
-                 f"            for step in T.serial({_CHUNK}):",
-                 "                local_t = start + step",
-                 f"                if (local_t > local_j) & (local_t < target + {0 if prior else 1}):",
-                 f"                    source = sequence * {length} + local_t"]
-        lines, gr = _load(context, state.row_gate, "source", "r", f"sg{injection}")
-        _append(body, "                    ", lines)
-        body.append(f"                    factor{injection}[0] = factor{injection}[0] * {gr}")
-        lines, q = _load(context, query, "token", "r", f"sq{injection}")
-        _append(body, "            ", lines)
-        lines, k = _load(context, key, "source_j", "r", f"sk{injection}")
-        _append(body, "            ", lines)
-        body += [f"            total{injection}[0] = total{injection}[0] + {q} * {k} * factor{injection}[0]",
-                 f"    Scores[sh, target, slot, {injection}] = total{injection}[0]"]
-    _compile(list(context.annotations) + [_annotation("Scores", scores)],
-             body, batch_heads * length)(*context.pointers, scores)
-    return scores
+        body += [f"        for r in T.Parallel({padded}):", "            products[r] = 0.0",
+                 f"            if r < {rows}:"]
+        lines, k = _load(context, key, "source_j", "r", f"key{injection}")
+        _append(body, "                ", lines)
+        body += [f"                products[r] = weight[r] * {k}",
+                 "        T.reduce_sum(products, total, dim=0)",
+                 f"        Scores[sh, target, slot, {injection}] = total[0]"]
+    body += [f"        for r in T.Parallel({padded}):", f"            if r < {rows}:"]
+    lines, gr = _load(context, state.row_gate, "source_j", "r", "gate")
+    _append(body, "                ", lines)
+    body += [f"                weight[r] = weight[r] * {gr}", "    else:"]
+    for injection in range(count):
+        body.append(f"        Scores[sh, target, slot, {injection}] = 0.0")
+    body += [f"for r in T.Parallel({padded}):", f"    if r < {rows}:",
+             "        Weighted[sh, target, r] = weight[r]"]
+    _compile(list(context.annotations) + [_annotation("Scores", scores), _annotation("Weighted", weighted)],
+             body, batch_heads * length)(*context.pointers, scores, weighted)
+    return scores, weighted
 
 
-def _apply_shared_scores(state, carry, query, scores, inputs, length, heads,
+def _apply_shared_scores(state, carry, query, score_cut, inputs, length, heads,
                          prior, output_dtype):
     batch_heads, _, rows, columns = carry.shape
-    context = _context(_state_expressions(state) + (query,), inputs, heads, length)
+    scores, weighted = score_cut
+    context = _context((state.column_gate, *(pair[1] for pair in state.injections)), inputs, heads, length)
     output = torch.empty((batch_heads // heads * length, heads, columns),
                          device=carry.device, dtype=output_dtype)
-    tiles = (columns + 127) // 128
+    width = 32
+    padded = 1 << (rows - 1).bit_length()
+    tiles = (columns + width - 1) // width
     body = [f"tile = block % {tiles}", f"target = (block // {tiles}) % {length}",
             f"sh = block // {tiles * length}", f"head = sh % {heads}",
             f"sequence = sh // {heads}", f"chunk = target // {_CHUNK}",
             f"start = chunk * {_CHUNK}", f"token = sequence * {length} + target",
-            "for lane in T.Parallel(128):", "    c = tile * 128 + lane",
-            f"    if c < {columns}:",
-            "        result = T.alloc_local((1,), 'float32')",
-            "        element = T.alloc_local((1,), 'float32')",
-            "        column_factor = T.alloc_local((1,), 'float32')",
-            "        result[0] = 0.0", f"        for r in T.serial({rows}):",
-            "            element[0] = T.cast(Carry[sh, chunk, r, c], 'float32')",
-            f"            for step in T.serial({_CHUNK}):",
-            "                local_t = start + step",
-            f"                if local_t < target + {0 if prior else 1}:",
-            f"                    source = sequence * {length} + local_t"]
-    lines, gr = _load(context, state.row_gate, "source", "r", "carryrg")
-    _append(body, "                    ", lines)
-    lines, gc = _load(context, state.column_gate, "source", "c", "carrycg")
-    _append(body, "                    ", lines)
-    body.append(f"                    element[0] = element[0] * {gr} * {gc}")
-    lines, q = _load(context, query, "token", "r", "carryq")
-    _append(body, "            ", lines)
-    body += [f"            result[0] = result[0] + {q} * element[0]",
-             f"        for slot in T.serial({_CHUNK}):", "            local_j = start + slot",
-             f"            if local_j < target + {0 if prior else 1}:",
-             f"                source_j = sequence * {length} + local_j",
-             "                column_factor[0] = 1.0",
-             f"                for step in T.serial({_CHUNK}):",
-             "                    local_t = start + step",
-             f"                    if (local_t > local_j) & (local_t < target + {0 if prior else 1}):",
-             f"                        source = sequence * {length} + local_t"]
-    lines, gc = _load(context, state.column_gate, "source", "c", "scorecg")
-    _append(body, "                        ", lines)
-    body.append(f"                        column_factor[0] = column_factor[0] * {gc}")
+            f"products = T.alloc_fragment(({padded}, {width}), 'float32')",
+            f"result = T.alloc_fragment(({width},), 'float32')",
+            f"column_factor = T.alloc_fragment(({width},), 'float32')",
+            f"injected = T.alloc_fragment(({width},), 'float32')",
+            f"for r, lane in T.Parallel({padded}, {width}):",
+            f"    c = tile * {width} + lane", "    products[r, lane] = 0.0",
+            f"    if (r < {rows}) & (c < {columns}):",
+            "        products[r, lane] = Weighted[sh, target, r] * Carry[sh, chunk, r, c]",
+            "T.reduce_sum(products, result, dim=0)",
+            f"for lane in T.Parallel({width}):",
+            "    column_factor[lane] = 1.0", "    injected[lane] = 0.0",
+            f"for reverse in T.serial({_CHUNK}):", f"    slot = {_CHUNK - 1} - reverse",
+            "    local_j = start + slot", f"    if local_j < target + {0 if prior else 1}:",
+            f"        source_j = sequence * {length} + local_j",
+            f"        for lane in T.Parallel({width}):", f"            c = tile * {width} + lane",
+            f"            if c < {columns}:"]
     for injection, (_, value) in enumerate(state.injections):
-        lines, v = _load(context, value, "source_j", "c", f"scorev{injection}")
+        lines, v = _load(context, value, "source_j", "c", f"value{injection}")
         _append(body, "                ", lines)
-        body.append(f"                result[0] = result[0] + Scores[sh, target, slot, {injection}] * {v} * column_factor[0]")
-    body.append("        Output[token, head, c] = result[0]")
+        body.append(f"                injected[lane] = injected[lane] + Scores[sh, target, slot, {injection}] * {v} * column_factor[lane]")
+    lines, gc = _load(context, state.column_gate, "source_j", "c", "gate")
+    _append(body, "                ", lines)
+    body += [f"                column_factor[lane] = column_factor[lane] * {gc}",
+             f"for lane in T.Parallel({width}):", f"    c = tile * {width} + lane",
+             f"    if c < {columns}:",
+             "        Output[token, head, c] = result[lane] * column_factor[lane] + injected[lane]"]
     annotations = list(context.annotations) + [_annotation("Carry", carry),
-                                              _annotation("Scores", scores),
+                                              _annotation("Scores", scores), _annotation("Weighted", weighted),
                                               _annotation("Output", output)]
-    _compile(annotations, body, batch_heads * length * tiles)(*context.pointers, carry, scores, output)
+    _compile(annotations, body, batch_heads * length * tiles)(*context.pointers, carry, scores, weighted, output)
     return output
 
 

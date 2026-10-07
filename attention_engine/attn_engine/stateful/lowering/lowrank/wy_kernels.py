@@ -7,9 +7,13 @@ _BLOCK = 32
 
 def eligible(operation_codes, injection_count, rows, columns):
     events = operation_codes.count("rank-one") + injection_count
-    return ("rank-one" in operation_codes and
-            all(x in ("scale", "rank-one") for x in operation_codes) and
-            1 <= events <= 4 and rows <= 128 and columns <= 128)
+    return (
+        "rank-one" in operation_codes
+        and all(x in ("scale", "rank-one") for x in operation_codes)
+        and 1 <= events <= 4
+        and rows <= 128
+        and columns <= 128
+    )
 
 
 def chunk_tokens(event_count):

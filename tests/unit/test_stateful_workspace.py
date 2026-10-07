@@ -64,6 +64,23 @@ def test_factored_inference_accepts_chunks_but_rejects_excessive_scratch():
         workspace.required_bytes(32768)
 
 
+def test_factored_short_replay_charges_every_checkpoint_before_rejecting():
+    """A small workspace cap must not admit uncharged 16-token chunk buffers."""
+    from dataclasses import replace
+
+    from examples.rwkv7_state import rwkv7_state
+
+    _, workspace = _workspace(_compile(rwkv7_state, seqlen=65, backward=False, size=64))
+    length = 65
+    token_bytes = length * workspace.bytes_per_token
+    # Five chunk entries plus the final-State allowance, not two 64-token chunks.
+    required = token_bytes + 6 * workspace.bytes_per_chunk
+    bounded = replace(workspace, maximum_bytes=required)
+    assert bounded.required_bytes(length, sequence_length=length) == required
+    with pytest.raises(RuntimeError, match="resource envelope"):
+        replace(workspace, maximum_bytes=required - 1).required_bytes(length, sequence_length=length)
+
+
 def test_factored_recurrence_charges_recorded_states_with_a_backward():
     """A compiled backward records the per-token State it replays from."""
     lowerer, workspace = _workspace(

@@ -1,7 +1,7 @@
 # P2-B 有序低秩 compact WY
 
 ## 状态
-scalar scale + ordered rank-one 的 compact WY 已接入；本轮完成 FP32 factor 直接绑定、去除 packing/stack。性能与行为证据见下节。完整任务仍不标为完成：原有 BF16 oracle 边界失败和 WY solve/readout spills 尚在，不放宽容差。
+scalar scale + ordered rank-one 的 TileLang compact WY 已接入 chunk solve/carry/readout；非交换 row/column-scale 使用 affine checkpoint schedule。2026-10-06 GPU lowrank/checkpoint/packed/GDN 回归 54 passed；历史 Triton 数据与当前 TileLang 证据分列如下。仍不宣称达到 FLA 延迟或完成 spills 优化。
 
 ## 依赖
 00
@@ -37,6 +37,60 @@ H20 GPU 6，`B={1,2}`、`H={1,8,16}`、`T={63,64,65,130,2048,8192}`、K=V=64、o
 CPU selection/measurement/workspace/operator：77 passed，1 expected tuning warning；修改文件 Ruff 通过。GPU `test_lowrank_wy.py`：10 passed、1 pre-existing BF16 T67 oracle-boundary failure。GPU `test_gdn_h20.py`：10 passed、1 unrelated pre-existing `stateful.lowering.lowrank.checkpoint._local_vjp` Triton branch merge failure：`dl` fp32[16] 与 fp32[128] 类型不一致；checkpoint/factored/backward 文件与基线字节相同。不修改这些测试或容差，不宣称全 suite 通过。
 
 拒绝的实验：直接 BF16 指针、load 时转 FP32，T2048 before/after 出现 2/393216 元素超原容差，最大 0.00048828125。回退到原 FP32 promotion 后，8 场景 differential output/final max_abs 全为 0；不保留改变数值的版本。
+
+## TileLang 调度修复（2026-10-06）
+
+上面的 Triton 证据仅为历史记录。当前 RWKV7 为 row-scale + rank-one，
+不满足 scalar-only WY eligibility；公共 inference 已恢复原 Triton 的
+chunk summary / Tensor Core carry / parallel replay，而非全序列单 block 循环。
+同输入、三轮交错 A/B：B1/K64/V64/T2048，H1 公共调用 8.858→0.918 ms
+（9.65x），H8 9.671→1.445 ms（6.70x）。增量 allocator peak 约增加 58%，
+仍慢于 FLA。原始数据：`benchmark_results/stateful_tilelang015_chunkcarry_ab.json`；
+完整合同矩阵与限制见 `docs/tilelang-stateful-operator-research.md`。
+
+scalar-only WY 独立恢复 solve / compact carry / parallel readout，删除通用
+dense checkpoint detour。rank/injection event order 保留，zero/signed gate
+使用 forward products，不逆 gate；不把 row-scale 混入 scalar 的交换性证明。
+TileLang triple-TF32 staging 与 Triton 的寄存器布局不同，chunk 固定 16 tokens，
+避免 128-row State 的共享内存超限。
+
+最终 GPU lowrank/WY/GDN/dense checkpoint/packed checkpoint：54 passed。
+新增 65-row carry 尾块与 31-row/three-event WY padding 回归，不放宽原容差。
+长 scalar-only private recurrence 的独立 FP64 output/final、zero/signed gates
+和 Graph replay 通过；Graph 0.878 ms，不作为 RWKV7 性能证据。
+CPU unit：192 passed、6 skipped；修改代码 Ruff/Python compile 通过。
+当前 FP32 factor staging 仍有 stack/copy；历史“直接绑定”不代表此 TileLang 实现。
+
+### 当前源码再接入与资源合同（2026-10-07）
+
+本轮起始源码的 `lowrank_kernels.execute` 仍走 non-WY 全序列串行 kernel，
+与上面历史 cutover 描述不一致。现在已实际接入已有 checkpoint
+summary/carry/replay，删除旧 serial kernel。短 dense T≤128 使用 16-token
+chunks，长 dense 使用 64；recorded/packed/supplied metadata 保持 16-token ABI。
+WY eligibility、autograd 与 packed 入口不改。
+
+同输入、五轮交错、BF16 public final-State：RWKV7 B1/K64/V64/T2048，
+H1 public 8.846→0.752 ms，H8 9.648→1.169 ms；pressure H8
+15.736→1.689 ms。短 RWKV7 H8/T65 Graph 0.313→0.139 ms，
+不保留曾退化的 unconditional 64-token schedule。outputs/finals 通过独立
+CPU authored-order recurrence；chunk reduction 不宣称逐位等价。
+
+`WorkspacePolicy` 对 factored inference 按保守 16-token chunk 计费，
+不扩大 workspace cap；T65 exact-cap/one-byte-under-cap 回归覆盖短 replay。
+64-row carry 去除冗余 shared staging，约 1.8–2.0% kernel 收益；
+32-row/fused operand split 实验未获稳定收益，不保留。
+
+GPU 回归：H20 GPU 3 上指定 lowrank/WY、checkpoint、packed、GDN、scalar
+测试 **81 passed / 150.01 s**。长度 65/130 的 output-only 与 continuation
+memory smoke 均通过 oracle 与 CUDA Graph；strided/scalar coefficient/
+multiple readout/continuation/Graph/initial immutable 混合 binding smoke
+均通过（rows/columns/length = 35/67/130、65/35/65、64/128/130）。
+增量 peak allocation 69,550,080→71,714,816 bytes；该变化已记录，不宣称
+内存下降。
+完整数据与限制见 `docs/tilelang-stateful-operator-research.md` 和
+`benchmark_results/stateful_tilelang015_triton_guided_followup.json`。
+
+
 
 
 ## 原子提交

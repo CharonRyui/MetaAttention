@@ -86,8 +86,8 @@ The v0.1.15 release also records a fix for dynamic-output allocation when the si
 | --- | --- | --- | --- |
 | `scan/affine.py`, `scan/elementwise.py`, `scan/vector.py`, `scalar/scalar.py` | TileLang `jit` + `PrimFunc` + `Kernel`; Python-specialized extents | **Migrated and exercised** | Keep the released ABI and shape-specialized cache identity. |
 | Identity/general diagonal and hierarchical carry | TileLang summary, carry, replay, softmax/shared readout and native loaders | **Migrated and exercised** | Preserve FP32 State arithmetic, authored BF16 rounding, prior flags, tails and final-State ownership. |
-| Low-rank/WY/checkpoint and backward (`checkpoint.py`, `lowrank_kernels.py`, `wy_kernels.py`) | TileLang summary/carry/replay/VJP kernels | **Migrated; GPU evidence below** | Keep device-side metadata/temporary buffers and ordered operations. |
-| Optimized scalar and rank-one scan (`scalar_kernels.py`, `scan/rank1.py`) | TileLang chunk/replay and vector scan kernels | **Migrated and exercised** | Preserve signed/zero gates, continuation and grouped/strided bindings. |
+| Low-rank/WY/checkpoint and backward (`checkpoint.py`, `lowrank_kernels.py`, `wy_kernels.py`) | TileLang summary/carry/replay/VJP kernels | **Migrated; targeted GPU evidence** | Preserve the established WY fast path; direct factor binding remains limited to non-WY eligible plans until its full ABI matrix is proven. |
+| Optimized scalar and rank-one scan (`scalar_kernels.py`, `scan/rank1.py`) | TileLang chunk/replay and vector scan kernels | **Migrated; optimized scan candidate reverted** | The fragment-backed scan was rejected by TileLang layout inference; shared ping-pong remains the verified implementation. |
 | Generated expressions and readout regions | TileLang expression IR/PrimFunc and native regions | **Migrated and exercised** | Preserve authored node rounding and shape-dependent readout ABI. |
 
 
@@ -125,6 +125,22 @@ Verification uses TileLang `0.1.15` from `/dev/shm/metaattention-tilelang-015`, 
 - `tests/functional/test_stateful_normalized_pair.py` plus `test_stateful_hierarchical_carry.py`: **28 passed**. Coverage includes FP32/BF16, grouped BHT/BTH inputs, independent keys, all four prior combinations, tail chunks, continuation, initial-State immutability, FP32 finals, lossless-promotion invariance and the 65-chunk hierarchy boundary.
 - Ruff checks on the seven changed lowering modules: **All checks passed**.
 - Public `StatefulOperator.compile(..., mode="dense", optimized=True)` smoke: BF16 inputs at `B=2, H=2, T=130, D=17, DV=35`, nonzero initial States, output/final parity against an independent CPU recurrence, and CUDA Graph replay all passed. The CUDA profiler observed **3 launches** for the warmed call: paired summary, paired direct prefix, normalized readout. This is a launch-count observation, not a latency benchmark.
+### Shape-specialized optimization pass
+
+The optimization pass keeps public State/input/output ABIs and authored FP32 accumulation order unchanged:
+
+- Scalar carry uses a 512-element fragment schedule for regular States with at least 4096 elements and an exact 512-element shape; smaller or irregular States retain the 256-element fallback.
+- Checkpoint carry removes the redundant state-tile staging copy for exact 32/64-row States; padded and multi-tile States retain the generic path.
+- ProductFeature readout uses a 16-column tile when `columns <= 16`; wider outputs retain the 32-column schedule.
+
+Focused verification: `test_stateful_checkpoint.py`, `test_lowrank_wy.py`, `test_product_contraction.py`, and `test_scalar_parallel.py` completed **60 passed** on an idle NVIDIA H20; `test_gdn_h20.py` completed **11 passed**.
+
+The post-change matrix was partially interrupted after valid records for linear, simple-gla, GLA, normalized-linear, retention, RWKV7, RWKV6, GSA, HGRN, Based, Rebased, GDN, and RetNet. The records showed large improvements for several chunked/product families, but RWKV7 was marked invalid by the independent oracle in that run and GDN reported approximately 1.26 s at `B=1,H=1/8,T=2048`; these are blockers, not performance successes. Full target parity with Triton/FLA is not established.
+### Follow-up diagnosis
+
+RWKV7's earlier invalid long-matrix result was not reproducible after isolating the benchmark invocation and restoring the original factored dispatcher. Focused GPU coverage passed **24 tests**; the representative `B=1,T=2048,D=64,DV=64` records were valid with max absolute output error `0.0306` at H=1 and `0.0305` at H=8.
+
+The long GDN profile is a genuine blocker: one `kernel_kernel` consumes approximately **1,262,603 us** at `B=1,H=8,T=2048,D=64,DV=64`, while preparation/copy operations are below 0.1 ms. This isolates the issue to the factored recurrence kernel, not public-call preparation. The current optimization therefore preserves the proven WY eligibility boundary and does not claim GDN performance parity.
 
 The repository `.venv` was not replaced: the initial upgrade attempt ran out of space on `/mnt/nvme`, so the release was exercised through a tmpfs overlay. The checked-in dependency/lock upgrade and the installed environment are separate facts; use the updated installation instructions to recreate the pinned environment. No old generated cache is evidence for the new release.
 
@@ -142,5 +158,215 @@ The repository `.venv` was not replaced: the initial upgrade attempt ran out of 
 - A BF16-output boundary probe at `T=67` measured FP32-vs-FP64 maximum output error **1.9e-7**. At one midpoint, values `-0.1105956957` and `-0.1105957165` rounded to adjacent BF16 values. Regression coverage checks FP32 recurrence separately and bounds BF16 storage error against the unrounded oracle by half an ULP plus FP32 accumulation tolerance.
 
 **Bottom line:** the Stateful backend cutover targets released TileLang 0.1.15, with shape-specialized kernels and independent correctness checks. Performance is not guaranteed; the current schedules must be benchmarked before making any throughput or latency claim.
+
+
+### RWKV7 inference schedule restoration (2026-10-06)
+
+The previous claim that the RWKV7 benchmark exercised scalar WY was incorrect.
+`examples/rwkv7_state.py` authors a row-scale followed by rank-one propagation;
+scalar-only WY eligibility rejects it. Profiling the migrated inference path
+observed one full-sequence kernel taking 9.174 ms at B1/H8/T2048/K64/V64.
+
+`lowrank/lowrank_kernels.py` now routes non-WY inference through the existing
+device-segmented checkpoint summary/carry/replay schedule rather than a
+single-block token loop. `checkpoint.py` restores Tensor Core carry contractions
+using the existing three-product FP32/TF32 macro, bounded K=32 tiles, and staged
+fragment-to-shared copies. Authored operation order, inverse-free recurrence,
+packed segmentation, local VJPs and initial/final-State ownership are unchanged.
+This is the schedule used by the pre-migration Triton checkpoint implementation,
+not a claim that row-scaled RWKV7 has scalar compact WY semantics.
+
+H20 GPU 3, B1/K64/V64, same-input final-state A/B, three alternating rounds,
+warmup 3 and 10 repetitions per round; table entries are medians of round medians:
+
+| H | T | Before public ms | After public ms | Speedup | Before Graph ms | After Graph ms |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 64 | 0.682 | 0.656 | 1.04x | 0.289 | 0.083 |
+| 1 | 2048 | 8.858 | 0.918 | 9.65x | 8.424 | 0.442 |
+| 8 | 64 | 0.702 | 0.639 | 1.10x | 0.306 | 0.092 |
+| 8 | 2048 | 9.671 | 1.445 | 6.70x | 9.492 | 1.008 |
+
+Raw rounds: `benchmark_results/stateful_tilelang015_chunkcarry_ab.json`.
+The separate 12-point output-only/final-state/continuation matrix is in
+`benchmark_results/stateful_tilelang015_chunkcarry_after/`; all points passed
+the runner's independent authored-order CPU recurrence check. FLA remains faster:
+T2048 output-only Meta/FLA = 0.977/0.596 ms (H1), 1.474/0.680 ms (H8).
+These are finite workload measurements, not a statistical confidence-interval gate.
+
+Tradeoff: warmed incremental allocator peak rises from 8,708,096 to 13,725,696
+bytes at H1/T2048 and 69,550,080 to 109,662,208 bytes at H8/T2048 (about 58%).
+Chunk transform/bias/entry workspace replaces the near-workspace-free serial walk;
+the existing factored candidate already charges affine chunk storage.
+
+Isolated H8/128-chunk/K64/V64 carry Graph smoke: 0.629 to 0.427 ms (1.47x),
+with independent FP64 chunk-entry parity; raw observation is in
+`benchmark_results/stateful_tilelang015_carry_smoke.json`. Public nonzero-State
+smoke B2/H2/T130/K64/V128 passed recurrence parity, split-at-63 continuation,
+initial immutability, and exact warmed CUDA Graph replay. Profiler observed
+summary/carry/replay durations 0.274/0.408/0.229 ms at H8/T2048 after cutover;
+they remain the main device-side optimization targets.
+
+Scalar-only WY separately uses chunk-parallel ordered event solves, compact U/W/V
+carry contractions and chunk-parallel readout, with no dense affine detour.
+Chunk length stays 16; single-rank-only event tiles pad to at least 32 to satisfy
+the four-warp Tensor Core layout. Nonmultiple Feature/event tiles use explicit
+zero padding, and GEMM accumulators are cleared before every independent product.
+An attempted 32-token/128-row schedule exceeded H20 dynamic shared memory
+(278,528 bytes); it was not retained.
+
+Final GPU regression command covered `test_lowrank_wy.py`, `test_gdn_h20.py`,
+`test_stateful_checkpoint.py` and `test_stateful_packed_checkpoint.py`: **54 passed**.
+New regressions cover 65-row carry reduction tails and three-event WY padding
+with a 31-row strided State. CPU unit suite: **192 passed, 6 skipped**. Changed
+lowerers/tests passed Ruff; changed lowerers passed Python compilation.
+Private scalar-only B1/H8/T2048/K64/V64 smoke passed independent FP64 output/final
+parity with zero/signed gates and CUDA Graph replay; new Graph latency was
+0.878 ms. Its HEAD serial baseline measured 1262.346 ms, not the previous live
+checkpoint detour and not RWKV7; do not reuse that ratio as a public RWKV7 claim.
+Raw observation/probe: `benchmark_results/stateful_tilelang015_wy_smoke.json`.
+
+### Triton-guided scalar product scans (2026-10-07)
+
+Compared the live TileLang scalar lowerer with `perf/structured-lowering` at
+`1366a12`, whose `_chunk_summary` and `_chunk_readout` use
+`tl.associative_scan(..., _multiply)`. TileLang 0.1.15 exposes cumulative sum/max,
+not a general associative product scan. The migrated implementation therefore
+uses an explicit six-level product tree, including a 64-by-64 interval matrix.
+
+`scalar/scalar_kernels.py` now alternates source/destination shared buffers over
+pairs of levels instead of copying each intermediate back. Both 1D gate scans
+and 2D interval scans keep the same multiplication tree, padding and FP32 casts;
+each scan has six explicit synchronization points instead of twelve. No gate division,
+log-prefix subtraction, public ABI, dispatch or global workspace change is made.
+The 2D scan declares a 16 KiB shared scratch tile instead of borrowing the score
+fragment for intermediate values; measured identity kernels erase the scan.
+
+Same-input raw-path Graph A/B on idle H20 GPU 3, PyTorch 2.11.0+cu128,
+TileLang 0.1.15, nonzero initial State, FP32 output/final, three warmups and five
+alternating rounds of 100 replays; entries are medians of round measurements:
+
+| H | T | State rows/columns | Gate | Before ms | After ms | Speedup |
+| ---: | ---: | --- | --- | ---: | ---: | ---: |
+| 1 | 2048 | 64/64 | log | 0.03557 | 0.03065 | 1.16x |
+| 8 | 2048 | 64/64 | log | 0.10714 | 0.08661 | 1.24x |
+| 8 | 8192 | 64/64 | log | 0.37603 | 0.30538 | 1.23x |
+| 4 | 130 | 35/67 | signed/reset | 0.03741 | 0.03231 | 1.16x |
+| 8 | 2048 | 64/64 | identity | 0.07621 | 0.07623 | unchanged |
+
+All five A/B cases have bitwise-equal outputs and final States and preserve the
+initial State. The baseline is the working-tree implementation immediately
+before this optimization, including existing uncommitted changes, not HEAD or
+the Triton branch. Raw rounds and measurement contracts are recorded in
+`benchmark_results/stateful_tilelang015_triton_guided_scalar_scan.json`.
+
+Public final-State A/B uses BF16 inputs/output and the independent authored-order
+CPU FP32 token oracle. Five alternating rounds, three warmups and 20 event samples
+per round; every output/final passed the oracle and remained bitwise equal:
+
+| Family | H | T | Before Graph ms | After Graph ms | Before public event ms | After public event ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| simple-gla | 1 | 2048 | 0.03974 | 0.03486 | 0.12819 | 0.12773 |
+| simple-gla | 8 | 2048 | 0.11000 | 0.09027 | 0.18136 | 0.16158 |
+| retention | 8 | 2048 | 0.10989 | 0.09032 | 0.18074 | 0.16098 |
+| simple-gla | 8 | 65 | 0.02122 | 0.02117 | 0.07618 | 0.07632 |
+
+H8/T2048 public Graph latency improves about 1.22x; public event latency drops
+about 11%. H1 public latency is host-launch dominated in this measurement. The
+65-token workload retains the resident schedule and shows no meaningful change.
+These are finite-workload observations, not a full matrix or confidence interval.
+
+Direct same-input FP32 raw-path comparison against the fixed Triton branch:
+T2048/K64/V64 log gates take 0.02353 ms (Triton) versus 0.03077 ms (TileLang)
+at H1, and 0.07197 versus 0.08666 ms at H8. TileLang remains 31%/20% slower,
+respectively; this optimization does not establish Triton performance parity.
+Maximum output differences are 1.01e-6/1.25e-6; final-State differences are
+4.77e-7/7.15e-7. Timing uses the same five-round/100-replay raw Graph protocol.
+
+
+Verification: `OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 ... python -m pytest
+--run-gpu -q tests/functional/test_scalar_parallel.py`: **19 passed**. Covers
+FP32/BF16, T63/64/65/130/2048, dynamic batch occupancy, grouped heads, signed/zero
+gates, log-underflow resets, 35-by-67 State tails, nonzero initial immutability,
+output-only/final-State, nonaligned continuation and public CUDA Graph replay.
+The initial GPU-suite run exceeded its 600-second deadline after seven completed
+cases; it is not counted as a completed suite. The completed run limits CPU
+threading for the independent recurrence oracle. Changed kernel Ruff and Python
+compilation checks passed. No regression tolerance or test code was changed.
+
+### Further Triton-guided inference and staging pass (2026-10-07)
+
+The live source at the start of this pass did **not** match the earlier inference
+restoration narrative: `lowrank_kernels.execute` still selected its full-sequence
+serial kernel for non-WY plans. Public RWKV7 T2048 measured approximately
+8.4/9.3 ms Graph latency at H1/H8. Earlier records describe earlier artifacts,
+not evidence that this starting working tree had the restored dispatcher.
+
+Non-WY dense inference now invokes the existing device-segmented checkpoint
+summary/carry/replay implementation with `record=False`. This follows the Triton
+affine chunk decomposition, preserves authored row/rank/column/scale order, and
+removes the obsolete full-sequence kernel. Factor packing retains FP32 promotion,
+scalar/broadcast/strided bindings and token-major inputs; public outputs stay
+B/H/T/V. Scalar-only WY eligibility, packed entry points and backward selection
+are unchanged. Short dense inference uses 16-token chunks through T128; longer
+inference uses 64-token chunks. Recorded, packed and supplied metadata retain
+the 16-token checkpoint ABI.
+
+Checkpoint carry exact 64-row tiles consume the shared staged State directly
+instead of copying it into another shared tile. Other shapes keep the original
+zero-padding/slicing path and triple-TF32 arithmetic. The 32-row candidate had
+no benefit and was not retained; 64-row carry improves about 1.8–2.0% across
+32/128 chunk measurements, with bitwise parity and independent FP64 entry checks.
+
+Gated scalar readout splits the loaded FP32 query lane directly into TF32 high
+and residual shared operands. It removes the intermediate query shared-memory
+round trip, retaining the existing prepared-left triple-product order. Identity
+readout keeps its previous measured schedule; no scalar tile-size cutover is
+retained. Six FP32 raw cases have zero output differential and unchanged finals.
+H8/T8192 raw Graph latency improves 0.30499 to 0.29190 ms (1.045x); public
+simple-gla H8/T8192 improves 0.30086 to 0.29122 ms (1.033x). H8/T2048 raw and
+public Graph improvements are approximately 1.4%; identity is unchanged.
+
+Rejected experiments are recorded rather than hidden: global 32-row/column
+scalar tiling regressed H8/T2048 by about 43% and H8/T8192 by about 54%, and
+one identity output exceeded the strict FP32 differential threshold. Summary-only
+32 tiling also regressed H8. Fused carry operand splitting improved 32-chunk
+workloads but regressed 128-chunk workloads by 1.6–2.8%; neither fused variant is
+retained. A temporary immutable query-lane binding produced invalid output;
+the retained implementation uses explicit mutable `T.alloc_var` and passes
+same-input differential checks without relaxing tolerances.
+
+Raw rounds, rejected candidates and fixed-source hashes are recorded in
+`benchmark_results/stateful_tilelang015_triton_guided_followup.json`.
+
+Public final-State same-input A/B against the saved serial working-tree baseline,
+H20 GPU 3, BF16 inputs/output, independent FP32 token oracle, five alternating
+rounds of 20 warmed samples. Values are medians of round medians:
+
+| Family | H | T | Before public event ms | After public event ms | Before Graph ms | After Graph ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| RWKV7 | 1 | 2048 | 8.84597 | 0.75219 | 8.42198 | 0.28706 |
+| RWKV7 | 8 | 2048 | 9.64792 | 1.16925 | 9.29938 | 0.74610 |
+| compositional pressure | 8 | 2048 | 15.73578 | 1.68898 | 15.37150 | 1.25090 |
+| RWKV7 | 1 | 64 | 0.65189 | 0.63853 | 0.28333 | 0.08056 |
+| RWKV7 | 8 | 65 | 0.68042 | 0.61651 | 0.31278 | 0.13858 |
+| RWKV7 | 8 | 130 | 0.96365 | 0.84155 | 0.58586 | 0.35814 |
+
+The initial unconditional 64-token replay candidate regressed T65
+(Graph 0.31003 to 0.35770 ms); the retained 16-token short schedule removes that
+regression. All displayed cases pass independent output/final oracle checks;
+low-rank outputs are tolerance-equivalent, not claimed bitwise equal because
+chunked reductions change accumulation order. These ratios compare the starting
+TileLang serial path, not Triton/FLA, and are not a full performance matrix.
+
+The compiler now charges factored inference at the conservative 16-token chunk
+granularity, covering short replay and eligible WY even when long non-WY calls
+use 64 tokens. The workspace cap is unchanged; the resource-boundary regression
+checks exact acceptance and one-byte-under-cap rejection for T65.
+CPU unit verification: **193 passed, 6 skipped**; changed modules/tests passed
+Ruff and Python compilation. The subsequent warmed GPU regression suite passed
+**81 tests in 150.01 s** on H20 GPU 3. Additional memory, mixed-binding,
+continuation and CUDA-Graph smokes passed; peak incremental allocation was
+69,550,080 bytes before versus 71,714,816 bytes after. The earlier combined
+run timed out during compilation and is superseded by the completed run.
 
 

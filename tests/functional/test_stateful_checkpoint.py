@@ -11,8 +11,8 @@ from attn_engine.stateful.lowering.lowrank.factored import factored_recurrence_b
 pytestmark = [pytest.mark.functional, pytest.mark.gpu, pytest.mark.usefixtures("gpu_device", "seed")]
 
 
-def _inputs(device, codes, *, length=35, decay=0.8):
-    batch, heads, rows, columns = 2, 2, 7, 19
+def _inputs(device, codes, *, length=35, decay=0.8, rows=7, columns=19):
+    batch, heads = 2, 2
     tokens, width = batch * length, max(rows, columns)
     left = torch.randn(len(codes), tokens, heads, width, 1, device=device) * 0.1
     right = torch.randn(len(codes), tokens, heads, rows, 1, device=device) * 0.1
@@ -98,6 +98,27 @@ def test_checkpoint_vjp_all_operands_match_fp64(gpu_device, rank_first, decay, c
         torch.testing.assert_close(actual, repeat, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("rows", [7, 32, 64])
+def test_inference_chunk_tail_and_continuation_match_fp64(gpu_device, rows):
+    codes = ("row-scale", "rank-one", "column-scale", "scale")
+    inputs = _inputs(gpu_device, codes, length=130, rows=rows)
+    arguments = _arguments(codes, inputs)
+    output, final, _ = forward(**arguments, output_dtype=torch.float32, record=False)
+    expected, expected_final, _ = _oracle(codes, tuple(x.double() for x in inputs))
+    torch.testing.assert_close(output.double(), expected, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(final.double(), expected_final, atol=2e-6, rtol=2e-5)
+    first_inputs = _slice(inputs, 0, 63)
+    first, carried, _ = forward(**_arguments(codes, first_inputs),
+                                output_dtype=torch.float32, record=False)
+    tail_inputs = _slice(inputs, 63, 130)
+    tail, split_final, _ = forward(
+        **_arguments(codes, (*tail_inputs[:-1], carried)),
+        output_dtype=torch.float32, record=False,
+    )
+    torch.testing.assert_close(torch.cat((first, tail), dim=2), output, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(split_final, final, atol=2e-6, rtol=2e-5)
+
+
 def _binding(context, gradients):
     return factored_recurrence_backward(
         operation_codes=context["factored.operation_codes"],
@@ -179,4 +200,23 @@ def test_checkpoint_multi_readout_vjp_matches_fp64(gpu_device, used):
             actual = torch.zeros_like(source)
         if oracle is None:
             oracle = torch.zeros_like(source, dtype=torch.float64)
+        torch.testing.assert_close(actual.double(), oracle, atol=2e-5, rtol=2e-4)
+
+
+@pytest.mark.parametrize("rows", [32, 64, 65])
+def test_checkpoint_carry_exact_and_partial_reduction_tiles_match_fp64(gpu_device, rows):
+    codes = ("row-scale", "rank-one")
+    inputs = _inputs(gpu_device, codes, rows=rows)
+    arguments = _arguments(codes, inputs)
+    output, final, checkpoints = forward(**arguments, output_dtype=torch.float32)
+    reference = tuple(x.double().detach().requires_grad_() for x in inputs)
+    expected, expected_final, expected_checkpoints = _oracle(codes, reference)
+    torch.testing.assert_close(output.double(), expected, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(final.double(), expected_final, atol=2e-6, rtol=2e-5)
+    torch.testing.assert_close(checkpoints.double(), expected_checkpoints, atol=2e-6, rtol=2e-5)
+    dy, df = torch.randn_like(output), torch.randn_like(final)
+    gradients = backward(**arguments, checkpoints=checkpoints, grad_output=dy, grad_final=df)
+    expected_gradients = torch.autograd.grad(
+        (expected * dy.double()).sum() + (expected_final * df.double()).sum(), reference)
+    for actual, oracle in zip(gradients, expected_gradients, strict=True):
         torch.testing.assert_close(actual.double(), oracle, atol=2e-5, rtol=2e-4)

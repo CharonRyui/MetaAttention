@@ -338,7 +338,7 @@ def tilelang_scalar_factorized_dense_raw(
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     identity_propagation = recipe.propagation[0].name == "__identity_propagation__"
     def bind(binding):
-        # Both kernels erase identity propagation loads at compile time. Reuse
+        # All schedules erase identity propagation loads at compile time. Reuse
         # a live FP32 pointer rather than launching a dense tensor of ones.
         if binding[0].name == "__identity_propagation__":
             return initial_state
@@ -370,9 +370,10 @@ def tilelang_scalar_factorized_dense_raw(
         recipe.right_factor[1],
         recipe.readout[1],
     )
-    # Scheduling depends only on this invocation's dimensions. The mathematical
-    # plan remains valid when B/T change for a later continuation call.
-    if sequence_length >= 128 and sequence_count * heads < 32:
+    # A chunk grid exposes sequence parallelism when B*H cannot fill the GPU.
+    # Fixed-size padded State tiles also handle row tails that the resident
+    # GEMM schedule cannot represent. Decide per call, including continuation.
+    if (sequence_length >= 128 and sequence_count * heads < 32) or rows % 32:
         from .scalar_kernels import scalar_chunked_dense_raw
 
         scalar_chunked_dense_raw(

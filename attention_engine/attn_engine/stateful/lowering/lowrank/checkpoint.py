@@ -8,6 +8,8 @@ from functools import lru_cache
 
 import torch
 
+from ..diagonal.identity import fp32_gemm_macro
+
 CHUNK_SIZE = 16
 _CODES = {"scale": 0, "row-scale": 1, "rank-one": 2, "column-scale": 3}
 
@@ -79,7 +81,7 @@ def _flat(tensor):
 
 
 @lru_cache(maxsize=None)
-def _compile_prefix(sequences, offsets_dtype, dense_length, device_index):
+def _compile_prefix(sequences, offsets_dtype, dense_length, device_index, chunk_size=CHUNK_SIZE):
     import tilelang
     import tilelang.language as T
 
@@ -99,7 +101,7 @@ def _compile_prefix(sequences, offsets_dtype, dense_length, device_index):
                 for index in T.Parallel(block):
                     counts[index] = T.if_then_else(
                         index < sequences,
-                        T.cast((Offsets[index + 1] - Offsets[index] + CHUNK_SIZE - 1) // CHUNK_SIZE, "int32"),
+                        T.cast((Offsets[index + 1] - Offsets[index] + chunk_size - 1) // chunk_size, "int32"),
                         0,
                     )
                 T.cumsum(counts, dim=0)
@@ -110,7 +112,7 @@ def _compile_prefix(sequences, offsets_dtype, dense_length, device_index):
 
 
 @lru_cache(maxsize=None)
-def _compile_metadata(sequences, capacity, offsets_dtype, device_index):
+def _compile_metadata(sequences, capacity, offsets_dtype, device_index, chunk_size=CHUNK_SIZE):
     import tilelang
     import tilelang.language as T
 
@@ -137,13 +139,13 @@ def _compile_metadata(sequences, capacity, offsets_dtype, device_index):
                                 high = middle
                         sequence = T.if_then_else(chunk < Prefix[sequences], low - 1, 0)
                         Metadata[chunk] = T.if_then_else(chunk < Prefix[sequences], sequence, -1)
-                        Metadata[capacity + chunk] = Offsets[sequence] + (chunk - Prefix[sequence]) * CHUNK_SIZE
+                        Metadata[capacity + chunk] = Offsets[sequence] + (chunk - Prefix[sequence]) * chunk_size
                         Metadata[2 * capacity + chunk] = Offsets[sequence + 1]
         return kernel
     return build()
 
 
-def metadata(token_count, sequence_count, device, sequence_offsets=None):
+def metadata(token_count, sequence_count, device, sequence_offsets=None, *, chunk_size=CHUNK_SIZE):
     """Build exact chunk segmentation without observing device offsets on CPU."""
     if sequence_offsets is None:
         if sequence_count == 0 or token_count % sequence_count:
@@ -153,16 +155,16 @@ def metadata(token_count, sequence_count, device, sequence_offsets=None):
         else:
             length = token_count // sequence_count
         offsets = torch.empty(sequence_count + 1, device=device, dtype=torch.int64)
-        capacity = sequence_count * _ceildiv(length, CHUNK_SIZE)
+        capacity = sequence_count * _ceildiv(length, chunk_size)
     else:
         offsets = _flat(sequence_offsets)
         length = -1
-        capacity = _ceildiv(token_count, CHUNK_SIZE) + sequence_count if token_count else 0
+        capacity = _ceildiv(token_count, chunk_size) + sequence_count if token_count else 0
     prefix = torch.empty(sequence_count + 1, device=device, dtype=torch.int32)
     chunks = torch.empty((3, capacity), device=device, dtype=torch.int64)
-    _compile_prefix(sequence_count, _dtype(offsets), length, offsets.device.index)(offsets, prefix)
+    _compile_prefix(sequence_count, _dtype(offsets), length, offsets.device.index, chunk_size)(offsets, prefix)
     if capacity:
-        _compile_metadata(sequence_count, capacity, _dtype(offsets), offsets.device.index)(
+        _compile_metadata(sequence_count, capacity, _dtype(offsets), offsets.device.index, chunk_size)(
             offsets, prefix, chunks.view(-1),
         )
     return offsets, prefix, chunks
@@ -203,7 +205,7 @@ def _apply_macro(T, rows, columns, width, total, br, bc):
 
 @lru_cache(maxsize=None)
 def _compile_summary(sizes, dtypes, *, heads, rows, columns, total, width, capacity,
-                     codes, injections, readouts, length, packed, reverse, device_index):
+                     codes, injections, readouts, length, packed, reverse, device_index, chunk_size=CHUNK_SIZE):
     import tilelang
     import tilelang.language as T
 
@@ -232,8 +234,8 @@ def _compile_summary(sizes, dtypes, *, heads, rows, columns, total, width, capac
                     for r, c in T.Parallel(br, bc):
                         matrix[r, c] = T.if_then_else((block < linear_blocks) & (r == block * bc + c), 1.0, 0.0)
                     T.fill(decay, 1.0)
-                    for step in T.serial(CHUNK_SIZE):
-                        token = start + CHUNK_SIZE - 1 - step if reverse else start + step
+                    for step in T.serial(chunk_size):
+                        token = start + chunk_size - 1 - step if reverse else start + step
                         if token < end:
                             flat = token * heads + head
                             if reverse:
@@ -283,7 +285,12 @@ def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, fin
     import tilelang
     import tilelang.language as T
 
-    br, bc = max(16, 1 << (rows - 1).bit_length()), 16
+    br, bc = max(32, 1 << (rows - 1).bit_length()), 32
+    bk = min(br, 64)
+
+    # Bounded K tiles keep shared storage linear in rows. Exact 64-row tiles
+    # consume the staged fragment directly; other shapes keep the proven staging.
+    gemm = fp32_gemm_macro(T)
 
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
@@ -301,6 +308,7 @@ def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, fin
                 state = T.alloc_fragment((br, bc), "float32")
                 previous = T.alloc_shared((br, bc), "float32")
                 next_state = T.alloc_fragment((br, bc), "float32")
+                transform_tile = T.alloc_shared((br, bk), "float32")
                 for r, c in T.Parallel(br, bc):
                     state[r, c] = T.if_then_else((r < rows) & (block * bc + c < columns),
                         T.cast(Initial[(sh * rows + r) * columns + block * bc + c], "float32"), 0.0)
@@ -313,10 +321,19 @@ def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, fin
                     if reverse or index + 1 < last - first:
                         T.copy(state, previous)
                         T.clear(next_state)
-                        for k in T.serial(rows):
-                            for r, c in T.Parallel(br, bc):
-                                transform = T.if_then_else(r < rows, Transform[(slot * rows + r) * rows + k], 0.0)
-                                next_state[r, c] = next_state[r, c] + transform * previous[k, c]
+                        if rows == 64:
+                            for r, k in T.Parallel(br, bk):
+                                transform_tile[r, k] = Transform[(slot * rows + r) * rows + k]
+                            gemm(transform_tile, previous, next_state)
+                        else:
+                            state_tile = T.alloc_shared((bk, bc), "float32")
+                            for kb in T.serial(_ceildiv(rows, bk)):
+                                for k, c in T.Parallel(bk, bc):
+                                    state_tile[k, c] = T.if_then_else(kb * bk + k < rows, previous[kb * bk + k, c], 0.0)
+                                for r, k in T.Parallel(br, bk):
+                                    transform_tile[r, k] = T.if_then_else((r < rows) & (kb * bk + k < rows),
+                                        Transform[(slot * rows + r) * rows + kb * bk + k], 0.0)
+                                gemm(transform_tile, state_tile, next_state)
                         for r, c in T.Parallel(br, bc):
                             decay = T.if_then_else(block * bc + c < columns, Decay[slot * columns + block * bc + c], 1.0)
                             bias = T.if_then_else((r < rows) & (block * bc + c < columns),
@@ -332,7 +349,7 @@ def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, fin
 
 @lru_cache(maxsize=None)
 def _compile_replay(sizes, dtypes, *, sequences, heads, rows, columns, total, width, capacity,
-                    codes, injections, readouts, length, packed, output_dtype, final_dtype, device_index):
+                    codes, injections, readouts, length, packed, output_dtype, final_dtype, device_index, chunk_size=CHUNK_SIZE):
     import tilelang
     import tilelang.language as T
 
@@ -361,7 +378,7 @@ def _compile_replay(sizes, dtypes, *, sequences, heads, rows, columns, total, wi
                     for r, c in T.Parallel(br, bc):
                         state[r, c] = T.if_then_else((r < rows) & (block * bc + c < columns),
                             Checkpoints[(slot * rows + r) * columns + block * bc + c], 0.0)
-                    for step in T.serial(CHUNK_SIZE):
+                    for step in T.serial(chunk_size):
                         token = start + step
                         if token < end:
                             flat = token * heads + head
@@ -381,7 +398,7 @@ def _compile_replay(sizes, dtypes, *, sequences, heads, rows, columns, total, wi
                                 for c in T.Parallel(bc):
                                     if block * bc + c < columns:
                                         Output[(readout * total + output_flat) * columns + block * bc + c] = T.cast(output[c], output_dtype)
-                    if start + CHUNK_SIZE >= end:
+                    if start + chunk_size >= end:
                         for r, c in T.Parallel(br, bc):
                             if (r < rows) & (block * bc + c < columns):
                                 Final[((sequence * heads + head) * rows + r) * columns + block * bc + c] = T.cast(state[r, c], final_dtype)
@@ -609,7 +626,13 @@ def forward(*, operation_codes, left_factors, right_factors, coefficients,
     """Return outputs, final State and FP32 entries; segmentation stays on device."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
         readout, initial_state, sequence_offsets)
-    offsets, prefix, chunks = (metadata(tokens, sequences, initial_state.device, sequence_offsets)
+    # Long inference amortizes carry with 64-token chunks. Short dense sequences
+    # retain Triton's 16-token replay granularity to expose enough independent
+    # CTAs. Recorded/packed/supplied metadata keep the backward checkpoint ABI.
+    chunk_size = (64 if not record and chunk_metadata is None
+                  and sequence_offsets is None and length > 128 else CHUNK_SIZE)
+    offsets, prefix, chunks = (metadata(tokens, sequences, initial_state.device, sequence_offsets,
+                                       chunk_size=chunk_size)
                                if chunk_metadata is None else chunk_metadata)
     capacity, device = chunks.shape[1], initial_state.device
     checkpoints = torch.empty((capacity, heads, rows, columns), device=device, dtype=torch.float32)
@@ -624,6 +647,7 @@ def forward(*, operation_codes, left_factors, right_factors, coefficients,
         parameters = _parameters(factors, heads=heads, rows=rows, columns=columns,
             tokens=tokens, capacity=capacity, operation_codes=operation_codes,
             injections=injection_left.shape[0], readouts=count, length=length, packed=packed, device=device)
+        parameters["chunk_size"] = chunk_size
         transform = torch.empty((capacity, heads, rows, rows), device=device, dtype=torch.float32)
         decay = torch.empty((capacity, heads, columns), device=device, dtype=torch.float32)
         bias = torch.empty_like(checkpoints)
@@ -641,7 +665,7 @@ def forward(*, operation_codes, left_factors, right_factors, coefficients,
             output_dtype=_dtype(output), final_dtype=_dtype(final))(
             *flat_factors, metadata_flat, offsets_flat, checkpoints.view(-1), output.view(-1), final.view(-1))
     if not packed:
-        checkpoints = checkpoints.reshape(sequences, _ceildiv(length, CHUNK_SIZE), heads, rows, columns).permute(0, 2, 1, 3, 4)
+        checkpoints = checkpoints.reshape(sequences, _ceildiv(length, chunk_size), heads, rows, columns).permute(0, 2, 1, 3, 4)
     if not record:
         checkpoints = checkpoints[:0]
     return output, final, checkpoints

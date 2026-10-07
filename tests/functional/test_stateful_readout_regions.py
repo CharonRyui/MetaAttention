@@ -313,7 +313,8 @@ def test_diagonal_block_separated_product_features(gpu_device, prior):
 
 @pytest.mark.parametrize("schedule", ["replay", "scores"])
 @pytest.mark.parametrize("prior", [False, True])
-def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule, prior):
+@pytest.mark.parametrize("dual", [False, True])
+def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule, prior, dual):
     from dataclasses import replace
     from attn_engine import (
         AlgorithmIR, AxisScale, Batch, FeatureRole, HeadMapping, HeadRole, Input,
@@ -326,10 +327,13 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
     specs = tuple(TensorInput(name, (Batch, source, Sequence, feature), torch.bfloat16)
                   for name, feature in (("q", row), ("k", row), ("v", column)))
     specs += (TensorInput("g", (Batch, heads, Sequence, row), torch.float32),)
+    if dual:
+        specs += (TensorInput("gc", (Batch, heads, Sequence, column), torch.float32),)
     term = StateTerm("memory", Input("q") * 0.5, row, prior=prior)
     algorithm = AlgorithmIR(
         inputs=specs, states=(StateSpec("memory", (Batch, heads, row, column)),),
-        transition=StateTransition("memory", propagations=(AxisScale(Input("g"), (row,)),),
+        transition=StateTransition("memory", propagations=(AxisScale(Input("g"), (row,)),)
+                                  + ((AxisScale(Input("gc"), (column,)),) if dual else ()),
             injections=(ProductInjection((ProductFactor(Input("k") * 0.5, (row,)),
                                           ProductFactor(Input("v"), (column,)))),)),
         readouts=(Readout("output", term, torch.float32), Readout("rounded", term, torch.bfloat16)),
@@ -348,12 +352,13 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
             chunked_recipe=select_chunked_schedule(executable.chunked_recipe, candidate.lowerer),
         )
     generator = torch.Generator().manual_seed(173)
-    host = {spec.name: (torch.randn(2, 1 if spec.name != "g" else 4, 137,
-                                  35 if spec.name == "v" else 13, generator=generator) * 0.2).to(spec.dtype)
+    host = {spec.name: (torch.randn(2, 4 if spec.name in ("g", "gc") else 1, 137,
+                                  35 if spec.name in ("v", "gc") else 13, generator=generator) * 0.2).to(spec.dtype)
             for spec in specs}
-    host["g"] = torch.rand(2, 4, 137, 13, generator=generator) * 1.5 - 0.5
-    host["g"][:, :, 63] = 0
-    host["g"][:, :, 64] = -0.5
+    for name in (("g", "gc") if dual else ("g",)):
+        host[name] = torch.rand(host[name].shape, generator=generator) * 1.5 - 0.5
+        host[name][:, :, 63] = 0
+        host[name][:, :, 64] = -0.5
     initial = torch.randn(2, 4, 13, 35, generator=generator) * 0.1
     values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
     start = StateTuple(("memory",), (initial.to(gpu_device),))
@@ -363,7 +368,10 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
         key = (host["k"][:, :, token] * 0.5).float().expand(2, 4, 13)
         value = host["v"][:, :, token].float().expand(2, 4, 35)
         before = state
-        state = state * host["g"][:, :, token, :, None] + key[..., None] * value[..., None, :]
+        state = state * host["g"][:, :, token, :, None]
+        if dual:
+            state = state * host["gc"][:, :, token, None, :]
+        state = state + key[..., None] * value[..., None, :]
         expected.append(torch.einsum("bhr,bhrc->bhc", query, before if prior else state))
     expected = torch.stack(expected, 2)
     full = compiled(**values, initial_state=start, return_final_state=True)
@@ -488,14 +496,17 @@ def test_native_multiple_injections_dynamic_workloads_and_continuation(gpu_devic
 
 
 @pytest.mark.parametrize("schedule", ["fused", "cut"])
-@pytest.mark.parametrize("priors", [(False, False), (True, True), (False, True)])
-def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, priors):
+@pytest.mark.parametrize("priors", [(False, False), (True, True), (False, True), (True, False)])
+@pytest.mark.parametrize("length", [1, 63, 64, 65, 137])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, priors, length, dtype):
     from dataclasses import replace
     from attn_engine import AlgorithmIR, Readout, Softmax, StateTerm, StatefulOperator, StateTuple, Target
     from attn_engine.stateful.lowering.chunked import select_chunked_schedule
     from examples.gated_slot_attention import gated_slot_attention, KEY, VALUE, QUERY_HEADS, KEY_HEADS, VALUE_HEADS, STATE_HEADS
 
-    base = gated_slot_attention(2, 2, 71, 13, 19, 11, dtype=torch.float32)
+    batch, heads, source_heads = 1, 8, 2
+    base = gated_slot_attention(batch, heads, length, 13, 19, 11, dtype=dtype)
     outer = base.algorithm.readouts[0].expression
     inner = outer.operand.operand
     expression = StateTerm(outer.state,
@@ -504,10 +515,10 @@ def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, prio
     operator = StatefulOperator(AlgorithmIR(
         inputs=base.algorithm.inputs, states=base.algorithm.states,
         transition=base.algorithm.transitions, head_mapping=base.algorithm.head_mapping,
-        readouts=(Readout("output", expression, torch.float32),),
+        readouts=(Readout("output", expression, dtype),),
     ))
     sizes = {KEY: 13, VALUE: 11, outer.role: 19,
-             QUERY_HEADS: 2, KEY_HEADS: 2, VALUE_HEADS: 2, STATE_HEADS: 2}
+             QUERY_HEADS: source_heads, KEY_HEADS: source_heads, VALUE_HEADS: source_heads, STATE_HEADS: heads}
     compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense")
     executable = operator._plans[compiled.specialization]
     if schedule == "cut":
@@ -517,24 +528,108 @@ def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, prio
             chunked_recipe=select_chunked_schedule(executable.chunked_recipe, candidate.lowerer),
         )
     generator = torch.Generator().manual_seed(179)
-    host = {name: torch.randn(2, 2, 71, width, generator=generator) * 0.2
+    host = {name: (torch.randn(batch, heads if name == "gate" else source_heads, length, width,
+                               generator=generator) * 0.2).to(dtype)
             for name, width in (("query", 13), ("key", 13), ("slot", 19), ("value", 11), ("gate", 19))}
     host["gate"] = -host["gate"].abs()
-    host["gate"][:, :, 63] = float("-inf")
-    initial = {"key_slot": torch.randn(2, 2, 13, 19, generator=generator) * 0.1,
-               "slot_value": torch.randn(2, 2, 19, 11, generator=generator) * 0.1}
+    host["gate"][:, :, 63::64] = float("-inf")
+    initial = {"key_slot": torch.randn(batch, heads, 13, 19, generator=generator) * 0.1,
+               "slot_value": torch.randn(batch, heads, 19, 11, generator=generator) * 0.1}
     first, second, expected = initial["key_slot"].clone(), initial["slot_value"].clone(), []
-    for token in range(71):
+    for token in range(length):
         before1, before2 = first, second
-        gate = host["gate"][:, :, token].exp()
-        first = first * gate[..., None, :] + host["key"][:, :, token, :, None] * host["slot"][:, :, token, None, :]
-        second = second * gate[..., None] + host["slot"][:, :, token, :, None] * host["value"][:, :, token, None, :]
-        query = host["query"][:, :, token] * (13 ** -0.5)
+        gate = host["gate"][:, :, token].float().exp()
+        key, slot, value = (host[name][:, :, token].float().repeat_interleave(heads // source_heads, 1)
+                            for name in ("key", "slot", "value"))
+        first = first * gate[..., None, :] + key[..., None] * slot[..., None, :]
+        second = second * gate[..., None] + slot[..., None] * value[..., None, :]
+        query = (host["query"][:, :, token] * (13 ** -0.5)).float().repeat_interleave(heads // source_heads, 1)
         weight = torch.einsum("bhr,bhrm->bhm", query, before1 if priors[0] else first).softmax(-1)
         expected.append(torch.einsum("bhm,bhmv->bhv", weight, before2 if priors[1] else second))
     values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
     start = StateTuple(tuple(initial), tuple(tensor.to(gpu_device) for tensor in initial.values()))
     result = compiled(**values, initial_state=start, return_final_state=True)
-    torch.testing.assert_close(result.outputs["output"].cpu(), torch.stack(expected, 2), rtol=2e-4, atol=2e-5)
+    oracle = torch.stack(expected, 2).to(dtype)
+    tolerance = dict(rtol=2e-4, atol=2e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-3)
+    torch.testing.assert_close(result.outputs["output"].cpu(), oracle, **tolerance)
+    output_only = compiled(**values, initial_state=start)
+    torch.testing.assert_close(output_only.outputs["output"].cpu(), oracle, **tolerance)
+    assert output_only.final_state is None
+    if length > 1:
+        split = min(17, length - 1)
+        prefix = compiled(**{name: tensor[:, :, :split] for name, tensor in values.items()},
+                          initial_state=start, return_final_state=True)
+        suffix = compiled(**{name: tensor[:, :, split:] for name, tensor in values.items()},
+                          initial_state=prefix.final_state, return_final_state=True)
+        torch.testing.assert_close(torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2).cpu(),
+                                   oracle, **tolerance)
+        for name, final in (("key_slot", first), ("slot_value", second)):
+            torch.testing.assert_close(suffix.final_state[name].cpu(), final, rtol=2e-4, atol=2e-5)
+    for name in initial:
+        torch.testing.assert_close(start[name].cpu(), initial[name], rtol=0, atol=0)
     for name, final in (("key_slot", first), ("slot_value", second)):
         torch.testing.assert_close(result.final_state[name].cpu(), final, rtol=2e-4, atol=2e-5)
+
+
+@pytest.mark.parametrize("length", [1, 63, 64, 65, 137])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_native_bonus_parallel_rows_and_chunk_tail(gpu_device, length, dtype):
+    from attn_engine import (
+        AlgorithmIR, AxisScale, Input, StatefulOperator, StateTransition, StateTuple, Target,
+    )
+    from examples.rwkv6_attention import (
+        rwkv6_attention, KEY, VALUE, QUERY_HEADS, KEY_HEADS, VALUE_HEADS, STATE_HEADS,
+    )
+
+    # Direct signed gates expose accidental inverse-prefix normalization. Odd
+    # dimensions exercise padded row reduction and the partial column tile.
+    batch, heads, rows, columns = 1, 8, 35, 23
+    base = rwkv6_attention(batch, heads, length, rows, columns, dtype=dtype).algorithm
+    transition = base.transitions[0]
+    operator = StatefulOperator(AlgorithmIR(
+        inputs=base.inputs, states=base.states, readouts=base.readouts,
+        head_mapping=base.head_mapping,
+        transition=StateTransition(transition.state,
+            propagations=(AxisScale(Input("decay"), (KEY,)),), injections=transition.injections),
+    ))
+    compiled = operator.compile(
+        role_sizes={QUERY_HEADS: 2, KEY_HEADS: 1, VALUE_HEADS: 2, STATE_HEADS: heads,
+                    KEY: rows, VALUE: columns}, target=Target(), mode="dense",
+    )
+    generator = torch.Generator().manual_seed(191)
+    host = {name: (torch.randn(batch, source_heads, length, width, generator=generator) * 0.2).to(dtype)
+            for name, source_heads, width in (("query", 2, rows), ("key", 1, rows),
+                                              ("value", 2, columns), ("bonus", heads, rows))}
+    host["decay"] = torch.rand(batch, heads, length, rows, generator=generator) * 1.2 - 0.3
+    host["decay"][:, :, 63::64] = 0.0
+    host["decay"][:, :, 64::65] = -0.5
+    initial = torch.randn(batch, heads, rows, columns, generator=generator) * 0.1
+    state, expected = initial.clone(), []
+    for token in range(length):
+        query = (host["query"][:, :, token] * rows**-0.5).repeat_interleave(4, 1)
+        key = host["key"][:, :, token].repeat_interleave(8, 1)
+        value = host["value"][:, :, token].repeat_interleave(4, 1)
+        bonus = (query * host["bonus"][:, :, token] * key).float().sum(-1)
+        output = torch.einsum("bhr,bhrc->bhc", query.float(), state) + bonus[..., None] * value.float()
+        expected.append(output.to(dtype))
+        state = state * host["decay"][:, :, token, :, None] + key.float()[..., None] * value.float()[..., None, :]
+    oracle = torch.stack(expected, 2)
+    values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
+    start = StateTuple(("memory",), (initial.to(gpu_device),))
+    tolerance = dict(rtol=2e-4, atol=2e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-3)
+    full = compiled(**values, initial_state=start, return_final_state=True)
+    output_only = compiled(**values, initial_state=start)
+    torch.testing.assert_close(full.outputs["output"].cpu(), oracle, **tolerance)
+    torch.testing.assert_close(output_only.outputs["output"].cpu(), oracle, **tolerance)
+    torch.testing.assert_close(full.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
+    assert output_only.final_state is None
+    if length > 1:
+        split = min(17, length - 1)
+        prefix = compiled(**{name: tensor[:, :, :split] for name, tensor in values.items()},
+                          initial_state=start, return_final_state=True)
+        suffix = compiled(**{name: tensor[:, :, split:] for name, tensor in values.items()},
+                          initial_state=prefix.final_state, return_final_state=True)
+        torch.testing.assert_close(torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2).cpu(),
+                                   oracle, **tolerance)
+        torch.testing.assert_close(suffix.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
+    torch.testing.assert_close(start["memory"].cpu(), initial, rtol=0, atol=0)

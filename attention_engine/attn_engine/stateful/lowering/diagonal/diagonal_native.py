@@ -138,7 +138,8 @@ def native_diagonal_resources(recipe, sizes, heads):
     chunk_bytes=sum(4*heads*(3*sizes[s.rows]*sizes[s.columns] + 2*(sizes[s.rows]+sizes[s.columns])) for s in recipe.states)
     flops=3*heads*sum(sizes[s.rows]*sizes[s.columns]*len(s.injections) for s in recipe.states)
     score_groups={(term.state, query.loader.cache_key, term.prior) for _,term,query in recipe.readouts}
-    score_bytes=4*heads*64*64*len(score_groups)
+    score_bytes=sum(4*heads*64*(64*len(states[name].injections)+sizes[states[name].rows])
+                    for name, _, _ in score_groups)
     score_launches=len(score_groups)
     cut_bytes=live_bytes=0
     if recipe.softmax is not None:

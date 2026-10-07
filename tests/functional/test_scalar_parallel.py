@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import pytest
 import torch
 
@@ -280,3 +281,45 @@ def test_one_scalar_executable_handles_changing_batch_occupancy(gpu_device):
                 return_final_state=True,
             )
         _assert_result(result, expected, expected_final)
+
+
+@pytest.mark.parametrize("gate_kind", [None, "direct", "log"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_raw_scalar_parallel_row_column_tails_and_continuation(gate_kind, dtype, gpu_device):
+    """Exercise padded GEMM tiles even for a short continuation suffix."""
+    from attn_engine.stateful.lowering.scalar.scalar import tilelang_scalar_factorized_dense_raw
+
+    heads, rows, columns, length = 4, 35, 67, 130
+    inputs, initial = _inputs(
+        1, heads, 2, 1, length, rows, columns, dtype, gate_kind, gpu_device
+    )
+    def binding(name, scale=1.0, log=False):
+        return (SimpleNamespace(name=name),
+                SimpleNamespace(operation="identity", scale=scale, is_log_scale=log))
+    recipe = SimpleNamespace(
+        propagation=binding("__identity_propagation__" if gate_kind is None else "gate",
+                            log=gate_kind == "log"),
+        left_factor=binding("key"), right_factor=binding("value"),
+        readout=binding("query", rows**-0.5),
+    )
+    def execute(values, state, write_final):
+        return tilelang_scalar_factorized_dense_raw(
+            values, state, recipe, sequence_count=1, sequence_length=values["query"].shape[2],
+            output_dtype=dtype, return_final_state=write_final,
+        )
+    expected, expected_final = _reference(inputs, initial, gate_kind)
+    before = initial.clone()
+    with torch.no_grad():
+        output, final = execute(inputs, initial, True)
+        output_only, absent = execute(inputs, initial, False)
+        prefix_inputs = {name: value[:, :, :65].contiguous() for name, value in inputs.items()}
+        suffix_inputs = {name: value[:, :, 65:].contiguous() for name, value in inputs.items()}
+        prefix, prefix_final = execute(prefix_inputs, initial, True)
+        suffix, suffix_final = execute(suffix_inputs, prefix_final, True)
+    assert absent is None
+    assert final.dtype == torch.float32 and suffix_final.dtype == torch.float32
+    for result in (output, output_only, torch.cat((prefix, suffix), dim=2)):
+        torch.testing.assert_close(result.cpu(), expected, rtol=0.02, atol=0.05)
+    for state in (final, suffix_final):
+        torch.testing.assert_close(state.cpu(), expected_final, rtol=0.01, atol=0.02)
+    torch.testing.assert_close(initial, before, rtol=0, atol=0)

@@ -1,8 +1,8 @@
-"""TileLang chunked lowering for raw-input scalar affine operators.
+"""Raw-input scalar affine summaries, exclusive carries and chunk readout.
 
-The kernel keeps the state tile resident while processing 64-token chunks.  All
-products are formed forwards (rather than reconstructed from prefix ratios), so
-signed and zero gates have the same semantics as the reference recurrence.
+Summary and readout CTAs run independently over 64-token chunks. Only the
+FP32 State carry traverses chunks in order. Products never divide by a gate or
+a prefix, so signed gates, resets and underflow preserve later injections.
 """
 
 from functools import lru_cache
@@ -12,55 +12,18 @@ import torch
 
 
 CHUNK_TOKENS = 64
+STATE_BLOCK = 64
+CARRY_BLOCK = 256
 
 
 def _metadata(tensor: torch.Tensor):
     return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
 
 
-@lru_cache(maxsize=None)
-def _compile_chunked(
-    propagation_meta,
-    left_meta,
-    right_meta,
-    readout_meta,
-    initial_meta,
-    output_meta,
-    final_meta,
-    *,
-    sequence_count: int,
-    sequence_length: int,
-    heads: int,
-    rows: int,
-    columns: int,
-    propagation_heads: int,
-    left_heads: int,
-    right_heads: int,
-    readout_heads: int,
-    identity: bool,
-    propagation_operation: str,
-    left_operation: str,
-    right_operation: str,
-    readout_operation: str,
-    propagation_scale: float,
-    left_scale: float,
-    right_scale: float,
-    readout_scale: float,
-    propagation_log: bool,
-    left_log: bool,
-    right_log: bool,
-    readout_log: bool,
-    write_final: bool,
-    threads: int,
-    device_index: int,
-):
-    import tilelang
-    import tilelang.language as T
+def _transform(T, expression):
+    operation, scale, is_log = expression
 
-    chunks = tilelang.cdiv(sequence_length, CHUNK_TOKENS)
-    block_columns = threads
-
-    def transform(value, operation, scale, is_log):
+    def transform(value):
         if operation == "exp":
             value = T.exp(value)
         value = value * scale
@@ -68,69 +31,334 @@ def _compile_chunked(
             value = T.exp(value)
         return value
 
+    return transform
+
+
+def _gate_macro(T, heads, length, identity, expression):
+    transform = _transform(T, expression)
+
+    @T.macro
+    def load_gates(Propagation, Gates, sequence, head, chunk):
+        for token in T.Parallel(CHUNK_TOKENS):
+            logical = chunk * CHUNK_TOKENS + token
+            if identity:
+                Gates[token] = 1.0
+            elif logical < length:
+                Gates[token] = transform(T.cast(
+                    Propagation[sequence, head // (heads // Propagation.shape[1]), logical], "float32"
+                ))
+            else:
+                # Padding must not decay a partial chunk's terminal State.
+                Gates[token] = 1.0
+        T.sync_threads()
+
+    return load_gates
+
+
+def _product_scan_macro(T, reverse):
+    """Division-free scan; alternate storage without a copy-back at each level."""
+    @T.macro
+    def scan(Values):
+        scratch = T.alloc_shared((CHUNK_TOKENS,), "float32")
+        # Six levels finish in Values. Each level reads only the other buffer,
+        # preserving the original multiplication tree and cross-warp ordering.
+        for pair in T.unroll(3):
+            distance = 1 << (2 * pair)
+            for token in T.Parallel(CHUNK_TOKENS):
+                if reverse:
+                    scratch[token] = Values[token] * T.if_then_else(
+                        token + distance < CHUNK_TOKENS, Values[token + distance], 1.0
+                    )
+                else:
+                    scratch[token] = Values[token] * T.if_then_else(
+                        token >= distance, Values[token - distance], 1.0
+                    )
+            T.sync_threads()
+            for token in T.Parallel(CHUNK_TOKENS):
+                if reverse:
+                    Values[token] = scratch[token] * T.if_then_else(
+                        token + 2 * distance < CHUNK_TOKENS, scratch[token + 2 * distance], 1.0
+                    )
+                else:
+                    Values[token] = scratch[token] * T.if_then_else(
+                        token >= 2 * distance, scratch[token - 2 * distance], 1.0
+                    )
+            T.sync_threads()
+    return scan
+
+
+@lru_cache(maxsize=None)
+def _compile_summary(propagation_meta, left_meta, right_meta, carry_meta, scale_meta,
+                     expressions, *, heads, length, identity, threads, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    from ..diagonal.identity import fp32_gemm_macro
+
+    batch, _, chunks, rows, columns = carry_meta[0]
+    load_gates = _gate_macro(T, heads, length, identity, expressions[0])
+    scan_suffix = _product_scan_macro(T, True)
+    left_transform = _transform(T, expressions[1])
+    right_transform = _transform(T, expressions[2])
+    gemm = fp32_gemm_macro(T)
+
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build_kernel():
         @T.prim_func
-        def kernel(
-            Propagation: T.StridedTensor(*propagation_meta),
-            Left: T.StridedTensor(*left_meta),
-            Right: T.StridedTensor(*right_meta),
-            Readout: T.StridedTensor(*readout_meta),
-            Initial: T.StridedTensor(*initial_meta),
-            Output: T.StridedTensor(*output_meta),
-            Final: T.StridedTensor(*final_meta),
-        ):
-            with T.Kernel(
-                sequence_count * heads,
-                T.ceildiv(columns, block_columns),
-                threads=threads,
-            ) as (sequence_head, column_block):
-                sequence = sequence_head // heads
-                head = sequence_head % heads
-                left_head = head // (heads // left_heads)
-                right_head = head // (heads // right_heads)
-                readout_head = head // (heads // readout_heads)
-                propagation_head = head // (heads // propagation_heads) if not identity else 0
-                column_start = column_block * block_columns
+        def kernel(Propagation: T.StridedTensor(*propagation_meta),
+                   Left: T.StridedTensor(*left_meta), Right: T.StridedTensor(*right_meta),
+                   Carry: T.StridedTensor(*carry_meta), Scale: T.StridedTensor(*scale_meta)):
+            with T.Kernel(batch * heads, chunks,
+                          T.ceildiv(rows, STATE_BLOCK) * T.ceildiv(columns, STATE_BLOCK),
+                          threads=threads) as (sh, chunk, tile):
+                sequence, head = sh // heads, sh % heads
+                rb = tile // T.ceildiv(columns, STATE_BLOCK)
+                cb = tile % T.ceildiv(columns, STATE_BLOCK)
+                key = T.alloc_shared((STATE_BLOCK, CHUNK_TOKENS), "float32")
+                value = T.alloc_shared((CHUNK_TOKENS, STATE_BLOCK), "float32")
+                gates = T.alloc_shared((CHUNK_TOKENS,), "float32")
+                suffix = T.alloc_shared((CHUNK_TOKENS,), "float32")
+                result = T.alloc_fragment((STATE_BLOCK, STATE_BLOCK), "float32")
+                if not identity:
+                    load_gates(Propagation, gates, sequence, head, chunk)
+                    # The injection at t is multiplied by gates t+1..end.
+                    for token in T.Parallel(CHUNK_TOKENS):
+                        suffix[token] = T.if_then_else(
+                            token + 1 < CHUNK_TOKENS, gates[token + 1], 1.0
+                        )
+                    T.sync_threads()
+                    scan_suffix(suffix)
+                    if tile == 0 and T.get_thread_binding() == 0:
+                        Scale[sh, chunk] = gates[0] * suffix[0]
+                for row, token in T.Parallel(STATE_BLOCK, CHUNK_TOKENS):
+                    logical = chunk * CHUNK_TOKENS + token
+                    if rb * STATE_BLOCK + row < rows and logical < length:
+                        key[row, token] = left_transform(T.cast(
+                            Left[sequence, head // (heads // Left.shape[1]), logical,
+                                 rb * STATE_BLOCK + row], "float32"
+                        ))
+                        if not identity:
+                            key[row, token] *= suffix[token]
+                    else:
+                        key[row, token] = 0.0
+                for token, column in T.Parallel(CHUNK_TOKENS, STATE_BLOCK):
+                    logical = chunk * CHUNK_TOKENS + token
+                    if cb * STATE_BLOCK + column < columns and logical < length:
+                        value[token, column] = right_transform(T.cast(
+                            Right[sequence, head // (heads // Right.shape[1]), logical,
+                                  cb * STATE_BLOCK + column], "float32"
+                        ))
+                    else:
+                        value[token, column] = 0.0
+                T.clear(result)
+                gemm(key, value, result)
+                for row, column in T.Parallel(STATE_BLOCK, STATE_BLOCK):
+                    if rb * STATE_BLOCK + row < rows and cb * STATE_BLOCK + column < columns:
+                        Carry[sequence, head, chunk, rb * STATE_BLOCK + row,
+                              cb * STATE_BLOCK + column] = result[row, column]
+        return kernel
 
-                column = column_start + T.get_thread_binding()
-                state = T.alloc_local((rows,), "float32")
-                result = T.alloc_local((1,), "float32")
-                if column < columns:
-                    for row in T.serial(rows):
-                        state[row] = T.cast(Initial[sequence, head, row, column], "float32")
-                    for chunk in T.serial(chunks):
-                        for token in T.serial(CHUNK_TOKENS):
-                            logical_token = chunk * CHUNK_TOKENS + token
-                            if logical_token < sequence_length:
-                                if identity:
-                                    gate = 1.0
-                                else:
-                                    gate = transform(
-                                        T.cast(Propagation[sequence, propagation_head, logical_token], "float32"),
-                                        propagation_operation, propagation_scale, propagation_log,
-                                    )
-                                value = transform(
-                                    T.cast(Right[sequence, right_head, logical_token, column], "float32"),
-                                    right_operation, right_scale, right_log,
-                                )
-                                result[0] = 0.0
-                                for row in T.serial(rows):
-                                    key = transform(
-                                        T.cast(Left[sequence, left_head, logical_token, row], "float32"),
-                                        left_operation, left_scale, left_log,
-                                    )
-                                    query = transform(
-                                        T.cast(Readout[sequence, readout_head, logical_token, row], "float32"),
-                                        readout_operation, readout_scale, readout_log,
-                                    )
-                                    state[row] = gate * state[row] + key * value
-                                    result[0] += query * state[row]
-                                Output[sequence, head, logical_token, column] = result[0]
-                    if write_final:
-                        for row in T.serial(rows):
-                            Final[sequence, head, row, column] = state[row]
+    return build_kernel()
 
+
+@lru_cache(maxsize=None)
+def _compile_carry(scale_meta, carry_meta, initial_meta, final_meta, *, identity,
+                   write_final, carry_block, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    batch, heads, chunks, rows, columns = carry_meta[0]
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(Scale: T.StridedTensor(*scale_meta), Carry: T.StridedTensor(*carry_meta),
+                   Initial: T.StridedTensor(*initial_meta), Final: T.StridedTensor(*final_meta)):
+            with T.Kernel(batch * heads, T.ceildiv(rows * columns, carry_block),
+                          threads=128) as (sh, block):
+                sequence, head = sh // heads, sh % heads
+                state = T.alloc_fragment((carry_block,), "float32")
+                bias = T.alloc_fragment((carry_block,), "float32")
+                for lane in T.Parallel(carry_block):
+                    element = block * carry_block + lane
+                    if element < rows * columns:
+                        state[lane] = Initial[sequence, head, element // columns, element % columns]
+                    else:
+                        state[lane] = 0.0
+                for chunk in T.serial(chunks):
+                    for lane in T.Parallel(carry_block):
+                        element = block * carry_block + lane
+                        if element < rows * columns:
+                            bias[lane] = Carry[sequence, head, chunk,
+                                               element // columns, element % columns]
+                            # Consume the summary before replacing it with the
+                            # exclusive carry. No second matrix workspace needed.
+                            Carry[sequence, head, chunk,
+                                  element // columns, element % columns] = state[lane]
+                            if identity:
+                                state[lane] += bias[lane]
+                            else:
+                                state[lane] = Scale[sh, chunk] * state[lane] + bias[lane]
+                if write_final:
+                    for lane in T.Parallel(carry_block):
+                        element = block * carry_block + lane
+                        if element < rows * columns:
+                            Final[sequence, head, element // columns, element % columns] = state[lane]
+        return kernel
+
+    return build_kernel()
+
+
+@lru_cache(maxsize=None)
+def _compile_readout(propagation_meta, left_meta, right_meta, readout_meta, carry_meta,
+                     output_meta, expressions, *, heads, length, identity, threads, device_index):
+    import tilelang
+    import tilelang.language as T
+
+    from ..diagonal.identity import fp32_gemm_macro
+
+    batch, _, chunks, rows, columns = carry_meta[0]
+    load_gates = _gate_macro(T, heads, length, identity, expressions[0])
+    scan_prefix = _product_scan_macro(T, False)
+    left_transform = _transform(T, expressions[1])
+    right_transform = _transform(T, expressions[2])
+    readout_transform = _transform(T, expressions[3])
+    gemm = fp32_gemm_macro(T)
+    @T.macro
+    def prepared_left_gemm(AH, AL, B, C):
+        """FP32 GEMM with a pre-split left operand.
+
+        The readout query feeds both query-key and query-State products.  The
+        hi/lo split is invariant across those products, so retain it once in
+        shared memory while each right operand still receives the standard
+        three-term TF32 decomposition.
+        """
+        bh = T.alloc_shared(B.shape, T.tfloat32)
+        bl = T.alloc_shared(B.shape, T.tfloat32)
+        for k, j in T.Parallel(B.shape[0], B.shape[1]):
+            bh[k, j] = T.cast(B[k, j], T.tfloat32)
+            bl[k, j] = T.cast(B[k, j] - T.cast(bh[k, j], "float32"), T.tfloat32)
+        T.gemm(AL, bh, C)
+        T.gemm(AH, bl, C)
+        T.gemm(AH, bh, C)
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(Propagation: T.StridedTensor(*propagation_meta),
+                   Left: T.StridedTensor(*left_meta), Right: T.StridedTensor(*right_meta),
+                   Readout: T.StridedTensor(*readout_meta), Carry: T.StridedTensor(*carry_meta),
+                   Output: T.StridedTensor(*output_meta)):
+            with T.Kernel(batch * heads, chunks, T.ceildiv(columns, STATE_BLOCK),
+                          threads=threads) as (sh, chunk, cb):
+                sequence, head = sh // heads, sh % heads
+                query = T.alloc_shared((CHUNK_TOKENS, STATE_BLOCK), "float32")
+                query_hi = T.alloc_shared((CHUNK_TOKENS, STATE_BLOCK), T.tfloat32)
+                query_lo = T.alloc_shared((CHUNK_TOKENS, STATE_BLOCK), T.tfloat32)
+                key = T.alloc_shared((STATE_BLOCK, CHUNK_TOKENS), "float32")
+                state = T.alloc_shared((STATE_BLOCK, STATE_BLOCK), "float32")
+                value = T.alloc_shared((CHUNK_TOKENS, STATE_BLOCK), "float32")
+                weights = T.alloc_shared((CHUNK_TOKENS, CHUNK_TOKENS), "float32")
+                weight_scratch = T.alloc_shared((CHUNK_TOKENS, CHUNK_TOKENS), "float32")
+                gates = T.alloc_shared((CHUNK_TOKENS,), "float32")
+                prefix = T.alloc_shared((CHUNK_TOKENS,), "float32")
+                scores = T.alloc_fragment((CHUNK_TOKENS, CHUNK_TOKENS), "float32")
+                output = T.alloc_fragment((CHUNK_TOKENS, STATE_BLOCK), "float32")
+                if not identity:
+                    load_gates(Propagation, gates, sequence, head, chunk)
+                    T.copy(gates, prefix)
+                    T.sync_threads()
+                    scan_prefix(prefix)
+                    # Reverse inclusive products over sources give the product
+                    # gates[source+1..token], without prefix ratios/log subtraction.
+                    for token, source in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
+                        weights[token, source] = T.if_then_else(
+                            source < token, gates[source + 1], 1.0
+                        )
+                    T.sync_threads()
+                    for pair in T.unroll(3):
+                        distance = 1 << (2 * pair)
+                        for token, source in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
+                            weight_scratch[token, source] = weights[token, source] * T.if_then_else(
+                                source + distance < CHUNK_TOKENS,
+                                weights[token, source + distance], 1.0
+                            )
+                        T.sync_threads()
+                        for token, source in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
+                            weights[token, source] = weight_scratch[token, source] * T.if_then_else(
+                                source + 2 * distance < CHUNK_TOKENS,
+                                weight_scratch[token, source + 2 * distance], 1.0
+                            )
+                        T.sync_threads()
+                T.clear(scores)
+                T.clear(output)
+                for rb in T.serial(T.ceildiv(rows, STATE_BLOCK)):
+                    for token, row in T.Parallel(CHUNK_TOKENS, STATE_BLOCK):
+                        logical = chunk * CHUNK_TOKENS + token
+                        query_value = T.alloc_var("float32", init=0.0)
+                        if logical < length and rb * STATE_BLOCK + row < rows:
+                            query_value = readout_transform(T.cast(
+                                Readout[sequence, head // (heads // Readout.shape[1]), logical,
+                                        rb * STATE_BLOCK + row], "float32"
+                            ))
+                            key[row, token] = left_transform(T.cast(
+                                Left[sequence, head // (heads // Left.shape[1]), logical,
+                                     rb * STATE_BLOCK + row], "float32"
+                            ))
+                        else:
+                            key[row, token] = 0.0
+                        if identity:
+                            query[token, row] = query_value
+                        else:
+                            query_hi[token, row] = T.cast(query_value, T.tfloat32)
+                            query_lo[token, row] = T.cast(
+                                query_value - T.cast(query_hi[token, row], "float32"),
+                                T.tfloat32,
+                            )
+                    for row, column in T.Parallel(STATE_BLOCK, STATE_BLOCK):
+                        if rb * STATE_BLOCK + row < rows and cb * STATE_BLOCK + column < columns:
+                            state[row, column] = Carry[sequence, head, chunk,
+                                                       rb * STATE_BLOCK + row,
+                                                       cb * STATE_BLOCK + column]
+                        else:
+                            state[row, column] = 0.0
+                    # Identity retains its measured staging schedule. Gated
+                    # readouts split directly from the loaded FP32 lane value.
+                    if identity:
+                        for token, row in T.Parallel(CHUNK_TOKENS, STATE_BLOCK):
+                            query_hi[token, row] = T.cast(query[token, row], T.tfloat32)
+                            query_lo[token, row] = T.cast(
+                                query[token, row] - T.cast(query_hi[token, row], "float32"),
+                                T.tfloat32,
+                            )
+                    T.sync_threads()
+                    prepared_left_gemm(query_hi, query_lo, key, scores)
+                    prepared_left_gemm(query_hi, query_lo, state, output)
+                for token, column in T.Parallel(CHUNK_TOKENS, STATE_BLOCK):
+                    if not identity:
+                        output[token, column] *= prefix[token]
+                for token, source in T.Parallel(CHUNK_TOKENS, CHUNK_TOKENS):
+                    if source <= token:
+                        if identity:
+                            weights[token, source] = scores[token, source]
+                        else:
+                            weights[token, source] *= scores[token, source]
+                    else:
+                        weights[token, source] = 0.0
+                for token, column in T.Parallel(CHUNK_TOKENS, STATE_BLOCK):
+                    logical = chunk * CHUNK_TOKENS + token
+                    if logical < length and cb * STATE_BLOCK + column < columns:
+                        value[token, column] = right_transform(T.cast(
+                            Right[sequence, head // (heads // Right.shape[1]), logical,
+                                  cb * STATE_BLOCK + column], "float32"
+                        ))
+                    else:
+                        value[token, column] = 0.0
+                gemm(weights, value, output)
+                for token, column in T.Parallel(CHUNK_TOKENS, STATE_BLOCK):
+                    logical = chunk * CHUNK_TOKENS + token
+                    if logical < length and cb * STATE_BLOCK + column < columns:
+                        Output[sequence, head, logical, cb * STATE_BLOCK + column] = output[token, column]
         return kernel
 
     return build_kernel()
@@ -151,29 +379,39 @@ def scalar_chunked_dense_raw(
     return_final_state: bool,
     threads: int,
 ) -> None:
-    """Launch the chunked TileLang scalar path using the established raw ABI."""
+    """Launch summary → exclusive carry → readout using the established raw ABI."""
     sequences, heads, rows, columns = initial.shape
-    propagation_heads = heads if identity_propagation else propagation.shape[1]
-    kernel = _compile_chunked(
-        _metadata(propagation), _metadata(left), _metadata(right), _metadata(readout),
-        _metadata(initial), _metadata(output), _metadata(final),
-        sequence_count=sequences, sequence_length=sequence_length, heads=heads,
-        rows=rows, columns=columns, propagation_heads=propagation_heads,
-        left_heads=left.shape[1], right_heads=right.shape[1], readout_heads=readout.shape[1],
-        identity=identity_propagation,
-        propagation_operation=expressions[0].operation,
-        left_operation=expressions[1].operation,
-        right_operation=expressions[2].operation,
-        readout_operation=expressions[3].operation,
-        propagation_scale=expressions[0].scale,
-        left_scale=expressions[1].scale,
-        right_scale=expressions[2].scale,
-        readout_scale=expressions[3].scale,
-        propagation_log=expressions[0].is_log_scale,
-        left_log=expressions[1].is_log_scale,
-        right_log=expressions[2].is_log_scale,
-        readout_log=expressions[3].is_log_scale,
-        write_final=return_final_state, threads=threads,
-        device_index=initial.device.index if initial.device.index is not None else torch.cuda.current_device(),
+    chunks = (sequence_length + CHUNK_TOKENS - 1) // CHUNK_TOKENS
+    carry = torch.empty(
+        sequences, heads, chunks, rows, columns, device=initial.device, dtype=torch.float32
     )
-    kernel(propagation, left, right, readout, initial, output, final)
+    # Identity kernels erase Scale accesses; retain a live pointer, not dummy storage.
+    scale = initial if identity_propagation else torch.empty(
+        sequences * heads, chunks, device=initial.device, dtype=torch.float32
+    )
+    expression_meta = tuple(
+        (expression.operation, expression.scale, expression.is_log_scale)
+        for expression in expressions
+    )
+    device_index = initial.device.index
+    if initial.is_cuda and device_index is None:
+        device_index = torch.cuda.current_device()
+    common = dict(heads=heads, length=sequence_length, identity=identity_propagation,
+                  threads=threads, device_index=device_index)
+    _compile_summary(
+        _metadata(propagation), _metadata(left), _metadata(right), _metadata(carry),
+        _metadata(scale), expression_meta, **common,
+    )(propagation, left, right, carry, scale)
+    # Regular substantial dense states use 512-element carry blocks, halving
+    # carry CTAs without changing the original tail schedule.
+    carry_elements = rows * columns
+    carry_block = 512 if carry_elements >= 4096 and carry_elements % 512 == 0 else CARRY_BLOCK
+    _compile_carry(
+        _metadata(scale), _metadata(carry), _metadata(initial), _metadata(final),
+        identity=identity_propagation, write_final=return_final_state,
+        carry_block=carry_block, device_index=device_index,
+    )(scale, carry, initial, final)
+    _compile_readout(
+        _metadata(propagation), _metadata(left), _metadata(right), _metadata(readout),
+        _metadata(carry), _metadata(output), expression_meta, **common,
+    )(propagation, left, right, readout, carry, output)

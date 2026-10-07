@@ -1243,6 +1243,9 @@ def compile_plan(
         aligned_bytes_per_token=selected_estimate.aligned_workspace_bytes_per_token,
         alignment_tokens=selected_estimate.alignment_tokens,
         bytes_per_chunk=selected_estimate.workspace_bytes_per_chunk,
+        # Factored inference can use 16-token WY/short replay chunks. Charge
+        # that worst case even when long non-WY calls select 64-token chunks.
+        chunk_tokens=16 if selected_plan.representation == PlanRepresentation.FACTORED_RECURRENCE else 64,
     )
     backward_candidate = None
     backward_kernel_config = None

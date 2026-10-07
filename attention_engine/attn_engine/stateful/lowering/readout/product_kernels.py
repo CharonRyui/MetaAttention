@@ -131,7 +131,7 @@ def product_chunk_scores(key, query, *, sequence_length, prior=False):
 @lru_cache(maxsize=None)
 def _compile_readout(
     query_left_meta, query_right_meta, value_meta, carry_meta, scores_meta, output_meta,
-    *, length, heads, left, right, columns, device_index,
+    *, length, heads, left, right, columns, tile_width, device_index,
 ):
     import tilelang
     import tilelang.language as T
@@ -152,15 +152,15 @@ def _compile_readout(
             Output: T.StridedTensor(*output_meta),
         ):
             with T.Kernel(
-                batch * heads, chunks, T.ceildiv(columns, _BLOCK), threads=128
-            ) as (batch_head, chunk, column_block):
+                batch * heads, chunks, T.ceildiv(columns, tile_width), threads=128
+            ) as (batch_head, chunk, column_tile):
                 sequence = batch_head // heads
                 head = batch_head % heads
-                output = T.alloc_fragment((CHUNK, _BLOCK), "float32")
+                output = T.alloc_fragment((CHUNK, tile_width), "float32")
                 query_product = T.alloc_fragment((CHUNK, _BLOCK), "float32")
-                state_shared = T.alloc_shared((_BLOCK, _BLOCK), "float32")
+                state_shared = T.alloc_shared((_BLOCK, tile_width), "float32")
                 scores_shared = T.alloc_shared((CHUNK, CHUNK), "float32")
-                value_shared = T.alloc_shared((CHUNK, _BLOCK), "float32")
+                value_shared = T.alloc_shared((CHUNK, tile_width), "float32")
                 T.clear(output)
                 for product_block in T.serial(T.ceildiv(product, _BLOCK)):
                     for token, feature in T.Parallel(CHUNK, _BLOCK):
@@ -169,45 +169,36 @@ def _compile_readout(
                         valid = (index < length) & (product_index < product)
                         query_product[token, feature] = T.if_then_else(
                             valid,
-                            T.cast(
-                                QueryLeft[sequence * length + index, head, product_index // right],
-                                "float32",
-                            ) * T.cast(
-                                QueryRight[sequence * length + index, head, product_index % right],
-                                "float32",
-                            ),
+                            T.cast(QueryLeft[sequence * length + index, head, product_index // right], "float32")
+                            * T.cast(QueryRight[sequence * length + index, head, product_index % right], "float32"),
                             0.0,
                         )
-                    for feature, column in T.Parallel(_BLOCK, _BLOCK):
+                    for feature, column in T.Parallel(_BLOCK, tile_width):
                         product_index = product_block * _BLOCK + feature
-                        column_index = column_block * _BLOCK + column
+                        column_index = column_tile * tile_width + column
                         state_shared[feature, column] = T.if_then_else(
                             (product_index < product) & (column_index < columns),
-                            T.cast(
-                                Carry[batch_head, chunk, product_index, column_index],
-                                "float32",
-                            ),
+                            T.cast(Carry[batch_head, chunk, product_index, column_index], "float32"),
                             0.0,
                         )
                     gemm(query_product, state_shared, output)
                 for token, source in T.Parallel(CHUNK, CHUNK):
                     scores_shared[token, source] = Scores[batch_head, chunk, token, source]
-                for token, column in T.Parallel(CHUNK, _BLOCK):
+                for token, column in T.Parallel(CHUNK, tile_width):
                     index = chunk * CHUNK + token
-                    column_index = column_block * _BLOCK + column
+                    column_index = column_tile * tile_width + column
                     value_shared[token, column] = T.if_then_else(
                         (index < length) & (column_index < columns),
                         T.cast(Value[sequence * length + index, head, column_index], "float32"),
                         0.0,
                     )
                 gemm(scores_shared, value_shared, output)
-                for token, column in T.Parallel(CHUNK, _BLOCK):
+                for token, column in T.Parallel(CHUNK, tile_width):
                     index = chunk * CHUNK + token
-                    column_index = column_block * _BLOCK + column
+                    column_index = column_tile * tile_width + column
                     if (index < length) & (column_index < columns):
                         Output[sequence * length + index, head, column_index] = output[token, column]
         return kernel
-
     return build_kernel()
 
 
@@ -231,6 +222,7 @@ def read_product_state(
         _metadata(carry), _metadata(scores), _metadata(output),
         length=sequence_length, heads=heads, left=key_left.shape[-1],
         right=key_right.shape[-1], columns=columns,
+        tile_width=16 if columns <= 16 else _BLOCK,
         device_index=key_left.device.index,
     )(query_left, query_right, value, carry, scores, output)
     return output
