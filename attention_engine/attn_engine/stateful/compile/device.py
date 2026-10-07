@@ -5,10 +5,8 @@ hardware facts and the small, lowering-facing default schedule space.  It does
 not select a winner; measurement remains the responsibility of ``tuning.py``.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any
-
 
 @dataclass(frozen=True)
 class DeviceProfile:

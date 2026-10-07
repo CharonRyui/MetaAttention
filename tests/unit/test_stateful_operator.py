@@ -117,6 +117,15 @@ def test_backward_binding_reuses_selected_forward_schedule():
     assert executable.plan.backward_kernel_config.values == executable.plan.kernel_config.values
 
 
+def test_forward_scan_uses_forward_kernel_configuration():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator)
+    executable = operator._plans[compiled.specialization]
+    assert executable.plan.kernel_config.values in (
+        (("threads", 128),),
+        (("block_tokens", 128),),
+    )
+
 def test_context_contract_rejects_dtype_role_and_shape_mismatches():
     from attn_engine.stateful.compile.plan import ContextContract, ContextValue
 

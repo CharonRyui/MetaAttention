@@ -785,9 +785,7 @@ class TileLangExecutable:
                 segment,
                 initial_state,
                 backward=self.backward_binding,
-                config=self.plan.backward_kernel_config.values
-                if self.plan.backward_kernel_config
-                else (),
+                config=self.plan.kernel_config.values,
             )
         from ..lowering.scan.elementwise import tilelang_elementwise_prefix
 
@@ -797,9 +795,7 @@ class TileLangExecutable:
             segment,
             initial_state,
             backward=self.backward_binding,
-            config=self.plan.backward_kernel_config.values
-            if self.plan.backward_kernel_config
-            else (),
+            config=self.plan.kernel_config.values,
             second=second,
         )
 
