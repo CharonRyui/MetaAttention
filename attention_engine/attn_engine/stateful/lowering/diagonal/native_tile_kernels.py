@@ -21,6 +21,7 @@ import torch
 
 _CHUNK = 64
 _TILE = 32
+_SUMMARY_KERNELS = {}
 
 
 def _dtype_name(dtype: torch.dtype) -> str:
@@ -31,6 +32,24 @@ def _dtype_name(dtype: torch.dtype) -> str:
 
 def _storage_size(tensor: torch.Tensor) -> int:
     return int(tensor.untyped_storage().nbytes() // tensor.element_size())
+
+
+def _tensor_metadata(tensor: torch.Tensor) -> tuple:
+    """Specialization metadata only; never retain a tensor or storage pointer."""
+    return (tensor.device, tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()),
+            int(tensor.storage_offset()), _storage_size(tensor))
+
+
+def _loader_metadata(expressions, sources, maps, loaders) -> tuple:
+    # Keep semantic use order, including repeated expressions and absent gates.
+    recipes = tuple(
+        None if expression is None else
+        (loaders[id(expression)].cache_key, tuple(maps[id(expression)].items()))
+        for expression in expressions
+    )
+    bindings = tuple((_tensor_metadata(source.tensor), source.strides, source.group, source.offset)
+                     for source in sources)
+    return recipes, bindings
 
 
 def _raw_storage_view(tensor: torch.Tensor) -> torch.Tensor:
@@ -107,6 +126,9 @@ class RawLoaderContext:
             self.loaders[id(expression)], self.maps[id(expression)], self.sources,
             token=token, head=head, feature=feature, sequence_length=self.sequence_length,
         )
+
+    def specialization_key(self, expressions):
+        return _loader_metadata(expressions, self.sources, self.maps, self.loaders)
 
 
 def _round_bf16(value: str) -> str:
@@ -190,7 +212,7 @@ def _annotation_sources(sources: tuple[_RawSource, ...]) -> str:
 
 
 @lru_cache(maxsize=None)
-def _kernel_source(body: str, annotations: str, name: str) -> Any:
+def _kernel_source(body: str, annotations: str, name: str, device: torch.device) -> Any:
     import tilelang
     import tilelang.language as T
 
@@ -260,7 +282,7 @@ def _summary_kernel(sources, maps, loaders, row_gate, column_gate, injections, *
         annotations += ", "
     annotations += f"Scale: T.StridedTensor({tuple(scale.shape)}, {tuple(scale.stride())}, 'float32'), "
     annotations += f"Bias: T.StridedTensor({tuple(bias.shape)}, {tuple(bias.stride())}, 'float32')"
-    return _kernel_source(body, annotations, "summary")
+    return _kernel_source(body, annotations, "summary", bias.device)
 
 
 def launch_native_summary(
@@ -281,11 +303,20 @@ def launch_native_summary(
     injections = tuple(injections)
     expressions = _expressions((row_gate, column_gate, injections))
     sources, maps, loaders = _bind(expressions, inputs, heads)
-    kernel = _summary_kernel(
-        sources, maps, loaders, row_gate, column_gate, injections,
-        batch=batch_heads // heads, length=sequence_length, heads=heads,
-        rows=rows, columns=columns, scale=scale, bias=bias,
+    key = (
+        _loader_metadata((row_gate, column_gate, *(expression for pair in injections for expression in pair)),
+                         sources, maps, loaders),
+        batch_heads // heads, heads, sequence_length, chunks, rows, columns, _CHUNK, _TILE,
+        _tensor_metadata(scale), _tensor_metadata(bias),
     )
+    kernel = _SUMMARY_KERNELS.get(key)
+    if kernel is None:
+        kernel = _summary_kernel(
+            sources, maps, loaders, row_gate, column_gate, injections,
+            batch=batch_heads // heads, length=sequence_length, heads=heads,
+            rows=rows, columns=columns, scale=scale, bias=bias,
+        )
+        _SUMMARY_KERNELS[key] = kernel
     kernel(*(_raw_storage_view(source.tensor) for source in sources), scale, bias)
 
 
@@ -347,7 +378,7 @@ def _replay_kernel(sources, maps, loaders, row_gate, column_gate, injections, qu
         annotations += f"Query: T.StridedTensor({tuple(query.shape)}, {tuple(query.stride())}, {_dtype_name(query.dtype)!r}), "
     annotations += f"Carry: T.StridedTensor({tuple(carry.shape)}, {tuple(carry.stride())}, 'float32'), "
     annotations += f"Output: T.StridedTensor({tuple(output.shape)}, {tuple(output.stride())}, {_dtype_name(output.dtype)!r})"
-    return _kernel_source(body, annotations, "replay")
+    return _kernel_source(body, annotations, "replay", carry.device)
 
 
 def launch_native_replay(

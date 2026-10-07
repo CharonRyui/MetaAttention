@@ -402,3 +402,67 @@ H8/T64 public 从 0.32581 ms（既有矩阵记录）降至 0.23702 ms，Graph �
 独立 authored-order oracle、RWKV6 FLA coverage（5 passed）、final-State 与
 continuation 合同均通过。原始数据见
 `benchmark_results/stateful_tilelang015_rwkv6_followup.json`。
+
+### Rank-one direct replay and native codegen cache (2026-10-07)
+
+`scan/rank1.py` now reuses a zero-copy initial-State carry for one-chunk
+execution, including final-State requests. This restores the Triton direct
+schedule without changing token recurrence or the multi-chunk path. Summary,
+carry and their three vector workspaces are skipped. H8/T64 output-only peak
+incremental allocation falls from 71,680 to 65,536 bytes.
+
+Native summary, bonus replay and fused softmax look up compiled kernels before
+loader expression emission and body/source generation. Keys contain ordered
+loader semantics and source maps, current device/dtype/shape/strides/storage
+offset/storage extent, head groups, B/H/T, prior flags and output/carry metadata.
+Each invocation still validates public inputs and binds current pointers;
+cache entries contain metadata and kernels, not tensors. Source caches also
+include device. The existing unbounded source-cache convention remains; many
+distinct layouts/storage extents can create additional compiled entries.
+
+H20 GPU 3, fixed pre-edit modules, same compiled operator and inputs, five
+alternating rounds of 30 warmed samples; compilation excluded. This is a
+TileLang before/after comparison, not an FLA speedup claim:
+
+| Family | H | T | Before public ms | After public ms | Before Graph ms | After Graph ms |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| HGRN | 1 | 64 | 0.12891 | 0.07534 | 0.01411 | 0.01395 |
+| HGRN | 8 | 64 | 0.13726 | 0.08042 | 0.01642 | 0.01363 |
+| HGRN | 1 | 2048 | 0.13387 | 0.13358 | 0.01886 | 0.01893 |
+| RWKV6 | 1 | 64 | 0.21402 | 0.18392 | 0.05376 | 0.05376 |
+| RWKV6 | 8 | 2048 | 0.36555 | 0.31733 | 0.19595 | 0.19602 |
+| GSA | 1 | 64 | 0.29616 | 0.25394 | 0.11485 | 0.11506 |
+| GSA | 1 | 2048 | 0.48075 | 0.41234 | 0.13158 | 0.13176 |
+| GSA | 8 | 2048 | 0.55077 | 0.47965 | 0.23272 | 0.23301 |
+| normalized-linear | 8 | 2048 | 0.21598 | 0.21693 | 0.12853 | 0.12845 |
+
+RWKV6/GSA public improvements are approximately 13–14%; Graph stays effectively
+unchanged, consistent with CPU codegen removal. HGRN T64 public improves about
+41%, with observed launches reduced 3 to 1. Long HGRN and normalized-linear are
+unchanged within measurement noise. The first GPU 0 A/B overlapped regression
+work and is superseded by the isolated GPU 3 numbers above.
+
+All nine cases pass independent authored-order oracle checks and bitwise
+before/after outputs/finals for output-only, final-State and continuation.
+Additional changed-input CUDA Graph replay passes for HGRN/RWKV6/GSA; RWKV6/GSA
+dynamic B/T rebinding passes B1/T64, B2/T65, B1/T130 and B1/T64 again, with retained
+outputs unchanged. Consumer regressions add fresh contiguous storage with changed
+offsets/extents for GSA and RWKV6 and retain noncontiguous-input rejection.
+CPU suite: 193 passed, 6 skipped; Ruff and compilation passed.
+The first combined rank-one/readout GPU run reported 132 passed and 74 failed:
+test fixtures supplied noncontiguous tensors to the contiguous-only public API,
+and two tests requested shared-scores for an unsupported dual-gate structure.
+The fixtures now use legal contiguous continuation/offset views and enumerate
+replay for dual gates, scores for the supported single axis; runtime validation,
+candidate eligibility and numerical tolerances are unchanged. All 96 affected
+native diagonal/softmax/bonus cases then passed (79 unrelated cases deselected)
+in 470 seconds. The earlier run's other cases, including all rank-one tests,
+passed; it is not reported as a passing full-suite run.
+
+The GSA per-token shared-vector candidate is **not retained**. Four cases had
+bitwise output parity, but raw replay Graph latency regressed 11.49–13.15%; the
+compiler also emitted a ThreadSync hoist warning describing a potential race.
+No tolerance was relaxed and no candidate arithmetic entered the repository.
+Raw rounds and memory observations:
+`benchmark_results/stateful_tilelang015_native_cache_followup.json`.
+

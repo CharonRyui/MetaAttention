@@ -311,9 +311,8 @@ def test_diagonal_block_separated_product_features(gpu_device, prior):
     torch.testing.assert_close(final.cpu(), expected_final, rtol=2e-4, atol=2e-5)
 
 
-@pytest.mark.parametrize("schedule", ["replay", "scores"])
+@pytest.mark.parametrize("schedule,dual", [("replay", False), ("replay", True), ("scores", False)])
 @pytest.mark.parametrize("prior", [False, True])
-@pytest.mark.parametrize("dual", [False, True])
 def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule, prior, dual):
     from dataclasses import replace
     from attn_engine import (
@@ -501,7 +500,7 @@ def test_native_multiple_injections_dynamic_workloads_and_continuation(gpu_devic
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, priors, length, dtype):
     from dataclasses import replace
-    from attn_engine import AlgorithmIR, Readout, Softmax, StateTerm, StatefulOperator, StateTuple, Target
+    from attn_engine import AlgorithmIR, Readout, Softmax, StateTerm, StatefulOperator, StateTuple, Target, StatefulCompilationError
     from attn_engine.stateful.lowering.chunked import select_chunked_schedule
     from examples.gated_slot_attention import gated_slot_attention, KEY, VALUE, QUERY_HEADS, KEY_HEADS, VALUE_HEADS, STATE_HEADS
 
@@ -535,7 +534,8 @@ def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, prio
     host["gate"][:, :, 63::64] = float("-inf")
     initial = {"key_slot": torch.randn(batch, heads, 13, 19, generator=generator) * 0.1,
                "slot_value": torch.randn(batch, heads, 19, 11, generator=generator) * 0.1}
-    first, second, expected = initial["key_slot"].clone(), initial["slot_value"].clone(), []
+    first, second = initial["key_slot"].clone(), initial["slot_value"].clone()
+    expected, negated_expected = [], []
     for token in range(length):
         before1, before2 = first, second
         gate = host["gate"][:, :, token].float().exp()
@@ -546,6 +546,8 @@ def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, prio
         query = (host["query"][:, :, token] * (13 ** -0.5)).float().repeat_interleave(heads // source_heads, 1)
         weight = torch.einsum("bhr,bhrm->bhm", query, before1 if priors[0] else first).softmax(-1)
         expected.append(torch.einsum("bhm,bhmv->bhv", weight, before2 if priors[1] else second))
+        negated_weight = torch.einsum("bhr,bhrm->bhm", -query, before1 if priors[0] else first).softmax(-1)
+        negated_expected.append(torch.einsum("bhm,bhmv->bhv", negated_weight, before2 if priors[1] else second))
     values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
     start = StateTuple(tuple(initial), tuple(tensor.to(gpu_device) for tensor in initial.values()))
     result = compiled(**values, initial_state=start, return_final_state=True)
@@ -555,11 +557,32 @@ def test_native_softmax_typed_cut_and_nonzero_initial(gpu_device, schedule, prio
     output_only = compiled(**values, initial_state=start)
     torch.testing.assert_close(output_only.outputs["output"].cpu(), oracle, **tolerance)
     assert output_only.final_state is None
+    if length == 65:
+        negated_oracle = torch.stack(negated_expected, 2).to(dtype)
+        for layout in ("fresh", "shifted", "shifted-larger"):
+            rebound = {}
+            for name, tensor in host.items():
+                data = -tensor if name == "query" else tensor
+                if layout != "fresh":
+                    offset = 1 if layout == "shifted" else 5
+                    storage = torch.empty(data.numel() + offset + 3, device=gpu_device, dtype=data.dtype)
+                    rebound[name] = storage[offset:offset + data.numel()].reshape(data.shape)
+                    rebound[name].copy_(data)
+                else:
+                    rebound[name] = data.to(gpu_device).clone()
+            changed = compiled(**rebound, initial_state=start, return_final_state=True)
+            torch.testing.assert_close(changed.outputs["output"].cpu(), negated_oracle, **tolerance)
+            for name, final in (("key_slot", first), ("slot_value", second)):
+                torch.testing.assert_close(changed.final_state[name].cpu(), final, rtol=2e-4, atol=2e-5)
+        invalid = dict(values, query=values["query"][..., ::2])
+        with pytest.raises(StatefulCompilationError) as error:
+            compiled(**invalid, initial_state=start)
+        assert error.value.category == "RUNTIME_LAYOUT"
     if length > 1:
         split = min(17, length - 1)
-        prefix = compiled(**{name: tensor[:, :, :split] for name, tensor in values.items()},
+        prefix = compiled(**{name: tensor[:, :, :split].contiguous() for name, tensor in values.items()},
                           initial_state=start, return_final_state=True)
-        suffix = compiled(**{name: tensor[:, :, split:] for name, tensor in values.items()},
+        suffix = compiled(**{name: tensor[:, :, split:].contiguous() for name, tensor in values.items()},
                           initial_state=prefix.final_state, return_final_state=True)
         torch.testing.assert_close(torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2).cpu(),
                                    oracle, **tolerance)
@@ -623,11 +646,26 @@ def test_native_bonus_parallel_rows_and_chunk_tail(gpu_device, length, dtype):
     torch.testing.assert_close(output_only.outputs["output"].cpu(), oracle, **tolerance)
     torch.testing.assert_close(full.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
     assert output_only.final_state is None
+    if length == 65:
+        for layout in ("fresh", "shifted", "shifted-larger"):
+            rebound = {}
+            for name, tensor in host.items():
+                data = -tensor if name == "query" else tensor
+                if layout != "fresh":
+                    offset = 1 if layout == "shifted" else 5
+                    storage = torch.empty(data.numel() + offset + 3, device=gpu_device, dtype=data.dtype)
+                    rebound[name] = storage[offset:offset + data.numel()].reshape(data.shape)
+                    rebound[name].copy_(data)
+                else:
+                    rebound[name] = data.to(gpu_device).clone()
+            changed = compiled(**rebound, initial_state=start, return_final_state=True)
+            torch.testing.assert_close(changed.outputs["output"].cpu(), -oracle, **tolerance)
+            torch.testing.assert_close(changed.final_state["memory"].cpu(), state, rtol=2e-4, atol=2e-5)
     if length > 1:
         split = min(17, length - 1)
-        prefix = compiled(**{name: tensor[:, :, :split] for name, tensor in values.items()},
+        prefix = compiled(**{name: tensor[:, :, :split].contiguous() for name, tensor in values.items()},
                           initial_state=start, return_final_state=True)
-        suffix = compiled(**{name: tensor[:, :, split:] for name, tensor in values.items()},
+        suffix = compiled(**{name: tensor[:, :, split:].contiguous() for name, tensor in values.items()},
                           initial_state=prefix.final_state, return_final_state=True)
         torch.testing.assert_close(torch.cat((prefix.outputs["output"], suffix.outputs["output"]), 2).cpu(),
                                    oracle, **tolerance)

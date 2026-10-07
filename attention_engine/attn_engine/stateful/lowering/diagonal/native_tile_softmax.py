@@ -12,7 +12,10 @@ import linecache
 
 import torch
 
+from .native_tile_kernels import _tensor_metadata
+
 _KERNELS = {}
+_REGION_KERNELS = {}
 _CHUNK = 64
 
 
@@ -24,7 +27,7 @@ def _meta(tensor):
     return tuple(tensor.shape), tuple(tensor.stride()), _dtype(tensor.dtype)
 
 
-def _compile(annotations, body, grid, threads=128):
+def _compile(annotations, body, grid, threads=128, *, device):
     """Compile a specialization with concrete raw-buffer annotations."""
     import tilelang
     import tilelang.language as T
@@ -36,9 +39,10 @@ def _compile(annotations, body, grid, threads=128):
             f"        with T.Kernel({grid}, threads={threads}) as block:\n"
             + "\n".join("            " + line for line in body)
             + "\n    return kernel\n")
-    key = hashlib.sha256(text.encode()).hexdigest()
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    key = (device, digest)
     if key not in _KERNELS:
-        filename = f"<native-diagonal-region-{key}>"
+        filename = f"<native-diagonal-region-{digest}>"
         linecache.cache[filename] = (len(text), None, text.splitlines(True), filename)
         namespace = {"tilelang": tilelang, "T": T}
         exec(compile(text, filename, "exec", dont_inherit=True), namespace)
@@ -107,6 +111,14 @@ def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
     if dense_query:
         annotations.append(_annotation("Query", query))
         arguments.append(query)
+    key = ("replay", context.specialization_key(expressions),
+           batch, heads, length, _CHUNK, bool(prior), dense_query, bonus is not None,
+           _tensor_metadata(carry), _tensor_metadata(output),
+           _tensor_metadata(query) if dense_query else None)
+    kernel = _REGION_KERNELS.get(key)
+    if kernel is not None:
+        kernel(*arguments)
+        return output
     # Match the original Triton replay domain: a CTA owns a chunk and a
     # column tile, while rows cooperate in the contraction. Each State element
     # advances once per token, not once per future target in the same chunk.
@@ -161,7 +173,9 @@ def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
     body.append("                Output[token, head, c] = result[lane]")
     if prior:
         advance()
-    _compile(annotations, body, batch_heads * chunks * tiles)(*arguments)
+    kernel = _compile(annotations, body, batch_heads * chunks * tiles, device=carry.device)
+    _REGION_KERNELS[key] = kernel
+    kernel(*arguments)
     return output
 
 
@@ -195,7 +209,7 @@ def softmax_cut(scores):
             f"for r in T.Parallel({padded}):", f"    if r < {features}:",
             "        Output[token, head, r] = values[r] / denominator[0]"]
     _compile([_annotation("Scores", scores), _annotation("Output", output)],
-             body, tokens * heads)(scores, output)
+             body, tokens * heads, device=scores.device)(scores, output)
     return output
 
 
@@ -225,10 +239,18 @@ def _fused_softmax(first, carry1, second, carry2, query, inputs, length, heads,
     batch_heads, chunks, rows, features = carry1.shape
     columns = carry2.shape[-1]
     pr, pm, pc = (1 << (size - 1).bit_length() for size in (rows, features, columns))
-    context = _context(_state_expressions(first) + _state_expressions(second) + (query,),
-                       inputs, heads, length)
+    expressions = _state_expressions(first) + _state_expressions(second) + (query,)
+    context = _context(expressions, inputs, heads, length)
     output = torch.empty((batch_heads // heads * length, heads, columns),
                          device=carry1.device, dtype=output_dtype)
+    key = ("fused-softmax", context.specialization_key(expressions),
+           len(first.injections), len(second.injections),
+           batch_heads // heads, heads, length, _CHUNK, bool(prior1), bool(prior2),
+           _tensor_metadata(carry1), _tensor_metadata(carry2), _tensor_metadata(output))
+    kernel = _REGION_KERNELS.get(key)
+    if kernel is not None:
+        kernel(*context.pointers, carry1, carry2, output)
+        return output
     body = [f"chunk = block % {chunks}", f"sh = block // {chunks}",
             f"head = sh % {heads}", f"sequence = sh // {heads}",
             f"memory1 = T.alloc_fragment(({pr}, {pm}), 'float32')",
@@ -285,7 +307,9 @@ def _fused_softmax(first, carry1, second, carry2, query, inputs, length, heads,
     annotations = list(context.annotations) + [_annotation("Carry1", carry1),
                                               _annotation("Carry2", carry2),
                                               _annotation("Output", output)]
-    _compile(annotations, body, batch_heads * chunks, threads=256)(*context.pointers, carry1, carry2, output)
+    kernel = _compile(annotations, body, batch_heads * chunks, threads=256, device=carry1.device)
+    _REGION_KERNELS[key] = kernel
+    kernel(*context.pointers, carry1, carry2, output)
     return output
 
 
@@ -330,7 +354,7 @@ def _shared_scores(state, carry, query, inputs, length, heads, prior):
     body += [f"for r in T.Parallel({padded}):", f"    if r < {rows}:",
              "        Weighted[sh, target, r] = weight[r]"]
     _compile(list(context.annotations) + [_annotation("Scores", scores), _annotation("Weighted", weighted)],
-             body, batch_heads * length)(*context.pointers, scores, weighted)
+             body, batch_heads * length, device=carry.device)(*context.pointers, scores, weighted)
     return scores, weighted
 
 
@@ -377,7 +401,7 @@ def _apply_shared_scores(state, carry, query, score_cut, inputs, length, heads,
     annotations = list(context.annotations) + [_annotation("Carry", carry),
                                               _annotation("Scores", scores), _annotation("Weighted", weighted),
                                               _annotation("Output", output)]
-    _compile(annotations, body, batch_heads * length * tiles)(*context.pointers, carry, scores, weighted, output)
+    _compile(annotations, body, batch_heads * length * tiles, device=carry.device)(*context.pointers, carry, scores, weighted, output)
     return output
 
 

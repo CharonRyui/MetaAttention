@@ -207,27 +207,30 @@ def execute_rank_one(recipe, inputs, initial, *, sequence_count, sequence_length
     if sequence_length == 0:
         return output, initial.clone() if return_final_state else None
     final = torch.empty_like(initial) if return_final_state else initial
-    shape = (sequence_count * heads, chunks, features)
-    scale = torch.empty(shape, device=initial.device, dtype=torch.float32)
-    bias = torch.empty_like(scale)
-    carry = torch.empty_like(scale)
     device_index = initial.device.index if initial.device.index is not None else torch.cuda.current_device()
-    _compile_summary(
-        _metadata(value), _metadata(gate), _metadata(scale), _metadata(bias),
-        batch=sequence_count, length=sequence_length, heads=heads, features=features,
-        value_strides=vs, gate_strides=gs, value_group=vg, gate_group=gg,
-        log_gate=recipe.log_gate, identity=identity, device_index=device_index,
-    )(value, gate, scale, bias)
-    from ..diagonal.diagonal_scan import hierarchical_carry
-    hierarchical_carry(
-        scale.reshape(sequence_count * heads, chunks, 1, features),
-        bias.reshape(sequence_count * heads, chunks, 1, features),
-        initial.reshape(sequence_count * heads, 1, features),
-        carry.reshape(sequence_count * heads, chunks, 1, features),
-        final.reshape(sequence_count * heads, 1, features),
-        identity=False,
-        write_final=False,
-    )
+    if chunks == 1:
+        carry = initial.reshape(sequence_count * heads, 1, features)
+    else:
+        shape = (sequence_count * heads, chunks, features)
+        scale = torch.empty(shape, device=initial.device, dtype=torch.float32)
+        bias = torch.empty_like(scale)
+        carry = torch.empty_like(scale)
+        _compile_summary(
+            _metadata(value), _metadata(gate), _metadata(scale), _metadata(bias),
+            batch=sequence_count, length=sequence_length, heads=heads, features=features,
+            value_strides=vs, gate_strides=gs, value_group=vg, gate_group=gg,
+            log_gate=recipe.log_gate, identity=identity, device_index=device_index,
+        )(value, gate, scale, bias)
+        from ..diagonal.diagonal_scan import hierarchical_carry
+        hierarchical_carry(
+            scale.reshape(sequence_count * heads, chunks, 1, features),
+            bias.reshape(sequence_count * heads, chunks, 1, features),
+            initial.reshape(sequence_count * heads, 1, features),
+            carry.reshape(sequence_count * heads, chunks, 1, features),
+            final.reshape(sequence_count * heads, 1, features),
+            identity=False,
+            write_final=False,
+        )
     _compile_apply(
         _metadata(value), _metadata(gate), _metadata(initial), _metadata(output), _metadata(final),
         _metadata(carry), batch=sequence_count, length=sequence_length, heads=heads,

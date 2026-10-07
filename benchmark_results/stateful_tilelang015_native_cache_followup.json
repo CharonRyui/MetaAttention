@@ -1,0 +1,677 @@
+{
+  "device": "NVIDIA H20 physical GPU3",
+  "comparison": "fixed working-tree source modules saved before this round; same compiled operator and inputs; warmed, five alternating rounds of 30 samples; compile excluded",
+  "contracts_correctness": [
+    "output-only",
+    "final-state",
+    "continuation"
+  ],
+  "accepted": [
+    "rank-one single chunk direct carry",
+    "native summary/replay/fused-softmax metadata lookup before body generation"
+  ],
+  "public_ab": [
+    {
+      "family": "hgrn",
+      "heads": 1,
+      "length": 64,
+      "before_ms": 0.12891200184822083,
+      "after_ms": 0.07534400001168251,
+      "rounds": {
+        "before": [
+          0.13014400005340576,
+          0.12891200184822083,
+          0.1266079992055893,
+          0.19993600249290466,
+          0.12732800096273422
+        ],
+        "after": [
+          0.07480000331997871,
+          0.07534400001168251,
+          0.11343999952077866,
+          0.122895997017622,
+          0.07444800063967705
+        ]
+      },
+      "before_graph_ms": 0.014112000353634357,
+      "after_graph_ms": 0.013952000066637993,
+      "before_profile": [
+        0.00911999999999989,
+        3,
+        0
+      ],
+      "after_profile": [
+        0.004255999999999858,
+        1,
+        0
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.03107452392578125
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "hgrn",
+      "heads": 8,
+      "length": 64,
+      "before_ms": 0.13726399838924408,
+      "after_ms": 0.0804160013794899,
+      "rounds": {
+        "before": [
+          0.13833599537611008,
+          0.13915199786424637,
+          0.13726399838924408,
+          0.13526400178670883,
+          0.13417600095272064
+        ],
+        "after": [
+          0.08052800223231316,
+          0.07924799993634224,
+          0.08084799721837044,
+          0.0804160013794899,
+          0.07945600152015686
+        ]
+      },
+      "before_graph_ms": 0.016416000202298164,
+      "after_graph_ms": 0.013632000423967838,
+      "before_profile": [
+        0.009343999999999823,
+        3,
+        0
+      ],
+      "after_profile": [
+        0.004384000000000015,
+        1,
+        0
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.031152725219726562
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "hgrn",
+      "heads": 1,
+      "length": 2048,
+      "before_ms": 0.13387199491262436,
+      "after_ms": 0.13358400017023087,
+      "rounds": {
+        "before": [
+          0.13831999897956848,
+          0.133760005235672,
+          0.13387199491262436,
+          0.20532799512147903,
+          0.1324159950017929
+        ],
+        "after": [
+          0.13358400017023087,
+          0.13499199599027634,
+          0.13312000036239624,
+          0.19867199659347534,
+          0.1326880007982254
+        ]
+      },
+      "before_graph_ms": 0.018864000216126442,
+      "after_graph_ms": 0.018928000703454018,
+      "before_profile": [
+        0.011169000000000097,
+        3,
+        0
+      ],
+      "after_profile": [
+        0.011200000000000272,
+        3,
+        0
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.03107452392578125
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "rwkv6",
+      "heads": 1,
+      "length": 64,
+      "before_ms": 0.21401599794626236,
+      "after_ms": 0.1839200034737587,
+      "rounds": {
+        "before": [
+          0.22097600251436234,
+          0.2106880024075508,
+          0.2115200012922287,
+          0.21401599794626236,
+          0.21980799734592438
+        ],
+        "after": [
+          0.18404799699783325,
+          0.1849920004606247,
+          0.18265600502490997,
+          0.18254399299621582,
+          0.1839200034737587
+        ]
+      },
+      "before_graph_ms": 0.05375999957323074,
+      "after_graph_ms": 0.05375999957323074,
+      "before_profile": [
+        0.047264000000000125,
+        1,
+        0
+      ],
+      "after_profile": [
+        0.047327999999999974,
+        1,
+        0
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.03045940399169922
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "rwkv6",
+      "heads": 8,
+      "length": 2048,
+      "before_ms": 0.36555200815200806,
+      "after_ms": 0.31732800602912903,
+      "rounds": {
+        "before": [
+          0.37305599451065063,
+          0.36555200815200806,
+          0.3630560040473938,
+          0.3659040033817291,
+          0.36507201194763184
+        ],
+        "after": [
+          0.3198560029268265,
+          0.32100799679756165,
+          0.31540800631046295,
+          0.31732800602912903,
+          0.31623999774456024
+        ]
+      },
+      "before_graph_ms": 0.19595199823379517,
+      "after_graph_ms": 0.19601599872112274,
+      "before_profile": [
+        0.19376099999999996,
+        2,
+        1
+      ],
+      "after_profile": [
+        0.19030100000000005,
+        2,
+        1
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.0557403564453125
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "gsa",
+      "heads": 1,
+      "length": 64,
+      "before_ms": 0.2961599975824356,
+      "after_ms": 0.2539359927177429,
+      "rounds": {
+        "before": [
+          0.29524800181388855,
+          0.2961599975824356,
+          0.2974880039691925,
+          0.298351988196373,
+          0.2930079996585846
+        ],
+        "after": [
+          0.2539359927177429,
+          0.2534240037202835,
+          0.2587519884109497,
+          0.2566559910774231,
+          0.25065600872039795
+        ]
+      },
+      "before_graph_ms": 0.11484800279140472,
+      "after_graph_ms": 0.11505599692463875,
+      "before_profile": [
+        0.1085440000000001,
+        1,
+        0
+      ],
+      "after_profile": [
+        0.10854399999999999,
+        1,
+        0
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.02794933319091797
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "gsa",
+      "heads": 1,
+      "length": 2048,
+      "before_ms": 0.48075200617313385,
+      "after_ms": 0.41233600676059723,
+      "rounds": {
+        "before": [
+          0.4811199903488159,
+          0.4840480089187622,
+          0.48075200617313385,
+          0.47859199345111847,
+          0.4744960069656372
+        ],
+        "after": [
+          0.41233600676059723,
+          0.4097599983215332,
+          0.4124799966812134,
+          0.4137119948863983,
+          0.40193599462509155
+        ]
+      },
+      "before_graph_ms": 0.13158400356769562,
+      "after_graph_ms": 0.13176000118255615,
+      "before_profile": [
+        0.12374300000000005,
+        3,
+        2
+      ],
+      "after_profile": [
+        0.12361500000000013,
+        3,
+        2
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.031017303466796875
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "gsa",
+      "heads": 8,
+      "length": 2048,
+      "before_ms": 0.5507679879665375,
+      "after_ms": 0.47964800894260406,
+      "rounds": {
+        "before": [
+          0.5507679879665375,
+          0.5463200211524963,
+          0.5557119846343994,
+          0.5515199899673462,
+          0.5484159886837006
+        ],
+        "after": [
+          0.47222399711608887,
+          0.4795680046081543,
+          0.4822240024805069,
+          0.48187199234962463,
+          0.47964800894260406
+        ]
+      },
+      "before_graph_ms": 0.2327200025320053,
+      "after_graph_ms": 0.2330079972743988,
+      "before_profile": [
+        0.22543900000000053,
+        3,
+        2
+      ],
+      "after_profile": [
+        0.22556699999999977,
+        3,
+        2
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.04646873474121094
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    },
+    {
+      "family": "normalized-linear",
+      "heads": 8,
+      "length": 2048,
+      "before_ms": 0.21598400175571442,
+      "after_ms": 0.21692799776792526,
+      "rounds": {
+        "before": [
+          0.21598400175571442,
+          0.2155200019478798,
+          0.21940799802541733,
+          0.21475200355052948,
+          0.2162879928946495
+        ],
+        "after": [
+          0.21609600633382797,
+          0.21692799776792526,
+          0.21580799669027328,
+          0.2176000028848648,
+          0.21831999719142914
+        ]
+      },
+      "before_graph_ms": 0.12852799892425537,
+      "after_graph_ms": 0.1284479945898056,
+      "before_profile": [
+        0.11987400000000024,
+        3,
+        0
+      ],
+      "after_profile": [
+        0.11999900000000002,
+        3,
+        0
+      ],
+      "correctness": {
+        "status": "VALID",
+        "max_abs_errors": {
+          "output:output": 0.004746913909912109
+        },
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": {
+          "output:output": {
+            "rtol": 0.02,
+            "atol": 0.05
+          }
+        }
+      },
+      "differential": "bitwise outputs/finals in all three contracts"
+    }
+  ],
+  "memory": [
+    {
+      "family": "hgrn",
+      "variant": "before",
+      "peak_incremental_bytes": 71680
+    },
+    {
+      "family": "hgrn",
+      "variant": "after",
+      "peak_incremental_bytes": 65536
+    },
+    {
+      "family": "rwkv6",
+      "variant": "after",
+      "peak_incremental_bytes": 14680064
+    },
+    {
+      "family": "gsa",
+      "variant": "after",
+      "peak_incremental_bytes": 6291456
+    }
+  ],
+  "rejected_gsa_vector": {
+    "device": "H20 GPU0",
+    "decision": "not integrated: raw Graph +11.49..13.15% and ThreadSync hoist warning",
+    "measurements": [
+      {
+        "H": 1,
+        "T": 64,
+        "raw_graph_ms": {
+          "before": 0.11355200037360191,
+          "after": 0.12848000228405
+        },
+        "public_ms": {
+          "before": 0.26691199839115143,
+          "after": 0.34244799613952637
+        },
+        "raw_rounds": {
+          "before": [
+            0.11347199976444244,
+            0.11352000012993813,
+            0.11356800049543381,
+            0.11355200037360191,
+            0.11364800110459328
+          ],
+          "after": [
+            0.1284480020403862,
+            0.12852799892425537,
+            0.12848000228405,
+            0.12841599434614182,
+            0.12852799892425537
+          ]
+        },
+        "public_rounds": {
+          "before": [
+            0.26718398928642273,
+            0.26910400390625,
+            0.26691199839115143,
+            0.2640800029039383,
+            0.26552000641822815
+          ],
+          "after": [
+            0.3442240059375763,
+            0.3484160006046295,
+            0.3410720080137253,
+            0.33825600147247314,
+            0.34244799613952637
+          ]
+        },
+        "output": "bitwise equal; independent oracle VALID"
+      },
+      {
+        "H": 1,
+        "T": 2048,
+        "raw_graph_ms": {
+          "before": 0.11401599645614624,
+          "after": 0.1289599984884262
+        },
+        "public_ms": {
+          "before": 0.4121759980916977,
+          "after": 0.49833598732948303
+        },
+        "raw_rounds": {
+          "before": [
+            0.11400000005960464,
+            0.11401599645614624,
+            0.11398400366306305,
+            0.11407999694347382,
+            0.11406399682164192
+          ],
+          "after": [
+            0.1289440020918846,
+            0.1289920061826706,
+            0.12892800569534302,
+            0.1289599984884262,
+            0.1289920061826706
+          ]
+        },
+        "public_rounds": {
+          "before": [
+            0.4225759953260422,
+            0.4121759980916977,
+            0.40888001024723053,
+            0.4132639914751053,
+            0.40889599919319153
+          ],
+          "after": [
+            0.49833598732948303,
+            0.5024159848690033,
+            0.4978239983320236,
+            0.49902400374412537,
+            0.4972800016403198
+          ]
+        },
+        "output": "bitwise equal; independent oracle VALID"
+      },
+      {
+        "H": 8,
+        "T": 2048,
+        "raw_graph_ms": {
+          "before": 0.17295999825000763,
+          "after": 0.19539200514554977
+        },
+        "public_ms": {
+          "before": 0.4838080108165741,
+          "after": 0.5784800052642822
+        },
+        "raw_rounds": {
+          "before": [
+            0.17308799922466278,
+            0.17292800545692444,
+            0.17292799800634384,
+            0.17295999825000763,
+            0.17297600209712982
+          ],
+          "after": [
+            0.19544000178575516,
+            0.19539200514554977,
+            0.19547200202941895,
+            0.19539200514554977,
+            0.19526399672031403
+          ]
+        },
+        "public_rounds": {
+          "before": [
+            0.48579199612140656,
+            0.48315200209617615,
+            0.48900799453258514,
+            0.47707200050354004,
+            0.4838080108165741
+          ],
+          "after": [
+            0.5784800052642822,
+            0.5824159979820251,
+            0.5788000226020813,
+            0.5763520002365112,
+            0.5764639973640442
+          ]
+        },
+        "output": "bitwise equal; independent oracle VALID"
+      },
+      {
+        "H": 8,
+        "T": 65,
+        "raw_graph_ms": {
+          "before": 0.11876800283789635,
+          "after": 0.1324159950017929
+        },
+        "public_ms": {
+          "before": 0.41438399255275726,
+          "after": 0.4981759935617447
+        },
+        "raw_rounds": {
+          "before": [
+            0.11868800222873688,
+            0.1188960000872612,
+            0.11875200271606445,
+            0.1189119964838028,
+            0.11876800283789635
+          ],
+          "after": [
+            0.1324159950017929,
+            0.13238400220870972,
+            0.1324160024523735,
+            0.13387200236320496,
+            0.13228799402713776
+          ]
+        },
+        "public_rounds": {
+          "before": [
+            0.4239040017127991,
+            0.41419200599193573,
+            0.4138079881668091,
+            0.4182880073785782,
+            0.41438399255275726
+          ],
+          "after": [
+            0.4981759935617447,
+            0.4955199956893921,
+            0.5167680084705353,
+            0.4989600032567978,
+            0.49265600740909576
+          ]
+        },
+        "output": "bitwise equal; independent oracle VALID"
+      }
+    ]
+  },
+  "verification": {
+    "graph_changed_input": "HGRN/RWKV6/GSA output and final VALID on GPU3",
+    "dynamic_B_T": "RWKV6/GSA B1T64/B2T65/B1T130/B1T64 VALID; retained outputs unchanged",
+    "CPU": "193 passed, 6 skipped",
+    "static": "Ruff and Python compile passed",
+    "GPU_initial": {
+      "passed": 132,
+      "failed": 74,
+      "causes": "test fixtures used noncontiguous public inputs (including newly added strided layouts and existing continuation slices); two tests requested unsupported dual-gate shared-scores; production runtime validation unchanged",
+      "action": "use fresh contiguous offset views; continuation slices contiguous; cover replay dual-gate and scores single-axis only; retain illegal-layout rejection"
+    },
+    "GPU_corrected": "96 passed, 79 deselected in 470 seconds: native authored diagonal/softmax/bonus; initial run remaining rank-one/readout cases passed. Not claimed as a passing full-suite run."
+  }
+}
