@@ -630,6 +630,33 @@ def test_structured_plans_and_kernel_config_have_separate_identities():
     )
     assert structured_plan.candidate.identity != structured_plan.kernel_config.identity
 
+def test_h20_profile_exposes_existing_schedule_domain_and_plan_identity():
+    from attn_engine.stateful.compile.device import (
+        DEFAULT_DEVICE_PROFILE,
+        ScheduleConfig,
+        schedule_configurations,
+    )
+    from attn_engine.stateful.compile.plan import LoweredCandidate, kernel_configurations
+
+    candidate = LoweredCandidate("candidate", "plan", "tilelang-elementwise", "forward")
+    assert DEFAULT_DEVICE_PROFILE.identity == "nvidia-h20-sm90"
+    assert kernel_configurations(candidate, DEFAULT_DEVICE_PROFILE) == (
+        (("block_tokens", 128),),
+        (("block_tokens", 64),),
+        (("block_tokens", 256),),
+    )
+    assert ScheduleConfig((("threads", 128),)).identity == (("threads", 128),)
+    assert schedule_configurations(candidate, DEFAULT_DEVICE_PROFILE)
+
+
+def test_profile_and_schedule_change_kernel_identity():
+    operator = StatefulOperator(_accumulator_ir())
+    compiled = _compile(operator)
+    plan = operator._plans[compiled.specialization].plan
+    assert plan.device_profile.identity == "nvidia-h20-sm90"
+    assert plan.kernel_config.identity
+    assert plan.tuning_identity
+
 
 def test_planner_enumerates_generic_baseline_and_registered_structured_candidates():
     operator = StatefulOperator(_accumulator_ir())

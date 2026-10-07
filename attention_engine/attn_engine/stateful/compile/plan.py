@@ -13,6 +13,8 @@ from typing import Any, Mapping
 
 import torch
 
+from .device import DEFAULT_DEVICE_PROFILE, DeviceProfile, resolve_device_profile, schedule_configurations
+
 
 class PlanRepresentation(str, Enum):
     GENERIC_DENSE_AFFINE = "generic-dense-affine"
@@ -516,10 +518,11 @@ def runtime_family_for(candidate: LoweredCandidate) -> str:
 
 def kernel_configurations(
     candidate: LoweredCandidate,
+    profile: DeviceProfile | None = None,
 ) -> tuple[tuple[tuple[str, int], ...], ...]:
-    if candidate.lowerer == "tilelang-elementwise":
-        return tuple((("block_tokens", size),) for size in (128, 64, 256))
-    return tuple((("threads", size),) for size in (128, 256))
+    """Return lowering-owned schedule candidates for a target profile."""
+    profile = DEFAULT_DEVICE_PROFILE if profile is None else profile
+    return tuple(config.values for config in schedule_configurations(candidate, profile))
 
 
 def select_candidate(
@@ -707,9 +710,11 @@ class TileLangPlan:
     uses_parallel_summary: bool = True
     candidate_estimates: tuple[tuple[str, CandidateEstimate], ...] = ()
     estimation_shape: EstimationShape | None = None
+    device_profile: DeviceProfile | None = None
 
     @property
     def backend(self) -> str:
+        return "tilelang"
         return "tilelang"
 
 
@@ -898,6 +903,7 @@ def compile_plan(
     compilation: Any,
 ) -> TileLangExecutable:
     """Enumerate mathematical plans, then bind one stable executable candidate."""
+    device_profile = resolve_device_profile(target)
     from ..lowering.chunked import compile_chunked_recipe
 
     chunked_recipe = (compile_chunked_recipe(operator.algorithm, dict(compilation.role_sizes))
@@ -1131,7 +1137,7 @@ def compile_plan(
     selected_plan = next(
         item for item in mathematical_plans if item.identity == candidate.plan_identity
     )
-    values = kernel_configurations(candidate)[0]
+    values = kernel_configurations(candidate, device_profile)[0]
     tuning_result = None
     if autotune:
         from .benchmark import invocation_factory
@@ -1154,6 +1160,7 @@ def compile_plan(
             candidates,
             candidate_estimates=candidate_estimates,
             estimation_shape=shape,
+            device_profile=device_profile,
         )
         provisional = TileLangExecutable(
             provisional_plan,
@@ -1175,12 +1182,12 @@ def compile_plan(
         )
         tuning_result = tune_candidates(
             candidates,
-            {item: kernel_configurations(item) for item in candidates},
+            {item: kernel_configurations(item, device_profile) for item in candidates},
             WORKLOAD_POLICY,
             factory,
             autotune=True,
             mode=mode,
-            environment=_target_fingerprint(target),
+            environment=(device_profile.target_identity, _target_fingerprint(target)),
             cache=cache,
             static_costs={item: int(estimates[item].cost) for item in candidates},
         )
@@ -1191,7 +1198,7 @@ def compile_plan(
             if item.identity == candidate.plan_identity
         )
         values = tuning_result.winner_config
-    kernel_config = KernelConfig(_digest((candidate.identity, values)), values)
+    kernel_config = KernelConfig(_digest((device_profile.target_identity, candidate.identity, values)), values)
     toolchain = _toolchain_fingerprint()
     environment = _target_fingerprint(target)
     fixed_roles = tuple((str(role), size) for role, size in compilation.role_sizes)
@@ -1230,10 +1237,12 @@ def compile_plan(
         (
             source_identity,
             fixed_roles,
+            device_profile.target_identity,
             environment,
             toolchain,
             WORKLOAD_POLICY.version,
             mode,
+            tuple((item.identity, kernel_configurations(item, device_profile)) for item in candidates),
         )
     )
     selected_estimate = estimates[candidate]
@@ -1277,6 +1286,7 @@ def compile_plan(
         backward_kernel_config,
         candidate_estimates=candidate_estimates,
         estimation_shape=shape,
+        device_profile=device_profile,
     )
     composition = Composition(candidate, backward_candidate, context_contract)
     composition.validate()
