@@ -385,3 +385,20 @@ ProductFeature functional GPU 测试全部通过，故保留为长序列中等 p
 维度的保守优化，短序列不宣称收益。
 
 
+
+### RWKV6 单 chunk output-only 路径（2026-10-07）
+
+Triton `_replay` 对单 chunk output-only 调用直接从 initial State replay，
+不需要 summary/carry。TileLang native diagonal 现对 `chunks == 1` 且不请求
+final-State 的调用插入 zero-copy synthetic chunk axis；final-State、multi-chunk
+和 continuation 路径保持原 summary/carry 逻辑。
+
+H20 GPU 5、RWKV6 D=DV=64：H1/T64 public CUDA event 从 0.32304 ms 降至
+0.23299 ms，Graph 从 0.05973 降至 0.05349 ms，total launches 从 3 降到 1；
+H8/T64 public 从 0.32581 ms（既有矩阵记录）降至 0.23702 ms，Graph 为
+0.05546 ms。H1/T2048 public 0.33115→0.32355 ms，Graph 0.07154→0.07138 ms，
+说明优化只针对单 chunk，未改变长序列调度。
+
+独立 authored-order oracle、RWKV6 FLA coverage（5 passed）、final-State 与
+continuation 合同均通过。原始数据见
+`benchmark_results/stateful_tilelang015_rwkv6_followup.json`。

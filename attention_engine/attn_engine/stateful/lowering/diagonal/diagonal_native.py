@@ -166,6 +166,10 @@ def execute_native_diagonal(recipe, inputs, initial_states, *, sequence_count, s
         batch_heads = sequence_count * heads
         rows, columns = initial.shape[-2:]
         chunks = (sequence_length + 63) // 64
+        if chunks == 1 and not return_final_state:
+            carry = initial.reshape(batch_heads, rows, columns).unsqueeze(1)
+            prepared[item.name] = (item, carry, initial)
+            continue
         scale = torch.empty((batch_heads, chunks, rows, columns), device=initial.device, dtype=torch.float32)
         bias = torch.empty_like(scale)
         launch_native_summary(item.row_gate, item.column_gate, item.injections, inputs, scale, bias,
