@@ -159,7 +159,7 @@ def _compile_readout(
                 output = T.alloc_fragment((CHUNK, tile_width), "float32")
                 query_product = T.alloc_fragment((CHUNK, _BLOCK), "float32")
                 state_shared = T.alloc_shared((_BLOCK, tile_width), "float32")
-                scores_shared = T.alloc_shared((CHUNK, CHUNK), "float32")
+                scores = T.alloc_fragment((CHUNK, CHUNK), "float32")
                 value_shared = T.alloc_shared((CHUNK, tile_width), "float32")
                 T.clear(output)
                 for product_block in T.serial(T.ceildiv(product, _BLOCK)):
@@ -183,7 +183,7 @@ def _compile_readout(
                         )
                     gemm(query_product, state_shared, output)
                 for token, source in T.Parallel(CHUNK, CHUNK):
-                    scores_shared[token, source] = Scores[batch_head, chunk, token, source]
+                    scores[token, source] = Scores[batch_head, chunk, token, source]
                 for token, column in T.Parallel(CHUNK, tile_width):
                     index = chunk * CHUNK + token
                     column_index = column_tile * tile_width + column
@@ -192,7 +192,7 @@ def _compile_readout(
                         T.cast(Value[sequence * length + index, head, column_index], "float32"),
                         0.0,
                     )
-                gemm(scores_shared, value_shared, output)
+                gemm(scores, value_shared, output)
                 for token, column in T.Parallel(CHUNK, tile_width):
                     index = chunk * CHUNK + token
                     column_index = column_tile * tile_width + column

@@ -369,4 +369,19 @@ continuation and CUDA-Graph smokes passed; peak incremental allocation was
 69,550,080 bytes before versus 71,714,816 bytes after. The earlier combined
 run timed out during compilation and is superseded by the completed run.
 
+### ProductFeature readout staging pass (2026-10-07)
+
+`perf/structured-lowering` 的 Triton `_readout` 直接以 fragment 保存可复用的
+64×64 local score tile；TileLang 原实现先把同一 Scores tile 搬到
+`scores_shared`，再执行 FP32 GEMM。based/rebased ProductFeature readout 现改为
+fragment score，去掉一次 shared-memory staging；因 `fp32_gemm_macro` 会在
+调用处生成 TF32 high/residual shared operands，数值顺序与输出 ABI 不变。
+
+H20 GPU 3 A/B（相同 carry、query、value、预计算 scores，5 轮、每轮 30 次
+CUDA event，编译不计入）结果：H8/T2048/16×16×64 从 0.07650 ms 降至
+0.07506 ms（1.019x）；H8/T2048/32×16×64 为 0.12483→0.12493 ms，视为
+持平；H2/T131/5×5×3 为 0.02481→0.02519 ms，短尾端小幅回退。六项
+ProductFeature functional GPU 测试全部通过，故保留为长序列中等 product
+维度的保守优化，短序列不宣称收益。
+
 

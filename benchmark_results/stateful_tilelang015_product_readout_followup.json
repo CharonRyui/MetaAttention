@@ -1,0 +1,13 @@
+{
+  "gpu": "NVIDIA H20 physical GPU 3",
+  "triton_reference": "perf/structured-lowering 1366a12 readout/product_kernels.py::_readout",
+  "candidate": "replace TileLang scores_shared with fragment scores in ProductFeature readout",
+  "contract": "same carry/query/value/precomputed scores; five rounds, 30 CUDA-event samples per round; compilation excluded",
+  "measurements": [
+    {"heads": 2, "length": 131, "left": 5, "right": 5, "columns": 3, "before_ms": 0.024814933227996033, "after_ms": 0.02519360010822614, "speedup": 0.9849697193492221},
+    {"heads": 8, "length": 2048, "left": 16, "right": 16, "columns": 64, "before_ms": 0.07649919961889586, "after_ms": 0.07506133317947387, "speedup": 1.0191558873059714},
+    {"heads": 8, "length": 2048, "left": 32, "right": 16, "columns": 64, "before_ms": 0.1248309334119161, "after_ms": 0.12492799957593283, "speedup": 0.9992230231465627}
+  ],
+  "correctness": "tests/functional/test_product_contraction.py: 6 passed",
+  "decision": "retain; measured benefit only for long H8/T2048 16x16 case, no short-tail claim"
+}

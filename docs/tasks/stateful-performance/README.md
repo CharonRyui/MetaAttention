@@ -23,3 +23,11 @@ expression、diagonal、scalar、lowrank、scan、readout 保持功能 locality�
 
 ## 执行与提交
 子代理实现互不重叠的文件集合，负责人拥有共享接口与集成、H20 smoke 和原子提交。每个提交必须包含可运行的行为及证据，不能只交 scaffold。性能数据需要区分真实观测和推断。短序列 public latency 和长序列 Graph 均需验收；不强制所有结构使用同一 launch 数。
+
+### ProductFeature readout staging（2026-10-07）
+
+based/rebased 的 ProductFeature readout 对照 Triton `_readout`，将可复用
+64×64 Scores 从 shared staging 改为 fragment，减少一次 shared-memory copy。
+六项 GPU functional tests 通过；H8/T2048/16×16×64 测得 1.019x，其他
+长/短形状持平或轻微回退，未扩大优化适用性。原始 A/B 见
+`benchmark_results/stateful_tilelang015_product_readout_followup.json`。
