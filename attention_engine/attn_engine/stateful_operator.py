@@ -995,17 +995,35 @@ class StatefulOperator:
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
         if (
-            plan.runtime_family in ("chunked-stateful", "product-feature-chunked")
+            plan.runtime_family in {
+                "chunked-stateful",
+                "product-feature-chunked",
+                "rank-one-diagonal",
+                "native-normalized",
+                "native-diagonal",
+            }
             and plan.chunked_recipe is not None
             and runtime.device.type == "cuda"
             and not runtime.packed
             and runtime.token_count > 0
             and not requires_grad_state
             and not any(tensor.requires_grad for tensor in inputs.values())
+            and (
+                plan.runtime_family != "rank-one-diagonal"
+                or plan.chunked_recipe.rank_one is not None
+            )
+            and (
+                plan.runtime_family != "native-normalized"
+                or plan.chunked_recipe.native_normalized is not None
+            )
+            and (
+                plan.runtime_family != "native-diagonal"
+                or plan.chunked_recipe.native_diagonal is not None
+            )
         ):
             return self._execute_chunked_stateful(
                 runtime, role_sizes, inputs, initial_states, return_final_state,
-                plan.chunked_recipe,
+                plan.chunked_recipe, plan.runtime_family,
             )
         if validation.reference_required:
             return self._execute_reference(
@@ -1445,12 +1463,15 @@ class StatefulOperator:
         initial_states: Mapping[str, torch.Tensor],
         return_final_state: bool,
         recipe: Any,
+        runtime_family: str,
     ) -> ExecutionResult:
         """Execute compiler-proven dense inference without reference plumbing."""
         from .stateful.lowering.chunked import bind_chunked_inputs, execute_chunked_states
 
         assert runtime.uniform_length is not None
-        if recipe.rank_one is not None:
+        if runtime_family == "rank-one-diagonal":
+            if recipe.rank_one is None:
+                raise RuntimeError("rank-one-diagonal plan has no rank-one recipe")
             from .stateful.lowering.scan.rank1 import execute_rank_one
 
             output, final = execute_rank_one(
@@ -1467,6 +1488,8 @@ class StatefulOperator:
                 StateTuple((recipe.rank_one.state,), (final,))
                 if final is not None else None,
             )
+        if recipe.rank_one is not None:
+            raise RuntimeError("rank-one recipe is not selected by the plan")
         values = bind_chunked_inputs(recipe, inputs, runtime)
         result = execute_chunked_states(
             self.algorithm, values=values, initial_states=initial_states,

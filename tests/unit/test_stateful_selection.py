@@ -111,7 +111,7 @@ def test_scalar_decay_keeps_the_factorized_selection():
     assert costs == sorted(costs)
 
 
-def test_rank_one_identity_readout_uses_chunked_stateful_candidate():
+def test_rank_one_identity_readout_uses_rank_one_diagonal_candidate():
     operator = hgrn(1, 1, 512, 64)
     compiled = operator.compile(
         role_sizes=_sizes(operator, 64, 1),
@@ -120,12 +120,18 @@ def test_rank_one_identity_readout_uses_chunked_stateful_candidate():
         optimized=True,
     )
     plan = compiled.operator._plans[compiled.specialization].plan
-    assert plan.candidate.lowerer == "tilelang-chunked-stateful"
-    assert plan.candidate.lowerer not in DENSE_SCAN
-@pytest.mark.parametrize("name", ["rwkv6", "gsa", "normalized-linear"])
-def test_reference_hotspots_select_non_dense_chunked_candidate(name):
+    assert plan.candidate.lowerer == "tilelang-rank-one-diagonal"
+    assert plan.mathematical_plan.representation == "rank-one-diagonal"
+@pytest.mark.parametrize(
+    ("name", "representation"),
+    [
+        ("rwkv6", "native-diagonal"),
+        ("gsa", "native-diagonal"),
+        ("normalized-linear", "native-normalized"),
+    ],
+)
+def test_reference_hotspots_select_typed_native_candidate(name, representation):
     from testing.benchmark_stateful_plans import CASES, role_sizes_for
-
     case = next(case for case in CASES if case.name == name)
     operator = case.factory(**case.kwargs(65))
     compiled = operator.compile(
@@ -136,7 +142,7 @@ def test_reference_hotspots_select_non_dense_chunked_candidate(name):
     )
     plan = compiled.operator._plans[compiled.specialization].plan
     assert plan.candidate.lowerer not in DENSE_SCAN
-    assert plan.mathematical_plan.representation == "chunked-stateful"
+    assert plan.mathematical_plan.representation == representation
 
 
 

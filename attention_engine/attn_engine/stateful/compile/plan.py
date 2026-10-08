@@ -25,6 +25,9 @@ class PlanRepresentation(str, Enum):
     SHARED_STATE_CONTRACTION = "shared-state-contraction"
     SCALAR_FACTORIZED = "scalar-factorized"
     FACTORED_RECURRENCE = "factored-recurrence"
+    RANK_ONE_DIAGONAL = "rank-one-diagonal"
+    NATIVE_NORMALIZED = "native-normalized"
+    NATIVE_DIAGONAL = "native-diagonal"
     PRODUCT_FEATURE_CHUNKED = "product-feature-chunked"
     CHUNKED_STATEFUL = "chunked-stateful"
     STATEFUL_REFERENCE = "stateful-reference"
@@ -109,6 +112,30 @@ PLAN_RULES = {
             "typed-stateful-injections",
             "chunk-boundary-state-carries",
             "typed-readout-expressions",
+        ),
+    ),
+    PlanRepresentation.RANK_ONE_DIAGONAL: PlanRule(
+        PlanRepresentation.RANK_ONE_DIAGONAL,
+        (
+            "typed-rank-one-state",
+            "diagonal-affine-transition",
+            "identity-state-readout",
+        ),
+    ),
+    PlanRepresentation.NATIVE_NORMALIZED: PlanRule(
+        PlanRepresentation.NATIVE_NORMALIZED,
+        (
+            "typed-normalized-readout",
+            "native-vector-bindings",
+            "chunk-boundary-state-carries",
+        ),
+    ),
+    PlanRepresentation.NATIVE_DIAGONAL: PlanRule(
+        PlanRepresentation.NATIVE_DIAGONAL,
+        (
+            "typed-diagonal-transition",
+            "native-expression-bindings",
+            "chunk-boundary-state-carries",
         ),
     ),
     PlanRepresentation.STATEFUL_REFERENCE: PlanRule(
@@ -331,6 +358,48 @@ class CandidateLowerer:
                 if shape.backward
                 else shape.factored_chunk_bytes,
             )
+        if representation is PlanRepresentation.RANK_ONE_DIAGONAL:
+            return CandidateEstimate(
+                True,
+                heads * (3 * state + shape.columns) * 4,
+                3 * heads * state,
+                3,
+                shape.chunked_states_workspace,
+                workspace_bytes_per_chunk=shape.chunked_states_chunk_bytes,
+            )
+        if representation is PlanRepresentation.NATIVE_NORMALIZED:
+            return CandidateEstimate(
+                True,
+                heads * (3 * state + shape.columns) * 4,
+                3 * heads * state,
+                3,
+                shape.chunked_states_workspace,
+                workspace_bytes_per_chunk=shape.chunked_states_chunk_bytes,
+            )
+        if representation is PlanRepresentation.NATIVE_DIAGONAL:
+            if shape.native_resources is None:
+                return CandidateEstimate(
+                    False, 0, 0, 0, 0, reason="native-diagonal-resources-missing"
+                )
+            resources = shape.native_resources
+            token_bytes, chunk_bytes = resources.output_bytes, resources.chunk_bytes
+            launches = resources.launches
+            if self.name == "tilelang-native-diagonal-shared-scores":
+                chunk_bytes += resources.score_bytes
+                launches += resources.score_launches
+            elif self.name == "tilelang-native-diagonal-readout-cut":
+                token_bytes += resources.cut_bytes
+                launches += 2
+            elif resources.cut_bytes and not resources.fused_softmax:
+                token_bytes += resources.cut_bytes
+            return CandidateEstimate(
+                True,
+                token_bytes + chunk_bytes // 64,
+                resources.flops_per_token,
+                launches,
+                token_bytes,
+                workspace_bytes_per_chunk=chunk_bytes,
+            )
         if representation in _SUMMARY_REPRESENTATIONS:
             arithmetic = 2 * heads * state * (2 if shape.dense_summary else 1)
             if representation is PlanRepresentation.AXIS_SCALE and shape.chunked:
@@ -388,6 +457,14 @@ class CandidateLowerer:
                 2 * heads * state * (shape.rows + shape.columns),
                 3,
                 heads * (2 * dense + 2 * state) * 4,
+            )
+        if representation is PlanRepresentation.STATEFUL_REFERENCE:
+            return CandidateEstimate(
+                True,
+                heads * (2 * dense + 4 * shape.state_total_elements) * 4,
+                4 * heads * shape.state_total_elements * (shape.rows + shape.columns),
+                4,
+                heads * (2 * dense + 4 * shape.state_total_elements) * 4,
             )
         # every State pays for its own features, so the charge sums per State
         # rather than multiplying the first State's size by their count
@@ -477,6 +554,31 @@ LOWERERS = (
         "tilelang-chunked-readout-cut",
         (PlanRepresentation.CHUNKED_STATEFUL,),
         "chunked-stateful",
+    ),
+    CandidateLowerer(
+        "tilelang-rank-one-diagonal",
+        (PlanRepresentation.RANK_ONE_DIAGONAL,),
+        "rank-one-diagonal",
+    ),
+    CandidateLowerer(
+        "tilelang-native-normalized",
+        (PlanRepresentation.NATIVE_NORMALIZED,),
+        "native-normalized",
+    ),
+    CandidateLowerer(
+        "tilelang-native-diagonal",
+        (PlanRepresentation.NATIVE_DIAGONAL,),
+        "native-diagonal",
+    ),
+    CandidateLowerer(
+        "tilelang-native-diagonal-shared-scores",
+        (PlanRepresentation.NATIVE_DIAGONAL,),
+        "native-diagonal",
+    ),
+    CandidateLowerer(
+        "tilelang-native-diagonal-readout-cut",
+        (PlanRepresentation.NATIVE_DIAGONAL,),
+        "native-diagonal",
     ),
     CandidateLowerer(
         "reference-stateful",
@@ -941,6 +1043,18 @@ def compile_plan(
     reference_required = requires_reference_lowering(operator.algorithm)
     rewrites = _structured_rewrites(structural_features) if optimized else ()
     representations: list[PlanRepresentation] = []
+    special_representation = None
+    if optimized and target.device_type == "cuda" and mode == "dense" and backward_ir is None:
+        if chunked_recipe is not None and chunked_recipe.rank_one is not None:
+            special_representation = PlanRepresentation.RANK_ONE_DIAGONAL
+        elif chunked_recipe is not None and chunked_recipe.native_normalized is not None:
+            special_representation = PlanRepresentation.NATIVE_NORMALIZED
+        elif chunked_recipe is not None and chunked_recipe.native_diagonal is not None:
+            special_representation = PlanRepresentation.NATIVE_DIAGONAL
+        elif product_feature_chunked:
+            special_representation = PlanRepresentation.PRODUCT_FEATURE_CHUNKED
+        elif chunked_recipe is not None:
+            special_representation = PlanRepresentation.CHUNKED_STATEFUL
     if not reference_required:
         representations.append(PlanRepresentation.GENERIC_DENSE_AFFINE)
         representations.extend(rewrites)
@@ -948,17 +1062,13 @@ def compile_plan(
             representations.append(PlanRepresentation.SCALAR_FACTORIZED)
         if optimized and rank_one_factored is not None and mode == "dense":
             representations.append(PlanRepresentation.FACTORED_RECURRENCE)
-    if product_feature_chunked:
-        representations.append(PlanRepresentation.PRODUCT_FEATURE_CHUNKED)
-    if chunked_stateful:
-        representations.append(PlanRepresentation.CHUNKED_STATEFUL)
-    if reference_required and not chunked_stateful:
+    if special_representation is not None:
+        representations.append(special_representation)
+    if reference_required:
         representations.append(PlanRepresentation.STATEFUL_REFERENCE)
     if not representations:
         representations.append(PlanRepresentation.GENERIC_DENSE_AFFINE)
     representations = list(dict.fromkeys(representations))
-    if reference_required:
-        rewrites = ()
     mathematical_plans = tuple(
         MathematicalPlan(
             _digest((source_identity, representation.value)),
@@ -1002,22 +1112,20 @@ def compile_plan(
         if chunked_states
         else (0, 0)
     )
-    if chunked_stateful and chunked_recipe.rank_one is not None:
+    if optimized and chunked_recipe is not None and chunked_recipe.rank_one is not None:
         elements = fixed_sizes[state.head_role] * fixed_sizes[chunked_recipe.rank_one.feature]
         # Three FP32 chunk vectors plus recursive groups; the extra chunk
-        # in WorkspacePolicy conservatively covers final State.
+        # conservatively covers final State.
         state_workspace, state_chunk_bytes = 4 * elements, 16 * elements
-    if chunked_stateful and chunked_recipe.native_normalized is not None:
+    if optimized and chunked_recipe is not None and chunked_recipe.native_normalized is not None:
         native = chunked_recipe.native_normalized
         memory = next(spec for spec in operator.algorithm.states if spec.name == native.memory)
         heads = fixed_sizes[memory.head_role]
         rows, columns = (fixed_sizes[role] for role in memory.feature_roles)
-        # Output plus paired summaries/carries and recursive group buffers;
-        # direct prefixes reuse storage; the extra boundary covers both finals.
         state_workspace = 4 * heads * columns
         state_chunk_bytes = 12 * heads * rows * (columns + 1)
     native_resources = None
-    if chunked_stateful and chunked_recipe.native_diagonal is not None:
+    if chunked_recipe is not None and chunked_recipe.native_diagonal is not None:
         from ..lowering.diagonal.diagonal_native import native_diagonal_resources
 
         native_resources = native_diagonal_resources(
@@ -1026,25 +1134,28 @@ def compile_plan(
         state_workspace = native_resources.output_bytes
         state_chunk_bytes = native_resources.chunk_bytes
     factored_token_bytes = factored_chunk_bytes = 0
-    if rank_one_factored is not None and mode == "dense" and backward_ir is None:
+    if rank_one_factored is not None and mode == "dense":
         heads = fixed_sizes[state.head_role]
         rows, columns = feature_sizes
-        operation_count = len(rank_one_factored.operations)
-        injection_count = rank_one_factored.injection_count
-        readout_count = len(rank_one_factored.readout_roles)
-        factored_token_bytes = (
-            4
-            * heads
-            * (
-                operation_count * (2 * rows + columns + 1)
-                + injection_count * (rows + columns)
-                + readout_count * (rows + 2 * columns)
-                + 4
-                * (operation_count + injection_count + readout_count)
-                * (rows + columns)
+        if backward_ir is not None:
+            factored_token_bytes = 2 * heads * rows * columns
+        else:
+            operation_count = len(rank_one_factored.operations)
+            injection_count = rank_one_factored.injection_count
+            readout_count = len(rank_one_factored.readout_roles)
+            factored_token_bytes = (
+                4
+                * heads
+                * (
+                    operation_count * (2 * rows + columns + 1)
+                    + injection_count * (rows + columns)
+                    + readout_count * (rows + 2 * columns)
+                    + 4
+                    * (operation_count + injection_count + readout_count)
+                    * (rows + columns)
+                )
             )
-        )
-        factored_chunk_bytes = 4 * heads * (rows * rows + 2 * rows * columns + columns)
+            factored_chunk_bytes = 4 * heads * (rows * rows + 2 * rows * columns + columns)
     state_total = 0
     for spec in operator.algorithm.states:
         sizes = [fixed_sizes[role] for role in spec.feature_roles]
@@ -1061,12 +1172,10 @@ def compile_plan(
             + (state_total // max(1, len(operator.algorithm.states)))
             for spec in operator.algorithm.states
         ),
-        live_state_elements=state_total,
-        backward=backward_ir is not None,
-        chunked=chunked_eligible,
-        chunked_states=chunked_states,
         chunked_states_workspace=state_workspace,
-        chunked_states_chunk_bytes=state_chunk_bytes if chunked_stateful else 0,
+        chunked_states_chunk_bytes=(
+            state_chunk_bytes if optimized and chunked_stateful else 0
+        ),
         factored_workspace=factored_token_bytes,
         factored_chunk_bytes=factored_chunk_bytes,
         native_resources=native_resources,
@@ -1116,7 +1225,12 @@ def compile_plan(
             ):
                 continue
             if (
-                item.representation is not PlanRepresentation.GENERIC_DENSE_AFFINE
+                item.representation not in {
+                    PlanRepresentation.GENERIC_DENSE_AFFINE,
+                    PlanRepresentation.RANK_ONE_DIAGONAL,
+                    PlanRepresentation.NATIVE_NORMALIZED,
+                    PlanRepresentation.NATIVE_DIAGONAL,
+                }
                 and not RUNTIME_FAMILY_ELIGIBILITY.get(
                     lowerer.runtime_family, lambda _: (True, None)
                 )(operator.algorithm)[0]
