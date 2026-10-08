@@ -55,6 +55,7 @@ def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
                 response = T.alloc_shared((event_total, _BLOCK), "float32")
                 prefix = T.alloc_shared((chunk,), "float32")
                 gate = T.alloc_shared((chunk,), "float32")
+                suffix = T.alloc_shared((chunk, chunk), "float32")
                 intervals = T.alloc_shared((event_total, event_total), "float32")
                 for r, c in T.Parallel(rows, _BLOCK):
                     state[r, c] = T.if_then_else(c + cb * _BLOCK < columns, T.cast(Initial[sequence, head, r, c + cb * _BLOCK], "float32"), 0.0)
@@ -73,6 +74,12 @@ def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
                             for s in T.serial(scale_count):
                                 gate[t] = gate[t] * T.cast(Coeff[s, sequence * length + token, head], "float32")
                             prefix[t] = gate[t] if t == 0 else prefix[t - 1] * gate[t]
+                    for t in T.serial(chunk):
+                        product = T.alloc_var("float32", init=1.0)
+                        for q in T.serial(chunk):
+                            if q > t:
+                                product = product * gate[q]
+                            suffix[t, q] = T.if_then_else(q > t, product, 1.0)
                         T.sync_threads()
                     for e in T.serial(event_total):
                         et = e // events
@@ -98,14 +105,10 @@ def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
                         kind = e % events
                         for p in T.serial(e):
                             pt = p // events
-                            interval = T.alloc_var("float32", init=1.0)
-                            for q in T.serial(chunk):
-                                if q > pt and q <= et:
-                                    interval = interval * gate[q]
                             dot = T.alloc_var("float32", init=0.0)
                             for r in T.serial(rows):
                                 dot += rvec[e, r] * u[p, r]
-                            intervals[e, p] = interval * dot
+                            intervals[e, p] = suffix[pt, et] * dot
                         T.sync_threads()
                         for c in T.Parallel(_BLOCK):
                             value = T.alloc_var("float32", init=inj[e, c])
@@ -125,11 +128,7 @@ def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
                                 value = T.alloc_var("float32", init=prefix[t] * entry[r, c])
                                 for e in T.serial((t + 1) * events):
                                     et = e // events
-                                    interval = T.alloc_var("float32", init=1.0)
-                                    for q in T.serial(chunk):
-                                        if q > et and q <= t:
-                                            interval = interval * gate[q]
-                                    value = value + u[e, r] * interval * response[e, c]
+                                    value = value + u[e, r] * suffix[et, t] * response[e, c]
                                 state[r, c] = value
                             T.sync_threads()
                             for q in T.unroll(readouts):
