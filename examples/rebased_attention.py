@@ -1,7 +1,8 @@
-"""FLA ``parallel_rebased`` expressed with the Stateful Operator DSL.
+"""ReBased product-feature recurrence expressed with the Stateful Operator DSL.
 
-Rebased keeps only the squared feature map, so one product-Feature numerator State
-and one matching denominator State suffice."""
+ReBased keeps only the squared feature map, so one product-Feature numerator
+State and one matching denominator State suffice.
+"""
 
 from __future__ import annotations
 

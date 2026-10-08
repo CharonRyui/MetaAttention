@@ -57,4 +57,4 @@ def test_matrix_record_schema_is_explicit_and_json_safe():
     record = {field: field for field in MATRIX_RECORD_FIELDS}
     record["unrelated"] = object()
     assert matrix_record_schema(record) == {field: field for field in MATRIX_RECORD_FIELDS}
-    assert "fla_correctness" in MATRIX_RECORD_FIELDS
+    assert "meta_correctness" in MATRIX_RECORD_FIELDS

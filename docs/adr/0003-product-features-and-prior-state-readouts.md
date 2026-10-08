@@ -6,9 +6,7 @@ status: accepted
 
 ## Decision
 
-The Algorithm IR expression language gains the five forms that the remaining
-per-token Flash Linear Attention families need, without changing the Scanable
-guarantee or the lowering pipeline that schema v2 established:
+The Algorithm IR expression language gains the vocabulary needed by the supported product-Feature profiles, without changing the Scanable guarantee or the lowering pipeline:
 
 - **Feature roles of any arity, including products.** `ProductFeatureRole(left,
   right)` declares a Feature whose axis is the flattened product of two Features,
@@ -57,21 +55,7 @@ implicit second transition; `prior=True` names the pre-transition State instead.
 
 ## Consequences
 
-- `examples/based_attention.py`, `examples/rebased_attention.py`,
-  `examples/gated_slot_attention.py`, and `examples/rwkv6_attention.py` author
-  Based, Rebased, Gated Slot Attention, and RWKV6; the coverage table in
-  `examples/fla_coverage.py` points at them, and
-  `tests/functional/test_fla_coverage.py` checks parity with `fused_chunk_based`,
-  `parallel_rebased`, `chunk_gsa`, and `chunk_rwkv6` on H20.
-- The RWKV6 entry was corrected rather than extended. The previous
-  `rwkv6_recurrence` Program read a token shift and a removal term into the
-  library's chunk kernel; `fla.ops.rwkv6.recurrent_naive` defines
-  `h = h * exp(w) + k (x) v` with the readout `(h + u (x) k v) . q`, so the
-  faithful Program is `rwkv6_attention`. The library's readout scales both
-  terms, `((h + u (x) k v) . (scale * q))`; the H20 parity test caught the
-  missing scale on the bonus term, which no CPU recurrence check had covered.
-  `Shift` stays supported schema-v2 vocabulary with its own unit test, but no
-  Program in the coverage table needs it after this correction.
+- Based, ReBased, Gated Slot Attention, and RWKV6 are authored as Stateful Operator Programs in `examples/`; their coverage uses independent references at that seam.
 - The reference lowering's workspace is charged per State axis, so a product
   Feature multiplies the State size: Rebased at `K = 64` (`K*K = 4096`) exceeds the
   H20 reference-plan envelope and is rejected with `RUNTIME_RESOURCE` rather than

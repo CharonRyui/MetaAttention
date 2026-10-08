@@ -1,7 +1,8 @@
-"""FLA ``chunk_retention`` expressed with the Stateful Operator DSL.
+"""Retention expressed with the Stateful Operator DSL.
 
-Retention's per-head decay is a constant schedule, which the caller supplies with
-:func:`retention_decay` as the ``decay`` input."""
+Retention's per-head decay is a constant schedule supplied by
+:func:`retention_decay` as the ``decay`` input.
+"""
 
 from __future__ import annotations
 
@@ -43,11 +44,9 @@ def retention_attention(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """FLA ``chunk_retention`` with the standard per-head decay schedule.
+    """Build retention with the standard per-head decay schedule.
 
-    ``fla.ops.retention`` builds ``g = log(1 - 2 ** (-5 - h))`` per head and
-    delegates to simple GLA, so the decay is a head-shaped constant. The caller
-    supplies it as the ``decay`` input of shape ``[B, H, T]``.
+    The caller supplies the head-shaped log decay as the ``decay`` input.
     """
     algorithm = AlgorithmIR(
         inputs=(
@@ -87,7 +86,7 @@ def retention_attention(
 
 
 def retention_decay(heads: int) -> torch.Tensor:
-    """The per-head log decay FLA's retention op constructs."""
+    """Return the per-head log decay schedule."""
     return torch.log1p(
         -torch.tensor(2.0).pow(-5.0 - torch.arange(heads).float())
     ).reshape(1, heads, 1)

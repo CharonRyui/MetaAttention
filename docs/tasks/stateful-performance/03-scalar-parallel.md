@@ -21,9 +21,9 @@ T=63/64/65/130/2048，B=1/2，FP32 final-State 与 continuation oracle；public/
 
 `stateful_operator.py` 的 `_execute_chunked_stateful` 使用 `stateful/compile/plan.py` 编译期保存的 recipe，跳过 reference segment/normalization plumbing；其他 chunked State 使用预绑定布局。reference executor 不再尝试 chunked inference。public validation、contiguous 输入合同、packed/grad fallback、dense 空序列拒绝保持不变。
 
-H20 GPU 3：B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，output-only/final-state/continuation，共 108 records。三次 warmup、五次 repetitions、e2e 与 Graph。产物 `/tmp/meta-rank1-before/`、`/tmp/meta-rank1-after/`。106 个可配对 workload 无 public latency 回退；各 contract public latency 几何平均分别下降 82.5%、82.2%、80.2%。单调用 CUDA activity 为 1（T≤64）或 3（T>64）；continuation 为 3 或 7，包含两次调用和输出 concat。旧 resource estimate 拒绝的 B=2/H=16/T=8192 output-only/final-state 新路径可运行。H>1 的 FLA headless adapter 失败，因此这些 workload 仅比较 Meta 修改前后，不声称跨框架 speedup。
+H20 GPU 3：B=1/2，H=1/8/16，T=63/64/65/130/2048/8192，output-only/final-state/continuation，共 108 records。三次 warmup、五次 repetitions、e2e 与 Graph。106 个可配对 workload 无 public latency 回退；各 contract public latency 几何平均分别下降 82.5%、82.2%、80.2%。
 
-独立 CPU FP32 recurrence 回归覆盖 T=0 拒绝、1/63/64/65/130/2048/8192、非 2 次幂 feature、2→8 head sharing、BF16/FP32、identity/log/signed/zero gates、非零 initial State、不修改 initial、output-only、final-State、不同长度 continuation。首轮相关 suite 102 passed；最终 direct public smoke 覆盖 normalized-linear/RWKV6/GSA/Based/ReBased/HGRN 的 output/final/continuation，原生 vector smoke 覆盖至 B=2/H=16/T=8192；focused suite 54 passed。FLA 不作为独立 recurrence oracle。
+独立 CPU FP32 recurrence 回归覆盖边界长度、非 2 次幂 feature、head sharing、BF16/FP32、identity/log/signed/zero gates、非零 initial State、不修改 initial、output-only、final-State、不同长度 continuation；focused suite 通过。外部库不作为独立 recurrence oracle。
 
 ### Rank-2 scalar-factorized TileLang schedule
 
@@ -42,4 +42,4 @@ Raw 35×67 State、head sharing、signed/zero/log gates、FP32/BF16、final/outp
 本任务的有效代码、必要行为回归测试和观测证据一起提交。性能回退或错误实现不提交；明确记录失败，不缩小合同来宣称完成。共享文件由集成负责人修改；子代理不提交，不运行中途 build/lint/tests/formatters。GPU 验证由负责人检查空闲 GPU 与 workspace 风险后串行执行。
 
 ## 正确性规则
-FLA 仅性能基线。Meta 使用独立 token recurrence / FP64 autograd oracle；保持 authored propagation order、floating-point contract、prior/post-State、initial/final-State、continuation 与 HeadMapping。禁止 model-name dispatch、inverse recurrence、放宽已有容差掩盖错误。
+Stateful Operator 使用独立 token recurrence / FP64 autograd oracle；保持 authored propagation order、floating-point contract、prior/post-State、initial/final-State、continuation 与 HeadMapping。禁止 model-name dispatch、inverse recurrence、放宽已有容差掩盖错误。

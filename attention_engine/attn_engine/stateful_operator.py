@@ -1,15 +1,12 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, fields, is_dataclass
 import hashlib
-import importlib.util
 import json
 import math
-import os
-import sys
 from typing import (
     Any,
-    Callable,
     Iterable,
     Iterator,
     Mapping,
@@ -345,8 +342,7 @@ class Shift(InputExpression):
     """Value of ``operand`` ``lag`` tokens earlier inside the same sequence.
 
     Tokens whose lag crosses a sequence boundary read the typed zero of
-    ``operand``, matching the zero padding used by the gate/token-shift forms in
-    Flash Linear Attention.
+    ``operand``.
     """
 
     operand: InputExpression
@@ -2853,27 +2849,3 @@ def _canonical_identity(value: Any) -> str:
 
 def _identity(value: Any) -> str:
     return json.dumps(_canonical(value), sort_keys=True, separators=(",", ":"))
-
-
-def load_generated_callable(source: str, callable_name: str) -> Callable[..., Any]:
-    """Load legacy LinearAttentionEngine generated source without changing its API."""
-    code_hash = hashlib.sha256(source.encode()).hexdigest()
-    cache_dir = os.path.join(os.path.dirname(__file__), "cache")
-    file_path = os.path.join(cache_dir, f"{code_hash}.py")
-    os.makedirs(cache_dir, exist_ok=True)
-    if not os.path.exists(file_path):
-        temporary = f"{file_path}.{os.getpid()}.tmp"
-        with open(temporary, "w", encoding="utf-8") as output:
-            output.write(source)
-        os.replace(temporary, file_path)
-    if cache_dir not in sys.path:
-        sys.path.append(cache_dir)
-    module = sys.modules.get(code_hash)
-    if module is None:
-        spec = importlib.util.spec_from_file_location(code_hash, file_path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError(f"could not load generated stateful module {file_path}")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[code_hash] = module
-        spec.loader.exec_module(module)
-    return getattr(module, callable_name)

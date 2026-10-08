@@ -6,8 +6,7 @@ status: accepted
 
 ## Decision
 
-Algorithm IR schema v2 keeps every v1 form and adds the vocabulary the remaining
-Flash Linear Attention families need, without giving up the Scanable guarantee:
+Algorithm IR schema v2 keeps every v1 form and adds the vocabulary needed by the supported Stateful Operator profiles, without giving up the Scanable guarantee:
 
 - **Several independent States.** `AlgorithmIR` accepts one `StateTransition`
   per declared `StateSpec`. States share one Head role and use at most two
@@ -39,11 +38,7 @@ the same lowering. V1-shaped Programs keep their existing specialized TileLang
 plans unchanged, so schema v2 cannot regress a v1 workload.
 
 ## Considered Options
-
-A dedicated lowering per new FLA family was rejected: it reintroduces the model
-catalog this compiler exists to avoid, and each new family would need its own
-analysis, backward, and cache identity. Extending the language and lowering each
-Program through the shared summary/scan machinery keeps one semantic source.
+A dedicated lowering per model family was rejected: it reintroduces the model catalog this compiler exists to avoid, and each new family would need its own analysis, backward, and cache identity. Extending the language and lowering each Program through the shared summary/scan machinery keeps one semantic source.
 
 State-dependent Transition operands (TTT, Titans) were rejected for this schema:
 letting a Transition read its own previous State makes the per-token map
@@ -58,14 +53,7 @@ any arity, `Outer`, `Contract`, `Softmax`, and prior-State readouts.)
 
 ## Consequences
 
-- Every per-token linear recurrence in `fla.ops` is expressed by a Program in
-  `examples/`, and `examples/fla_coverage.py` records the coverage table that
-  points at those factories; `tests/functional/test_fla_coverage.py` checks
-  library parity for the operators whose reference semantics were confirmed from
-  source.
-- Softmax and sparse attention (`attn`, `forgetting_attn`, `nsa`) stay with
-  `AttentionEngine`; a stateful linear-recurrence language is the wrong home for
-  them, and that engine already implements their online forms.
+- Every supported per-token linear recurrence is expressed by a Program in `examples/`, so coverage remains at the generic Stateful Operator seam.
 - The v1 fast paths are unchanged, so the workspace envelope is now charged per
   State of the Program rather than from the first State alone.
 - Programs that use v2 vocabulary select the reference plan, which is a

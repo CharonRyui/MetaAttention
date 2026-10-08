@@ -1,7 +1,8 @@
-"""FLA ``chunk_gsa`` (Gated Slot Attention) expressed with the Stateful Operator DSL.
+"""Gated Slot Attention expressed with the Stateful Operator DSL.
 
-Two gated States are joined by a softmax over the slot axis. ``chunk_abc`` shares
-this Program; ABC's extra beta Injection is out of scope."""
+Two gated States are joined by a softmax over the slot axis. ABC's extra beta
+Injection is out of scope.
+"""
 
 from __future__ import annotations
 

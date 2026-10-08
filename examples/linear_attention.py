@@ -1,20 +1,13 @@
-"""Flash Linear Attention families expressed with the StatefulOperator DSL.
+"""Linear recurrent attention families expressed with the Stateful Operator DSL.
 
 All factories use the head-first ``[B, H, T, ...]`` runtime layout expected by
 ``StatefulOperator``. Their mathematical state is a ``[K, V]`` matrix:
 
 ``H_t = P_t(H_{t-1}) + k_t v_t^T`` and ``o_t = q_t H_t / sqrt(K)``.
 
-The names match the corresponding FLA operators:
-
-* :func:`linear_attention` matches ``chunk_linear_attn(normalize=False)``;
-* :func:`simple_gla_attention` matches ``chunk_simple_gla``;
-* :func:`gla_attention` matches ``chunk_gla`` with a feature-wise gate;
-* :func:`lightning_attention` matches Lightning Attention's scalar gate schedule.
-
-FLA's normalized linear attention keeps an additional denominator State, so it is
-a separate Program in :mod:`examples.normalized_linear_attention`. Forgetting
-attention is softmax attention with decay, not this matrix-state recurrence.
+The module also contains scalar-gated, feature-gated, lightning, forgetting,
+delta-rule, and explicit recurrent variants. Normalized linear attention uses
+the separate two-State Program in :mod:`examples.normalized_linear_attention`.
 """
 from __future__ import annotations
 
@@ -145,7 +138,7 @@ def linear_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build FLA ``chunk_linear_attn(normalize=False)`` semantics."""
+    """Build the ungated matrix-State recurrence."""
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
     return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate=None)
@@ -161,7 +154,7 @@ def simple_gla_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build FLA ``chunk_simple_gla`` semantics with a scalar log gate."""
+    """Build the scalar-gated matrix-State recurrence."""
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
     return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="scalar")
@@ -177,7 +170,7 @@ def gla_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build FLA ``chunk_gla`` semantics with a feature-wise log gate."""
+    """Build the feature-gated matrix-State recurrence."""
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
     return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="feature")
@@ -193,11 +186,9 @@ def dual_gate_gla_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build FLA ``chunk_gla`` with a gate on each State axis.
+    """Build a matrix-State recurrence with a gate on each State axis.
 
-    This is ``fused_recurrent_gla(gk, gv)``'s shape and the two-Axis Scale
-    profile of Gated Delta Rule's ``left_gate``/``right_gate``: one feature-wise
-    log gate decays the key axis and one decays the value axis.
+    One feature-wise log gate decays the key axis and one decays the value axis.
     """
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
@@ -214,10 +205,10 @@ def lightning_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build the FLA Lightning Attention state recurrence.
+    """Build the Lightning Attention scalar-gate recurrence.
 
     The caller supplies the scalar log gate generated from ``layer_idx`` and
-    ``num_layers`` by FLA's public API.
+    ``num_layers``.
     """
     return simple_gla_attention(
         batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype
@@ -234,7 +225,7 @@ def forgetting_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build FLA forgetting-attention's scalar log-decay state recurrence."""
+    """Build the forgetting-attention scalar log-decay recurrence."""
     return simple_gla_attention(
         batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype
     )

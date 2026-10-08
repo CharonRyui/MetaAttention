@@ -1,7 +1,8 @@
-"""FLA ``chunk_hgrn`` expressed with the Stateful Operator DSL.
+"""HGRN expressed with the Stateful Operator DSL.
 
 HGRN is a per-Feature vector State whose readout is the State itself, with the
-per-Feature log decay supplied as an input."""
+per-Feature log decay supplied as an input.
+"""
 
 from __future__ import annotations
 
@@ -41,9 +42,8 @@ def hgrn(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """FLA ``chunk_hgrn``: a per-Feature vector State whose readout is itself.
+    """Build the per-Feature vector-State recurrence.
 
-    ``fla.ops.hgrn.naive`` updates ``h = exp(g) * h + x`` and writes ``o = h``.
     HGRN has no head axis, so callers pass ``heads=1`` and supply the headless
     ``[B, T, D]`` tensors as ``[B, 1, T, D]``; ``gate`` is the per-Feature log
     decay.

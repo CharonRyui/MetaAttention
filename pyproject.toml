@@ -18,7 +18,6 @@ dependencies = [
 
 [project.optional-dependencies]
 bench = [
-  "flash-linear-attention==0.2.0",
   "pandas",
   "transformers==4.45.0",
 ]

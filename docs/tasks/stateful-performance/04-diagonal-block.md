@@ -50,9 +50,8 @@ summary 是一次 kernel launch；短序列 carry 一次，readout 一次，长�
 
 原矩阵 `FAILED_GATE` 原因是同进程反复 profiler 后开头 device events 渐进缺失；保留完整失败证据。新进程 GSA/B2/H16/T65 探针 6/6 捕获全部 43 次 runtime launches 和 43 个 kernel events，并单独排除一个 priming spin，完整 trace 为 `benchmark_results/diagonal_activity_trace_probe.json`。最终 `benchmark_results/diagonal_readout_activity_isolated.json` 对全部 72 workloads 分别新建进程：216 合同点、1296 个原始样本全部完整捕获，逐样本 runtime launches/device kernel counts 相等，spin 始终独立排除。kernel activity 时间几何平均下降 16.66%，launch 数不变；不修改原失败记录。采集中途 `/tmp` 所在 filesystem 无可用空间，改到有空间的 NVMe 临时目录完成剩余 5 个 workloads，失败日志保留。
 
-默认 Target 实际 CLI 为 `../bench.sh --families rwkv6,gsa --seqlens 64 2048 8192 --batches 2 --heads 8 --contract all --timing both --warmup 3 --repetitions 10 --gpu 6 --output-dir benchmark_results/diagonal_readout_public_smoke`。18 条记录中 14 条 Meta OK，4 条 T8192 的 output-only/final-state 因现有 1 GiB workspace bound 拒绝；两家族 T8192 continuation 均成功。该限制不通过提高生产 cap 绕过。FLA 仅性能基线，该 smoke 不代替本轮同合同 A/B，也未证明 Meta 快于 FLA。
+默认 Target 实际 CLI 为 `testing/benchmark_stateful_plans.py --families rwkv6,gsa --seqlen 64 2048 8192 --contract all --timing both --warmup 3 --repetitions 10`。该 smoke 仅记录 Stateful Operator 的结构、性能与独立 oracle；不引入外部 baseline。
 
-综合摘要 `benchmark_results/diagonal_readout_acceptance.json` 列出全部数值、复测、默认 cap 拒绝和证据源。原始 JSON 保留本地，交付同时归档 gzip 压缩记录；一次性 GPU/oracle/复测脚本已删除，用户既存 `testing/benchmark_fla_meta_stateful.py` 未改动。
 
 ### RWKV6 prior-State bonus fusion (2026-10-03)
 

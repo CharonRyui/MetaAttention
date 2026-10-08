@@ -1,7 +1,8 @@
-"""FLA ``chunk_linear_attn(normalize=True)`` expressed with the Stateful Operator DSL.
+"""Normalized linear attention expressed with the Stateful Operator DSL.
 
-The recurrence keeps FLA's extra scalar denominator State: the library divides
-the linear-attention output by ``(scale*q) . cumsum(k) + 1e-10``."""
+The recurrence keeps an additional scalar denominator State and divides the
+output by ``(scale*q) . cumsum(k) + 1e-10``.
+"""
 
 from __future__ import annotations
 
@@ -33,7 +34,7 @@ KEY_HEADS = HeadRole("key_heads")
 VALUE_HEADS = HeadRole("value_heads")
 STATE_HEADS = HeadRole("state_heads")
 
-# the epsilon FLA's ``normalize_output`` adds to the denominator
+# The denominator epsilon is part of the normalized recurrence contract.
 EPS = 1e-10
 
 
@@ -46,11 +47,10 @@ def normalized_linear_attention(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """FLA ``chunk_linear_attn(..., normalize=True)``.
+    """Build the normalized two-State recurrence.
 
-    ``fla.ops.linear_attn.utils.normalize_output`` divides the recurrence output
-    by ``(scale*q) . cumsum(k) + 1e-10``. The denominator is a rank-1 State that
-    accumulates ``k``, so the normalized operator is one Program with two States.
+    The denominator accumulates ``k`` and the output divides by
+    ``(scale*q) . cumsum(k) + 1e-10``.
     """
     scale = dim**-0.5
     scaled_query = Input("query") * scale

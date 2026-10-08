@@ -20,7 +20,7 @@ The first production Target is CUDA H20. It supports canonical contiguous dense 
 
 A catalog of whole-program templates was rejected because every unseen algorithm would require a new dispatcher case and semantic implementation. A mixed generic/specialized architecture was rejected because dedicated GDN or model-specific paths would preserve multiple semantic sources. A sequential generic recurrence was rejected because parallel chunked execution is part of the Stateful Operator promise. An unrestricted tensor/state DSL was rejected because arbitrary contractions, callbacks, and State ranks cannot receive complete scan, VJP, lowering, and performance guarantees in the first schema.
 
-`LinearAttentionEngine` remains unchanged outside this compiler guarantee. Routing all legacy modifier behavior through the new finite language would either enlarge this change substantially or retain a fallback path. The dedicated `GDNEngine` is removed because GDN must be an ordinary composition of generic nodes.
+Dedicated model-specific recurrent engines are removed because each supported recurrence must be an ordinary composition of generic nodes.
 
 ## Consequences
 

@@ -1,7 +1,8 @@
-"""FLA ``chunk_rwkv6`` expressed with the Stateful Operator DSL.
+"""RWKV6 recurrence expressed with the Stateful Operator DSL.
 
-The library's recurrence decays the State per Key Feature, keeps a bonus skip for
-the current token, and reads the State from before the current transition."""
+The recurrence decays the State per Key Feature, keeps a bonus skip for the
+current token, and reads the State from before the current transition.
+"""
 
 from __future__ import annotations
 
@@ -46,15 +47,10 @@ def rwkv6_attention(
     *,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """FLA ``chunk_rwkv6``: decay, bonus skip, and a pre-transition readout.
+    """Build the RWKV6 decay, bonus-skip, prior-State recurrence.
 
-    ``fla.ops.rwkv6.recurrent_naive`` advances ``h = h * exp(w) + k (x) v`` and
-    reads the *previous* State with a current-token bonus:
-
-    ``o_i = ((h + u (x) k_i v_i) . (scale * q_i))``
-
-    so the readout needs a prior-State term and a Feature-axis contraction of
-    ``scale * q * u * k``. ``w`` is the log decay, as in the library.
+    The readout uses a prior-State term and a Feature-axis contraction of
+    ``scale * q * u * k``; ``w`` is the log decay.
     """
     scaled_query = Input("query") * (dim**-0.5)
     algorithm = AlgorithmIR(

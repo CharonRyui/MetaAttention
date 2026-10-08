@@ -587,21 +587,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/13/37/a065dc3bd6e49423a6532c642ca7378d3f467b1ef44c2800c937af7f9739/filelock-3.29.4-py3-none-any.whl", hash = "sha256:dac1648087d5115554850d113e7dd8c83ab2d38e3435dde2d4f163847e57b767", size = 42757, upload-time = "2026-06-13T16:11:59.582Z" },
 ]
 
-[[package]]
-name = "flash-linear-attention"
-version = "0.2.0"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "datasets" },
-    { name = "einops" },
-    { name = "ninja" },
-    { name = "torch" },
-    { name = "transformers" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/5e/b2/9f29181db054f7e2ca127de4010a99776425e3b8da0bcd41bff59256f905/flash_linear_attention-0.2.0.tar.gz", hash = "sha256:a0888508daa764cb267625cb751a00db119f3688661836cfd07b36ebcbceafa7", size = 309391, upload-time = "2025-04-11T20:32:05.546Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8e/8d/154ea1c30f6a7f040d8a92f5f4cb03ba79d2474f587176bc6a342e15a4fc/flash_linear_attention-0.2.0-py3-none-any.whl", hash = "sha256:f526fbe287f60071e4b85fac18593dd143b0d96d6303b533326e9fd61afb80c5", size = 506731, upload-time = "2025-04-11T20:32:04.375Z" },
-]
 
 [[package]]
 name = "fonttools"
@@ -1160,7 +1145,6 @@ dependencies = [
 
 [package.optional-dependencies]
 bench = [
-    { name = "flash-linear-attention" },
     { name = "pandas", version = "2.3.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "pandas", version = "3.0.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "transformers" },
@@ -1179,7 +1163,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "einops" },
-    { name = "flash-linear-attention", marker = "extra == 'bench'", specifier = "==0.2.0" },
     { name = "jinja2" },
     { name = "matplotlib" },
     { name = "ninja" },

@@ -1,8 +1,9 @@
-"""FLA ``fused_chunk_based`` expressed with the Stateful Operator DSL.
+"""Based product-feature recurrence expressed with the Stateful Operator DSL.
 
 Based's kernel polynomial ``1 + (q.k) + 0.5 (q.k)^2`` needs a second-order product
-Feature as a State axis, so the Program keeps six States and normalizes with the
-library's ``1e-6`` epsilon."""
+Feature as a State axis, so the Program keeps six States and normalizes with
+``1e-6`` epsilon.
+"""
 
 from __future__ import annotations
 

@@ -611,15 +611,6 @@ def bench_gated_retention(
     g.detach_().requires_grad_(require_grad)
     v.detach_().requires_grad_(require_grad)
 
-    q1 = q.clone()
-    k1 = k.clone()
-    v1 = v.clone()
-    g1 = g.clone().to(dtype)
-
-    q1.detach_().requires_grad_(require_grad)
-    k1.detach_().requires_grad_(require_grad)
-    g1.detach_().requires_grad_(require_grad)
-    v1.detach_().requires_grad_(require_grad)
 
     # ours
     attention_module = gated_retention(B, H, S, D, DV, dtype=dtype)
@@ -641,44 +632,6 @@ def bench_gated_retention(
 
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
 
-    # flash-linear-attention
-    try:
-        from fla.ops.simple_gla import chunk_simple_gla
-
-        fwd_lat_ref = timer(
-            lambda: chunk_simple_gla(q1, k1, v1, g1, head_first=True)[0]
-        )
-
-        if require_grad:
-            out_ref, _ = chunk_simple_gla(q1, k1, v1, g1, head_first=True)
-            bwd_lat_ref = timer(lambda: out_ref.backward(do, retain_graph=True))
-        else:
-            bwd_lat_ref = None
-        result_dict["FlashLinearAttention"] = (fwd_lat_ref, bwd_lat_ref)
-
-    except Exception as e:
-        print(f"Warning: fla.ops.simple_gla not available: {e}")
-
-    # torch inductor
-    try:
-        from fla.ops.simple_gla.naive import torch_simple_gla
-
-        q1.detach_().requires_grad_(require_grad)
-        k1.detach_().requires_grad_(require_grad)
-        v1.detach_().requires_grad_(require_grad)
-        g1.detach_().requires_grad_(require_grad)
-
-        torch_simple_gla = torch.compile(torch_simple_gla)
-        fwd_lat_ref2 = timer(lambda: torch_simple_gla(q1, k1, v1, g1, chunk_size=512))
-
-        if require_grad:
-            out_ref2 = torch_simple_gla(q1, k1, v1, g1, chunk_size=512)
-            bwd_lat_ref2 = timer(lambda: out_ref2.backward(do, retain_graph=True))
-        else:
-            bwd_lat_ref2 = None
-        result_dict["Torch Inductor"] = (fwd_lat_ref2, bwd_lat_ref2)
-    except Exception as e:
-        print(f"Warning: Torch Inductor benchmark failed: {e}")
 
     return result_dict
 
@@ -712,16 +665,6 @@ def bench_retnet_recurrent(
     g.detach_().requires_grad_(False)
     v.detach_().requires_grad_(require_grad)
 
-    # clone for reference
-    q1 = q.clone()
-    k1 = k.clone()
-    v1 = v.clone()
-    g1 = g.clone()
-
-    q1.detach_().requires_grad_(require_grad)
-    k1.detach_().requires_grad_(require_grad)
-    g1.detach_().requires_grad_(False)
-    v1.detach_().requires_grad_(require_grad)
 
     # ours
     attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype)
@@ -743,47 +686,6 @@ def bench_retnet_recurrent(
 
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
 
-    # flash-linear-attention
-    try:
-        from fla.ops.retention import chunk_retention
-
-        fwd_lat_ref = timer(lambda: chunk_retention(q1, k1, v1, head_first=True)[0])
-        if require_grad:
-            o_ref, _ = chunk_retention(q1, k1, v1, head_first=True)
-            bwd_lat_ref = timer(lambda: o_ref.backward(do, retain_graph=True))
-        result_dict["FlashLinearAttention"] = (fwd_lat_ref, bwd_lat_ref)
-    except Exception as e:
-        print(f"Warning: fla.ops.retention not available: {e}")
-
-    # torch inductor
-    try:
-
-        @torch.compile
-        def ref(q, k, v):
-            orig_type = q.dtype
-            q, k, v = q.float(), k.float(), v.float()
-            _, n_heads, seq_len, d_head = q.shape
-            s = (
-                1
-                - q.new_tensor(2.0, dtype=torch.float).pow(
-                    -5.0 - q.new_tensor(range(n_heads), dtype=torch.float)
-                )
-            ).log2()
-            n = q.new_tensor(range(seq_len), dtype=torch.float)
-            n = torch.exp2((n.unsqueeze(-1) - n) * s.view(-1, 1, 1)) * n.unsqueeze(
-                -1
-            ).ge(n)
-            s = torch.einsum("bhqd,bhkd,hqk->bhqk", q * d_head**-0.5, k, n.to(q.dtype))
-            o = torch.einsum("bhqk,bhkd->bhqd", s, v)
-            return o.to(orig_type)
-
-        fwd_lat_ref2 = timer(lambda: ref(q1, k1, v1))
-        if require_grad:
-            o_ref2 = ref(q1, k1, v1)
-            bwd_lat_ref2 = timer(lambda: o_ref2.backward(do, retain_graph=True))
-        result_dict["Torch Inductor"] = (fwd_lat_ref2, bwd_lat_ref2)
-    except Exception as e:
-        print(f"Warning: Torch Inductor benchmark failed: {e}")
 
     return result_dict
 
@@ -915,41 +817,6 @@ def bench_mamba2_ssm(
         bwd_lat = timer(lambda: o.backward(do_ours, retain_graph=True))
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
 
-    # mamba2 ssm
-    value = value.detach_().requires_grad_(require_grad)
-    A_mamba.detach_().requires_grad_(require_grad)
-    dt_mamba.detach_().requires_grad_(require_grad)
-    key.detach_().requires_grad_(require_grad)
-    query.detach_().requires_grad_(require_grad)
-
-    try:
-        from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
-
-        fwd_lat_ref = timer(
-            lambda: mamba_chunk_scan_combined(
-                value,
-                dt_mamba,
-                A_mamba,
-                key,
-                query,
-                chunk_size=64,
-            )
-        )
-        if require_grad:
-            out_ref = mamba_chunk_scan_combined(
-                value,
-                dt_mamba,
-                A_mamba,
-                key,
-                query,
-                chunk_size=64,
-            )
-            bwd_lat_ref = timer(lambda: out_ref.backward(do, retain_graph=True))
-        else:
-            bwd_lat_ref = None
-        result_dict["Mamba2"] = (fwd_lat_ref, bwd_lat_ref)
-    except Exception as e:
-        print(f"Warning: mamba2 ssm not available: {e}")
 
     # torch inductor
     try:
@@ -1174,7 +1041,6 @@ def bench_mla_decode(
     result_dict = {}
 
     q = torch.randn(B, 1, HQ, D, dtype=dtype, device="cuda")
-    # To be compatible with flashMLA
     KV = torch.randn(B * SKV // 64, 64, HKV, DV, dtype=dtype, device="cuda")
     k_pe = torch.randn(B * SKV // 64, 64, HKV, D - DV, dtype=dtype, device="cuda")
     KV = torch.concat([KV, k_pe], dim=-1).contiguous()
@@ -1184,84 +1050,6 @@ def bench_mla_decode(
     fwd_lat = timer(lambda: attention_module(q, KV))
     result_dict["MetaAttention"] = (fwd_lat, None)
 
-    # FlashMLA
-    try:
-        import triton
-        from flash_mla import flash_mla_with_kvcache, get_mla_metadata
-
-        cache_seqlens = torch.full((B,), SKV, dtype=torch.int32, device="cuda")
-        max_seqlen = cache_seqlens.max().item()
-        max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
-
-        tile_scheduler_metadata, num_splits = get_mla_metadata(
-            cache_seqlens, 1 * HQ // HKV, HKV
-        )
-        block_size = 64
-        block_table = torch.arange(
-            B * max_seqlen_pad // block_size, dtype=torch.int32, device="cuda"
-        ).view(B, max_seqlen_pad // block_size)
-
-        fwd_lat_ref = timer(
-            lambda: flash_mla_with_kvcache(
-                q,
-                KV,
-                block_table,
-                cache_seqlens,
-                DV,
-                tile_scheduler_metadata,
-                num_splits,
-                causal=True,
-            )
-        )
-
-        result_dict["FlashMLA"] = (fwd_lat_ref, None)
-
-    except Exception as e:
-        print(f"Warning: flashMLA not available: {e}")
-
-    # triton
-    try:
-        from ref.flash_mla_decode_triton import flash_mla_triton
-
-        q_nope, q_pe = q[..., :DV].contiguous(), q[..., DV:].contiguous()
-        blocked_k_nope, blocked_k_pe = (
-            KV[..., :DV].contiguous(),
-            KV[..., DV:].contiguous(),
-        )
-        cache_seqlens = torch.full((B,), SKV, dtype=torch.int32, device="cuda")
-        max_seqlen = cache_seqlens.max().item()
-        max_seqlen_pad = triton.cdiv(max_seqlen, 256) * 256
-
-        block_size = 64
-        block_table = torch.arange(
-            B * max_seqlen_pad // block_size, dtype=torch.int32, device="cuda"
-        ).view(B, max_seqlen_pad // block_size)
-
-        fwd_lat_ref = timer(
-            lambda: flash_mla_triton(
-                q_nope,
-                q_pe,
-                block_table,
-                blocked_k_nope,
-                blocked_k_pe,
-                max_seqlen_pad,
-                block_size,
-                B,
-                1,
-                cache_seqlens,
-                HQ,
-                HKV,
-                D,
-                DV,
-                True,
-                dtype,
-            )
-        )
-
-        result_dict["FlashMLA Triton"] = (fwd_lat_ref, None)
-
-    except Exception as e:
-        print(f"Warning: Triton MLA Decode not available: {e}")
 
     return result_dict
 

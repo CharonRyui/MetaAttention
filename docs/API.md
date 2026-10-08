@@ -110,9 +110,9 @@ artifacts may be regenerated under the relocated module names.
 
 All Stateful kernel families now use released TileLang `0.1.15`, including
 generated expressions, diagonal/native readouts, scalar/vector scans, low-rank
-WY, and dense/packed checkpoint forward/backward. FLA and legacy attention are
-separate backend surfaces. Kernel binaries remain shape-specialized; dynamic
-public invocation sizes do not imply one symbolic Batch/Sequence binary.
+WY, and dense/packed checkpoint forward/backward. Kernel binaries remain
+shape-specialized; dynamic public invocation sizes do not imply one symbolic
+Batch/Sequence binary.
 This correctness-first cutover does not promise the historical timings below.
 See `docs/tilelang-stateful-operator-research.md` for verification and constraints.
 
@@ -178,8 +178,9 @@ propagation, Product Injection tuples, explicit Head Mapping, and single-role
 State Contractions. Compiler analysis, Mathematical Plans, Lowered Candidates,
 KernelConfig, context contracts, and caches are internal.
 
-Schema v2 keeps every v1 form and adds what the remaining Flash Linear
-Attention families need:
+Schema v2 keeps every v1 form and adds multiple States, rank-1 States,
+expression readouts, token shifts, and typed arithmetic needed by the Stateful
+Operator examples.
 
 - **Several independent States** with one Transition each; States share one Head
   role and use at most two distinct Feature roles.
@@ -226,11 +227,8 @@ Prior-State terms and readout dependencies retain their authored semantics.
 Packed and gradient execution retain the segmented affine scan. Programs within
 the v1 language retain typed specialized TileLang plans.
 
-Each Flash Linear Attention operator that is a per-token linear recurrence has
-its Program in its own `examples/<family>.py` module, and
-`examples/fla_coverage.py` records the coverage table that points at those
-factories; `tests/functional/test_fla_coverage.py` checks parity with the library
-operators.
+Stateful Operator examples keep each per-token recurrence in its own
+`examples/<family>.py` module so the examples exercise the compiler directly.
 
 The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
 outputs, FP32 State, canonical contiguous layouts, and Feature pairs in
@@ -274,34 +272,28 @@ from chunk carries: `B*T*bytes_per_token + B*(ceil(T/64)+1)*bytes_per_chunk`.
 The extra chunk allowance covers final States. The runtime checks this bound
 before launching; it no longer allocates an unused duplicate reservation buffer.
 
-`testing/benchmark_stateful_plans.py --families based,rebased,rwkv6,gsa,hgrn,gdn,rwkv7,pressure --seqlen 512 2048 --fla --json /tmp/plans.json`
-reports the selected lowerer, public-call timing, CUDA Graph replay, launches and
-workspace. Stock FLA is timed as a performance baseline only; its outputs are
-not a correctness oracle.
+`testing/benchmark_stateful_plans.py --families based,rebased,rwkv6,gsa,hgrn,gdn,rwkv7,pressure --seqlen 512 2048 --json /tmp/plans.json`
+reports the selected lowerer, public-call timing, CUDA Graph replay, launches,
+and workspace. Correctness uses the independent authored-order recurrence.
 
 Measured on an idle H20, BF16, `B=1,H=8,T=2048,K=V=64`, five warmups and
 median of twenty CUDA-event samples around the public callable with final State:
 
-| Structure/example | Before end-to-end ms | After end-to-end ms | After Graph ms | FLA Graph ms |
-| --- | ---: | ---: | ---: | ---: |
-| Based (`K=16`) | 11.384 | 1.931 | 0.816 | 0.468 |
-| ReBased (`K=16`) | 2.814 | 1.084 | 0.609 | 0.078 |
-| Normalized linear | 0.766 | 0.874 | 0.203 | 0.068 |
-| RWKV6 | 2.796 | 0.908 | 0.365 | 0.131 |
-| GSA (`slots=16`) | 2.119 | 0.988 | 0.312 | 0.142 |
-| HGRN (`H=1`) | 0.570 | 0.519 | 0.060 | 0.065 |
-| GDN | 4.661 | 1.074 | 0.604 | 0.190 |
-| RWKV7 State | 4.968 | 1.031 | 0.601 | 0.351 |
-| Ordered composition pressure | 82.628 | 1.372 | 0.924 | unavailable |
+| Structure/example | Before end-to-end ms | After end-to-end ms | After Graph ms |
+| --- | ---: | ---: | ---: |
+| Based (`K=16`) | 11.384 | 1.931 | 0.816 |
+| ReBased (`K=16`) | 2.814 | 1.084 | 0.609 |
+| Normalized linear | 0.766 | 0.874 | 0.203 |
+| RWKV6 | 2.796 | 0.908 | 0.365 |
+| GSA (`slots=16`) | 2.119 | 0.988 | 0.312 |
+| HGRN (`H=1`) | 0.570 | 0.519 | 0.060 |
+| GDN | 4.661 | 1.074 | 0.604 |
+| RWKV7 State | 4.968 | 1.031 | 0.601 |
+| Ordered composition pressure | 82.628 | 1.372 | 0.924 |
 
-Before Based and pressure needed an explicit 8 GiB workspace envelope; every
-after case runs with the default 1 GiB envelope. Before pressure's auxiliary
-output failed the independent FP32 tolerance; after output and auxiliary pass.
-Normalized linear end-to-end latency regresses despite faster Graph replay.
-FLA remains faster for most cases; its timing is not a correctness claim.
-After results pass an independent FP32 token recurrence for outputs and every
-final State at lengths 65, 512 and 2048 with nonzero initial States, plus batched
-continuation split across nonaligned chunks.
+The results pass an independent FP32 token recurrence for outputs and final
+States at lengths 65, 512, and 2048, including nonzero initial States and
+batched continuation splits.
 
 The historical follow-up Triton packing pass reused single injection/readout
 bindings and left unused operation buffers at one element. On that H20 workload, the
@@ -420,10 +412,6 @@ by 82.5% (output-only), 82.2% (final-state), and 80.2% (continuation), with no
 observed paired regression. Two B=2/H=16/T=8192 calls previously rejected by
 the old resource estimate now run with the native workspace bound. At B=H=1,
 T=64 output-only changed from 0.485 to 0.122 ms and CUDA activity count from
-11 to 1. Measurements used three warmups and five repetitions; FLA is only a
-performance baseline, and continuation includes two calls plus output concat.
-The headless FLA HGRN adapter rejects H>1; those rows compare Meta before/after
-only and do not establish a cross-framework speedup.
 
 Matrix diagonal inference now binds authored pointwise expressions directly to
 raw BF16/FP32 inputs. Row and column summary scales occupy separate vectors,
@@ -462,22 +450,6 @@ Final H20 measurements use BF16, `B=1`, output-only, five warmups and twenty
 samples. Public-call medians below include CPU dispatch; CUDA Graph replay does
 not. Full records: `benchmark_results/diagonal_native_final.json`.
 
-| Structure | H | T | Meta public ms | Meta Graph ms | FLA public ms |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| RWKV6 | 1 | 64 | 0.263 | 0.064 | 0.303 |
-| RWKV6 | 1 | 2048 | 0.355 | 0.084 | 0.312 |
-| RWKV6 | 8 | 64 | 0.266 | 0.065 | 0.362 |
-| RWKV6 | 8 | 2048 | 0.397 | 0.159 | 0.378 |
-| GSA | 1 | 64 | 0.332 | 0.123 | 0.562 |
-| GSA | 1 | 2048 | 0.501 | 0.137 | 0.505 |
-| GSA | 8 | 64 | 0.333 | 0.130 | 0.568 |
-| GSA | 8 | 2048 | 0.637 | 0.325 | 0.576 |
-| HGRN | 1 | 64 | 0.119 | 0.014 | 0.113 |
-| HGRN | 1 | 2048 | 0.175 | 0.020 | 0.115 |
-
-FLA remains faster on the longer RWKV6/H=8 GSA/HGRN calls. HGRN/H>1 still has no
-runnable FLA comparison. Profiler activity was unavailable in this final run;
-the records leave kernel time and launch counts null rather than infer them.
 
 The subsequent host-overhead pass compiles each native dense input's
 `(Batch, Head, Sequence, Feature)` axis map once. Vector, normalized-pair, and
@@ -531,19 +503,6 @@ from `175001` to `156001` function calls, with `_validate_runtime` cumulative
 time decreasing from `0.025 s` to `0.018 s`. These are host-structure measurements
 and do not imply a GPU arithmetic change.
 
-## Legacy Customized Linear Attention API
-The modifier-based `LinearAttentionEngine` remains available with its existing
-interface and behavior. It is outside the Stateful Operator compiler guarantee
-and is not routed through this compiler.
-
-
-```py
-mod = LinearAttentionEngine(qkv_meta, q_mod=..., k_mod=..., v_mod=..., decay_mod=..., custom_io=...)
-output = mod(q, k, v, decay, custom_input)
-```
-GDN is an explicit generic Algorithm IR composition. A dedicated GDN engine is
-not part of the public interface; FlashQLA is only an independent mathematical
-or performance reference, never a Stateful Operator execution backend.
 
 See `docs/stateful-operator-ir-spec.md` for the complete contract.
 

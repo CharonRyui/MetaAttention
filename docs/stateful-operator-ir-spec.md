@@ -115,11 +115,9 @@ The primary and only public behavioral test seam is constructing a `StatefulOper
 80. As a caller, I want every invocation to return immutable `ExecutionResult`, so that return shape never depends on output or State count.
 81. As a caller, I want named and indexed output access, so that multiple outputs remain deterministic and ergonomic.
 82. As a caller, I want final State absent and unmaterialized unless requested, so that output-only execution avoids unnecessary work.
-83. As an existing MetaAttention user, I want `LinearAttentionEngine` behavior unchanged, so that this compiler does not create an unrelated migration.
-84. As a project maintainer, I want the dedicated `GDNEngine` removed, so that GDN cannot retain a second semantic execution path.
-85. As a project maintainer, I want GLA, RetNet recurrent, Mamba2-style selective State, and GDN expressed only through generic nodes, so that examples teach the compiler language rather than model factories.
-86. As a correctness reviewer, I want independent PyTorch references, so that generated forward and backward cannot agree with the same compiler defect.
-87. As a performance reviewer, I want a predeclared statistical gate, so that merge decisions cannot be chosen after observing benchmark results.
+83. As a project maintainer, I want all supported recurrent profiles expressed only through generic nodes, so that examples teach the compiler language rather than external library adapters.
+84. As a correctness reviewer, I want independent PyTorch references, so that generated forward and backward cannot agree with the same compiler defect.
+85. As a performance reviewer, I want a predeclared statistical gate, so that merge decisions cannot be chosen after observing benchmark results.
 88. As a performance reviewer, I want first compilation time recorded but not gated, so that runtime regression and compiler-development cost remain separate evidence.
 89. As a maintainer, I want the compiler schema version in semantic identity, so that language changes invalidate incompatible artifacts.
 90. As a concurrent caller, I want atomic cache publication and process-safe locking, so that no caller observes partial generated artifacts.
@@ -186,8 +184,6 @@ not a compiler primitive or dispatch key.
 - Binary artifact identity adds compiler, TileLang, CUDA ABI, and compatible driver/toolchain fingerprint.
 - Performance-tuning identity is isolated by exact H20 product variant, resource fingerprint, software stack, and clock policy. Tuning results are never shared merely by compute capability or architecture.
 - Shared artifacts use process-safe locking and atomic publication. Transient compilation, driver, and resource failures remove temporary artifacts and never create persistent negative cache entries.
-- `LinearAttentionEngine` remains unchanged and outside the new compiler guarantee. It is not routed through Stateful Operator in this scope.
-- `GDNEngine` is removed, including export, implementation, tests, documentation, and repository callers. GDN remains an explicit Algorithm IR example and independent-reference profile.
 - GLA, RetNet recurrent, selective Axis-Scale state evolution, and GDN are acceptance profiles, never lowering identities or library factories.
 
 ## Testing Decisions
@@ -228,10 +224,7 @@ not a compiler primitive or dispatch key.
 
 ## Out of Scope
 
-- Changing or routing `LinearAttentionEngine` through Stateful Operator.
 - Changing ordinary `AttentionEngine`, decode attention, MLA, score modifiers, mask modifiers, Online Functions, or their `CustomIO` behavior.
-- Preserving or replacing `GDNEngine` with another compatibility wrapper.
-- Public model-specific GLA, RetNet, Mamba2, or GDN factories.
 - Model-name, frontend-name, input-name, or whole-profile lowering dispatch.
 - FlashQLA/GDN kernels as a Stateful Operator execution backend.
 - Arbitrary Python transition, injection, readout, composition, or backward callbacks.

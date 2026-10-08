@@ -8,7 +8,6 @@ import torch
 from testing.benchmark_stateful_plans import (
     CASES,
     _correctness,
-    _ratios,
     _split_inputs,
     _token_oracle,
     inputs_for,
@@ -36,13 +35,6 @@ def test_missing_final_state_is_invalid_only_for_state_contracts():
     assert _correctness(expected, None, expected, states, "continuation")["status"] == "INVALID"
 
 
-def test_invalid_baseline_retains_directional_timing_ratios():
-    meta = {"cpu_wall_ms": 2.0, "public_cuda_event_ms": 1.0, "graph_ms": 0.5}
-    baseline = {"cpu_wall_ms": 6.0, "public_cuda_event_ms": 4.0,
-                "graph_ms": 1.0, "correctness": "INVALID"}
-    assert _ratios(meta, baseline) == {
-        "cpu_wall_ms": 3.0, "public_cuda_event_ms": 4.0, "graph_ms": 2.0,
-    }
 
 
 @pytest.mark.parametrize("name", ["linear", "simple-gla", "gla", "gdn", "gsa", "based", "rebased", "rwkv6", "rwkv7", "hgrn"])

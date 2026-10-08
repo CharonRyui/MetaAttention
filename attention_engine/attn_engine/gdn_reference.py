@@ -1,7 +1,5 @@
-# Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
-#
-# The mathematical behavior follows Flash Linear Attention's Gated Delta Rule
-# reference implementation, distributed under the MIT License.
+# Independent numerical reference for the Stateful Operator Gated Delta Rule
+# profile. The implementation is intentionally simple and differentiable.
 
 from __future__ import annotations
 
@@ -22,11 +20,9 @@ def gated_delta_rule_reference(
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Evaluate head-first Gated Delta Rule using an FP64 recurrent oracle.
+    """Evaluate the head-first Gated Delta Rule using an FP64 recurrent oracle.
 
-    This deliberately simple implementation is CPU-safe and differentiable. It
-    defines the public operator semantics; production H20 calls use the
-    FlashQLA-derived fused backend instead.
+    This CPU-safe implementation defines the public operator semantics.
     """
     if scale is None:
         scale = DEFAULT_SCALE

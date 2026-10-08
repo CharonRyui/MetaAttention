@@ -4,7 +4,6 @@ This diagnostic reports structural plans and warmed measurements under explicit
 output-only, final-State, or two-call continuation contracts. CPU wall time
 includes synchronization; public-call CUDA events and Graph replay are separate
 metrics. Native-layout timings exclude preparation, whose cost is also reported.
-FLA is only a performance baseline: invalid outputs do not suppress timing ratios.
 Meta correctness is checked against an independent authored-order token recurrence.
 
 Usage::
@@ -181,7 +180,6 @@ MATRIX_RECORD_FIELDS = (
     "peak_allocated_bytes",
     "peak_reserved_bytes",
     "meta_correctness",
-    "fla_correctness",
 )
 
 
@@ -456,108 +454,6 @@ def _graph_time(call, warmup: int, repetitions: int) -> float:
     return _median_time(graph.replay, warmup, repetitions)
 
 
-@dataclass(frozen=True)
-class FLABaseline:
-    prepare: object
-    invoke: object
-    state_names: tuple[str, ...]
-    state_contract: bool = True
-    note: str = ""
-    preprocessing: str = "native-layout transpose/contiguous; timed in public call"
-
-    def split(self, result):
-        output, state = (result[0], result[1]) if isinstance(result, (tuple, list)) else (result, None)
-        if state is None:
-            return {"output": output}, None
-        values = (state,) if len(self.state_names) == 1 else tuple(state)
-        return {"output": output}, dict(zip(self.state_names, values))
-
-
-def _fla_call(case: Case, inputs: dict):
-    """Describe preparation and invocation separately; neither is silently free."""
-    name = case.name
-    if name in ("pressure", "mamba2"):
-        return None
-    if name == "hgrn":
-        from fla.ops.hgrn import chunk_hgrn
-
-        def invoke_hgrn(args, initial, final):
-            output, state = chunk_hgrn(*args, initial_state=initial, output_final_state=final)
-            return output.unsqueeze(1), None if state is None else state.unsqueeze(1)
-
-        return FLABaseline(
-            lambda values: (values["value"].squeeze(1), values["gate"].squeeze(1)),
-            invoke_hgrn, ("hidden",), preprocessing="squeeze views; timed in public call",
-        )
-
-    def prepare(values):
-        native = {key: value.transpose(1, 2).contiguous() for key, value in values.items()}
-        if name == "retnet":
-            native["gate"] = native["gate"].log()
-        if name == "rwkv6":
-            native["bonus"] = values["bonus"][0, :, 0].float().contiguous()
-        if name == "rwkv7":
-            beta = native["beta"].unsqueeze(-1)
-            native["injected"] = (native["value"] * beta).to(native["value"].dtype)
-            native["left"] = (-native["key"] * beta).to(native["key"].dtype)
-        return native
-
-    state_contract = name not in ("normalized-linear", "based", "rebased")
-    state_names = ("key_slot", "slot_value") if name == "gsa" else ("memory",)
-    note = "" if state_contract else "FLA does not expose all equivalent recurrent States"
-    if name in ("linear", "normalized-linear"):
-        from fla.ops.linear_attn import chunk_linear_attn as function
-    elif name in ("simple-gla", "retention", "retnet"):
-        from fla.ops.simple_gla import chunk_simple_gla as function
-    elif name == "gla":
-        from fla.ops.gla import chunk_gla as function
-    elif name == "based":
-        from fla.ops.based import fused_chunk_based as function
-    elif name == "rebased":
-        from fla.ops.rebased import parallel_rebased as function
-    elif name == "rwkv6":
-        from fla.ops.rwkv6 import chunk_rwkv6 as function
-    elif name == "gsa":
-        from fla.ops.gsa import chunk_gsa as function
-    elif name == "gdn":
-        from fla.ops.gated_delta_rule import chunk_gated_delta_rule as function
-    elif name == "rwkv7":
-        from fla.ops.generalized_delta_rule.dplr import chunk_dplr_delta_rule as function
-    else:
-        return None
-
-    def invoke(values, initial, final):
-        q, k, v = (values[key] for key in ("query", "key", "value"))
-        kwargs = {"head_first": False}
-        if state_contract or name == "normalized-linear":
-            kwargs.update(initial_state=initial, output_final_state=final)
-        if name in ("linear", "normalized-linear"):
-            result = function(q, k, v, normalize=name == "normalized-linear", **kwargs)
-        elif name in ("simple-gla", "retention", "retnet"):
-            result = function(q, k, v, values.get("gate", values.get("decay")), **kwargs)
-        elif name == "gla":
-            result = function(q, k, v, values["gate"], **kwargs)
-        elif name in ("based", "rebased"):
-            result = function(q, k, v, **kwargs)
-        elif name == "rwkv6":
-            result = function(q, k, v, values["decay"], values["bonus"], **kwargs)
-        elif name == "gsa":
-            result = function(q, k, v, values["slot"], values["gate"], **kwargs)
-        elif name == "gdn":
-            result = function(q, k, v, values["gate"], values["beta"], use_qk_l2norm_in_kernel=False, **kwargs)
-        else:
-            result = function(q, k, values["injected"], values["left"], values["removal"], values["decay"], scale=1.0, **kwargs)
-        output, state = (result[0], result[1]) if isinstance(result, (tuple, list)) else (result, None)
-        return output.transpose(1, 2), state
-
-    preprocessing = "transpose/contiguous"
-    if name == "rwkv7":
-        preprocessing += "; beta multiplication and BF16 casts (algebra differs from authored propagation order)"
-    elif name == "rwkv6":
-        preprocessing += "; FP32 bonus materialization"
-    elif name == "retnet":
-        preprocessing += "; gate log"
-    return FLABaseline(prepare, invoke, state_names, state_contract, note, preprocessing)
 
 
 def _kernel_profile(call, attempts: int = 2) -> tuple[float, int, int]:
@@ -614,23 +510,6 @@ def _meta_call(compiled, parts, contract):
     return run
 
 
-def _baseline_call(adapter, parts, contract, *, prepared=False):
-    def run():
-        first = parts[0] if prepared else adapter.prepare(parts[0])
-        result = adapter.invoke(first, None, contract != "output-only")
-        outputs, states = adapter.split(result)
-        if contract == "continuation":
-            second = parts[1] if prepared else adapter.prepare(parts[1])
-            initial = result[1]
-            if initial is None:
-                raise RuntimeError("FLA did not return a continuation State")
-            if adapter.state_names == ("hidden",):
-                initial = initial.squeeze(1)
-            suffix, states = adapter.split(adapter.invoke(second, initial, True))
-            outputs = {name: torch.cat((outputs[name], output), dim=2)
-                       for name, output in suffix.items()}
-        return outputs, states
-    return run
 
 
 def _measure_call(call, warmup, repetitions, timing="both"):
@@ -670,16 +549,11 @@ def _measure_call(call, warmup, repetitions, timing="both"):
     return record
 
 
-def _ratios(meta, baseline):
-    # Correctness is deliberately not a gate: FLA is only a speed baseline.
-    return {name: baseline[name] / meta[name]
-            for name in ("cpu_wall_ms", "public_cuda_event_ms", "graph_ms")
-            if name in meta and name in baseline and meta[name] > 0}
 
 
 def measure(
     case: Case, seqlen: int, device: torch.device, warmup: int, repetitions: int,
-    *, fla: bool = False, contract: str = "final-state", timing: str = "both",
+    *, contract: str = "final-state", timing: str = "both",
 ) -> dict:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
@@ -693,10 +567,9 @@ def measure(
               "batch": case.batch, "dim": case.dim, "dim_value": case.dim_value,
               "contract": contract, "continuation_split": seqlen // 2 if contract == "continuation" else None,
               "device": torch.cuda.get_device_name(device), "torch_version": torch.__version__,
-              "timing_units": "milliseconds", "ratio_direction": "FLA / Meta (>1 means Meta faster)",
+              "timing_units": "milliseconds",
               "input_layout": "B,H,T,features; preparation inside public-call intervals",
               "initial_state": "zero; continuation suffix receives actual prefix final-State"}
-    record["fla_correctness"] = None
     record["contract_scope"] = (
         "one public call; output only" if contract == "output-only" else
         "one public call; all declared final States" if contract == "final-state" else
@@ -740,40 +613,6 @@ def measure(
     record["meta_native_layout"] = {"layout": "public authored layout", "preparation_cpu_wall_ms": 0.0,
                                     "preparation_cuda_event_ms": 0.0,
                                     "note": "no separate native-layout public interface; internal normalization remains timed"}
-    if not fla:
-        return record
-    try:
-        adapter = _fla_call(case, inputs)
-        if adapter is None:
-            record["fla_note"] = "no library adapter for this authored Program"
-            return record
-        equivalent = contract == "output-only" or adapter.state_contract
-        record.update(fla_contract_comparable=equivalent, fla_preprocessing=adapter.preprocessing,
-                      fla_preprocessing_timed=True, fla_note=adapter.note)
-        # Unsupported state adapters still supply an explicitly non-comparable
-        # output-only speed diagnostic; never fabricate equivalent States.
-        baseline_contract = contract if equivalent else "output-only"
-        baseline_parts = parts if equivalent else [inputs]
-        baseline = _baseline_call(adapter, baseline_parts, baseline_contract)
-        actual, states = baseline()
-        record["fla_correctness"] = _correctness(actual, states, expected, expected_states, baseline_contract)
-        del actual, states
-        record["fla"] = _measure_call(baseline, warmup, repetitions, timing)
-        record["fla"]["contract"] = baseline_contract
-        if equivalent:
-            record["speedup"] = _ratios(record, record["fla"])
-        prepare = lambda: [adapter.prepare(part) for part in baseline_parts]
-        record["fla_native_layout"] = {
-            "preparation_cpu_wall_ms": _cpu_wall_time(prepare, warmup, repetitions),
-            "preparation_cuda_event_ms": _median_time(prepare, warmup, repetitions),
-            "preprocessing_timed": False,
-            "layout": "B,T,H,features (HGRN: B,T,D)",
-        }
-        prepared = prepare()
-        native = _baseline_call(adapter, prepared, baseline_contract, prepared=True)
-        record["fla_native_layout"].update(_measure_call(native, warmup, repetitions, timing))
-    except (ImportError, RuntimeError, TypeError, ValueError, AssertionError) as error:
-        record["fla_error"] = str(error)
     return record
 
 
@@ -799,11 +638,6 @@ def main() -> None:
     parser.add_argument("--matrix-batches", type=int, nargs="+", default=MATRIX_BATCHES)
     parser.add_argument("--matrix-heads", type=int, nargs="+", default=MATRIX_HEADS)
     parser.add_argument("--matrix-seqlens", type=int, nargs="+", default=MATRIX_SEQLENS)
-    parser.add_argument(
-        "--fla",
-        action="store_true",
-        help="time FLA as a performance baseline and report independent oracle diagnostics",
-    )
     args = parser.parse_args()
     torch.set_num_threads(1)
     if not torch.cuda.is_available():
@@ -846,7 +680,7 @@ def main() -> None:
             torch.manual_seed(42)
             record = measure(
                 case, seqlen, device, args.warmup, args.repetitions,
-                fla=args.fla, contract=contract, timing=args.timing,
+                contract=contract, timing=args.timing,
             )
             records.append(record)
             _print_record(matrix_record_schema(record) if args.matrix else record)
@@ -856,7 +690,7 @@ def main() -> None:
             indent=2,
         ))
     if any(record["status"] != "OK" for record in records):
-        raise SystemExit("Meta measurement failed; see records (FLA diagnostics do not determine this status)")
+        raise SystemExit("Meta measurement failed; see records")
 
 
 if __name__ == "__main__":
