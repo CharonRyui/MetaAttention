@@ -47,6 +47,9 @@ dev = [
   "pytest>=9.1.1",
   "ruff>=0.15.19",
 ]
+fla-benchmark = [
+  "flash-linear-attention==0.2.0",
+]
 
 [build-system]
 requires = ["setuptools>=69", "wheel"]

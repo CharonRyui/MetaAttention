@@ -76,8 +76,31 @@ the public interface.
 
 Stateful Operator correctness and performance diagnostics use
 `testing/benchmark_stateful_plans.py`; its independent authored-order recurrence
-is the correctness oracle and its output-only/final-State/continuation contracts
-are measured without external baseline adapters.
+is the correctness oracle for output-only, final-State, and continuation contracts.
+### Compare Stateful Operator with FLA
+
+Install the optional FLA baseline in its isolated uv dependency group:
+
+```bash
+uv sync --group fla-benchmark
+```
+
+Run the conservative first-phase matrix on an otherwise idle NVIDIA GPU:
+
+```bash
+uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
+  --families linear,simple-gla,gla,normalized-linear,retention,rwkv6,gsa,hgrn \
+  --contract all --timing both --output-dir benchmark_results/stateful_fla
+```
+
+The runner selects a physical GPU before importing CUDA, includes public-call
+preparation in both sides, validates MetaAttention against its independent
+authored-order recurrence, validates directly comparable FLA outputs, and only
+then reports `FLA / MetaAttention` speedups. Families without a semantic FLA
+mapping are recorded as non-comparable rather than included in the ratio. The
+JSON, CSV, and plots are artifacts; benchmark results require a fixed GPU,
+software environment, warmup/repetition count, and idle-device record.
+The standalone Stateful plan runner measures those contracts without external baseline adapters.
 
 
 
