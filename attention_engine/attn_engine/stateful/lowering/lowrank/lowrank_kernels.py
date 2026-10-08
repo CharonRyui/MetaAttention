@@ -10,7 +10,8 @@ import torch
 
 
 def execute(*, operation_codes, left_factors, right_factors, coefficients,
-            injection_left, injection_right, readouts, initial_state, output_dtypes):
+            injection_left, injection_right, readouts, initial_state, output_dtypes,
+            symmetric_rank_one=False):
     batch, heads, rows, columns = initial_state.shape
     tokens = readouts[0].shape[0]
     if tokens % batch:
@@ -39,6 +40,7 @@ def execute(*, operation_codes, left_factors, right_factors, coefficients,
             initial_state=initial_state,
             length=length,
             output_dtypes=output_dtypes,
+            symmetric_rank_one=symmetric_rank_one,
         )
 
     from .checkpoint import forward

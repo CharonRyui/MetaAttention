@@ -26,9 +26,9 @@ def _meta(x):
 
 @lru_cache(maxsize=None)
 def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
-            query_meta, initial_meta, output_meta, final_meta, *, batch, heads,
-            rows, columns, length, rank_count, scale_count, injection_count,
-            readouts, chunk, events, event_total, device_index):
+             query_meta, initial_meta, output_meta, final_meta, *, batch, heads,
+             rows, columns, length, rank_count, scale_count, injection_count,
+             readouts, chunk, events, event_total, symmetric_rank_one, device_index):
     import tilelang
     import tilelang.language as T
 
@@ -89,7 +89,7 @@ def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
                         if kind < rank_count:
                             for r in T.Parallel(rows):
                                 u[e, r] = T.if_then_else(valid, T.cast(Coeff[scale_count + kind, sequence * length + token, head], "float32") * T.cast(Left[kind, sequence * length + token, head, r], "float32"), 0.0)
-                                rvec[e, r] = T.if_then_else(valid, T.cast(Right[kind, sequence * length + token, head, r], "float32"), 0.0)
+                                rvec[e, r] = T.if_then_else(valid, T.cast(Left[kind, sequence * length + token, head, r] if symmetric_rank_one else Right[kind, sequence * length + token, head, r], "float32"), 0.0)
                             for c in T.Parallel(_BLOCK):
                                 inj[e, c] = 0.0
                         else:
@@ -148,7 +148,7 @@ def _compile(left_meta, right_meta, coeff_meta, inj_l_meta, inj_r_meta,
 
 
 def execute(*, codes, left, right, coefficient, injection_left, injection_right,
-            query, initial_state, length, output_dtypes):
+            query, initial_state, length, output_dtypes, symmetric_rank_one=False):
     batch, heads, rows, columns = initial_state.shape
     rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
     scale_ops = tuple(i for i, code in enumerate(codes) if code == 0)
@@ -163,7 +163,11 @@ def execute(*, codes, left, right, coefficient, injection_left, injection_right,
             return x.reshape(1, 1, 1).expand(batch * length, heads, size)
         return x.reshape(batch * length, heads, -1).expand(batch * length, heads, size)
     L = torch.stack([bind(left[i].float(), rows) for i in range(len(rank_ops))]).contiguous()
-    R = torch.stack([bind(right[i].float(), rows) for i in range(len(rank_ops))]).contiguous()
+    # A typed symmetric proof makes the right factor identical to the left
+    # expression. Reuse the same storage while retaining the kernel ABI.
+    R = L if symmetric_rank_one else torch.stack(
+        [bind(right[i].float(), rows) for i in range(len(rank_ops))]
+    ).contiguous()
     # The kernel stores scalar gates first, then rank coefficients.  Both tuples
     # retain authored order within their operation kind while rank factors stay
     # compact, so original operation indices must not index the compact tensors.
@@ -176,6 +180,6 @@ def execute(*, codes, left, right, coefficient, injection_left, injection_right,
     Q = torch.stack([bind(x.float(), rows) for x in query]).contiguous()
     output = torch.empty((readout_count, batch * length, heads, columns), device=device, dtype=torch.float32)
     final = torch.empty((batch, heads, rows, columns), device=device, dtype=torch.float32)
-    kernel = _compile(_meta(L), _meta(R), _meta(C), _meta(IL), _meta(IR), _meta(Q), _meta(initial_state), _meta(output), _meta(final), batch=batch, heads=heads, rows=rows, columns=columns, length=length, rank_count=len(rank_ops), scale_count=len(scale_ops), injection_count=injection_count, readouts=readout_count, chunk=chunk, events=events, event_total=event_total, device_index=device.index)
+    kernel = _compile(_meta(L), _meta(R), _meta(C), _meta(IL), _meta(IR), _meta(Q), _meta(initial_state), _meta(output), _meta(final), batch=batch, heads=heads, rows=rows, columns=columns, length=length, rank_count=len(rank_ops), scale_count=len(scale_ops), injection_count=injection_count, readouts=readout_count, chunk=chunk, events=events, event_total=event_total, symmetric_rank_one=symmetric_rank_one, device_index=device.index)
     kernel(L, R, C, IL, IR, Q, initial_state, output, final)
     return tuple(output[i].reshape(batch, length, heads, columns).permute(0, 2, 1, 3).to(dtype) for i, dtype in enumerate(output_dtypes)), final.to(initial_state.dtype)

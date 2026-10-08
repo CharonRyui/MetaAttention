@@ -70,11 +70,13 @@ class RankOneFactoredIR:
 
     ``operations`` preserves authored order and ``readout_roles`` records every
     independent contraction fused by the inference chunk schedule.
+    ``symmetric_rank_one`` proves that every rank-one propagation uses the same
+    feature expression on both sides of its contraction.
     """
-
     operations: tuple[FactoredOperationIR, ...]
     injection_count: int
     readout_roles: tuple[Any, ...]
+    symmetric_rank_one: bool = False
 
 
 @dataclass(frozen=True)
@@ -996,7 +998,14 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         roles = {tuple(factor.roles) for factor in injection.factors}
         if roles != {(first_role,), (second_role,)}:
             return None
-    return RankOneFactoredIR(tuple(operations), len(injections), readout_roles)
+    symmetric_rank_one = all(
+        node.left == node.right
+        for node in algorithm.transitions[0].propagations
+        if isinstance(node, RankOnePropagation)
+    )
+    return RankOneFactoredIR(
+        tuple(operations), len(injections), readout_roles, symmetric_rank_one
+    )
 
 
 def _dense_scalar_binding(

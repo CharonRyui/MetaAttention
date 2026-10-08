@@ -844,6 +844,7 @@ class TileLangExecutable:
     dense_summary: bool
     scalar_factorized: Any | None
     rank_one_factored: Any | None = None
+    symmetric_rank_one: bool = False
     composition: Composition | None = None
     backward_binding: Any | None = None
     chunked_recipe: Any | None = None
@@ -1293,6 +1294,9 @@ def compile_plan(
             dense_summary,
             scalar_factorized,
             rank_one_factored=rank_one_factored,
+            symmetric_rank_one=bool(
+                rank_one_factored is not None and rank_one_factored.symmetric_rank_one
+            ),
             chunked_recipe=chunked_recipe,
         )
         device = torch.device(target.device_type)
@@ -1440,6 +1444,11 @@ def compile_plan(
             rank_one_factored
             if candidate.lowerer == "tilelang-factored-recurrence"
             else None
+        ),
+        symmetric_rank_one=bool(
+            candidate.lowerer == "tilelang-factored-recurrence"
+            and rank_one_factored is not None
+            and rank_one_factored.symmetric_rank_one
         ),
         composition=composition,
         backward_binding=backward_binding,

@@ -12,7 +12,7 @@ import pytest
 
 from attn_engine import FeatureRole, HeadRole, ProductFeatureRole, Target
 from examples.based_attention import based_attention
-from examples.gated_delta_rule import gated_delta_rule
+from examples.gated_delta_rule import compositional_pressure_profile, gated_delta_rule
 from examples.linear_attention import (
     dual_gate_gla_attention,
     gla_attention,
@@ -103,6 +103,29 @@ def test_rank_one_propagation_never_selects_a_dense_scan():
     selected = dict(plan.candidate_estimates)[plan.candidate.identity]
     assert selected.cost == min(estimate.cost for _, estimate in plan.candidate_estimates)
 
+
+def test_rank_one_metadata_records_symmetric_and_asymmetric_proofs():
+    symmetric_operator = gated_delta_rule(1, HEADS, 65, 16, 16, HQ=1)
+    symmetric_compiled = symmetric_operator.compile(
+        role_sizes=_sizes(symmetric_operator, 16, 16), target=Target(), mode="dense"
+    )
+    symmetric_executable = symmetric_compiled.operator._plans[
+        symmetric_compiled.specialization
+    ]
+    assert symmetric_executable.rank_one_factored is not None
+    assert symmetric_executable.rank_one_factored.symmetric_rank_one is True
+    assert symmetric_executable.symmetric_rank_one is True
+
+    asymmetric = compositional_pressure_profile(
+        B=1, H=HEADS, S=65, D=16, DV=16, HQ=1
+    )
+    compiled = asymmetric.compile(
+        role_sizes=_sizes(asymmetric, 16, 16), target=Target(), mode="dense"
+    )
+    asymmetric_executable = compiled.operator._plans[compiled.specialization]
+    assert asymmetric_executable.rank_one_factored is not None
+    assert asymmetric_executable.rank_one_factored.symmetric_rank_one is False
+    assert asymmetric_executable.symmetric_rank_one is False
 
 def test_scalar_decay_keeps_the_factorized_selection():
     plan = _plan(simple_gla_attention)

@@ -2309,6 +2309,7 @@ class StatefulOperator:
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
+                symmetric_rank_one=executable.symmetric_rank_one,
             )
         final_state = (
             StateTuple((state_spec.name,), (final,)) if return_final_state else None

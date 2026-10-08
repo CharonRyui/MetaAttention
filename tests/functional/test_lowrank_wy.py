@@ -285,3 +285,35 @@ def test_wy_three_event_padding_with_partial_feature_tiles(gpu_device):
     for actual, reference in zip(output, expected, strict=True):
         torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+
+@pytest.mark.parametrize("length", [1, 17, 65])
+def test_wy_symmetric_rank_one_reuses_left_factor_without_changing_results(
+    gpu_device, length
+):
+    arguments = _case(gpu_device, length, torch.float32)
+    arguments["right_factors"] = [tensor + 1000.0 for tensor in arguments["left_factors"]]
+    expected_arguments = dict(arguments)
+    expected_arguments["right_factors"] = list(arguments["left_factors"])
+    with torch.no_grad():
+        actual, actual_final = execute(**arguments, symmetric_rank_one=True)
+        expected, expected_final = _oracle(expected_arguments, torch.float64)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    if length == 1:
+        return
+    with torch.no_grad():
+        split = max(1, length // 2)
+        prefix = _slice(arguments, 0, split)
+        suffix = _slice(arguments, split, length)
+        prefix_output, prefix_final = execute(**prefix, symmetric_rank_one=True)
+        suffix["initial_state"] = prefix_final
+        suffix_output, suffix_final = execute(**suffix, symmetric_rank_one=True)
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(actual_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
+    for result, first, second in zip(actual, prefix_output, suffix_output, strict=True):
+        torch.testing.assert_close(
+            torch.cat((first, second), dim=2).cpu(), result.cpu(), rtol=2e-4, atol=2e-4
+        )
+    torch.testing.assert_close(suffix_final.cpu(), actual_final.cpu(), rtol=2e-4, atol=2e-4)

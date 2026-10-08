@@ -31,14 +31,15 @@ def _stack_left(parts, codes, tokens, heads, rows, columns):
 def factored_recurrence_chunked(
     *,
     operation_codes: tuple[str, ...],
-    left_factors: list[torch.Tensor],
-    right_factors: list[torch.Tensor],
-    coefficients: list[torch.Tensor],
+    left_factors: list[torch.Tensor | None],
+    right_factors: list[torch.Tensor | None],
+    coefficients: list[torch.Tensor | None],
     injection_left: list[torch.Tensor],
     injection_right: list[torch.Tensor],
     readouts: list[torch.Tensor],
     initial_state: torch.Tensor,
     output_dtypes: tuple[torch.dtype, ...],
+    symmetric_rank_one: bool = False,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Execute ordered affine summaries, FP32 chunk carries and parallel replay."""
     from .lowrank_kernels import execute
@@ -53,6 +54,7 @@ def factored_recurrence_chunked(
         readouts=readouts,
         initial_state=initial_state,
         output_dtypes=output_dtypes,
+        symmetric_rank_one=symmetric_rank_one,
     )
 
 
