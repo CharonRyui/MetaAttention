@@ -2205,7 +2205,14 @@ class StatefulOperator:
 
         state_spec = self.algorithm.states[0]
         first_role, second_role = state_spec.feature_roles
-        backward_path = executable.backward_binding is not None
+        backward_path = (
+            executable.backward_binding is not None
+            and torch.is_grad_enabled()
+            and (
+                initial_state.requires_grad
+                or any(value.requires_grad for value in values.values())
+            )
+        )
         if backward_path:
             token_count, heads = runtime.token_count, runtime.state_heads
             rows, _ = runtime.feature_sizes
