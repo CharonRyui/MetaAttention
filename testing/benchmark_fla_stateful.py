@@ -40,7 +40,7 @@ P0_BATCHES = (1, 2)
 P0_HEADS = (1, 8, 16)
 P0_SEQLENS = (63, 64, 65, 130, 2048, 8192)
 P0_CONTRACTS = ("output-only", "final-state", "continuation")
-RESULT_SCHEMA_VERSION = 4
+RESULT_SCHEMA_VERSION = 5
 
 
 @dataclass(frozen=True)
@@ -244,17 +244,33 @@ def _fla_call(case, inputs):
     if name == "hgrn":
         from fla.ops.hgrn import fused_recurrent_hgrn
 
-        def invoke_hgrn(values, initial, final):
-            output, state = fused_recurrent_hgrn(
-                *values, initial_state=initial, output_final_state=final
+        def prepare_hgrn(values):
+            value, gate = values["value"], values["gate"]
+            batch, heads, length, width = value.shape
+            return (
+                value.reshape(batch * heads, length, width),
+                gate.reshape(batch * heads, length, width),
             )
-            return output.unsqueeze(1), None if state is None else state.unsqueeze(1)
+
+        def invoke_hgrn(values, initial, final):
+            value, gate = values
+            batch_heads, length, width = value.shape
+            if initial is not None:
+                initial = initial.reshape(batch_heads, width)
+            output, state = fused_recurrent_hgrn(
+                value, gate, initial_state=initial, output_final_state=final
+            )
+            batch = batch_heads // case.heads
+            output = output.reshape(batch, case.heads, length, width)
+            if state is not None:
+                state = state.reshape(batch, case.heads, width)
+            return output, state
 
         return FLABaseline(
-            lambda values: (values["value"].squeeze(1), values["gate"].squeeze(1)),
+            prepare_hgrn,
             invoke_hgrn,
             ("hidden",),
-            preprocessing="squeeze headless views; timed in public call",
+            preprocessing="flatten B,H into FLA batch; timed in public call",
         )
 
     def prepare(values):
@@ -268,8 +284,6 @@ def _fla_call(case, inputs):
             native["a"] = (-native["removal"]).to(native["removal"].dtype)
             native["b"] = (native["key"] * beta).to(native["key"].dtype)
         return native
-
-
 
     state_contract = name not in ("normalized-linear", "based", "rebased")
     state_names = ("key_slot", "slot_value") if name == "gsa" else ("memory",)
@@ -421,6 +435,18 @@ def _workloads(benchmark, families: list[str], batches: list[int], heads: list[i
     )
 
 
+def _meta_failure_status(error: Exception) -> str:
+    """Classify failures after compilation without conflating workspace rejects."""
+    message = str(error)
+    if "COMPILE_RESOURCE" in message:
+        return "META_COMPILE_REJECTED"
+    if "RUNTIME_RESOURCE" in message or "workspace" in message.lower():
+        return "META_RUNTIME_REJECTED"
+    if "compile" in message.lower():
+        return "META_COMPILE_REJECTED"
+    return "META_FAILED"
+
+
 def _measure_pair(benchmark, torch, case, seqlen, device, warmup, repetitions, contract, timing):
     operator = case.factory(**case.kwargs(seqlen))
     sizes = benchmark.role_sizes_for(operator, case, seqlen)
@@ -478,7 +504,7 @@ def _measure_pair(benchmark, torch, case, seqlen, device, warmup, repetitions, c
         if result["status"] != "OK":
             return result
     except Exception as error:
-        result.update(status="META_COMPILE_REJECTED", error=str(error))
+        result.update(status=_meta_failure_status(error), error=str(error))
         return result
 
     try:
@@ -523,7 +549,7 @@ def _measure_pair(benchmark, torch, case, seqlen, device, warmup, repetitions, c
         if "speedup_public_cuda_event_ms" in result:
             result["winner"] = "MetaAttention" if result["speedup_public_cuda_event_ms"] > 1 else "FLA"
     except (ImportError, RuntimeError, TypeError, ValueError) as error:
-        result.update(fla_status="FAILED", fla_error=str(error))
+        result.update(fla_status="FAILED", status="FLA_FAILED", fla_error=str(error))
     return result
 
 
@@ -573,7 +599,6 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 def _plot(path: Path, rows: list[dict], title: str) -> None:
     import matplotlib.pyplot as plt
     import numpy as np
-
     usable = [row for row in rows if row["meta_ms"] and row["fla_ms"]]
     if not usable:
         raise RuntimeError("no successful Meta/FLA pairs available for plotting")
@@ -598,6 +623,7 @@ def _plot(path: Path, rows: list[dict], title: str) -> None:
 
 
 def _plot_matrix(output_dir: Path, rows: list[dict], title: str) -> None:
+    import matplotlib.colors as colors
     import matplotlib.pyplot as plt
     import numpy as np
 
@@ -607,7 +633,8 @@ def _plot_matrix(output_dir: Path, rows: list[dict], title: str) -> None:
         labels = [f"{row['family']}\nB{row['batch']} H{row['heads']} T{row['seqlen']}" for row in selected]
         values = np.asarray([row["speedup"] for row in selected], dtype=float)[None, :]
         figure, axis = plt.subplots(figsize=(min(48, max(12, len(labels) * 0.36)), 2.8), constrained_layout=True)
-        image = axis.imshow(values, aspect="auto", cmap="RdYlGn", vmin=0, vmax=max(2.0, float(values.max())))
+        vmax = max(2.0, float(values.max()), 1.0 / max(float(values.min()), 1e-12))
+        image = axis.imshow(values, aspect="auto", cmap="RdYlGn", norm=colors.LogNorm(vmin=1.0 / vmax, vmax=vmax))
         axis.set_title(f"{title}: FLA / MetaAttn ({contract})")
         axis.set_yticks([0], ["speedup"])
         axis.set_xticks(range(len(labels)), labels, rotation=75, ha="right", fontsize=7)
@@ -671,7 +698,7 @@ def main() -> None:
         print(json.dumps({"family": case.name, "B": case.batch, "H": case.heads, "T": seqlen, "contract": contract, "meta_ms": record.get("meta", {}).get("public_cuda_event_ms"), "fla_ms": record.get("fla", {}).get("public_cuda_event_ms"), "speedup": record.get("speedup_public_cuda_event_ms"), "status": record.get("status"), "fla_status": record.get("fla_status")}, sort_keys=True), flush=True)
     output_dir = args.output_dir or Path("benchmark_results") / f"stateful_fla_meta_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "manifest.json").write_text(json.dumps({"schema_version": RESULT_SCHEMA_VERSION, "selected_gpu": asdict(selected), "matrix": matrix, "expected_records": len(workloads), "actual_records": len(records), "timing": args.timing, "warmup": args.warmup, "repetitions": args.repetitions, "fla_correctness": "not measured by design"}, indent=2), encoding="utf-8")
+    (output_dir / "manifest.json").write_text(json.dumps({"schema_version": RESULT_SCHEMA_VERSION, "selected_gpu": asdict(selected), "matrix": matrix, "expected_records": len(workloads), "actual_records": len(records), "timing": args.timing, "warmup": args.warmup, "repetitions": args.repetitions, "correctness": {"meta": "measured against independent authored-order FP32 oracle", "fla": "measured when adapter execution succeeds", "pair": "measured when both outputs are available"}}, indent=2), encoding="utf-8")
     (output_dir / "records.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
     rows = _csv_rows(records)
     _write_csv(output_dir / "summary.csv", rows)

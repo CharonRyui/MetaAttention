@@ -77,3 +77,41 @@ def test_fla_baseline_records_non_comparable_family(monkeypatch):
     assert adapter is not None
     assert adapter.comparable is False
     assert "native a/b" in adapter.note
+
+def test_meta_failure_status_distinguishes_runtime_resource():
+    from testing.benchmark_fla_stateful import _meta_failure_status
+
+    assert _meta_failure_status(RuntimeError("RUNTIME_RESOURCE at workspace")) == "META_RUNTIME_REJECTED"
+    assert _meta_failure_status(RuntimeError("COMPILE_RESOURCE at workspace")) == "META_COMPILE_REJECTED"
+    assert _meta_failure_status(ValueError("bad input")) == "META_FAILED"
+def test_hgrn_fla_adapter_flattens_heads(monkeypatch):
+    import torch
+    from testing.benchmark_fla_stateful import _fla_call
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = next(item for item in benchmark.CASES if item.name == "hgrn")
+    case = case.__class__(**{**case.__dict__, "batch": 2, "heads": 8})
+    operator = case.factory(**case.kwargs(3))
+    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cuda"))
+    adapter = _fla_call(case, inputs)
+    prepared = adapter.prepare(inputs)
+    assert prepared[0].shape == (16, 3, 64)
+    output, state = adapter.invoke(prepared, None, True)
+    assert output.shape == (2, 8, 3, 64)
+    assert state.shape == (2, 8, 64)
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("family", ["linear", "retention", "retnet"])
+def test_long_scalar_families_use_safe_schedule(gpu_device, family):
+    import torch
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = next(item for item in benchmark.CASES if item.name == family)
+    case = case.__class__(**{**case.__dict__, "batch": 2, "heads": 16})
+    operator = case.factory(**case.kwargs(8192))
+    sizes = benchmark.role_sizes_for(operator, case, 8192)
+    compiled = operator.compile(role_sizes=sizes, target=benchmark.Target(), mode="dense", optimized=True)
+    inputs = benchmark.inputs_for(operator, case, 8192, gpu_device)
+    actual, _ = benchmark._meta_call(compiled, [inputs], "output-only")()
+    expected, _ = benchmark._token_oracle(operator, inputs, sizes)
+    assert torch.allclose(actual["output"].cpu().float(), expected["output"], rtol=0.02, atol=0.05)
