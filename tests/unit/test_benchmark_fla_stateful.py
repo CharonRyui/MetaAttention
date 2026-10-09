@@ -84,21 +84,37 @@ def test_meta_failure_status_distinguishes_runtime_resource():
     assert _meta_failure_status(RuntimeError("RUNTIME_RESOURCE at workspace")) == "META_RUNTIME_REJECTED"
     assert _meta_failure_status(RuntimeError("COMPILE_RESOURCE at workspace")) == "META_COMPILE_REJECTED"
     assert _meta_failure_status(ValueError("bad input")) == "META_FAILED"
-def test_hgrn_fla_adapter_flattens_heads(monkeypatch):
-    import torch
-    from testing.benchmark_fla_stateful import _fla_call
-    from testing import benchmark_stateful_plans as benchmark
+def test_valid_pair_requires_all_correctness_and_statuses():
+    from testing.benchmark_fla_stateful import _valid_pair
 
-    case = next(item for item in benchmark.CASES if item.name == "hgrn")
-    case = case.__class__(**{**case.__dict__, "batch": 2, "heads": 8})
-    operator = case.factory(**case.kwargs(3))
-    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cuda"))
-    adapter = _fla_call(case, inputs)
-    prepared = adapter.prepare(inputs)
-    assert prepared[0].shape == (16, 3, 64)
-    output, state = adapter.invoke(prepared, None, True)
-    assert output.shape == (2, 8, 3, 64)
-    assert state.shape == (2, 8, 64)
+    record = {
+        "status": "OK",
+        "fla_status": "OK",
+        "fla_contract_comparable": True,
+        "meta_correctness": {"status": "VALID"},
+        "fla_correctness": {"status": "VALID"},
+        "pair_correctness": {"status": "VALID"},
+    }
+    assert _valid_pair(record)
+    for field in ("meta_correctness", "fla_correctness", "pair_correctness"):
+        invalid = {**record, field: {"status": "INVALID"}}
+        assert not _valid_pair(invalid)
+    assert not _valid_pair({**record, "status": "OK", "fla_status": "FAILED"})
+
+
+def test_csv_rows_hide_measurements_for_invalid_pairs():
+    from testing.benchmark_fla_stateful import _csv_rows
+
+    record = {
+        "schema_version": 5, "family": "linear", "batch": 1, "heads": 1,
+        "seqlen": 3, "contract": "output-only", "status": "OK", "fla_status": "FAILED",
+        "meta": {"public_cuda_event_ms": 1.0}, "fla": {"public_cuda_event_ms": 2.0},
+        "speedup_public_cuda_event_ms": 2.0,
+    }
+    row = _csv_rows([record])[0]
+    assert row["meta_ms"] is None
+    assert row["fla_ms"] is None
+    assert row["speedup"] is None
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("family", ["linear", "retention", "retnet"])

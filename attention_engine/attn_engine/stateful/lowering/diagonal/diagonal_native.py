@@ -159,6 +159,13 @@ def native_diagonal_resources(recipe, sizes, heads):
                                    recipe.fused_softmax)
 def execute_native_diagonal(recipe, inputs, initial_states, *, sequence_count, sequence_length, heads, return_final_state):
     from .native_tile_kernels import launch_native_summary, launch_native_carry, launch_native_replay
+    # A single replay consumer owns every State element and can publish the
+    # final fragment itself. Other schedules retain summary/carry unchanged.
+    direct_final = (
+        sequence_length <= 64 and return_final_state and len(recipe.states) == 1
+        and recipe.softmax is None and not recipe.shared_scores
+        and len(recipe.readouts) + (recipe.bonus is not None) == 1
+    )
     prepared = {}
     finals = {}
     for item in recipe.states:
@@ -166,9 +173,12 @@ def execute_native_diagonal(recipe, inputs, initial_states, *, sequence_count, s
         batch_heads = sequence_count * heads
         rows, columns = initial.shape[-2:]
         chunks = (sequence_length + 63) // 64
-        if chunks == 1 and not return_final_state:
+        if chunks == 1 and (not return_final_state or direct_final):
             carry = initial.reshape(batch_heads, rows, columns).unsqueeze(1)
-            prepared[item.name] = (item, carry, initial)
+            final = torch.empty_like(initial) if direct_final else initial
+            prepared[item.name] = (item, carry, final)
+            if direct_final:
+                finals[item.name] = final
             continue
         scale = torch.empty((batch_heads, chunks, rows, columns), device=initial.device, dtype=torch.float32)
         bias = torch.empty_like(scale)
@@ -193,21 +203,22 @@ def execute_native_diagonal(recipe, inputs, initial_states, *, sequence_count, s
                                                  sequence_length=sequence_length, heads=heads))
     else:
         for readout, term, query in recipe.readouts:
-            item, carry, _ = prepared[term.state]
+            item, carry, final = prepared[term.state]
             output = torch.empty((sequence_count * sequence_length, heads,
                                   initial_states[term.state].shape[-1]),
                                  device=carry.device, dtype=readout.output_dtype)
             launch_native_replay(carry, item.row_gate, item.column_gate, item.injections,
                                  query, inputs, output, sequence_length=sequence_length,
-                                 heads=heads, prior=term.prior)
+                                 heads=heads, prior=term.prior, final=final if direct_final else None)
             outputs[readout.name] = output
     if recipe.bonus is not None:
         from .native_tile_softmax import bonus_readout
         readout, term, query, bonus_value = recipe.bonus
-        item, carry, _ = prepared[term.state]
+        item, carry, final = prepared[term.state]
         outputs[readout.name] = bonus_readout(item, carry, query, bonus_value, inputs,
                                               sequence_length=sequence_length, heads=heads,
-                                              prior=term.prior, output_dtype=readout.output_dtype)
+                                              prior=term.prior, output_dtype=readout.output_dtype,
+                                              final=final if direct_final else None)
     if recipe.softmax is not None:
         from .native_tile_softmax import softmax_readout
         readout, first, second, query = recipe.softmax

@@ -89,7 +89,7 @@ def _slice(arguments, start, stop):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize("length", [1, 17, 67])
+@pytest.mark.parametrize("length", [1, 17, 67, 129, 257])
 def test_wy_ordered_two_rank_updates_multiple_terms_and_continuation(gpu_device, dtype, length):
     arguments = _case(gpu_device, length, dtype)
     # Verify BF16 input arithmetic independently of output quantization.
@@ -137,6 +137,14 @@ def test_wy_ordered_two_rank_updates_multiple_terms_and_continuation(gpu_device,
             else:
                 torch.testing.assert_close(torch.cat((first, last), 2), actual, rtol=2e-4, atol=2e-4)
         torch.testing.assert_close(suffix_final, final, rtol=2e-4, atol=2e-4)
+    if length == 257 and dtype == torch.float32:
+        graph = torch.cuda.CUDAGraph()
+        with torch.no_grad(), torch.cuda.graph(graph):
+            captured, captured_final = execute(**arguments)
+        graph.replay()
+        for actual, reference in zip(captured, expected, strict=True):
+            torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
+        torch.testing.assert_close(captured_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
 
 
 @pytest.mark.parametrize("length", [1, 19, 65, 130])
@@ -171,8 +179,9 @@ def test_noncommuting_row_scale_output_continuation_and_graph(gpu_device, length
     torch.testing.assert_close(captured_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
 
 
-def test_reversing_two_arbitrary_rank_updates_changes_outputs(gpu_device):
-    arguments = _case(gpu_device, 19, torch.float32)
+@pytest.mark.parametrize("length", [19, 257])
+def test_reversing_two_arbitrary_rank_updates_changes_outputs(gpu_device, length):
+    arguments = _case(gpu_device, length, torch.float32)
     reversed_arguments = dict(arguments)
     for name in ("left_factors", "right_factors", "coefficients"):
         values = list(arguments[name])
@@ -205,8 +214,9 @@ def test_single_rank_injection_and_readout_with_partial_chunk(gpu_device):
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
 
 
-def test_rank_only_transition_without_injections(gpu_device):
-    arguments = _case(gpu_device, 35, torch.float32)
+@pytest.mark.parametrize("length", [35, 257])
+def test_rank_only_transition_without_injections(gpu_device, length):
+    arguments = _case(gpu_device, length, torch.float32)
     arguments["operation_codes"] = ("rank-one",)
     for name in ("left_factors", "right_factors", "coefficients"):
         arguments[name] = arguments[name][:1]
@@ -223,8 +233,9 @@ def test_rank_only_transition_without_injections(gpu_device):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_wy_strided_factors_broadcast_heads_and_scalar_gates(gpu_device, dtype):
-    arguments = _case(gpu_device, 67, dtype)
+@pytest.mark.parametrize("length", [67, 257])
+def test_wy_strided_factors_broadcast_heads_and_scalar_gates(gpu_device, dtype, length):
+    arguments = _case(gpu_device, length, dtype)
     arguments["output_dtypes"] = (torch.float32, torch.float32)
     for name in ("left_factors", "right_factors", "injection_left", "injection_right", "readouts"):
         parts = []
@@ -258,7 +269,7 @@ def test_wy_strided_factors_broadcast_heads_and_scalar_gates(gpu_device, dtype):
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(arguments["initial_state"], initial, rtol=0, atol=0)
     prefix_args = _slice(oracle_arguments, 0, 33)
-    suffix_args = _slice(oracle_arguments, 33, 67)
+    suffix_args = _slice(oracle_arguments, 33, length)
     with torch.no_grad():
         prefix, prefix_final = execute(**prefix_args)
         suffix_args["initial_state"] = prefix_final
@@ -271,8 +282,9 @@ def test_wy_strided_factors_broadcast_heads_and_scalar_gates(gpu_device, dtype):
     torch.testing.assert_close(suffix_final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
 
 
-def test_wy_three_event_padding_with_partial_feature_tiles(gpu_device):
-    arguments = _case(gpu_device, 67, torch.float32)
+@pytest.mark.parametrize("length", [67, 257])
+def test_wy_three_event_padding_with_partial_feature_tiles(gpu_device, length):
+    arguments = _case(gpu_device, length, torch.float32)
     # Two rank events plus one injection require 48 real events in a 64 tile.
     arguments["injection_left"] = arguments["injection_left"][:1]
     arguments["injection_right"] = arguments["injection_right"][:1]
@@ -286,7 +298,7 @@ def test_wy_three_event_padding_with_partial_feature_tiles(gpu_device):
         torch.testing.assert_close(actual.cpu(), reference.float(), rtol=2e-4, atol=2e-4)
     torch.testing.assert_close(final.cpu(), expected_final.float(), rtol=2e-4, atol=2e-4)
 
-@pytest.mark.parametrize("length", [1, 17, 65])
+@pytest.mark.parametrize("length", [1, 17, 65, 257])
 def test_wy_symmetric_rank_one_reuses_left_factor_without_changing_results(
     gpu_device, length
 ):

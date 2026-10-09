@@ -93,19 +93,23 @@ def validate_target(device: torch.device, target) -> None:
 
 
 def validate_aliases(inputs: Mapping[str, torch.Tensor]) -> None:
-    tensors = list(inputs.items())
-    for index, (left_name, left) in enumerate(tensors):
-        for right_name, right in tensors[index + 1 :]:
-            if (
-                left is right
-                or left.untyped_storage().data_ptr()
-                != right.untyped_storage().data_ptr()
-            ):
+    # Public layout validation has already established contiguous tensors, so
+    # each input occupies one byte interval. Read storage metadata once per
+    # input, not twice for every pair; still inspect current pointers each call.
+    tensors = tuple((name, tensor, tensor.untyped_storage().data_ptr())
+                    for name, tensor in inputs.items())
+    intervals = {}
+    for index, (left_name, left, left_pointer) in enumerate(tensors):
+        for right_name, right, right_pointer in tensors[index + 1 :]:
+            if left is right or left_pointer != right_pointer:
                 continue
-            left_start = left.storage_offset() * left.element_size()
-            right_start = right.storage_offset() * right.element_size()
-            left_end = left_start + left.numel() * left.element_size()
-            right_end = right_start + right.numel() * right.element_size()
+            for name, tensor in ((left_name, left), (right_name, right)):
+                if name not in intervals:
+                    itemsize = tensor.element_size()
+                    start = tensor.storage_offset() * itemsize
+                    intervals[name] = (start, start + tensor.numel() * itemsize)
+            left_start, left_end = intervals[left_name]
+            right_start, right_end = intervals[right_name]
             if max(left_start, right_start) < min(left_end, right_end):
                 raise StatefulCompilationError(
                     "RUNTIME_ALIAS", "inputs", {"overlapping": [left_name, right_name]}

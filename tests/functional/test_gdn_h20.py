@@ -90,12 +90,13 @@ def _bindings(device: torch.device, *, length: int = 64):
     return query, key, value, gate, beta
 
 
-def test_gdn_generic_profile_matches_independent_reference(gpu_device):
-    query, key, value, gate, beta = _bindings(gpu_device)
+@pytest.mark.parametrize("length", [64, 257])
+def test_gdn_generic_profile_matches_independent_reference(gpu_device, length):
+    query, key, value, gate, beta = _bindings(gpu_device, length=length)
     initial = torch.randn(
         1, 2, 128, 128, device=gpu_device, dtype=torch.float32, requires_grad=True
     )
-    operator = gated_delta_rule(1, 2, 64, 128, 128, HQ=1)
+    operator = gated_delta_rule(1, 2, length, 128, 128, HQ=1)
     compiled = _compile_gdn(operator)
     with torch.no_grad():
         result = compiled(
@@ -126,11 +127,14 @@ def test_gdn_generic_profile_matches_independent_reference(gpu_device):
     )
 
 
-def test_gdn_continuation_matches_full_invocation(gpu_device):
+@pytest.mark.parametrize("length", [128, 257])
+def test_gdn_continuation_matches_full_invocation(gpu_device, length):
     query, key, value, gate, beta = (
-        tensor.detach() for tensor in _bindings(gpu_device, length=128)
+        tensor.detach() for tensor in _bindings(gpu_device, length=length)
     )
-    operator = gated_delta_rule(1, 2, 128, 128, 128, HQ=1)
+    initial = torch.randn(1, 2, 128, 128, device=gpu_device) * 0.1
+    initial_before = initial.clone()
+    operator = gated_delta_rule(1, 2, length, 128, 128, HQ=1)
     compiled = _compile_gdn(operator)
     prefix_query = query[:, :, :64].contiguous()
     prefix_key = key[:, :, :64].contiguous()
@@ -144,6 +148,7 @@ def test_gdn_continuation_matches_full_invocation(gpu_device):
         value=value,
         gate=gate,
         beta=beta,
+        initial_state=StateTuple(("memory",), (initial,)),
         return_final_state=True,
     )
     prefix = prefix_compiled(
@@ -153,6 +158,7 @@ def test_gdn_continuation_matches_full_invocation(gpu_device):
         gate=prefix_gate,
         beta=prefix_beta,
         return_final_state=True,
+        initial_state=StateTuple(("memory",), (initial,)),
     )
     assert prefix.final_state is not None
     suffix_query = query[:, :, 64:].contiguous()
@@ -181,6 +187,7 @@ def test_gdn_continuation_matches_full_invocation(gpu_device):
     torch.testing.assert_close(
         suffix.final_state[0], full.final_state[0], rtol=0.1, atol=0.1
     )
+    torch.testing.assert_close(initial, initial_before, rtol=0, atol=0)
 
 
 def _pressure_bindings(device: torch.device, lengths: tuple[int, ...]):

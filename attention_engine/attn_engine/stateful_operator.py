@@ -803,6 +803,8 @@ class _StateValidation:
 class _ValidationRecipe:
     """Compiled structural contract; it contains no runtime tensor data."""
     expected_input_names: tuple[str, ...]
+    state_names: tuple[str, ...]
+    output_names: tuple[str, ...]
     inputs: tuple[_InputValidation, ...]
     states: tuple[_StateValidation, ...]
     reference_required: bool
@@ -950,7 +952,7 @@ class StatefulOperator:
         runtime, role_sizes = self._validate_runtime(
             inputs,
             sequence_offsets,
-            dict(compiled.compilation.role_sizes),
+            compiled.compilation.role_sizes,
             validation,
         )
         expected_packed = compiled.compilation.mode == "packed"
@@ -973,11 +975,12 @@ class StatefulOperator:
         requires_grad_state = any(
             tensor.requires_grad for tensor in initial_states.values()
         )
+        requires_grad_inputs = any(tensor.requires_grad for tensor in inputs.values())
         if not compiled.compilation.options.backward and (
             torch.is_grad_enabled()
             and (
                 requires_grad_state
-                or any(tensor.requires_grad for tensor in inputs.values())
+                or requires_grad_inputs
             )
         ):
             raise StatefulCompilationError(
@@ -1007,7 +1010,7 @@ class StatefulOperator:
             and not runtime.packed
             and runtime.token_count > 0
             and not requires_grad_state
-            and not any(tensor.requires_grad for tensor in inputs.values())
+            and not requires_grad_inputs
             and (
                 plan.runtime_family != "rank-one-diagonal"
                 or plan.chunked_recipe.rank_one is not None
@@ -1023,7 +1026,7 @@ class StatefulOperator:
         ):
             return self._execute_chunked_stateful(
                 runtime, role_sizes, inputs, initial_states, return_final_state,
-                plan.chunked_recipe, plan.runtime_family,
+                plan.chunked_recipe, plan.runtime_family, validation,
             )
         if validation.reference_required:
             return self._execute_reference(
@@ -1037,7 +1040,7 @@ class StatefulOperator:
             and not runtime.packed
             and scalar_profile is not None
             and scalar_profile.dense is not None
-            and not any(tensor.requires_grad for tensor in inputs.values())
+            and not requires_grad_inputs
             and not state.requires_grad
         )
         if raw_dense:
@@ -1160,6 +1163,8 @@ class StatefulOperator:
         ordered = tuple(sorted(role_sizes.items(), key=lambda item: _identity(item[0])))
         validation = _ValidationRecipe(
             expected_input_names=tuple(spec.name for spec in self.algorithm.inputs),
+            state_names=tuple(spec.name for spec in self.algorithm.states),
+            output_names=tuple(readout.name for readout in self.algorithm.readouts),
             inputs=tuple(
                 _InputValidation(
                     spec.name,
@@ -1207,18 +1212,16 @@ class StatefulOperator:
         self,
         inputs: Mapping[str, torch.Tensor],
         offsets: torch.Tensor | None,
-        declared_roles: Mapping[LogicalRole, int],
+        declared_roles: tuple[tuple[LogicalRole, int], ...],
         validation: _ValidationRecipe,
     ) -> tuple[_Runtime, dict[str, int]]:
         packed = offsets is not None
         device: torch.device | None = None
         # Fixed Roles are validated against the compiled contract; a Role carried
         # only by a State (never by an Input) must still resolve.
-        role_sizes: dict[LogicalRole, int] = {
-            role: size
-            for role, size in (declared_roles or {}).items()
-            if isinstance(role, (HeadRole, FeatureRole))
-        }
+        # Compilation already restricts these immutable pairs to Head/Feature
+        # Roles. Make one mutable extent map; all input checks below still run.
+        role_sizes: dict[LogicalRole, int] = dict(declared_roles)
         token_count: int | None = None
         uniform_length: int | None = None
         for spec in validation.inputs:
@@ -1405,7 +1408,7 @@ class StatefulOperator:
         cache_default: bool,
     ) -> dict[str, torch.Tensor]:
         """Validate initial State for every declared State and return them by name."""
-        expected = tuple(spec.name for spec in validation.states)
+        expected = validation.state_names
         if state is not None and (
             not isinstance(state, StateTuple) or state.names != expected
         ):
@@ -1464,6 +1467,7 @@ class StatefulOperator:
         return_final_state: bool,
         recipe: Any,
         runtime_family: str,
+        validation: _ValidationRecipe,
     ) -> ExecutionResult:
         """Execute compiler-proven dense inference without reference plumbing."""
         from .stateful.lowering.chunked import bind_chunked_inputs, execute_chunked_states
@@ -1481,11 +1485,8 @@ class StatefulOperator:
                 return_final_state=return_final_state,
             )
             return ExecutionResult(
-                NamedOutputTuple(
-                    tuple(name for name, _ in recipe.rank_one.outputs),
-                    tuple(output for _ in recipe.rank_one.outputs),
-                ),
-                StateTuple((recipe.rank_one.state,), (final,))
+                NamedOutputTuple._unchecked(validation.output_names, (output,)),
+                StateTuple._unchecked(validation.state_names, (final,))
                 if final is not None else None,
             )
         if recipe.rank_one is not None:
@@ -1507,9 +1508,9 @@ class StatefulOperator:
             for readout in self.algorithm.readouts
         )
         return ExecutionResult(
-            NamedOutputTuple(tuple(readout.name for readout in self.algorithm.readouts), ordered),
-            StateTuple(tuple(state.name for state in self.algorithm.states),
-                       tuple(finals[state.name] for state in self.algorithm.states))
+            NamedOutputTuple._unchecked(validation.output_names, ordered),
+            StateTuple._unchecked(validation.state_names,
+                                  tuple(finals[name] for name in validation.state_names))
             if finals is not None else None,
         )
 
@@ -2648,7 +2649,7 @@ def _evaluate(
             prior_states=prior_states,
         )
         expanded = left.float().unsqueeze(-1) * right.float().unsqueeze(-2)
-        return expanded.reshape(*left.shape[:2], left.shape[-1] * right.shape[-1])
+        return expanded.reshape(*left.shape[:-1], left.shape[-1] * right.shape[-1])
     if isinstance(expression, Contract):
         left = _evaluate(
             expression.left,

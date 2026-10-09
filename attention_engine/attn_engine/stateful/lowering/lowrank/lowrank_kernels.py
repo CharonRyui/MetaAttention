@@ -1,8 +1,8 @@
 """TileLang lowering for ordered low-rank affine recurrences.
 
-Scalar-only eligible plans use compact WY. Noncommuting plans use device-side
-affine summaries, exclusive chunk carries and parallel replay, retaining the
-historical token-major factor ABI and authored FP32 operation order.
+Scalar-only eligible plans use short register-State recurrence or block compact
+WY. Noncommuting plans retain affine summaries, exclusive chunk carries and
+parallel replay with the historical token-major factor ABI.
 """
 
 import torch

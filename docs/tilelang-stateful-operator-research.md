@@ -547,3 +547,75 @@ Raw rounds, memory, boundaries and per-lowerer attribution are retained in
 failed matrix rather than replacing it with a passing subset. No runtime code
 or eligibility rule changed during this investigation.
 
+### Short public-call preparation and direct final replay (2026-10-09)
+
+Native diagonal replay now looks up its compiled kernel from ordered loader
+semantics and current binding/output/carry metadata before emitting expressions
+or generating source. Bonus replay also delays annotation formatting until a
+cache miss. Identical `(input name, axis recipe)` uses share one raw source
+within an invocation; distinct row/column uses remain separate. No cache entry
+retains input tensors or pointers. Device, shape, strides, storage offset/extent,
+head groups, prior flags and optional final-State metadata remain in the keys.
+This removes repeated host code generation for GLA and redundant binding/view
+preparation for RWKV6 without changing arithmetic or the long device schedule.
+
+For one State and one ordinary or bonus readout, with no shared-score or
+softmax schedule, sequences through 64 tokens can publish final-State directly
+from the replay fragment. Summary/carry are skipped for these final-State calls
+as they already were for output-only calls. Each State element has one owner;
+the final write follows all valid token transitions, including the transition
+after a prior-State readout. This removes two launches and three FP32
+`B*H*rows*columns` workspaces; the distinct returned final-State allocation
+remains. Longer sequences and other readout schedules keep summary/carry.
+The existing authored-binding regression adds one-readout T64/T65 cases with
+both prior flags, signed/zero dual gates, grouped heads, nonzero initial-State,
+odd feature tails and continuation. Existing bonus regressions cover T1/63/64/65.
+
+HGRN's vector-State recipe already uses raw bindings and one-chunk direct replay,
+so no rank-two vector-propagation or model-name dispatch is added. Its public
+host path now reuses compile-time unique State/output name tuples and the existing
+trusted result-tuple constructor, builds the mutable role extent map once, and
+shares one current-input gradient scan. Alias validation reads each current
+storage pointer once rather than once per pair; byte intervals are only computed
+for same-storage candidates. All public name, dtype, shape, layout, alias, State,
+gradient, target and workspace checks still execute on each call.
+
+Pre-edit source copies are retained under
+`/tmp/metaattention_short_paths_baseline/attention_engine/attn_engine/`;
+the integration baseline also exists at
+`/tmp/metaattention_before_implementation/attn_engine/`. No timing, build,
+lint or test was run by this implementation worker; measured public/Graph
+latency and full integration verification must be supplied by the parent run.
+
+
+### 集成实现证据（2026-10-09）
+
+本轮 H20 smoke 使用 GPU 5，当前源码的 git commit 为
+`c9dcd0a17c5fb4bf1a0455db31eef4664afa2a2e`；环境版本为
+Torch `2.11.0+cu128`、CUDA `12.8`、TileLang `0.1.15`、FLA
+`0.2.0`。runner 现在把实际测量源码 SHA256 和这些版本写入新 manifest。
+
+低秩 GDN output-only 的 10 个 B1/H1,H8/T64,65,130,2048,8192
+workload 均通过独立 oracle 与 Graph replay。H8/T2048 的 Meta public/Graph
+为 `1.5864/1.2497 ms`，修改前 package 为 `44.3094/42.9491 ms`；
+H8/T8192 为 `5.0594/4.8248 ms`，修改前为 `178.0668/176.9654 ms`。
+同一 smoke 的最大 output absolute error 为 `0.00388`，使用既有 `0.02/0.05`
+relative/absolute tolerance；这些是 Meta 对修改前 Meta package 的 A/B 数字，
+不是 FLA speedup。
+
+GLA、RWKV6、HGRN 的 B1/H1,H8/T64,2048,8192 18 项也均通过 oracle；短路径
+变化不均匀，故不宣称统一加速。相对修改前 package，public 变化范围为
+`0.65×` 到 `2.46×`（比值为旧/新），Graph 变化范围为 `0.76×` 到 `1.33×`。
+ProductFeature GPU functional regressions now explicitly run with `--run-gpu`:
+12 passed, including independent ProductFeature order, grouped Q/K/V,
+FP32/BF16, nonzero initial/final States and continuation. Native GEMM results
+stage into CTA shared tiles before reading a fixed denominator lane; this
+avoids fragment layout conflicts without dropping causal chunk-local work.
+
+The actual compiled public API also passes 30 contract smoke scenarios:
+GDN/Based/ReBased/GLA/RWKV6/HGRN, B2/H2, T1/64/65/130/257, nonzero initial,
+nonzero storage offsets, complete final State, continuation (T>1), CUDA Graph
+replay and initial-State immutability. Evidence:
+`benchmark_results/stateful_repair_contracts.json`. These scenarios are not
+FLA comparisons or proof of training correctness. Historical FLA records
+remain unchanged and are not counted as newly verified performance pairs.

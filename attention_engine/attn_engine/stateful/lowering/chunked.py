@@ -425,6 +425,7 @@ class ChunkedRecipe:
     rank_one: Any | None
     native_normalized: Any | None
     native_diagonal: Any | None
+    native_product_normalized: Any | None
     inputs: tuple[Any, ...]
     feature_order: tuple[Any, ...]
 
@@ -570,6 +571,7 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         return None
     from .scan.rank1 import compile_rank_one
     from .readout.native import compile_native_normalized
+    from .readout.product_native import compile_native_product_normalized
     from .diagonal.diagonal_native import compile_native_diagonal
     from .reference import feature_layout
     from ...stateful_operator import Batch, FeatureRole, HeadRole, Sequence
@@ -615,10 +617,11 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
             if not readout_region_resources((1, 1, rows, columns), (1, 1, rows, 1),
                                             softmax=False)["eligible"]:
                 native = None
+    product = compile_native_product_normalized(algorithm, readouts, role_sizes)
     diagonal = compile_native_diagonal(algorithm, readouts, bonus, role_sizes)
     # The materialized-factor executor and normalized pair admit one injection.
     # Multiple injections require the complete raw-loader/readout proof.
-    if diagonal is None and any(len(item.injections) > 1 for item in algorithm.transitions):
+    if product is None and diagonal is None and any(len(item.injections) > 1 for item in algorithm.transitions):
         return None
     return ChunkedRecipe(
         MappingProxyType({state.name: state for state in algorithm.states}),
@@ -631,6 +634,7 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         compile_rank_one(algorithm),
         native,
         diagonal,
+        product,
         tuple(bindings),
         feature_order,
     )
@@ -653,6 +657,8 @@ def select_chunked_schedule(recipe, lowerer):
 def bind_chunked_inputs(recipe: ChunkedRecipe, inputs, runtime):
     """Bind dense values without reference segments or per-call IR analysis."""
 
+    if recipe.native_product_normalized is not None:
+        return inputs
     if recipe.native_normalized is not None:
         return inputs
     if recipe.native_diagonal is not None:
@@ -711,8 +717,22 @@ def execute_chunked_states(
         return None
     if recipe is None:
         recipe = compile_chunked_recipe(algorithm, role_sizes)
+        if recipe is not None and recipe.native_product_normalized is not None:
+            # Direct internal callers provide canonical token-major values;
+            # only the public binder supplies the authored raw-input ABI.
+            from dataclasses import replace
+
+            recipe = replace(recipe, native_product_normalized=None)
     if recipe is None:
         return None
+    if recipe.native_product_normalized is not None:
+        from .readout.product_native import execute_native_product_normalized
+
+        return execute_native_product_normalized(
+            recipe.native_product_normalized, values, initial_states,
+            sequence_count=token_count // sequence_length, sequence_length=sequence_length,
+            heads=heads, return_final_state=return_final_state,
+        )
     if recipe.native_normalized is not None:
         from .readout.native import execute_native_normalized
 

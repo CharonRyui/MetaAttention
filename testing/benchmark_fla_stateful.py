@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import importlib.metadata
 import json
 import os
 import shutil
@@ -78,6 +80,30 @@ def _run_nvidia_smi(args: list[str]) -> subprocess.CompletedProcess[str]:
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError(f"failed to query nvidia-smi: {error}") from error
+
+
+def _provenance(torch) -> dict:
+    root = Path(__file__).resolve().parents[1]
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=root,
+            capture_output=True, text=True, timeout=5, check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        revision = None
+    versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
+    for distribution in ("tilelang", "flash-linear-attention"):
+        try:
+            versions[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            versions[distribution] = None
+    digest = hashlib.sha256()
+    # Identify actual measured sources, including uncommitted implementation.
+    for directory in (root / "attention_engine" / "attn_engine", root / "testing"):
+        for path in sorted(directory.rglob("*.py")):
+            digest.update(str(path.relative_to(root)).encode() + b"\0")
+            digest.update(path.read_bytes() + b"\0")
+    return {"git_commit": revision, "source_sha256": digest.hexdigest(), "versions": versions}
 
 
 def _integer(value: str) -> int | None:
@@ -247,11 +273,14 @@ def _fla_call(case, inputs):
         def prepare_hgrn(values):
             value, gate = values["value"], values["gate"]
             batch, heads, length, width = value.shape
+            # HGRN has a headless gate/state.  Replicate that single authored
+            # gate across grouped value heads before flattening B and H for FLA.
+            if gate.shape[1] == 1 and heads != 1:
+                gate = gate.expand(batch, heads, length, width)
             return (
                 value.reshape(batch * heads, length, width),
                 gate.reshape(batch * heads, length, width),
             )
-
         def invoke_hgrn(values, initial, final):
             value, gate = values
             batch_heads, length, width = value.shape
@@ -273,6 +302,8 @@ def _fla_call(case, inputs):
             preprocessing="flatten B,H into FLA batch; timed in public call",
         )
 
+    state_contract = name not in {"linear", "retention", "retnet", "based", "rebased", "gsa", "gdn"}
+    state_names = ("memory",)
     def prepare(values):
         native = {key: value.transpose(1, 2).contiguous() for key, value in values.items()}
         if name == "retnet":
@@ -285,14 +316,15 @@ def _fla_call(case, inputs):
             native["b"] = (native["key"] * beta).to(native["key"].dtype)
         return native
 
-    state_contract = name not in ("normalized-linear", "based", "rebased")
-    state_names = ("key_slot", "slot_value") if name == "gsa" else ("memory",)
     if name == "linear":
         from fla.ops.linear_attn import fused_recurrent_linear_attn as function
     elif name == "normalized-linear":
         from fla.ops.linear_attn import fused_recurrent_linear_attn as function
     elif name == "retention":
-        from fla.ops.retention import fused_recurrent_retention as function
+        # Use the simple-GLA kernel with the prepared decay tensor.  The
+        # retention wrapper rebuilds its decay with a host-side arange, which
+        # introduces a CPU->CUDA copy during Graph capture.
+        from fla.ops.simple_gla import fused_recurrent_simple_gla as function
     elif name in ("simple-gla", "retnet"):
         from fla.ops.simple_gla import fused_recurrent_simple_gla as function
     elif name == "gla":
@@ -334,7 +366,10 @@ def _fla_call(case, inputs):
         if name in ("linear", "normalized-linear"):
             result = function(query, key, value, normalize=False, **kwargs)
         elif name == "retention":
-            result = function(query, key, value, **kwargs)
+            result = function(
+                query, key, value, g_gamma=values["decay"][0, 0],
+                scale=query.shape[-1] ** -0.5, **kwargs,
+            )
         elif name in ("simple-gla", "retnet"):
             result = function(query, key, value, values.get("gate", values.get("decay")), **kwargs)
         elif name == "gla":
@@ -385,6 +420,18 @@ def _pair_correctness(torch, meta_outputs, fla_outputs):
     return {"status": "VALID" if valid else "INVALID", "max_abs_errors": errors}
 
 
+def _valid_pair(record: dict) -> bool:
+    """Whether a record is eligible to expose a Meta/FLA comparison."""
+    if record.get("status") != "OK" or record.get("fla_status") != "OK":
+        return False
+    if record.get("fla_contract_comparable") is not True:
+        return False
+    return all(
+        record.get(name, {}).get("status") == "VALID"
+        for name in ("meta_correctness", "fla_correctness", "pair_correctness")
+    )
+
+
 
 
 
@@ -400,6 +447,8 @@ def benchmark_matrix(
         raise ValueError("matrix axes must not be empty")
     if set(families) - set(P0_FAMILIES):
         raise ValueError(f"families must be one of: {', '.join(P0_FAMILIES)}")
+    if set(contracts) - set(P0_CONTRACTS):
+        raise ValueError(f"contracts must be one of: {', '.join(P0_CONTRACTS)}")
     if any(value < 1 for value in (*batches, *heads, *seqlens)):
         raise ValueError("matrix axes must be positive")
     if "continuation" in contracts and min(seqlens) < 2:
@@ -418,6 +467,9 @@ def _workloads(benchmark, families: list[str], batches: list[int], heads: list[i
     unknown = set(families) - set(P0_FAMILIES)
     if unknown:
         raise ValueError(f"unknown or unsupported FLA families: {sorted(unknown)}")
+    unknown_contracts = set(contracts) - set(P0_CONTRACTS)
+    if unknown_contracts:
+        raise ValueError(f"unknown contracts: {sorted(unknown_contracts)}")
     if not batches or not heads or not seqlens or not contracts:
         raise ValueError("matrix axes must not be empty")
     if any(value < 1 for value in (*batches, *heads, *seqlens)):
@@ -510,7 +562,7 @@ def _measure_pair(benchmark, torch, case, seqlen, device, warmup, repetitions, c
     try:
         adapter = _fla_call(case, inputs)
         if adapter is None:
-            result.update(fla_status="UNAVAILABLE", fla_error="no FLA adapter")
+            result.update(fla_status="UNAVAILABLE", status="NOT_COMPARABLE", fla_error="no FLA adapter")
             return result
         fla_contract = contract if contract == "output-only" or adapter.state_contract else "output-only"
         fla_parts = parts if fla_contract == contract else [inputs]
@@ -529,7 +581,6 @@ def _measure_pair(benchmark, torch, case, seqlen, device, warmup, repetitions, c
         if not adapter.comparable:
             result.update(fla_status="NOT_COMPARABLE", status="NOT_COMPARABLE", fla_note=adapter.note)
             return result
-        result["pair_correctness"] = _pair_correctness(torch, meta_outputs, fla_outputs)
         if result["fla_correctness"]["status"] != "VALID":
             result.update(fla_status="INVALID", status="FLA_INVALID")
             return result
@@ -563,6 +614,7 @@ def _csv_rows(records: list[dict]) -> list[dict]:
     )
     rows = []
     for record in records:
+        valid_pair = _valid_pair(record)
         meta = record.get("meta", {})
         fla = record.get("fla", {})
         row = {
@@ -573,15 +625,19 @@ def _csv_rows(records: list[dict]) -> list[dict]:
             "fla_contract_comparable": record.get("fla_contract_comparable"),
             "meta_lowerer": record.get("meta_lowerer"),
             "mathematical_representation": record.get("mathematical_representation"),
-            "meta_ms": meta.get("public_cuda_event_ms"), "fla_ms": fla.get("public_cuda_event_ms"),
-            "speedup": record.get("speedup_public_cuda_event_ms"),
-            "meta_graph_ms": meta.get("graph_ms"), "fla_graph_ms": fla.get("graph_ms"),
-            "meta_kernel_ms": meta.get("kernel_ms"), "fla_kernel_ms": fla.get("kernel_ms"),
-            "meta_launches": meta.get("total_launches"), "fla_launches": fla.get("total_launches"),
-            "meta_peak_incremental_bytes": meta.get("peak_incremental_bytes"),
-            "fla_peak_incremental_bytes": fla.get("peak_incremental_bytes"),
-            "meta_peak_reserved_bytes": meta.get("peak_reserved_bytes"),
-            "fla_peak_reserved_bytes": fla.get("peak_reserved_bytes"),
+            "meta_ms": meta.get("public_cuda_event_ms") if valid_pair else None,
+            "fla_ms": fla.get("public_cuda_event_ms") if valid_pair else None,
+            "speedup": record.get("speedup_public_cuda_event_ms") if valid_pair else None,
+            "meta_graph_ms": meta.get("graph_ms") if valid_pair else None,
+            "fla_graph_ms": fla.get("graph_ms") if valid_pair else None,
+            "meta_kernel_ms": meta.get("kernel_ms") if valid_pair else None,
+            "fla_kernel_ms": fla.get("kernel_ms") if valid_pair else None,
+            "meta_launches": meta.get("total_launches") if valid_pair else None,
+            "fla_launches": fla.get("total_launches") if valid_pair else None,
+            "meta_peak_incremental_bytes": meta.get("peak_incremental_bytes") if valid_pair else None,
+            "fla_peak_incremental_bytes": fla.get("peak_incremental_bytes") if valid_pair else None,
+            "meta_peak_reserved_bytes": meta.get("peak_reserved_bytes") if valid_pair else None,
+            "fla_peak_reserved_bytes": fla.get("peak_reserved_bytes") if valid_pair else None,
         }
         rows.append({field: row[field] for field in fields})
     return rows
@@ -599,7 +655,7 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 def _plot(path: Path, rows: list[dict], title: str) -> None:
     import matplotlib.pyplot as plt
     import numpy as np
-    usable = [row for row in rows if row["meta_ms"] and row["fla_ms"]]
+    usable = [row for row in rows if row["speedup"] is not None and row["meta_ms"] and row["fla_ms"]]
     if not usable:
         raise RuntimeError("no successful Meta/FLA pairs available for plotting")
     labels = [f"{row['family']}\nB{row['batch']} H{row['heads']} T{row['seqlen']}" for row in usable]
@@ -630,17 +686,23 @@ def _plot_matrix(output_dir: Path, rows: list[dict], title: str) -> None:
     usable = [row for row in rows if row["speedup"] is not None]
     for contract in sorted({row["contract"] for row in usable}):
         selected = [row for row in usable if row["contract"] == contract]
-        labels = [f"{row['family']}\nB{row['batch']} H{row['heads']} T{row['seqlen']}" for row in selected]
-        values = np.asarray([row["speedup"] for row in selected], dtype=float)[None, :]
-        figure, axis = plt.subplots(figsize=(min(48, max(12, len(labels) * 0.36)), 2.8), constrained_layout=True)
-        vmax = max(2.0, float(values.max()), 1.0 / max(float(values.min()), 1e-12))
-        image = axis.imshow(values, aspect="auto", cmap="RdYlGn", norm=colors.LogNorm(vmin=1.0 / vmax, vmax=vmax))
-        axis.set_title(f"{title}: FLA / MetaAttn ({contract})")
-        axis.set_yticks([0], ["speedup"])
-        axis.set_xticks(range(len(labels)), labels, rotation=75, ha="right", fontsize=7)
-        figure.colorbar(image, ax=axis, label=">1 means MetaAttn faster")
-        figure.savefig(output_dir / f"speedup_{contract}.png", dpi=160)
-        plt.close(figure)
+        for family in sorted({row["family"] for row in selected}):
+            family_rows = [row for row in selected if row["family"] == family]
+            labels = [f"B{row['batch']} H{row['heads']} T{row['seqlen']}" for row in family_rows]
+            values = np.asarray([row["speedup"] for row in family_rows], dtype=float)[None, :]
+            figure, axis = plt.subplots(figsize=(min(24, max(6, len(labels) * 0.45)), 2.8), constrained_layout=True)
+            finite = values[np.isfinite(values) & (values > 0)]
+            if finite.size == 0:
+                plt.close(figure)
+                continue
+            vmax = max(2.0, float(finite.max()), 1.0 / float(finite.min()))
+            image = axis.imshow(values, aspect="auto", cmap="RdYlGn", norm=colors.LogNorm(vmin=1.0 / vmax, vmax=vmax))
+            axis.set_title(f"{title}: FLA / MetaAttn ({family}, {contract})")
+            axis.set_yticks([0], ["speedup"])
+            axis.set_xticks(range(len(labels)), labels, rotation=75, ha="right", fontsize=7)
+            figure.colorbar(image, ax=axis, label=">1 means MetaAttn faster (1x center)")
+            figure.savefig(output_dir / f"speedup_{contract}_{family}.png", dpi=160)
+            plt.close(figure)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -698,7 +760,8 @@ def main() -> None:
         print(json.dumps({"family": case.name, "B": case.batch, "H": case.heads, "T": seqlen, "contract": contract, "meta_ms": record.get("meta", {}).get("public_cuda_event_ms"), "fla_ms": record.get("fla", {}).get("public_cuda_event_ms"), "speedup": record.get("speedup_public_cuda_event_ms"), "status": record.get("status"), "fla_status": record.get("fla_status")}, sort_keys=True), flush=True)
     output_dir = args.output_dir or Path("benchmark_results") / f"stateful_fla_meta_{datetime.now(timezone.utc):%Y%m%dT%H%M%SZ}"
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "manifest.json").write_text(json.dumps({"schema_version": RESULT_SCHEMA_VERSION, "selected_gpu": asdict(selected), "matrix": matrix, "expected_records": len(workloads), "actual_records": len(records), "timing": args.timing, "warmup": args.warmup, "repetitions": args.repetitions, "correctness": {"meta": "measured against independent authored-order FP32 oracle", "fla": "measured when adapter execution succeeds", "pair": "measured when both outputs are available"}}, indent=2), encoding="utf-8")
+    manifest = {"schema_version": RESULT_SCHEMA_VERSION, "selected_gpu": asdict(selected), "matrix": matrix, "expected_records": len(workloads), "actual_records": len(records), "timing": args.timing, "warmup": args.warmup, "repetitions": args.repetitions, "provenance": _provenance(torch), "correctness": {"meta": "measured against independent authored-order FP32 oracle", "fla": "measured when adapter execution succeeds", "pair": "measured when both outputs are available", "valid_pair": "status OK, FLA status OK, comparable contract, and all three correctness statuses VALID"}, "valid_pairs": sum(_valid_pair(record) for record in records)}
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     (output_dir / "records.json").write_text(json.dumps(records, indent=2), encoding="utf-8")
     rows = _csv_rows(records)
     _write_csv(output_dir / "summary.csv", rows)

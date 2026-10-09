@@ -9,7 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from attn_engine import ProductFeatureRole
+from attn_engine import ProductFeatureRole, StateTuple, Target
 from attn_engine.stateful.lowering.chunked import execute_chunked_states
 from attn_engine.stateful.lowering.diagonal.diagonal_kernels import prepare_state
 from attn_engine.stateful.lowering.readout.product_kernels import product_chunk_scores, read_product_state
@@ -62,6 +62,28 @@ def test_distinct_product_factors_order_carry_and_continuation(gpu_device, prior
         readouts=(Readout("out", StateTerm("memory", query_pair, pair_role, prior=prior), torch.float32),),
         head_mapping=HeadMapping({head_role: head_role}),
     )
+    # Exercise the normalized native public operator with the same independent
+    # factors and ProductFeature order, not just the low-level contraction.
+    from attn_engine import Constant, StateTuple, StatefulOperator, Target
+
+    normalized_algorithm = AlgorithmIR(
+        inputs=algorithm.inputs,
+        states=(*algorithm.states, StateSpec("normalizer", (Batch, head_role, pair_role))),
+        transition=(*algorithm.transitions, StateTransition("normalizer", injections=(ProductInjection((
+            ProductFactor(key_pair, (pair_role,)),
+        )),))),
+        readouts=(Readout("out", StateTerm("memory", query_pair, pair_role, prior=prior)
+                         / (StateTerm("normalizer", query_pair, pair_role, prior=prior) + Constant(100.0)),
+                         torch.float32),),
+        head_mapping=algorithm.head_mapping,
+    )
+    compiled = StatefulOperator(normalized_algorithm).compile(
+        role_sizes={head_role: heads, left_role: left, right_role: right,
+                    pair_role: left * right, value_role: columns},
+        target=Target(), mode="dense", optimized=True, backward=False,
+    )
+    public_initial = StateTuple(("memory", "normalizer"), (initial, denominator_initial.squeeze(-1)))
+    public_inputs = {"kl": kl, "kr": kr, "ql": ql, "qr": qr, "v": value}
 
     def run(start, end, state, denominator_state, reuse):
         count = end - start
@@ -107,6 +129,7 @@ def test_distinct_product_factors_order_carry_and_continuation(gpu_device, prior
             heads=heads, token_count=batch * length, device=gpu_device,
             return_final_state=True, sequence_length=length,
         )
+        normalized = compiled(**public_inputs, initial_state=public_initial, return_final_state=True)
 
     state = initial.double().reshape(batch, heads, left, right, columns).clone()
     den_state = denominator_initial.double().reshape(batch, heads, left, right, 1).clone()
@@ -131,19 +154,34 @@ def test_distinct_product_factors_order_carry_and_continuation(gpu_device, prior
         torch.testing.assert_close(output, state.flatten(2, 3).float(), atol=2e-5, rtol=2e-4)
     for output in (den_final, continued_den):
         torch.testing.assert_close(output, den_state.flatten(2, 3).float(), atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(normalized.outputs["out"].permute(0, 2, 1, 3),
+                               expected / (expected_den + 100.0), atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(normalized.final_state["memory"], state.flatten(2, 3).float(),
+                               atol=2e-5, rtol=2e-4)
+    torch.testing.assert_close(normalized.final_state["normalizer"], den_state.flatten(2, 3).squeeze(-1).float(),
+                               atol=2e-5, rtol=2e-4)
 
 
 @pytest.mark.parametrize("family", ["based", "rebased"])
-def test_polynomial_readout_initial_final_and_continuation(gpu_device, family):
-    batch, heads, length, dim, columns = 2, 2, 131, 5, 3
+@pytest.mark.parametrize("length", [31, 131])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_polynomial_readout_initial_final_and_continuation(gpu_device, family, length, dtype):
+    batch, heads, dim, columns = 2, 4, 16, 64
     factory = based_attention if family == "based" else rebased_attention
-    algorithm = factory(batch, heads, length, dim, columns, dtype=torch.float32).algorithm
+    operator = factory(batch, heads, length, dim, columns, dtype=dtype)
+    algorithm = operator.algorithm
     generator = torch.Generator(device=gpu_device).manual_seed(109)
-    # Positive Q/K keep the normalizer away from cancellation, while values and
-    # nonzero initial numerators exercise signed arithmetic and expanded carry.
-    query = torch.rand(batch, length, heads, dim, device=gpu_device, generator=generator) * 0.5
-    key = torch.rand(batch, length, heads, dim, device=gpu_device, generator=generator) * 0.5
-    value = torch.randn(batch, length, heads, columns, device=gpu_device, generator=generator) * 0.2
+    # Independent grouped input heads and a 256x64 product State exercise
+    # public contiguous layouts and direct native feature-strided loaders.
+    def random(source_heads, features, signed=False):
+        raw = torch.rand(batch, source_heads, length, features * 2,
+                         device=gpu_device, generator=generator)
+        return ((raw - 0.5 if signed else raw) * 0.5).to(dtype)[..., ::2]
+
+    native_inputs = {"query": random(1, dim), "key": random(2, dim),
+                     "value": random(2, columns, True)}
+    query, key, value = (native_inputs[name].repeat_interleave(heads // native_inputs[name].shape[1], 1)
+                         .permute(0, 2, 1, 3) for name in ("query", "key", "value"))
     roles = {}
     for state in algorithm.states:
         for role in state.feature_roles:
@@ -156,6 +194,13 @@ def test_polynomial_readout_initial_final_and_continuation(gpu_device, family):
                 roles[role] = columns
             else:
                 roles[role] = 1
+    head_roles = {role.name: role for spec in algorithm.inputs for role in spec.roles if hasattr(role, "name")}
+    compiled = operator.compile(
+        role_sizes={**roles, head_roles["query_heads"]: 1,
+                    head_roles["key_heads"]: 2, head_roles["value_heads"]: 2,
+                    algorithm.states[0].roles[1]: heads},
+        target=Target(), mode="dense", optimized=True, backward=False,
+    )
     initial = {}
     for state in algorithm.states:
         shape = (batch, heads, *(roles[role] for role in state.feature_roles))
@@ -164,28 +209,48 @@ def test_polynomial_readout_initial_final_and_continuation(gpu_device, family):
         else:
             initial[state.name] = torch.randn(shape, device=gpu_device, generator=generator) * 0.1
 
-    def run(start, end, state):
-        count = end - start
-        outputs, final = execute_chunked_states(
-            algorithm,
-            values={name: tensor[:, start:end].reshape(batch * count, heads, -1)
-                    for name, tensor in {"query": query, "key": key, "value": value}.items()},
-            initial_states=state,
-            segment=torch.arange(batch, device=gpu_device).repeat_interleave(count),
-            role_sizes=roles, heads=heads, token_count=batch * count,
-            device=gpu_device, return_final_state=True, sequence_length=count,
+    def run(start, end, state, finals=True):
+        result = compiled(
+            **{name: tensor[:, :, start:end].contiguous() for name, tensor in native_inputs.items()},
+            initial_state=StateTuple(tuple(state), tuple(state.values())),
+            return_final_state=finals,
         )
-        return outputs["output"].reshape(batch, count, heads, columns), final
+        return (result.outputs["output"].permute(0, 2, 1, 3),
+                result.final_state.as_dict() if finals else None)
 
+    split = min(17, length - 1)
     with torch.no_grad():
         actual, final = run(0, length, initial)
-        first, middle = run(0, 65, initial)
-        second, continued = run(65, length, middle)
+        output_only, _ = run(0, length, initial, False)
+        first, middle = run(0, split, initial)
+        second, continued = run(split, length, middle)
+        materialized, materialized_final = execute_chunked_states(
+            algorithm,
+            values={name: tensor.reshape(batch * length, heads, -1)
+                    for name, tensor in {"query": query, "key": key, "value": value}.items()},
+            initial_states=initial,
+            segment=torch.arange(batch, device=gpu_device).repeat_interleave(length),
+            role_sizes=roles, heads=heads, token_count=batch * length,
+            device=gpu_device, return_final_state=True, sequence_length=length,
+        )
+        from attn_engine.stateful.lowering.chunked import compile_chunked_recipe
+        from attn_engine.stateful.lowering.readout.product_native import execute_native_product_normalized
+
+        native_recipe = compile_chunked_recipe(algorithm, roles).native_product_normalized
+        strided, strided_final = execute_native_product_normalized(
+            native_recipe, native_inputs, initial, sequence_count=batch,
+            sequence_length=length, heads=heads, return_final_state=True,
+        )
+        from attn_engine import StatefulCompilationError
+
+        with pytest.raises(StatefulCompilationError) as error:
+            compiled(**native_inputs, initial_state=StateTuple(tuple(initial), tuple(initial.values())))
+        assert error.value.category == "RUNTIME_LAYOUT"
     oracle = {name: tensor.double().clone() for name, tensor in initial.items()}
     expected = []
     for token in range(length):
-        # Authored scale is applied in FP32 before the product map is built.
-        q = (query[:, token].float() * dim**-0.5).double()
+        # Match authored input-node rounding before the FP32 product map.
+        q = (query[:, token] * dim**-0.5).float().double()
         k, v = key[:, token].double(), value[:, token].double()
         pair = torch.einsum("bhi,bhj->bhij", k, k).flatten(-2)
         q_pair = torch.einsum("bhi,bhj->bhij", q, q).flatten(-2)
@@ -209,9 +274,14 @@ def test_polynomial_readout_initial_final_and_continuation(gpu_device, family):
             numerator = torch.einsum("bhi,bhic->bhc", q_pair, oracle["numerator"])
             denominator = torch.einsum("bhi,bhi->bh", q_pair, oracle["denominator"]).unsqueeze(-1) + 1e-5
         expected.append(numerator / denominator)
-    expected = torch.stack(expected, 1).float()
-    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-4)
-    torch.testing.assert_close(torch.cat((first, second), 1), expected, atol=2e-5, rtol=2e-4)
+    expected = torch.stack(expected, 1).to(dtype)
+    tolerance = dict(atol=2e-5, rtol=2e-4) if dtype == torch.float32 else dict(atol=2e-3, rtol=2e-2)
+    for result in (actual, output_only, torch.cat((first, second), 1),
+                   materialized["output"].reshape(batch, length, heads, columns),
+                   strided["output"].reshape(batch, length, heads, columns)):
+        torch.testing.assert_close(result, expected, **tolerance)
     for name, state in oracle.items():
         torch.testing.assert_close(final[name], state.float(), atol=2e-5, rtol=2e-4)
         torch.testing.assert_close(continued[name], state.float(), atol=2e-5, rtol=2e-4)
+        torch.testing.assert_close(materialized_final[name], state.float(), atol=2e-5, rtol=2e-4)
+        torch.testing.assert_close(strided_final[name], state.float(), atol=2e-5, rtol=2e-4)

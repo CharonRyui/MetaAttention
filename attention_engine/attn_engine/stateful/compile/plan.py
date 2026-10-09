@@ -1088,16 +1088,6 @@ def compile_plan(
 
     fixed_sizes = dict(compilation.role_sizes)
     state = operator.algorithm.states[0]
-    transitions = operator.algorithm.transitions
-    chunked_eligible = (
-        mode == "dense"
-        and backward_ir is None
-        and not dense_summary
-        and target.device_type == "cuda"
-        and len(transitions) == 1
-        and len(transitions[0].injections) == 1
-        and len(operator.algorithm.readouts) == 1
-    )
     from ..lowering.chunked import chunked_states_workspace
 
     chunked_states = (
@@ -1126,6 +1116,14 @@ def compile_plan(
         state_workspace = 4 * heads * columns
         state_chunk_bytes = 12 * heads * rows * (columns + 1)
     native_resources = None
+    if optimized and chunked_recipe is not None and chunked_recipe.native_product_normalized is not None:
+        from ..lowering.readout.product_native import native_product_estimate
+
+        native_resources = native_product_estimate(
+            chunked_recipe.native_product_normalized, fixed_sizes, fixed_sizes[state.head_role],
+        )
+        state_workspace = native_resources.output_bytes
+        state_chunk_bytes = native_resources.chunk_bytes
     if chunked_recipe is not None and chunked_recipe.native_diagonal is not None:
         from ..lowering.diagonal.diagonal_native import native_diagonal_resources
 
@@ -1157,6 +1155,16 @@ def compile_plan(
                 )
             )
             factored_chunk_bytes = 4 * heads * (rows * rows + 2 * rows * columns + columns)
+            from ..lowering.lowrank.wy_kernels import eligible as wy_eligible, scratch_bytes_per_chunk
+
+            operation_codes = tuple(operation.kind for operation in rank_one_factored.operations)
+            if wy_eligible(operation_codes, injection_count, rows, columns):
+                factored_chunk_bytes = max(
+                    factored_chunk_bytes,
+                    heads * scratch_bytes_per_chunk(
+                        operation_codes, injection_count, readout_count, rows, columns,
+                    ),
+                )
     state_total = 0
     for spec in operator.algorithm.states:
         sizes = [fixed_sizes[role] for role in spec.feature_roles]
@@ -1175,7 +1183,7 @@ def compile_plan(
         ),
         chunked_states_workspace=state_workspace,
         chunked_states_chunk_bytes=(
-            state_chunk_bytes if optimized and chunked_stateful else 0
+            state_chunk_bytes if optimized and (chunked_stateful or product_feature_chunked) else 0
         ),
         factored_workspace=factored_token_bytes,
         factored_chunk_bytes=factored_chunk_bytes,

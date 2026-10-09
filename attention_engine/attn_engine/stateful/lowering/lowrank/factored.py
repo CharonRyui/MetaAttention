@@ -1,7 +1,7 @@
 """Ordered low-rank recurrence lowering with FP32 checkpointed gradients.
 
-Inference uses affine chunk summaries; training saves chunk-entry States and
-replays one chunk locally for the inverse-free VJP. Both preserve authored order.
+Inference uses register-State recurrence or block compact WY for scalar/rank-one
+plans and affine summaries otherwise. Training retains checkpointed inverse-free VJP.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def factored_recurrence_chunked(
     output_dtypes: tuple[torch.dtype, ...],
     symmetric_rank_one: bool = False,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
-    """Execute ordered affine summaries, FP32 chunk carries and parallel replay."""
+    """Execute scalar/rank-one schedules or ordered affine chunk replay."""
     from .lowrank_kernels import execute
 
     return execute(

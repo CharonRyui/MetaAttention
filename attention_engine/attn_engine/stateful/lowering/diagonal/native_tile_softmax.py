@@ -91,11 +91,13 @@ def _context(expressions, inputs, heads, length):
 
 
 def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
-            output_dtype, bonus=None):
+            output_dtype, bonus=None, final=None):
     """Read a state using an authored loader or an explicit FP32 query cut."""
     length = sequence_length
     batch_heads, chunks, rows, columns = carry.shape
     batch = batch_heads // heads
+    if final is not None and (chunks != 1 or final.shape != (batch, heads, rows, columns)):
+        raise ValueError("direct replay final requires one chunk and a matching rank-two State")
     dense_query = isinstance(query, torch.Tensor)
     expressions = _state_expressions(state)
     if not dense_query:
@@ -105,20 +107,27 @@ def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
     context = _context(expressions, inputs, heads, length)
     output = torch.empty((batch * length, heads, columns), device=carry.device,
                          dtype=output_dtype)
+    key = ("replay", context.specialization_key(expressions),
+           batch, heads, length, _CHUNK, bool(prior), dense_query, bonus is not None,
+           _tensor_metadata(carry), _tensor_metadata(output),
+           _tensor_metadata(query) if dense_query else None,
+           _tensor_metadata(final) if final is not None else None)
+    kernel = _REGION_KERNELS.get(key)
+    if kernel is not None:
+        arguments = (*context.pointers, carry, output, query) if dense_query else (*context.pointers, carry, output)
+        if final is not None:
+            arguments += (final,)
+        kernel(*arguments)
+        return output
     annotations = list(context.annotations) + [_annotation("Carry", carry),
                                               _annotation("Output", output)]
     arguments = list(context.pointers) + [carry, output]
     if dense_query:
         annotations.append(_annotation("Query", query))
         arguments.append(query)
-    key = ("replay", context.specialization_key(expressions),
-           batch, heads, length, _CHUNK, bool(prior), dense_query, bonus is not None,
-           _tensor_metadata(carry), _tensor_metadata(output),
-           _tensor_metadata(query) if dense_query else None)
-    kernel = _REGION_KERNELS.get(key)
-    if kernel is not None:
-        kernel(*arguments)
-        return output
+    if final is not None:
+        annotations.append(_annotation("Final", final))
+        arguments.append(final)
     # Match the original Triton replay domain: a CTA owns a chunk and a
     # column tile, while rows cooperate in the contraction. Each State element
     # advances once per token, not once per future target in the same chunk.
@@ -173,6 +182,11 @@ def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
     body.append("                Output[token, head, c] = result[lane]")
     if prior:
         advance()
+    if final is not None:
+        body.extend([f"for r, lane in T.Parallel({padded_rows}, {width}):",
+                     f"    c = tile * {width} + lane",
+                     f"    if (r < {rows}) & (c < {columns}):",
+                     "        Final[sequence, head, r, c] = memory[r, lane]"])
     kernel = _compile(annotations, body, batch_heads * chunks * tiles, device=carry.device)
     _REGION_KERNELS[key] = kernel
     kernel(*arguments)
@@ -180,7 +194,7 @@ def _replay(state, carry, query, inputs, *, sequence_length, heads, prior,
 
 
 def bonus_readout(state, carry, query, bonus, inputs, *, sequence_length, heads,
-                  prior=True, output_dtype=torch.float32):
+                  prior=True, output_dtype=torch.float32, final=None):
     """Prior-state contraction plus the authored current-token bonus.
 
     ``bonus`` is the complete pointwise left operand of Contract(..., 1), not
@@ -188,7 +202,7 @@ def bonus_readout(state, carry, query, bonus, inputs, *, sequence_length, heads,
     rounding. The compiler's bonus proof identifies the first injection value.
     """
     return _replay(state, carry, query, inputs, sequence_length=sequence_length,
-                   heads=heads, prior=prior, output_dtype=output_dtype, bonus=bonus)
+                   heads=heads, prior=prior, output_dtype=output_dtype, bonus=bonus, final=final)
 
 
 def softmax_cut(scores):

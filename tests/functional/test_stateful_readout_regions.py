@@ -311,9 +311,12 @@ def test_diagonal_block_separated_product_features(gpu_device, prior):
     torch.testing.assert_close(final.cpu(), expected_final, rtol=2e-4, atol=2e-5)
 
 
-@pytest.mark.parametrize("schedule,dual", [("replay", False), ("replay", True), ("scores", False)])
+@pytest.mark.parametrize("schedule,dual,length", [
+    ("replay", False, 137), ("replay", True, 137), ("scores", False, 137),
+    ("single", True, 64), ("single", True, 65),
+])
 @pytest.mark.parametrize("prior", [False, True])
-def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule, prior, dual):
+def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule, prior, dual, length):
     from dataclasses import replace
     from attn_engine import (
         AlgorithmIR, AxisScale, Batch, FeatureRole, HeadMapping, HeadRole, Input,
@@ -335,7 +338,9 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
                                   + ((AxisScale(Input("gc"), (column,)),) if dual else ()),
             injections=(ProductInjection((ProductFactor(Input("k") * 0.5, (row,)),
                                           ProductFactor(Input("v"), (column,)))),)),
-        readouts=(Readout("output", term, torch.float32), Readout("rounded", term, torch.bfloat16)),
+        readouts=(Readout("output", term, torch.float32),) + (
+            (Readout("rounded", term, torch.bfloat16),) if schedule != "single" else ()
+        ),
         head_mapping=HeadMapping({source: heads, heads: heads}),
     )
     operator = StatefulOperator(algorithm)
@@ -351,18 +356,19 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
             chunked_recipe=select_chunked_schedule(executable.chunked_recipe, candidate.lowerer),
         )
     generator = torch.Generator().manual_seed(173)
-    host = {spec.name: (torch.randn(2, 4 if spec.name in ("g", "gc") else 1, 137,
+    host = {spec.name: (torch.randn(2, 4 if spec.name in ("g", "gc") else 1, length,
                                   35 if spec.name in ("v", "gc") else 13, generator=generator) * 0.2).to(spec.dtype)
             for spec in specs}
     for name in (("g", "gc") if dual else ("g",)):
         host[name] = torch.rand(host[name].shape, generator=generator) * 1.5 - 0.5
         host[name][:, :, 63] = 0
-        host[name][:, :, 64] = -0.5
+        if length > 64:
+            host[name][:, :, 64] = -0.5
     initial = torch.randn(2, 4, 13, 35, generator=generator) * 0.1
     values = {name: tensor.to(gpu_device) for name, tensor in host.items()}
     start = StateTuple(("memory",), (initial.to(gpu_device),))
     state, expected = initial.clone(), []
-    for token in range(137):
+    for token in range(length):
         query = (host["q"][:, :, token] * 0.5).float().expand(2, 4, 13)
         key = (host["k"][:, :, token] * 0.5).float().expand(2, 4, 13)
         value = host["v"][:, :, token].float().expand(2, 4, 35)
@@ -380,7 +386,8 @@ def test_native_diagonal_authored_bindings_and_continuation(gpu_device, schedule
                       initial_state=start, return_final_state=True)
     suffix = compiled(**{name: tensor[:, :, split:].contiguous() for name, tensor in values.items()},
                       initial_state=prefix.final_state, return_final_state=True)
-    for name, dtype in (("output", torch.float32), ("rounded", torch.bfloat16)):
+    for readout in algorithm.readouts:
+        name, dtype = readout.name, readout.output_dtype
         tolerance = dict(rtol=2e-4, atol=2e-5) if dtype == torch.float32 else dict(rtol=2e-2, atol=2e-3)
         torch.testing.assert_close(full.outputs[name].cpu(), expected.to(dtype), **tolerance)
         torch.testing.assert_close(output_only.outputs[name].cpu(), expected.to(dtype), **tolerance)

@@ -93,6 +93,56 @@ multiple readout/continuation/Graph/initial immutable 混合 binding smoke
 
 
 
+## Register-State / block-GEMM WY cutover（2026-10-09）
+
+删除旧单 CTA 全序列 WY event kernel 的 scalar dot、逐 token 全 State
+重建和 shared-State 路径。T≤128 使用 register-State direct recurrence：
+每个 rank contraction/readout 为并行 FP32 reduction，propagation 逐项按
+authored order 执行，injection 仍在全部 propagation 之后。
+T>128 使用 16-token solve / chunk carry / parallel readout 三阶段：
+rank/injection interaction 为 triple-TF32 GEMM，strictly lower triangular
+system 使用 ordered forward substitution（并行 K reduction 与全部 RHS）；
+得到 D/F 后 carry 仅执行 chunk entry→response→final-State 的 block GEMM。
+readout 为 query×entry 与 causal query×event×response，不恢复每个 token
+的完整 State。所有 factor、workspace、carry 均保留 FP32，没有 BF16 降精度。
+
+Eligibility 仅由 typed operation codes 与尺寸证明：scalar `gI` 与每个
+`I+c lrᵀ` 交换，故长 WY 可在同 token 的 propagation region 内收集
+scalar gates，rank 相对顺序与后续 injection 不变；这是代数/容差合同，
+不宣称 regroup 后逐位一致。没有 row/column-scale 的交换性假设，
+没有 inverse/log gate，zero/signed gates 用 forward products。
+left!=right、多 injection/readout 和 typed symmetric factor 复用均保留。
+backward/checkpoint/packed kernel 与其 ABI 未改。
+
+`scratch_bytes_per_chunk` 返回单 head/chunk 的所有同时存活 global WY
+scratch：`4*(2*E*Rpad + 2*E*V + Rpad*V + Q*16*E + 16)`，
+其中 E 是 max(32,16*(rank+injection)) 向上取二次幂，Rpad 是
+max(32,R) 向上取二次幂。factor/output/final allocation 单独计费；
+只在长 WY 分支分配，不与 checkpoint scratch 共存。默认 cap 不放宽。
+
+行为回归扩展至 T129/257 的 ordered two-rank、zero/signed gates、
+continuation、strided/broadcast factors、三 event padding、rank-only、
+symmetric factor、CUDA Graph，公共 grouped GDN 增加 T257/nonzero initial
+与 initial immutable 检查；已有 oracle 与容差未放宽。
+集成首轮 H20 output-only smoke：B1、H1/H8、T64/65/130/2048/8192 共
+10 项全部通过独立 authored-order FP32 oracle 和 Graph replay 校验。
+同环境修改前 package 基线与当前实现使用同 seed、3 次 warmup、15 次重复，
+不包含编译。H8/T2048 public 44.3094→1.5864 ms，Graph
+42.9491→1.2497 ms；H8/T8192 public 178.0668→5.0594 ms，Graph
+176.9654→4.8248 ms。这是当前实现相对修改前 Meta package 的观测，
+不是相对 FLA 的比值；其余行为回归由集成测试单独报告。
+替换前源码在 `/tmp/metaattention_wy_kernels_before_gdn.py`、
+`/tmp/metaattention_lowrank_kernels_before_gdn.py`、
+`/tmp/metaattention_factored_before_gdn.py`；负责人另有完整 package A/B snapshot。
+
+最终 H20 GPU 5 显式 GPU 回归：`test_lowrank_wy.py`、`test_gdn_h20.py`、
+`test_stateful_readout_regions.py`、`test_stateful_checkpoint.py`、
+`test_stateful_packed_checkpoint.py` 合计 **256 passed / 2079.91 s**。
+公开 API 的 nonzero initial/final、continuation、Graph、initial immutable
+另由 30 项跨 family smoke 验证，见 `benchmark_results/stateful_repair_contracts.json`。
+已测 GDN/short-path Meta A/B 原始数据保存于
+`benchmark_results/stateful_repair_meta_ab.json`；仍不当作 FLA speedup。
+
 ## 原子提交
 本任务的有效代码、必要行为回归测试和观测证据一起提交。性能回退或错误实现不提交；明确记录失败，不缩小合同来宣称完成。共享文件由集成负责人修改；子代理不提交，不运行中途 build/lint/tests/formatters。GPU 验证由负责人检查空闲 GPU 与 workspace 风险后串行执行。
 
