@@ -1,6 +1,5 @@
 import math
 import time
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -451,9 +450,9 @@ def check_gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, require_grad=Tru
     accum_dtype = torch.float32
     q = torch.randn(B, H, S, D, device="cuda", dtype=dtype, requires_grad=require_grad)
     k = torch.randn(B, H, S, D, device="cuda", dtype=dtype, requires_grad=require_grad)
-    g = F.logsigmoid(
-        torch.randn(B, H, S, device="cuda", dtype=accum_dtype)
-    ).clamp_min(-5)
+    g = F.logsigmoid(torch.randn(B, H, S, device="cuda", dtype=accum_dtype)).clamp_min(
+        -5
+    )
     v = torch.randn(B, H, S, DV, device="cuda", dtype=dtype, requires_grad=require_grad)
     do = torch.randn(B, H, S, DV, device="cuda", dtype=dtype)
 
@@ -469,6 +468,11 @@ def check_gated_retention(B, H, S, D, DV, dtype=torch.bfloat16, require_grad=Tru
     o = attention_module(query=q, key=k, value=v, gate=g).outputs["output"]
     if require_grad:
         o.backward(do, retain_graph=True)
+
+
+def check_sigmoid_attention(
+    B, H, S, D, DV, device="cuda", dtype=torch.float16, require_grad=True
+):
     attention_module = sigmoid_attention(B, H, S, D, DV, tune=True)
 
     def ref(query, key, value, sigmoid_bias, causal=True):

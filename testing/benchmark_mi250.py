@@ -16,7 +16,6 @@ from tilelang.profiler import do_bench
 import torch
 import torch.nn.functional as F
 import math
-import triton
 import pandas as pd
 import os
 
@@ -342,7 +341,6 @@ def bench_retnet_recurrent(
     g.detach_().requires_grad_(False)
     v.detach_().requires_grad_(require_grad)
 
-
     # ours
     attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype)
     attention_module = _compile_factory_profile(
@@ -362,7 +360,6 @@ def bench_retnet_recurrent(
         bwd_lat = do_bench(lambda: o.backward(do, retain_graph=True))
 
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
-
 
     return result_dict
 
@@ -440,7 +437,6 @@ def bench_mamba2_ssm(
     key.detach_().requires_grad_(require_grad)
     query.detach_().requires_grad_(require_grad)
 
-
     return result_dict
 
 
@@ -456,7 +452,6 @@ def bench_mla_decode(B, HQ, SKV, D, DV, HKV=1, dtype=torch.float16):
     attention_module = mla_decode(B, HQ, SKV, D, DV, HK=HKV, HV=HKV, dtype=dtype)
     fwd_lat = do_bench(lambda: attention_module(q, q_pe, KV, k_pe))
     result_dict["MetaAttention"] = (fwd_lat, None)
-
 
     return result_dict
 

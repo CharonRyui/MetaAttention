@@ -11,7 +11,11 @@ def test_dense_binding_preserves_strides_and_grouped_head_mapping_without_expans
     feature = FeatureRole("feature")
     # Deliberately non-contiguous BF16 storage: the descriptor must use its
     # physical strides rather than asking for a normalized copy.
-    raw = torch.arange(2 * 2 * 3 * 4, dtype=torch.float32).reshape(2, 2, 3, 4).to(torch.bfloat16)
+    raw = (
+        torch.arange(2 * 2 * 3 * 4, dtype=torch.float32)
+        .reshape(2, 2, 3, 4)
+        .to(torch.bfloat16)
+    )
     raw = raw.transpose(1, 2)
     spec = TensorInput("query", (Batch, Sequence, head, feature), torch.bfloat16)
     binding = build_binding(
@@ -41,7 +45,9 @@ def test_packed_binding_uses_offsets_and_supports_empty_sequences():
     head = HeadRole("state")
     feature = FeatureRole("feature")
     offsets = torch.tensor([0, 0, 2, 2, 5], dtype=torch.int32)
-    raw = torch.arange(5 * 2 * 3, dtype=torch.float32).reshape(5, 2, 3).to(torch.bfloat16)
+    raw = (
+        torch.arange(5 * 2 * 3, dtype=torch.float32).reshape(5, 2, 3).to(torch.bfloat16)
+    )
     spec = TensorInput("key", (Batch, head, Sequence, feature), torch.bfloat16)
     binding = build_binding(
         spec,
@@ -60,11 +66,12 @@ def test_packed_binding_uses_offsets_and_supports_empty_sequences():
     assert binding.sequence_for_token(2) == 3
     assert binding.token_in_sequence(4) == 2
     torch.testing.assert_close(binding.load(4, 1, 2), raw[4, 1, 2].float())
-    assert binding.offset(4, 1, 2) == raw.storage_offset() + 4 * raw.stride(0) + raw.stride(1) + 2 * raw.stride(2)
+    assert binding.offset(4, 1, 2) == raw.storage_offset() + 4 * raw.stride(
+        0
+    ) + raw.stride(1) + 2 * raw.stride(2)
 
 
 def test_broadcast_binding_replays_batch_value_across_dense_tokens():
-    head = HeadRole("state")
     feature = FeatureRole("feature")
     raw = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float32)
     spec = TensorInput("bias", (Batch, feature), torch.float32)

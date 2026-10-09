@@ -234,7 +234,7 @@ program = kernel(
 mod = tl.compile(
     program,
     out_idx={{output_idx_list}},
-    execution_backend="dlpack",
+    execution_backend="auto",
 )
 # TL_INFERFACE = """
 class _attention(torch.autograd.Function):
