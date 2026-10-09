@@ -373,7 +373,7 @@ def tilelang_scalar_factorized_dense_raw(
     # A chunk grid exposes sequence parallelism when B*H cannot fill the GPU.
     # Fixed-size padded State tiles also handle row tails that the resident
     # GEMM schedule cannot represent. Decide per call, including continuation.
-    if (sequence_length >= 128 and sequence_count * heads < 32) or rows % 32:
+    if (sequence_length >= 128 and sequence_count * heads <= 32) or rows % 32:
         from .scalar_kernels import scalar_chunked_dense_raw
 
         scalar_chunked_dense_raw(
