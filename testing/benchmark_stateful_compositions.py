@@ -108,7 +108,11 @@ def _benchmark_kind(
     )
     measurements: dict[str, list[dict[str, object]]] = {"optimized": [], "generic": []}
     for batch_index in range(batches):
-        order = ("optimized", "generic") if batch_index % 2 == 0 else ("generic", "optimized")
+        order = (
+            ("optimized", "generic")
+            if batch_index % 2 == 0
+            else ("generic", "optimized")
+        )
         for label in order:
             compiled = optimized if label == "optimized" else generic
             measurements[label].append(
@@ -151,8 +155,12 @@ def _benchmark_kind(
             "generic_cuda_event_ms": statistics.median(generic_cuda),
             "optimized_wall_ms": statistics.median(optimized_wall),
             "generic_wall_ms": statistics.median(generic_wall),
-            "optimized_peak_incremental_allocated_bytes": statistics.median(optimized_memory),
-            "generic_peak_incremental_allocated_bytes": statistics.median(generic_memory),
+            "optimized_peak_incremental_allocated_bytes": statistics.median(
+                optimized_memory
+            ),
+            "generic_peak_incremental_allocated_bytes": statistics.median(
+                generic_memory
+            ),
             "generic_over_optimized_cuda_ratio": statistics.median(generic_cuda)
             / statistics.median(optimized_cuda),
             "generic_over_optimized_wall_ratio": statistics.median(generic_wall)
@@ -175,8 +183,16 @@ def main() -> None:
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
-    if args.batch < 1 or args.length < 1 or args.warmup < 0 or args.repetitions < 1 or args.batches < 10:
-        raise SystemExit("positive dimensions, nonnegative warmup, and at least ten batches are required")
+    if (
+        args.batch < 1
+        or args.length < 1
+        or args.warmup < 0
+        or args.repetitions < 1
+        or args.batches < 10
+    ):
+        raise SystemExit(
+            "positive dimensions, nonnegative warmup, and at least ten batches are required"
+        )
     torch.set_num_threads(1)
     records = [
         _benchmark_kind(

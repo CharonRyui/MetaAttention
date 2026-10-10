@@ -42,12 +42,11 @@ def tilelang_elementwise_prefix(
         config = (("block_tokens", config),)
     if backward is None:
         from ..backward import default_backward
+
         backward = default_backward("elementwise", config)
     return _TileLangElementwisePrefix.apply(
         scale, second, bias, segment, initial_state, backward, tuple(config)
     )
-
-
 
 
 @lru_cache(maxsize=None)
@@ -151,9 +150,7 @@ def _compile_elementwise_prefix(
                     accumulated_bias[0] = 0.0
                     current_segment[0] = -1
                     for step in T.Serial(token_count):
-                        token = (
-                            token_count - 1 - step if reverse else step
-                        )
+                        token = token_count - 1 - step if reverse else step
                         if segment[token] != current_segment[0]:
                             accumulated_scale[0] = 1.0
                             accumulated_second[0] = 1.0
@@ -175,13 +172,13 @@ def _compile_elementwise_prefix(
                         accumulated_scale[0] = row_term[0] * accumulated_scale[0]
                         output_bias[token, head, row, column] = accumulated_bias[0]
                         if write_scale[0]:
-                            output_scale[
-                                token, head, scale_row, scale_column
-                            ] = accumulated_scale[0]
-                        if paired and row == 0:
-                            output_second[token, head, 0, column] = (
-                                accumulated_second[0]
+                            output_scale[token, head, scale_row, scale_column] = (
+                                accumulated_scale[0]
                             )
+                        if paired and row == 0:
+                            output_second[token, head, 0, column] = accumulated_second[
+                                0
+                            ]
 
         return kernel
 
@@ -206,21 +203,49 @@ def _tilelang_segmented_elementwise_scan(
     else:
         # one factor per State axis, composed per element inside the kernel
         output_scale = torch.empty(
-            scale.shape[0], scale.shape[1], rows, 1, device=scale.device, dtype=scale.dtype
+            scale.shape[0],
+            scale.shape[1],
+            rows,
+            1,
+            device=scale.device,
+            dtype=scale.dtype,
         )
         output_second = torch.empty(
-            second.shape[0], second.shape[1], 1, columns, device=second.device, dtype=second.dtype
+            second.shape[0],
+            second.shape[1],
+            1,
+            columns,
+            device=second.device,
+            dtype=second.dtype,
         )
     output_bias = bias if inplace else torch.empty_like(bias)
     if bias.numel() == 0:
         return output_scale, output_second, output_bias
     # an unpaired call still passes correctly shaped operands the kernel never
     # reads or writes, so one compiled signature serves both modes
-    second_operand = second if second is not None else torch.empty(
-        scale.shape[0], scale.shape[1], 1, columns, device=scale.device, dtype=scale.dtype
+    second_operand = (
+        second
+        if second is not None
+        else torch.empty(
+            scale.shape[0],
+            scale.shape[1],
+            1,
+            columns,
+            device=scale.device,
+            dtype=scale.dtype,
+        )
     )
-    output_second_operand = output_second if output_second is not None else torch.empty(
-        scale.shape[0], scale.shape[1], 1, columns, device=scale.device, dtype=scale.dtype
+    output_second_operand = (
+        output_second
+        if output_second is not None
+        else torch.empty(
+            scale.shape[0],
+            scale.shape[1],
+            1,
+            columns,
+            device=scale.device,
+            dtype=scale.dtype,
+        )
     )
     device_index = scale.device.index
     if device_index is None:
@@ -281,7 +306,13 @@ class _TileLangElementwisePrefix(torch.autograd.Function):
             states = output_scale * initial + output_bias
         ctx.backward_binding = backward
         ctx.save_for_backward(
-            scale, second, segment, output_scale, output_second, output_bias, initial_state
+            scale,
+            second,
+            segment,
+            output_scale,
+            output_second,
+            output_bias,
+            initial_state,
         )
         return states
 
@@ -323,7 +354,6 @@ class _TileLangElementwisePrefix(torch.autograd.Function):
             None,
             None,
         )
-
 
 
 def _sum_to_shape(value: torch.Tensor, shape: torch.Size) -> torch.Tensor:

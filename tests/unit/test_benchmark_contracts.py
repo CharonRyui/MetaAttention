@@ -55,8 +55,6 @@ def _assert_metaattention_rows(paths: tuple[Path, ...]) -> None:
         assert any(row and row[0] == "MetaAttention" for row in rows[1:])
 
 
-
-
 def test_benchmark_case_matrices_are_exact():
     h100 = h100_cases()
     mi250 = mi250_cases()

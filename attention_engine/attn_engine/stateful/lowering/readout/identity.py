@@ -8,7 +8,11 @@ __all__ = ["native_identity_normalized_readout"]
 
 
 def _metadata(tensor):
-    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype).removeprefix("torch."),
+    )
 
 
 def _carry_view(tensor, batch, heads, chunks, rows, columns):
@@ -59,8 +63,11 @@ def _compile_normalized_readout(
     query_group = heads // query_meta[0][1]
     query_dtype = query_meta[2]
     # TVM folds nested constant casts through BF16; round the scalar first.
-    rounded_scale = (None if query_scale is None else
-                     torch.tensor(query_scale, dtype=getattr(torch, query_dtype)).item())
+    rounded_scale = (
+        None
+        if query_scale is None
+        else torch.tensor(query_scale, dtype=getattr(torch, query_dtype)).item()
+    )
 
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build_kernel():
@@ -109,9 +116,15 @@ def _compile_normalized_readout(
                                 # the query dtype before the FP32 contraction seam.
                                 query_shared[token, row] = T.cast(
                                     T.cast(
-                                        T.cast(query[sequence, head // query_group,
-                                                     chunk * 64 + token,
-                                                     row_block * 32 + row], "float32")
+                                        T.cast(
+                                            query[
+                                                sequence,
+                                                head // query_group,
+                                                chunk * 64 + token,
+                                                row_block * 32 + row,
+                                            ],
+                                            "float32",
+                                        )
                                         * rounded_scale,
                                         query_dtype,
                                     ),
@@ -163,7 +176,9 @@ def _compile_normalized_readout(
                     gemm(query_shared, key_shared, scores)
                     gemm(query_shared, memory_shared, numerator)
                     for token, row in T.Parallel(64, 32):
-                        den_products[token, row] = query_shared[token, row] * T.if_then_else(
+                        den_products[token, row] = query_shared[
+                            token, row
+                        ] * T.if_then_else(
                             row_block * 32 + row < rows,
                             T.cast(
                                 normalizer[

@@ -13,6 +13,7 @@ rounding at every authored node.  CUDA lowerers can replace the private executio
 adapter with a TileLang launch without changing this interface; no intermediate
 expression tensor is required by the evaluator itself.
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -77,7 +78,9 @@ class CompiledExpression:
 
     def __init__(
         self,
-        expression: InputExpression | Mapping[str, InputExpression] | Sequence[InputExpression],
+        expression: InputExpression
+        | Mapping[str, InputExpression]
+        | Sequence[InputExpression],
         *,
         output_dtype: torch.dtype | None = None,
     ) -> None:
@@ -90,7 +93,9 @@ class CompiledExpression:
         if isinstance(expression, Mapping):
             self._name_roots = tuple(expression.keys())
             roots_expr = tuple(expression.values())
-        elif isinstance(expression, Sequence) and not isinstance(expression, (str, bytes)):
+        elif isinstance(expression, Sequence) and not isinstance(
+            expression, (str, bytes)
+        ):
             self._name_roots = None
             roots_expr = tuple(expression)
         else:
@@ -143,9 +148,7 @@ class CompiledExpression:
             self._roots,
         )
         self._leaf_names = tuple(
-            node.expression.name
-            for node in self._nodes
-            if node.kind == "input"
+            node.expression.name for node in self._nodes if node.kind == "input"
         )
         self._state_leaves = tuple(
             node.expression for node in self._nodes if node.kind == "state"
@@ -201,7 +204,10 @@ class CompiledExpression:
             for source in (*bindings.values(), *states.values())
         ):
             from .expression_kernels import launch_expression
-            fused = launch_expression(self, bindings, states, output_dtype or self._output_dtype)
+
+            fused = launch_expression(
+                self, bindings, states, output_dtype or self._output_dtype
+            )
             if fused is not None:
                 if self._name_roots is not None:
                     values = fused if isinstance(fused, tuple) else (fused,)
@@ -245,13 +251,21 @@ class CompiledExpression:
                         shifted[lag:] = value[:-lag]
                 elif value.ndim and value.shape[0] > lag:
                     same = segment[lag:] == segment[:-lag]
-                    shifted[lag:] = torch.where(same.reshape(-1, *([1] * (value.ndim - 1))), value[:-lag], torch.zeros_like(value[:-lag]))
+                    shifted[lag:] = torch.where(
+                        same.reshape(-1, *([1] * (value.ndim - 1))),
+                        value[:-lag],
+                        torch.zeros_like(value[:-lag]),
+                    )
                 values[index] = shifted
             elif node.kind == "softmax":
                 values[index] = values[node.children[0]].float().softmax(-1)
             elif node.kind in ("add", "multiply", "divide"):
                 left, right = values[node.children[0]], values[node.children[1]]
-                values[index] = {"add": torch.add, "multiply": torch.mul, "divide": torch.div}[node.kind](left, right)
+                values[index] = {
+                    "add": torch.add,
+                    "multiply": torch.mul,
+                    "divide": torch.div,
+                }[node.kind](left, right)
             else:
                 values[index] = _apply_unary(expr, values[node.children[0]])
         result = tuple(values[root] for root in self._roots)
@@ -267,7 +281,9 @@ class CompiledExpression:
 
 
 def compile_expression(
-    expression: InputExpression | Mapping[str, InputExpression] | Sequence[InputExpression],
+    expression: InputExpression
+    | Mapping[str, InputExpression]
+    | Sequence[InputExpression],
     *,
     output_dtype: torch.dtype | None = None,
 ) -> CompiledExpression:
@@ -276,7 +292,9 @@ def compile_expression(
 
 
 def evaluate_expression(
-    expression: InputExpression | Mapping[str, InputExpression] | Sequence[InputExpression],
+    expression: InputExpression
+    | Mapping[str, InputExpression]
+    | Sequence[InputExpression],
     bound: Mapping[str, Any] | Any,
     *,
     state_terms: Mapping[Any, Any] | None = None,
@@ -284,10 +302,15 @@ def evaluate_expression(
     segment: torch.Tensor | None = None,
 ) -> Any:
     """Evaluate an expression through the same public compiler seam."""
-    return compile_expression(expression, output_dtype=output_dtype)(bound, state_terms, segment=segment)
+    return compile_expression(expression, output_dtype=output_dtype)(
+        bound, state_terms, segment=segment
+    )
+
 
 def make_expression_evaluator(
-    expression: InputExpression | Mapping[str, InputExpression] | Sequence[InputExpression],
+    expression: InputExpression
+    | Mapping[str, InputExpression]
+    | Sequence[InputExpression],
     *,
     output_dtype: torch.dtype | None = None,
 ) -> CompiledExpression:
@@ -296,14 +319,18 @@ def make_expression_evaluator(
 
 
 def evaluate_readout(
-    expression: InputExpression | Mapping[str, InputExpression] | Sequence[InputExpression],
+    expression: InputExpression
+    | Mapping[str, InputExpression]
+    | Sequence[InputExpression],
     bound: Mapping[str, Any] | Any,
     state_terms: Mapping[Any, Any] | None = None,
     *,
     output_dtype: torch.dtype | None = None,
     segment: torch.Tensor | None = None,
 ) -> Any:
-    return compile_expression(expression, output_dtype=output_dtype)(bound, state_terms, segment=segment)
+    return compile_expression(expression, output_dtype=output_dtype)(
+        bound, state_terms, segment=segment
+    )
 
 
 def _as_mapping(value: Any) -> Mapping[Any, Any]:
@@ -335,7 +362,9 @@ def _state_binding(states: Mapping[Any, Any], expression: StateTerm) -> Any:
     return states.get(expression.state)
 
 
-def _first_device(bindings: Mapping[Any, Any], states: Mapping[Any, Any]) -> torch.device:
+def _first_device(
+    bindings: Mapping[Any, Any], states: Mapping[Any, Any]
+) -> torch.device:
     for source in (*bindings.values(), *states.values()):
         if isinstance(source, torch.Tensor):
             return source.device
@@ -368,6 +397,9 @@ def _apply_unary(expression: Any, value: torch.Tensor) -> torch.Tensor:
 
 
 __all__ = [
-    "CompiledExpression", "compile_expression", "evaluate_expression",
-    "make_expression_evaluator", "evaluate_readout",
+    "CompiledExpression",
+    "compile_expression",
+    "evaluate_expression",
+    "make_expression_evaluator",
+    "evaluate_readout",
 ]

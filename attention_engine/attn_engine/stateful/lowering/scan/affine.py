@@ -180,20 +180,60 @@ def _tilelang_dense_affine_scan(
         empty_left = torch.empty_like(left)
         empty_right = torch.empty_like(right)
         _compile_dense_matmul_step(
-            token_count, heads, rows, rows, rows, offset, offset, False, 1, False,
-            device_index, threads,
+            token_count,
+            heads,
+            rows,
+            rows,
+            rows,
+            offset,
+            offset,
+            False,
+            1,
+            False,
+            device_index,
+            threads,
         )(left, left, segment, empty_left, next_left)
         _compile_dense_matmul_step(
-            token_count, heads, columns, columns, columns, offset, offset, True, 2, False,
-            device_index, threads,
+            token_count,
+            heads,
+            columns,
+            columns,
+            columns,
+            offset,
+            offset,
+            True,
+            2,
+            False,
+            device_index,
+            threads,
         )(right, right, segment, empty_right, next_right)
         _compile_dense_matmul_step(
-            token_count, heads, rows, rows, columns, offset, offset, False, 0, False,
-            device_index, threads,
+            token_count,
+            heads,
+            rows,
+            rows,
+            columns,
+            offset,
+            offset,
+            False,
+            0,
+            False,
+            device_index,
+            threads,
         )(left, bias, segment, empty_bias, temporary)
         _compile_dense_matmul_step(
-            token_count, heads, rows, columns, columns, offset, 0, False, 0, True,
-            device_index, threads,
+            token_count,
+            heads,
+            rows,
+            columns,
+            columns,
+            offset,
+            0,
+            False,
+            0,
+            True,
+            device_index,
+            threads,
         )(temporary, right, segment, bias, next_bias)
         left, right, bias = next_left, next_right, next_bias
         offset *= 2
@@ -223,6 +263,7 @@ def tilelang_dense_affine_prefix(
         config = (("threads", config),)
     if backward is None:
         from ..backward import default_backward
+
         backward = default_backward("dense", config)
     return _TileLangDenseAffinePrefix.apply(
         left, right, bias, segment, initial_state, backward, tuple(config)
@@ -238,7 +279,9 @@ class _TileLangDenseAffinePrefix(torch.autograd.Function):
         prefix_left, prefix_right, prefix_bias = _tilelang_dense_affine_scan(
             left, right, bias, segment, threads=dict(config).get("threads", 128)
         )
-        states = prefix_left @ initial_state[segment.long()] @ prefix_right + prefix_bias
+        states = (
+            prefix_left @ initial_state[segment.long()] @ prefix_right + prefix_bias
+        )
         ctx.backward_binding = backward
         ctx.save_for_backward(left, right, segment, initial_state, states)
         return states

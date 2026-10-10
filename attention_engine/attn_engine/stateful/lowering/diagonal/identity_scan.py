@@ -10,7 +10,11 @@ _GROUP = 32
 
 
 def _metadata(tensor):
-    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype).removeprefix("torch."),
+    )
 
 
 def _state_view(state):
@@ -26,9 +30,17 @@ def _state_view(state):
 
 @lru_cache(maxsize=None)
 def _compile_identity_scan(
-    bias_meta, initial_meta, carry_meta, final_meta,
-    den_bias_meta, den_initial_meta, den_carry_meta, den_final_meta,
-    mode: str, write_final: bool, device_index: int,
+    bias_meta,
+    initial_meta,
+    carry_meta,
+    final_meta,
+    den_bias_meta,
+    den_initial_meta,
+    den_carry_meta,
+    den_final_meta,
+    mode: str,
+    write_final: bool,
+    device_index: int,
 ):
     import tilelang
     import tilelang.language as T
@@ -43,7 +55,9 @@ def _compile_identity_scan(
     steps = chunks if mode == "direct" else _GROUP
     # Unroll direct levels so aliasing summaries/carries have disjoint addresses.
     chunk_loop = T.unroll if paired and mode == "direct" else T.serial
-    chunk_annotations = {"pragma_unroll_explicit": True} if paired and mode == "direct" else {}
+    chunk_annotations = (
+        {"pragma_unroll_explicit": True} if paired and mode == "direct" else {}
+    )
 
     @T.macro
     def scan(Bias, Initial, Carry, Final, sh, group, block):
@@ -58,12 +72,19 @@ def _compile_identity_scan(
             elif mode == "direct":
                 state[lane] = T.if_then_else(
                     x < size,
-                    Initial[sh // Initial.shape[1], sh % Initial.shape[1], x // cols, x % cols],
+                    Initial[
+                        sh // Initial.shape[1],
+                        sh % Initial.shape[1],
+                        x // cols,
+                        x % cols,
+                    ],
                     0.0,
                 )
             else:
                 state[lane] = T.if_then_else(
-                    x < size, Initial[sh, group, x // cols, x % cols], 0.0,
+                    x < size,
+                    Initial[sh, group, x // cols, x % cols],
+                    0.0,
                 )
         for step in chunk_loop(steps, annotations=chunk_annotations):
             chunk = step if mode == "direct" else group * _GROUP + step
@@ -72,7 +93,8 @@ def _compile_identity_scan(
                 x = block * _BLOCK + lane
                 summary[lane] = T.if_then_else(
                     (chunk < chunks) & (x < size),
-                    Bias[sh, chunk, x // cols, x % cols], 0.0,
+                    Bias[sh, chunk, x // cols, x % cols],
+                    0.0,
                 )
             for lane in T.Parallel(_BLOCK):
                 x = block * _BLOCK + lane
@@ -87,11 +109,17 @@ def _compile_identity_scan(
                     Carry[sh, group, x // cols, x % cols] = state[lane]
                 elif write_final:
                     if group == groups - 1:
-                        Final[sh // Final.shape[1], sh % Final.shape[1], x // cols, x % cols] = state[lane]
+                        Final[
+                            sh // Final.shape[1],
+                            sh % Final.shape[1],
+                            x // cols,
+                            x % cols,
+                        ] = state[lane]
 
     @tilelang.jit
     def build_kernel():
         if paired:
+
             @T.prim_func
             def kernel(
                 Bias: T.StridedTensor(*bias_meta),
@@ -103,12 +131,25 @@ def _compile_identity_scan(
                 DenCarry: T.StridedTensor(*den_carry_meta),
                 DenFinal: T.StridedTensor(*den_final_meta),
             ):
-                with T.Kernel(bh, groups, grid_blocks, threads=128) as (sh, group, block):
+                with T.Kernel(bh, groups, grid_blocks, threads=128) as (
+                    sh,
+                    group,
+                    block,
+                ):
                     if block < blocks:
                         scan(Bias, Initial, Carry, Final, sh, group, block)
                     else:
-                        scan(DenBias, DenInitial, DenCarry, DenFinal, sh, group, block - blocks)
+                        scan(
+                            DenBias,
+                            DenInitial,
+                            DenCarry,
+                            DenFinal,
+                            sh,
+                            group,
+                            block - blocks,
+                        )
         else:
+
             @T.prim_func
             def kernel(
                 Bias: T.StridedTensor(*bias_meta),
@@ -118,6 +159,7 @@ def _compile_identity_scan(
             ):
                 with T.Kernel(bh, groups, blocks, threads=128) as (sh, group, block):
                     scan(Bias, Initial, Carry, Final, sh, group, block)
+
         return kernel
 
     return build_kernel()
@@ -139,8 +181,11 @@ def _launch(mode, bias, initial, carry, final, *, write_final, pair=None):
     if device_index is None:
         device_index = torch.cuda.current_device()
     kernel = _compile_identity_scan(
-        *(_metadata(tensor) for tensor in tensors), *den_meta,
-        mode, write_final, device_index,
+        *(_metadata(tensor) for tensor in tensors),
+        *den_meta,
+        mode,
+        write_final,
+        device_index,
     )
     kernel(*tensors, *(pair or ()))
 
@@ -154,15 +199,26 @@ def identity_hierarchical_carry(bias, initial, carry, final, *, write_final):
         _launch("direct", bias, initial, carry, final, write_final=write_final)
         return
     groups = (chunks + _GROUP - 1) // _GROUP
-    group_bias = torch.empty((bh, groups, rows, columns), device=bias.device, dtype=torch.float32)
+    group_bias = torch.empty(
+        (bh, groups, rows, columns), device=bias.device, dtype=torch.float32
+    )
     group_carry = torch.empty_like(group_bias)
     _launch("local", bias, initial, group_bias, final, write_final=False)
-    identity_hierarchical_carry(group_bias, initial, group_carry, final, write_final=False)
+    identity_hierarchical_carry(
+        group_bias, initial, group_carry, final, write_final=False
+    )
     _launch("apply", bias, group_carry, carry, final, write_final=write_final)
 
 
 def identity_hierarchical_carry_pair(
-    bias, den_bias, initial, den_initial, final, den_final, *, write_final,
+    bias,
+    den_bias,
+    initial,
+    den_initial,
+    final,
+    den_final,
+    *,
+    write_final,
 ):
     """Pair every level; direct levels reuse summaries after consuming each bias."""
     bh, chunks, rows, columns = bias.shape
@@ -170,28 +226,52 @@ def identity_hierarchical_carry_pair(
         return bias, den_bias
     if chunks <= 64:
         _launch(
-            "direct", bias, initial, bias, final, write_final=write_final,
+            "direct",
+            bias,
+            initial,
+            bias,
+            final,
+            write_final=write_final,
             pair=(den_bias, den_initial, den_bias, den_final),
         )
         return bias, den_bias
     groups = (chunks + _GROUP - 1) // _GROUP
-    group_bias = torch.empty((bh, groups, rows, columns), device=bias.device, dtype=torch.float32)
+    group_bias = torch.empty(
+        (bh, groups, rows, columns), device=bias.device, dtype=torch.float32
+    )
     den_group_bias = torch.empty(
-        (bh, groups, *den_bias.shape[-2:]), device=den_bias.device, dtype=torch.float32,
+        (bh, groups, *den_bias.shape[-2:]),
+        device=den_bias.device,
+        dtype=torch.float32,
     )
     # All original biases are consumed before the direct recursion overwrites
     # its group summaries. Long applies keep their input and output separate.
     _launch(
-        "local", bias, initial, group_bias, final, write_final=False,
+        "local",
+        bias,
+        initial,
+        group_bias,
+        final,
+        write_final=False,
         pair=(den_bias, den_initial, den_group_bias, den_final),
     )
     group_carry, den_group_carry = identity_hierarchical_carry_pair(
-        group_bias, den_group_bias, initial, den_initial,
-        final, den_final, write_final=False,
+        group_bias,
+        den_group_bias,
+        initial,
+        den_initial,
+        final,
+        den_final,
+        write_final=False,
     )
     carry, den_carry = torch.empty_like(bias), torch.empty_like(den_bias)
     _launch(
-        "apply", bias, group_carry, carry, final, write_final=write_final,
+        "apply",
+        bias,
+        group_carry,
+        carry,
+        final,
+        write_final=write_final,
         pair=(den_bias, den_group_carry, den_carry, den_final),
     )
     return carry, den_carry

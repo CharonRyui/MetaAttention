@@ -39,13 +39,18 @@ def validate_algorithm_structure(algorithm: AlgorithmIR) -> None:
     _reject_duplicate_names(algorithm.inputs, "inputs")
     _reject_duplicate_names(algorithm.states, "states")
     if not algorithm.states:
-        raise StatefulCompilationError("IR_SCHEMA", "states", {"expected": "at least one"})
+        raise StatefulCompilationError(
+            "IR_SCHEMA", "states", {"expected": "at least one"}
+        )
     transitions = algorithm.transitions
     if len(transitions) != len(algorithm.states):
         raise StatefulCompilationError(
             "IR_SCHEMA",
             "transitions",
-            {"states": [state.name for state in algorithm.states], "transitions": len(transitions)},
+            {
+                "states": [state.name for state in algorithm.states],
+                "transitions": len(transitions),
+            },
         )
     declared = {state.name for state in algorithm.states}
     seen: set[str] = set()
@@ -53,7 +58,9 @@ def validate_algorithm_structure(algorithm: AlgorithmIR) -> None:
         path = f"transitions[{index}].state"
         if transition.state not in declared:
             raise StatefulCompilationError(
-                "IR_TYPE", path, {"unknown_state": transition.state, "states": sorted(declared)}
+                "IR_TYPE",
+                path,
+                {"unknown_state": transition.state, "states": sorted(declared)},
             )
         if transition.state in seen:
             raise StatefulCompilationError(
@@ -61,7 +68,9 @@ def validate_algorithm_structure(algorithm: AlgorithmIR) -> None:
             )
         seen.add(transition.state)
     if not algorithm.readouts:
-        raise StatefulCompilationError("IR_SCHEMA", "readouts", {"expected": "at least one"})
+        raise StatefulCompilationError(
+            "IR_SCHEMA", "readouts", {"expected": "at least one"}
+        )
     for index, readout in enumerate(algorithm.readouts):
         if isinstance(readout, (StateContraction, Readout)):
             continue
@@ -113,28 +122,41 @@ def validate_transition_structure(algorithm: AlgorithmIR) -> None:
     for index, readout in enumerate(algorithm.readouts):
         state_names = set(states)
         if isinstance(readout, StateContraction):
-            if readout.state not in state_names or readout.role not in states[readout.state].feature_roles:
+            if (
+                readout.state not in state_names
+                or readout.role not in states[readout.state].feature_roles
+            ):
                 raise StatefulCompilationError(
                     "IR_TYPE",
                     f"readouts[{index}]",
                     {"state": readout.state, "role": str(readout.role)},
                 )
             continue
-        for term_path, term in _state_terms(readout.expression, f"readouts[{index}].expression"):
+        for term_path, term in _state_terms(
+            readout.expression, f"readouts[{index}].expression"
+        ):
             if term.state not in state_names:
                 raise StatefulCompilationError(
-                    "IR_TYPE", term_path, {"unknown_state": term.state, "states": sorted(state_names)}
+                    "IR_TYPE",
+                    term_path,
+                    {"unknown_state": term.state, "states": sorted(state_names)},
                 )
             state = states[term.state]
             if term.role is not None and term.role not in state.feature_roles:
                 raise StatefulCompilationError(
                     "IR_TYPE",
                     term_path,
-                    {"state": term.state, "role": str(term.role), "features": [str(role) for role in state.feature_roles]},
+                    {
+                        "state": term.state,
+                        "role": str(term.role),
+                        "features": [str(role) for role in state.feature_roles],
+                    },
                 )
             if term.role is None and state.rank != 1:
                 raise StatefulCompilationError(
-                    "IR_TYPE", term_path, {"identity_readout": "requires a rank-1 State"}
+                    "IR_TYPE",
+                    term_path,
+                    {"identity_readout": "requires a rank-1 State"},
                 )
 
 
@@ -147,14 +169,15 @@ def _propagation_expressions(propagation, path: str):
         yield f"{path}.coefficient", propagation.coefficient
 
 
-def _reject_state_terms(
-    expression: InputExpression, path: str, context: str
-) -> None:
+def _reject_state_terms(expression: InputExpression, path: str, context: str) -> None:
     for term_path, term in _state_terms(expression, path):
         raise StatefulCompilationError(
             "IR_TYPE",
             term_path,
-            {"state": term.state, "expected": f"{context} expression without State Terms"},
+            {
+                "state": term.state,
+                "expected": f"{context} expression without State Terms",
+            },
         )
 
 

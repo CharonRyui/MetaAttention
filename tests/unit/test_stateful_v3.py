@@ -78,12 +78,15 @@ def _inputs():
 
 
 def _pair_term(state="numerator", *, prior=False, times=1.0):
-    return StateTerm(
-        state,
-        Outer(Input("query"), Input("query"), PAIR),
-        PAIR,
-        prior=prior,
-    ) * times
+    return (
+        StateTerm(
+            state,
+            Outer(Input("query"), Input("query"), PAIR),
+            PAIR,
+            prior=prior,
+        )
+        * times
+    )
 
 
 def _count_term():
@@ -118,15 +121,23 @@ def _operator(readout, *, with_count=True, transition=None):
     return StatefulOperator(
         AlgorithmIR(
             inputs=(
-                TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), torch.float32),
+                TensorInput(
+                    "query", (Batch, QUERY_HEADS, Sequence, KEY), torch.float32
+                ),
                 TensorInput("key", (Batch, KEY_HEADS, Sequence, KEY), torch.float32),
-                TensorInput("value", (Batch, VALUE_HEADS, Sequence, VALUE), torch.float32),
+                TensorInput(
+                    "value", (Batch, VALUE_HEADS, Sequence, VALUE), torch.float32
+                ),
             ),
             states=tuple(states),
             transition=tuple(transitions),
             readouts=(readout,),
             head_mapping=HeadMapping(
-                {QUERY_HEADS: STATE_HEADS, KEY_HEADS: STATE_HEADS, VALUE_HEADS: STATE_HEADS}
+                {
+                    QUERY_HEADS: STATE_HEADS,
+                    KEY_HEADS: STATE_HEADS,
+                    VALUE_HEADS: STATE_HEADS,
+                }
             ),
         )
     )
@@ -150,9 +161,7 @@ def test_outer_requires_an_operand_carrying_each_named_feature():
         _operator(
             Readout(
                 "output",
-                StateTerm(
-                    "numerator", Outer(Input("value"), Input("key"), PAIR), PAIR
-                ),
+                StateTerm("numerator", Outer(Input("value"), Input("key"), PAIR), PAIR),
                 torch.float32,
             )
         )
@@ -287,11 +296,17 @@ def test_prior_state_term_reads_the_state_before_the_transition():
     assert captured.value.category == "IR_TYPE"
 
     inputs = _inputs()
-    prior = _compile(_operator(Readout("output", _pair_term(prior=True), torch.float32)))
+    prior = _compile(
+        _operator(Readout("output", _pair_term(prior=True), torch.float32))
+    )
     post = _compile(_operator(Readout("output", _pair_term(), torch.float32)))
     prior_output = prior(**inputs).outputs["output"]
     post_output = post(**inputs).outputs["output"]
 
     # the first token has no history, so only the post-transition readout sees it
-    assert torch.allclose(prior_output[:, :, 0], torch.zeros_like(prior_output[:, :, 0]))
-    assert not torch.allclose(post_output[:, :, 0], torch.zeros_like(post_output[:, :, 0]))
+    assert torch.allclose(
+        prior_output[:, :, 0], torch.zeros_like(prior_output[:, :, 0])
+    )
+    assert not torch.allclose(
+        post_output[:, :, 0], torch.zeros_like(post_output[:, :, 0])
+    )

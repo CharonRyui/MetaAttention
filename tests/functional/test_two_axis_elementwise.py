@@ -19,7 +19,9 @@ from examples.linear_attention import dual_gate_gla_attention
 pytestmark = [pytest.mark.functional, pytest.mark.gpu, pytest.mark.slow]
 
 
-def _compile(operator, heads: int, dim: int, *, mode: str = "dense", backward: bool = False):
+def _compile(
+    operator, heads: int, dim: int, *, mode: str = "dense", backward: bool = False
+):
     state = operator.algorithm.states[0]
     return operator.compile(
         role_sizes={
@@ -41,9 +43,15 @@ def _bindings(device, lengths: tuple[int, ...], heads: int, dim: int):
     """Token-major packed inputs for one or more logical sequences."""
     generator = torch.Generator(device=device).manual_seed(11)
     total = sum(lengths)
-    query = torch.randn(total, heads, dim, device=device, dtype=torch.bfloat16, generator=generator)
-    key = torch.randn(total, heads, dim, device=device, dtype=torch.bfloat16, generator=generator)
-    value = torch.randn(total, heads, dim, device=device, dtype=torch.bfloat16, generator=generator)
+    query = torch.randn(
+        total, heads, dim, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    key = torch.randn(
+        total, heads, dim, device=device, dtype=torch.bfloat16, generator=generator
+    )
+    value = torch.randn(
+        total, heads, dim, device=device, dtype=torch.bfloat16, generator=generator
+    )
     key_gate = -torch.rand(total, heads, dim, device=device, generator=generator)
     value_gate = -torch.rand(total, heads, dim, device=device, generator=generator)
     return {
@@ -63,10 +71,9 @@ def _reference(bindings, lengths, initial, scale):
     for sequence, length in enumerate(lengths):
         state = initial[sequence].float().clone()
         for token in range(offset, offset + length):
-            decay = (
-                bindings["key_gate"][token].float().exp().unsqueeze(-1)
-                * bindings["value_gate"][token].float().exp().unsqueeze(-2)
-            )
+            decay = bindings["key_gate"][token].float().exp().unsqueeze(-1) * bindings[
+                "value_gate"
+            ][token].float().exp().unsqueeze(-2)
             state = state * decay + torch.einsum(
                 "hk,hv->hkv",
                 bindings["key"][token].float(),
@@ -83,7 +90,9 @@ def _reference(bindings, lengths, initial, scale):
     output = (
         torch.stack(outputs)
         if outputs
-        else torch.empty(0, states[0].shape[0], states[0].shape[1], device=initial.device)
+        else torch.empty(
+            0, states[0].shape[0], states[0].shape[1], device=initial.device
+        )
     )
     return output, stacked
 
@@ -125,9 +134,7 @@ def test_two_axis_gla_dense_matches_the_token_recurrence(gpu_device):
 def test_two_axis_gla_packed_isolates_sequences_and_empty_runs(gpu_device):
     heads, dim = 2, 64
     lengths = (0, 33, 31, 0)
-    offsets = torch.tensor(
-        (0, 0, 33, 64, 64), device=gpu_device, dtype=torch.int32
-    )
+    offsets = torch.tensor((0, 0, 33, 64, 64), device=gpu_device, dtype=torch.int32)
     bindings = _bindings(gpu_device, lengths, heads, dim)
     initial = 0.1 * torch.randn(
         len(lengths), heads, dim, dim, device=gpu_device, dtype=torch.float32

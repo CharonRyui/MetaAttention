@@ -334,8 +334,9 @@ def test_diagonal_typed_readout_tail_and_continuation(gpu_device, kind):
         head_mapping=HeadMapping({head: head}),
     )
     operator = StatefulOperator(algorithm)
-    compiled = operator.compile(role_sizes={head: heads, row: rows, col: columns},
-                                target=Target(), mode="dense")
+    compiled = operator.compile(
+        role_sizes={head: heads, row: rows, col: columns}, target=Target(), mode="dense"
+    )
 
     def run(start, end, carry):
         values = {

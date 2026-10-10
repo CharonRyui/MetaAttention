@@ -73,11 +73,14 @@ def _profile(call, attempts: int = 2) -> dict:
     for attempt in range(attempts):
         try:
             torch.cuda.synchronize()
-            with profile(activities=[ProfilerActivity.CUDA], acc_events=True) as profiler:
+            with profile(
+                activities=[ProfilerActivity.CUDA], acc_events=True
+            ) as profiler:
                 call()
                 torch.cuda.synchronize()
             events = [
-                event for event in profiler.events()
+                event
+                for event in profiler.events()
                 if event.device_type == torch.autograd.DeviceType.CUDA
             ]
         except RuntimeError as caught:
@@ -87,12 +90,15 @@ def _profile(call, attempts: int = 2) -> dict:
     names = [event.name for event in events]
     non_kernel_tokens = ("memcpy", "memset", "alloc", "free")
     kernel_events = [
-        name for name in names
+        name
+        for name in names
         if not any(token in name.lower() for token in non_kernel_tokens)
     ]
     result = {
         "cuda_activity_events": len(events) if events else None,
-        "cuda_activity_ms": sum(event.device_time_total for event in events) / 1000.0 if events else None,
+        "cuda_activity_ms": sum(event.device_time_total for event in events) / 1000.0
+        if events
+        else None,
         "kernel_launches": len(kernel_events) if events else None,
         "launch_source": "PyTorch CUPTI CUDA activity events; empty capture is reported as unavailable",
     }
@@ -113,7 +119,8 @@ def _measure(call, case: Case, warmup: int, repetitions: int) -> dict:
     metrics = {
         "cuda_event_ms": latency_ms,
         "attention_tflops": _attention_flops(case) / (latency_ms * 1e9),
-        "peak_incremental_allocated_bytes": torch.cuda.max_memory_allocated() - before_allocated,
+        "peak_incremental_allocated_bytes": torch.cuda.max_memory_allocated()
+        - before_allocated,
         "peak_allocated_bytes": torch.cuda.max_memory_allocated(),
         "peak_reserved_bytes": torch.cuda.max_memory_reserved(),
         "memory_scope": "PyTorch CUDA allocator around one warmed invocation",
@@ -137,12 +144,22 @@ def _run_case(case: Case, warmup: int, repetitions: int) -> dict:
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(0)
     q = torch.randn(
-        case.batch, case.seqlen, case.heads, case.dim,
-        device=device, dtype=torch.float16, generator=generator,
+        case.batch,
+        case.seqlen,
+        case.heads,
+        case.dim,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
     )
     k = torch.randn(
-        case.batch, case.seqlen, case.kv_heads, case.dim,
-        device=device, dtype=torch.float16, generator=generator,
+        case.batch,
+        case.seqlen,
+        case.kv_heads,
+        case.dim,
+        device=device,
+        dtype=torch.float16,
+        generator=generator,
     )
     v = torch.randn_like(k)
 
@@ -192,8 +209,10 @@ def _run_case(case: Case, warmup: int, repetitions: int) -> dict:
         "correctness": correctness,
         "meta_attention": meta_metrics,
         "flash_attention": flash_metrics,
-        "flash_over_meta_latency_ratio": flash_metrics["cuda_event_ms"] / meta_metrics["cuda_event_ms"],
-        "meta_over_flash_latency_ratio": meta_metrics["cuda_event_ms"] / flash_metrics["cuda_event_ms"],
+        "flash_over_meta_latency_ratio": flash_metrics["cuda_event_ms"]
+        / meta_metrics["cuda_event_ms"],
+        "meta_over_flash_latency_ratio": meta_metrics["cuda_event_ms"]
+        / flash_metrics["cuda_event_ms"],
     }
     print(
         f"{case.name:14s} B={case.batch} H={case.heads} HKV={case.kv_heads} "
@@ -212,7 +231,8 @@ def main() -> None:
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--quick", action="store_true", help="use one short case")
     parser.add_argument(
-        "--output", type=Path,
+        "--output",
+        type=Path,
         help="write structured results JSON; defaults to no artifact",
     )
     args = parser.parse_args()

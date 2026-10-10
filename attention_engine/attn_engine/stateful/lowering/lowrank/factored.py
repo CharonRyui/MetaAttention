@@ -9,11 +9,12 @@ from __future__ import annotations
 import torch
 
 
-
 def _stack(parts: list[torch.Tensor], shape: tuple[int, ...], device) -> torch.Tensor:
     if not parts:
         return torch.empty((0, *shape), device=device, dtype=torch.float32)
-    return torch.stack([part.reshape(shape) for part in parts], dim=0).float().contiguous()
+    return (
+        torch.stack([part.reshape(shape) for part in parts], dim=0).float().contiguous()
+    )
 
 
 def _stack_left(parts, codes, tokens, heads, rows, columns):
@@ -101,9 +102,20 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
     """Autograd transport for checkpointed factored recurrence lowering."""
 
     @staticmethod
-    def forward(ctx, operation_codes, left, right, coefficient,
-                injection_left, injection_right, readout, initial_state,
-                output_dtypes, backward, config):
+    def forward(
+        ctx,
+        operation_codes,
+        left,
+        right,
+        coefficient,
+        injection_left,
+        injection_right,
+        readout,
+        initial_state,
+        output_dtypes,
+        backward,
+        config,
+    ):
         from .checkpoint import forward
 
         output, final, recorded = forward(
@@ -122,9 +134,21 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
         ctx.operation_codes = operation_codes
         ctx.output_dtypes = output_dtypes
         ctx.set_materialize_grads(False)
-        ctx.save_for_backward(left, right, coefficient, injection_left,
-                              injection_right, readout, recorded, initial_state, final)
-        return (*tuple(output[i].to(dtype) for i, dtype in enumerate(output_dtypes)), final)
+        ctx.save_for_backward(
+            left,
+            right,
+            coefficient,
+            injection_left,
+            injection_right,
+            readout,
+            recorded,
+            initial_state,
+            final,
+        )
+        return (
+            *tuple(output[i].to(dtype) for i, dtype in enumerate(output_dtypes)),
+            final,
+        )
 
     @staticmethod
     def backward(ctx, *cotangents):
@@ -134,13 +158,31 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
         else:
             final_shape = ctx.saved_tensors[-1].shape
             query = ctx.saved_tensors[5]
-            shape = (final_shape[0], final_shape[1], query.shape[1] // final_shape[0], final_shape[3])
-            grad_output = torch.stack([
-                gradient.float() if gradient is not None else torch.zeros(shape, device=query.device)
-                for gradient in output_grads
-            ]).contiguous()
-        (left, right, coefficient, injection_left, injection_right,
-         readout, recorded, initial_state, final) = ctx.saved_tensors
+            shape = (
+                final_shape[0],
+                final_shape[1],
+                query.shape[1] // final_shape[0],
+                final_shape[3],
+            )
+            grad_output = torch.stack(
+                [
+                    gradient.float()
+                    if gradient is not None
+                    else torch.zeros(shape, device=query.device)
+                    for gradient in output_grads
+                ]
+            ).contiguous()
+        (
+            left,
+            right,
+            coefficient,
+            injection_left,
+            injection_right,
+            readout,
+            recorded,
+            initial_state,
+            final,
+        ) = ctx.saved_tensors
         if ctx.backward_binding is None:
             raise RuntimeError("factored recurrence has no compiler-selected backward")
         context = {
@@ -189,12 +231,16 @@ def factored_recurrence_dense(
         left = _stack([], shape, device)
     query = _stack(readouts, shape, device)
     result = _TileLangFactoredRecurrence.apply(
-        tuple(operation_codes), left,
+        tuple(operation_codes),
+        left,
         _stack(right_factors, shape, device),
         _stack(coefficients, scalar_shape, device),
         _stack(injection_left, shape, device),
         _stack(injection_right, columns_shape, device),
-        query, initial_state.contiguous(),
-        tuple(output_dtypes), backward, tuple(config),
+        query,
+        initial_state.contiguous(),
+        tuple(output_dtypes),
+        backward,
+        tuple(config),
     )
     return tuple(result[:-1]), result[-1]

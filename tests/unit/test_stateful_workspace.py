@@ -78,7 +78,9 @@ def test_factored_short_replay_charges_every_checkpoint_before_rejecting():
     bounded = replace(workspace, maximum_bytes=required)
     assert bounded.required_bytes(length, sequence_length=length) == required
     with pytest.raises(RuntimeError, match="resource envelope"):
-        replace(workspace, maximum_bytes=required - 1).required_bytes(length, sequence_length=length)
+        replace(workspace, maximum_bytes=required - 1).required_bytes(
+            length, sequence_length=length
+        )
 
 
 def test_factored_recurrence_charges_recorded_states_with_a_backward():
@@ -143,14 +145,14 @@ def test_native_normalized_bounds_long_sequences_without_input_staging():
         _compile(normalized_linear_attention, seqlen=8192, backward=False, size=64)
     )
     # Two sequences and recursive carries fit without raising the production cap.
-    assert 0 < workspace.required_bytes(
-        2 * 8192, sequence_count=2, sequence_length=8192
-    ) < ENVELOPE
+    assert (
+        0
+        < workspace.required_bytes(2 * 8192, sequence_count=2, sequence_length=8192)
+        < ENVELOPE
+    )
     # Batch still scales scratch; eliminating staging cannot bypass the gate.
     with pytest.raises(RuntimeError, match="resource envelope"):
-        workspace.required_bytes(
-            32 * 32769, sequence_count=32, sequence_length=32769
-        )
+        workspace.required_bytes(32 * 32769, sequence_count=32, sequence_length=32769)
 
 
 @pytest.mark.parametrize("family", ["based", "rebased"])
@@ -161,12 +163,14 @@ def test_product_workspace_rejects_uncharged_tail_and_batch_scratch(family, leng
 
     from testing import benchmark_stateful_plans as benchmark
 
-    case = replace(next(case for case in benchmark.CASES if case.name == family),
-                   batch=2, heads=8)
+    case = replace(
+        next(case for case in benchmark.CASES if case.name == family), batch=2, heads=8
+    )
     operator = case.factory(**case.kwargs(length))
     sizes = benchmark.role_sizes_for(operator, case, length)
-    compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense",
-                                optimized=True, backward=False)
+    compiled = operator.compile(
+        role_sizes=sizes, target=Target(), mode="dense", optimized=True, backward=False
+    )
     _, workspace = _workspace(compiled)
     # At least summary and exclusive carry must be charged; recursive scan
     # temporaries may make the conservative bound larger.
@@ -178,12 +182,17 @@ def test_product_workspace_rejects_uncharged_tail_and_batch_scratch(family, leng
     chunk_bytes = 2 * 4 * case.heads * state_elements
     minimum = case.batch * length * workspace.bytes_per_token
     minimum += case.batch * ((length + 63) // 64 + 1) * chunk_bytes
-    required = workspace.required_bytes(case.batch * length, sequence_count=case.batch,
-                                        sequence_length=length)
+    required = workspace.required_bytes(
+        case.batch * length, sequence_count=case.batch, sequence_length=length
+    )
     assert required >= minimum
     boundary = replace(workspace, maximum_bytes=required)
-    assert boundary.required_bytes(case.batch * length, sequence_count=case.batch,
-                                   sequence_length=length) == required
+    assert (
+        boundary.required_bytes(
+            case.batch * length, sequence_count=case.batch, sequence_length=length
+        )
+        == required
+    )
     with pytest.raises(RuntimeError, match="resource envelope"):
         replace(boundary, maximum_bytes=required - 1).required_bytes(
             case.batch * length, sequence_count=case.batch, sequence_length=length

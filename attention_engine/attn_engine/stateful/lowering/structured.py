@@ -6,6 +6,7 @@ only a property of the authored role structure.  The operator remains the owner
 of segment handling and output layout while this module owns the small algebraic
 kernels used by each structured runtime family.
 """
+
 from __future__ import annotations
 
 from typing import Any, Callable, Mapping, Sequence
@@ -31,6 +32,7 @@ def axis_scale_eligibility(algorithm: Any) -> Eligibility:
     if not all(type(node).__name__ == "AxisScale" for node in propagations):
         return False, "propagation-sequence-contains-non-axis-scale"
     return True, None
+
 
 def vector_propagation_eligibility(algorithm: Any) -> Eligibility:
     """Return whether one State has the feature-vector GLA algebra."""
@@ -75,9 +77,7 @@ def product_injection_eligibility(algorithm: Any) -> Eligibility:
     )
     if not injections:
         return False, "no-product-injection"
-    features = {
-        role for state in algorithm.states for role in state.feature_roles
-    }
+    features = {role for state in algorithm.states for role in state.feature_roles}
     for index, injection in enumerate(injections):
         roles = [tuple(factor.roles) for factor in injection.factors]
         if any(set(item) - features for item in roles):
@@ -95,9 +95,14 @@ def rank_one_eligibility(algorithm: Any) -> Eligibility:
     propagations = tuple(
         node for transition in algorithm.transitions for node in transition.propagations
     )
-    if not propagations or not any(type(node).__name__ == "RankOnePropagation" for node in propagations):
+    if not propagations or not any(
+        type(node).__name__ == "RankOnePropagation" for node in propagations
+    ):
         return False, "no-rank-one-propagation"
-    if not all(type(node).__name__ in {"RankOnePropagation", "AxisScale"} for node in propagations):
+    if not all(
+        type(node).__name__ in {"RankOnePropagation", "AxisScale"}
+        for node in propagations
+    ):
         return False, "propagation-sequence-contains-unsupported-node"
     return True, None
 
@@ -106,7 +111,11 @@ def shared_state_contraction_eligibility(algorithm: Any) -> Eligibility:
     """Return whether at least two independent readouts share one State."""
     from ...stateful_operator import StateContraction
 
-    readouts = [readout for readout in algorithm.readouts if isinstance(readout, StateContraction)]
+    readouts = [
+        readout
+        for readout in algorithm.readouts
+        if isinstance(readout, StateContraction)
+    ]
     if len(readouts) != len(algorithm.readouts):
         return False, "readout-expressions-are-not-state-contractions"
     if len(readouts) < 2:
@@ -125,6 +134,7 @@ def factored_recurrence_eligibility(algorithm: Any) -> Eligibility:
         return False, "not-a-factored-recurrence"
     return True, None
 
+
 def product_feature_chunked_eligibility(algorithm: Any) -> Eligibility:
     """Return whether typed ProductFeature states fit the chunked executor."""
     from .chunked import chunked_states_eligible
@@ -139,6 +149,8 @@ def product_feature_chunked_eligibility(algorithm: Any) -> Eligibility:
     ):
         return False, "no-product-feature-state"
     return True, None
+
+
 def chunked_stateful_eligibility(algorithm: Any) -> Eligibility:
     """Return whether the generic typed State schedule can run in chunks."""
     from .chunked import chunked_states_eligible
@@ -153,8 +165,6 @@ def chunked_stateful_eligibility(algorithm: Any) -> Eligibility:
     if not chunked_states_eligible(algorithm):
         return False, "program-is-not-chunked-eligible"
     return True, None
-
-
 
 
 RUNTIME_FAMILY_ELIGIBILITY: dict[str, Callable[[Any], Eligibility]] = {
@@ -211,7 +221,9 @@ def _axis_scale_summary(
         )
         for node in propagations:
             if type(node).__name__ != "AxisScale":
-                raise ValueError("axis-scale runtime received an unsupported propagation")
+                raise ValueError(
+                    "axis-scale runtime received an unsupported propagation"
+                )
             factor = evaluate(node.factor, values).float()
             if len(node.roles) == 2 or not node.roles:
                 left = factor * left
@@ -223,9 +235,7 @@ def _axis_scale_summary(
                 raise ValueError("AxisScale role is not a State Feature role")
         return left, right, None, None
 
-    single: torch.Tensor | None = torch.ones(
-        token_count, heads, 1, 1, device=device
-    )
+    single: torch.Tensor | None = torch.ones(token_count, heads, 1, 1, device=device)
     rows_factor: torch.Tensor | None = None
     columns_factor: torch.Tensor | None = None
     for node in propagations:
@@ -260,7 +270,12 @@ def _axis_scale_summary(
         # one factor per axis: the kernel composes them per element
         return None, None, rows_factor, columns_factor
     if rows_factor is not None or columns_factor is not None:
-        return None, None, rows_factor if rows_factor is not None else columns_factor, None
+        return (
+            None,
+            None,
+            rows_factor if rows_factor is not None else columns_factor,
+            None,
+        )
     return None, None, single, None
 
 
@@ -278,8 +293,16 @@ def rank_one_summary(
     device: torch.device,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
     """Compose ordered rank-one updates and AxisScales as dense affine factors."""
-    left = torch.eye(left_size, device=device).expand(token_count, heads, left_size, left_size).contiguous()
-    right = torch.eye(right_size, device=device).expand(token_count, heads, right_size, right_size).contiguous()
+    left = (
+        torch.eye(left_size, device=device)
+        .expand(token_count, heads, left_size, left_size)
+        .contiguous()
+    )
+    right = (
+        torch.eye(right_size, device=device)
+        .expand(token_count, heads, right_size, right_size)
+        .contiguous()
+    )
     elementwise: torch.Tensor | None = None
     for node in propagations:
         kind = type(node).__name__
@@ -296,16 +319,28 @@ def rank_one_summary(
             else:
                 raise ValueError("AxisScale role is not a State Feature role")
         elif kind == "RankOnePropagation":
-            left_vector = feature_vector(evaluate(node.left, values), node.role, state_spec)
-            right_vector = feature_vector(evaluate(node.right, values), node.role, state_spec)
+            left_vector = feature_vector(
+                evaluate(node.left, values), node.role, state_spec
+            )
+            right_vector = feature_vector(
+                evaluate(node.right, values), node.role, state_spec
+            )
             coefficient = evaluate(node.coefficient, values).float()[..., :1, :1]
             if node.role == state_spec.feature_roles[0]:
-                update = torch.eye(left_size, device=device).expand(token_count, heads, left_size, left_size)
-                update = update + coefficient * left_vector.unsqueeze(-1) * right_vector.unsqueeze(-2)
+                update = torch.eye(left_size, device=device).expand(
+                    token_count, heads, left_size, left_size
+                )
+                update = update + coefficient * left_vector.unsqueeze(
+                    -1
+                ) * right_vector.unsqueeze(-2)
                 left = update @ left
             else:
-                update = torch.eye(right_size, device=device).expand(token_count, heads, right_size, right_size)
-                update = update + coefficient * right_vector.unsqueeze(-1) * left_vector.unsqueeze(-2)
+                update = torch.eye(right_size, device=device).expand(
+                    token_count, heads, right_size, right_size
+                )
+                update = update + coefficient * right_vector.unsqueeze(
+                    -1
+                ) * left_vector.unsqueeze(-2)
                 right = right @ update
         else:
             raise ValueError("rank-one runtime received an unsupported propagation")
@@ -327,22 +362,30 @@ def product_injection_terms(
     """Materialize additive injections, using explicit GEMM-shaped products."""
     result: torch.Tensor | None = None
     for injection in injections:
-        factors = [evaluate(factor.expression, values).float() for factor in injection.factors]
+        factors = [
+            evaluate(factor.expression, values).float() for factor in injection.factors
+        ]
         product: torch.Tensor | float = 1.0
-        if len(factors) == 2 and {tuple(factor.roles) for factor in injection.factors} == {
-            (feature_roles[0],), (feature_roles[1],)
-        }:
+        if len(factors) == 2 and {
+            tuple(factor.roles) for factor in injection.factors
+        } == {(feature_roles[0],), (feature_roles[1],)}:
             first = factors[0]
             second = factors[1]
             first_role = injection.factors[0].roles[0]
             if first_role == feature_roles[0]:
-                product = first[..., :, 0].unsqueeze(-1) * second[..., 0, :].unsqueeze(-2)
+                product = first[..., :, 0].unsqueeze(-1) * second[..., 0, :].unsqueeze(
+                    -2
+                )
             else:
-                product = second[..., :, 0].unsqueeze(-1) * first[..., 0, :].unsqueeze(-2)
+                product = second[..., :, 0].unsqueeze(-1) * first[..., 0, :].unsqueeze(
+                    -2
+                )
         else:
             for factor in factors:
                 product = product * factor
-        product = torch.broadcast_to(product, (token_count, heads, left_size, right_size))
+        product = torch.broadcast_to(
+            product, (token_count, heads, left_size, right_size)
+        )
         if result is None:
             result = product.contiguous()
         else:
@@ -362,7 +405,9 @@ def shared_readouts(
     """Contract shared State in role groups, preserving declared readout order."""
     grouped: dict[Any, list[tuple[Any, torch.Tensor]]] = {}
     for readout in readouts:
-        operand = feature_vector(evaluate(readout.operand, values), readout.role, state_spec).float()
+        operand = feature_vector(
+            evaluate(readout.operand, values), readout.role, state_spec
+        ).float()
         grouped.setdefault(readout.role, []).append((readout, operand))
     outputs: dict[str, torch.Tensor] = {}
     for role, members in grouped.items():

@@ -76,6 +76,7 @@ def test_feature_vector_gla_selects_vector_propagation():
     assert "vector-propagation" in representations
     assert "axis-scale" in representations
 
+
 def test_product_feature_program_selects_chunked_runtime():
     for factory, dim in ((based_attention, 16), (rebased_attention, 16)):
         plan = _plan(factory, rows=dim, columns=64)
@@ -84,24 +85,29 @@ def test_product_feature_program_selects_chunked_runtime():
         assert plan.mathematical_plan.representation == "product-feature-chunked"
 
 
-
 def test_feature_vector_plan_remains_vector_candidate_for_chunked_runtime():
     plan = _plan(gla_attention, rows=64, columns=64)
     assert plan.candidate.lowerer == "tilelang-vector-propagation"
     assert plan.workspace.bytes_per_token == 0
 
+
 def test_diagonal_decay_never_selects_a_dense_scan():
     plan = _plan(gla_attention)
     assert plan.candidate.lowerer not in DENSE_SCAN
     selected = dict(plan.candidate_estimates)[plan.candidate.identity]
-    assert selected.cost == min(estimate.cost for _, estimate in plan.candidate_estimates)
+    assert selected.cost == min(
+        estimate.cost for _, estimate in plan.candidate_estimates
+    )
+
 
 def test_rank_one_propagation_never_selects_a_dense_scan():
     plan = _plan(gated_delta_rule)
     assert plan.candidate.lowerer == "tilelang-factored-recurrence"
     assert plan.candidate.lowerer not in DENSE_SCAN
     selected = dict(plan.candidate_estimates)[plan.candidate.identity]
-    assert selected.cost == min(estimate.cost for _, estimate in plan.candidate_estimates)
+    assert selected.cost == min(
+        estimate.cost for _, estimate in plan.candidate_estimates
+    )
 
 
 def test_rank_one_metadata_records_symmetric_and_asymmetric_proofs():
@@ -116,9 +122,7 @@ def test_rank_one_metadata_records_symmetric_and_asymmetric_proofs():
     assert symmetric_executable.rank_one_factored.symmetric_rank_one is True
     assert symmetric_executable.symmetric_rank_one is True
 
-    asymmetric = compositional_pressure_profile(
-        B=1, H=HEADS, S=65, D=16, DV=16, HQ=1
-    )
+    asymmetric = compositional_pressure_profile(B=1, H=HEADS, S=65, D=16, DV=16, HQ=1)
     compiled = asymmetric.compile(
         role_sizes=_sizes(asymmetric, 16, 16), target=Target(), mode="dense"
     )
@@ -126,6 +130,7 @@ def test_rank_one_metadata_records_symmetric_and_asymmetric_proofs():
     assert asymmetric_executable.rank_one_factored is not None
     assert asymmetric_executable.rank_one_factored.symmetric_rank_one is False
     assert asymmetric_executable.symmetric_rank_one is False
+
 
 def test_scalar_decay_keeps_the_factorized_selection():
     plan = _plan(simple_gla_attention)
@@ -145,6 +150,8 @@ def test_rank_one_identity_readout_uses_rank_one_diagonal_candidate():
     plan = compiled.operator._plans[compiled.specialization].plan
     assert plan.candidate.lowerer == "tilelang-rank-one-diagonal"
     assert plan.mathematical_plan.representation == "rank-one-diagonal"
+
+
 @pytest.mark.parametrize(
     ("name", "representation"),
     [
@@ -155,6 +162,7 @@ def test_rank_one_identity_readout_uses_rank_one_diagonal_candidate():
 )
 def test_reference_hotspots_select_typed_native_candidate(name, representation):
     from testing.benchmark_stateful_plans import CASES, role_sizes_for
+
     case = next(case for case in CASES if case.name == name)
     operator = case.factory(**case.kwargs(65))
     compiled = operator.compile(
@@ -166,8 +174,6 @@ def test_reference_hotspots_select_typed_native_candidate(name, representation):
     plan = compiled.operator._plans[compiled.specialization].plan
     assert plan.candidate.lowerer not in DENSE_SCAN
     assert plan.mathematical_plan.representation == representation
-
-
 
 
 def test_estimates_are_inspectable_with_all_three_components():
@@ -205,9 +211,7 @@ def test_infeasible_candidate_leaves_a_lower_ranked_plan():
         estimate = lowerer.estimate(plans[name], shape)
         estimates[name] = estimate
         assert estimate.workspace_bytes_per_token > 0
-        candidate = lowerer.lower(
-            plans[name], shape, maximum_workspace_bytes=budget
-        )
+        candidate = lowerer.lower(plans[name], shape, maximum_workspace_bytes=budget)
         if candidate is not None:
             lowered[name] = candidate
     assert "tilelang-generic" not in lowered
@@ -250,6 +254,8 @@ def test_two_scaled_axes_lower_without_a_dense_summary():
         backward=True,
     )
     assert (
-        backward_compiled.operator._plans[backward_compiled.specialization].dense_summary
+        backward_compiled.operator._plans[
+            backward_compiled.specialization
+        ].dense_summary
         is False
     )

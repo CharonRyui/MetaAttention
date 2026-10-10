@@ -4,6 +4,7 @@ Dense and packed recurrences share device-segmented TileLang kernels. Affine
 summaries carry chunk-entry States; only local replay has a 16-token State axis.
 All segmentation, recurrence and gradient reductions remain on the device.
 """
+
 from functools import lru_cache
 
 import torch
@@ -37,6 +38,7 @@ def _operation_code(T, codes, op):
         code = T.if_then_else(op == index, value, code)
     return code
 
+
 @lru_cache(maxsize=None)
 def _compile_copy(shape, strides, source_dtype, result_dtype, device_index):
     import tilelang
@@ -50,13 +52,20 @@ def _compile_copy(shape, strides, source_dtype, result_dtype, device_index):
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
         @T.prim_func
-        def kernel(Source: T.Tensor((span,), source_dtype), Result: T.Tensor((size,), result_dtype)):
+        def kernel(
+            Source: T.Tensor((span,), source_dtype),
+            Result: T.Tensor((size,), result_dtype),
+        ):
             with T.Kernel(_ceildiv(size, 256), threads=128) as block:
                 for lane in T.Parallel(256):
                     index = block * 256 + lane
                     if index < size:
-                        Result[index] = T.cast(Source[_address(index, shape, strides)], result_dtype)
+                        Result[index] = T.cast(
+                            Source[_address(index, shape, strides)], result_dtype
+                        )
+
         return kernel
+
     return build()
 
 
@@ -68,7 +77,8 @@ def _copy(source, result):
     span = 1 + sum((extent - 1) * stride for extent, stride in zip(shape, strides))
     storage = torch.as_strided(source, (span,), (1,))
     _compile_copy(shape, strides, _dtype(source), _dtype(result), source.device.index)(
-        storage, result.view(-1),
+        storage,
+        result.view(-1),
     )
 
 
@@ -81,7 +91,9 @@ def _flat(tensor):
 
 
 @lru_cache(maxsize=None)
-def _compile_prefix(sequences, offsets_dtype, dense_length, device_index, chunk_size=CHUNK_SIZE):
+def _compile_prefix(
+    sequences, offsets_dtype, dense_length, device_index, chunk_size=CHUNK_SIZE
+):
     import tilelang
     import tilelang.language as T
 
@@ -90,8 +102,10 @@ def _compile_prefix(sequences, offsets_dtype, dense_length, device_index, chunk_
     @tilelang.jit
     def build():
         @T.prim_func
-        def kernel(Offsets: T.Tensor((sequences + 1,), offsets_dtype),
-                   Prefix: T.Tensor((sequences + 1,), "int32")):
+        def kernel(
+            Offsets: T.Tensor((sequences + 1,), offsets_dtype),
+            Prefix: T.Tensor((sequences + 1,), "int32"),
+        ):
             with T.Kernel(1, threads=128):
                 counts = T.alloc_shared((block,), "int32")
                 if dense_length >= 0:
@@ -101,18 +115,26 @@ def _compile_prefix(sequences, offsets_dtype, dense_length, device_index, chunk_
                 for index in T.Parallel(block):
                     counts[index] = T.if_then_else(
                         index < sequences,
-                        T.cast((Offsets[index + 1] - Offsets[index] + chunk_size - 1) // chunk_size, "int32"),
+                        T.cast(
+                            (Offsets[index + 1] - Offsets[index] + chunk_size - 1)
+                            // chunk_size,
+                            "int32",
+                        ),
                         0,
                     )
                 T.cumsum(counts, dim=0)
                 for index in T.Parallel(sequences + 1):
                     Prefix[index] = T.if_then_else(index == 0, 0, counts[index - 1])
+
         return kernel
+
     return build()
 
 
 @lru_cache(maxsize=None)
-def _compile_metadata(sequences, capacity, offsets_dtype, device_index, chunk_size=CHUNK_SIZE):
+def _compile_metadata(
+    sequences, capacity, offsets_dtype, device_index, chunk_size=CHUNK_SIZE
+):
     import tilelang
     import tilelang.language as T
 
@@ -121,9 +143,11 @@ def _compile_metadata(sequences, capacity, offsets_dtype, device_index, chunk_si
     @tilelang.jit
     def build():
         @T.prim_func
-        def kernel(Offsets: T.Tensor((sequences + 1,), offsets_dtype),
-                   Prefix: T.Tensor((sequences + 1,), "int32"),
-                   Metadata: T.Tensor((3 * capacity,), "int64")):
+        def kernel(
+            Offsets: T.Tensor((sequences + 1,), offsets_dtype),
+            Prefix: T.Tensor((sequences + 1,), "int32"),
+            Metadata: T.Tensor((3 * capacity,), "int64"),
+        ):
             with T.Kernel(_ceildiv(capacity, 128), threads=128) as block:
                 for lane in T.Parallel(128):
                     chunk = block * 128 + lane
@@ -132,20 +156,30 @@ def _compile_metadata(sequences, capacity, offsets_dtype, device_index, chunk_si
                         high = T.alloc_var("int32", init=sequences)
                         for iteration in T.serial(steps):
                             middle = (low + high) // 2
-                            boundary = T.if_then_else(middle <= sequences, Prefix[middle], Prefix[sequences])
+                            boundary = T.if_then_else(
+                                middle <= sequences, Prefix[middle], Prefix[sequences]
+                            )
                             if boundary <= chunk:
                                 low = middle + 1
                             else:
                                 high = middle
                         sequence = T.if_then_else(chunk < Prefix[sequences], low - 1, 0)
-                        Metadata[chunk] = T.if_then_else(chunk < Prefix[sequences], sequence, -1)
-                        Metadata[capacity + chunk] = Offsets[sequence] + (chunk - Prefix[sequence]) * chunk_size
+                        Metadata[chunk] = T.if_then_else(
+                            chunk < Prefix[sequences], sequence, -1
+                        )
+                        Metadata[capacity + chunk] = (
+                            Offsets[sequence] + (chunk - Prefix[sequence]) * chunk_size
+                        )
                         Metadata[2 * capacity + chunk] = Offsets[sequence + 1]
+
         return kernel
+
     return build()
 
 
-def metadata(token_count, sequence_count, device, sequence_offsets=None, *, chunk_size=CHUNK_SIZE):
+def metadata(
+    token_count, sequence_count, device, sequence_offsets=None, *, chunk_size=CHUNK_SIZE
+):
     """Build exact chunk segmentation without observing device offsets on CPU."""
     if sequence_offsets is None:
         if sequence_count == 0 or token_count % sequence_count:
@@ -159,13 +193,21 @@ def metadata(token_count, sequence_count, device, sequence_offsets=None, *, chun
     else:
         offsets = _flat(sequence_offsets)
         length = -1
-        capacity = _ceildiv(token_count, chunk_size) + sequence_count if token_count else 0
+        capacity = (
+            _ceildiv(token_count, chunk_size) + sequence_count if token_count else 0
+        )
     prefix = torch.empty(sequence_count + 1, device=device, dtype=torch.int32)
     chunks = torch.empty((3, capacity), device=device, dtype=torch.int64)
-    _compile_prefix(sequence_count, _dtype(offsets), length, offsets.device.index, chunk_size)(offsets, prefix)
+    _compile_prefix(
+        sequence_count, _dtype(offsets), length, offsets.device.index, chunk_size
+    )(offsets, prefix)
     if capacity:
-        _compile_metadata(sequence_count, capacity, _dtype(offsets), offsets.device.index, chunk_size)(
-            offsets, prefix, chunks.view(-1),
+        _compile_metadata(
+            sequence_count, capacity, _dtype(offsets), offsets.device.index, chunk_size
+        )(
+            offsets,
+            prefix,
+            chunks.view(-1),
         )
     return offsets, prefix, chunks
 
@@ -178,34 +220,72 @@ def _apply_macro(T, rows, columns, width, total, br, bc):
                 State[r, c] = State[r, c] * T.cast(Coeff[op * total + flat], "float32")
         elif code == 1:
             for r, c in T.Parallel(br, bc):
-                gate = T.if_then_else(r < rows, T.cast(Left[(op * total + flat) * width + r], "float32"), 1.0)
+                gate = T.if_then_else(
+                    r < rows,
+                    T.cast(Left[(op * total + flat) * width + r], "float32"),
+                    1.0,
+                )
                 State[r, c] = State[r, c] * gate
         elif code == 3:
             for r, c in T.Parallel(br, bc):
                 column = column_base + c
-                gate = T.if_then_else((column >= 0) & (column < columns),
-                                      T.cast(Left[(op * total + flat) * width + column], "float32"), 1.0)
+                gate = T.if_then_else(
+                    (column >= 0) & (column < columns),
+                    T.cast(Left[(op * total + flat) * width + column], "float32"),
+                    1.0,
+                )
                 State[r, c] = State[r, c] * gate
         else:
             products = T.alloc_fragment((br, bc), "float32")
             projection = T.alloc_fragment((bc,), "float32")
             for r, c in T.Parallel(br, bc):
-                factor = T.if_then_else(r < rows,
-                    T.cast(Left[(op * total + flat) * width + r], "float32") if transpose
-                    else T.cast(Right[(op * total + flat) * rows + r], "float32"), 0.0)
+                factor = T.if_then_else(
+                    r < rows,
+                    T.cast(Left[(op * total + flat) * width + r], "float32")
+                    if transpose
+                    else T.cast(Right[(op * total + flat) * rows + r], "float32"),
+                    0.0,
+                )
                 products[r, c] = State[r, c] * factor
             T.reduce_sum(products, projection, dim=0)
             for r, c in T.Parallel(br, bc):
-                factor = T.if_then_else(r < rows,
-                    T.cast(Right[(op * total + flat) * rows + r], "float32") if transpose
-                    else T.cast(Left[(op * total + flat) * width + r], "float32"), 0.0)
-                State[r, c] = State[r, c] + T.cast(Coeff[op * total + flat], "float32") * factor * projection[c]
+                factor = T.if_then_else(
+                    r < rows,
+                    T.cast(Right[(op * total + flat) * rows + r], "float32")
+                    if transpose
+                    else T.cast(Left[(op * total + flat) * width + r], "float32"),
+                    0.0,
+                )
+                State[r, c] = (
+                    State[r, c]
+                    + T.cast(Coeff[op * total + flat], "float32")
+                    * factor
+                    * projection[c]
+                )
+
     return apply
 
 
 @lru_cache(maxsize=None)
-def _compile_summary(sizes, dtypes, *, heads, rows, columns, total, width, capacity,
-                     codes, injections, readouts, length, packed, reverse, device_index, chunk_size=CHUNK_SIZE):
+def _compile_summary(
+    sizes,
+    dtypes,
+    *,
+    heads,
+    rows,
+    columns,
+    total,
+    width,
+    capacity,
+    codes,
+    injections,
+    readouts,
+    length,
+    packed,
+    reverse,
+    device_index,
+    chunk_size=CHUNK_SIZE,
+):
     import tilelang
     import tilelang.language as T
 
@@ -216,14 +296,23 @@ def _compile_summary(sizes, dtypes, *, heads, rows, columns, total, width, capac
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
         @T.prim_func
-        def kernel(Left: T.Tensor((sizes[0],), dtypes[0]), Right: T.Tensor((sizes[1],), dtypes[1]),
-                   Coeff: T.Tensor((sizes[2],), dtypes[2]), IK: T.Tensor((sizes[3],), dtypes[3]),
-                   IV: T.Tensor((sizes[4],), dtypes[4]), Q: T.Tensor((sizes[5],), dtypes[5]),
-                   DY: T.Tensor((sizes[6],), dtypes[6]), Metadata: T.Tensor((3 * capacity,), "int64"),
-                   Offsets: T.Tensor((sizes[7],), dtypes[7]), Transform: T.Tensor((capacity * heads * rows * rows,), "float32"),
-                   Decay: T.Tensor((capacity * heads * columns,), "float32"),
-                   Bias: T.Tensor((capacity * heads * rows * columns,), "float32")):
-            with T.Kernel(capacity, heads, linear_blocks + _ceildiv(columns, bc), threads=128) as (chunk, head, block):
+        def kernel(
+            Left: T.Tensor((sizes[0],), dtypes[0]),
+            Right: T.Tensor((sizes[1],), dtypes[1]),
+            Coeff: T.Tensor((sizes[2],), dtypes[2]),
+            IK: T.Tensor((sizes[3],), dtypes[3]),
+            IV: T.Tensor((sizes[4],), dtypes[4]),
+            Q: T.Tensor((sizes[5],), dtypes[5]),
+            DY: T.Tensor((sizes[6],), dtypes[6]),
+            Metadata: T.Tensor((3 * capacity,), "int64"),
+            Offsets: T.Tensor((sizes[7],), dtypes[7]),
+            Transform: T.Tensor((capacity * heads * rows * rows,), "float32"),
+            Decay: T.Tensor((capacity * heads * columns,), "float32"),
+            Bias: T.Tensor((capacity * heads * rows * columns,), "float32"),
+        ):
+            with T.Kernel(
+                capacity, heads, linear_blocks + _ceildiv(columns, bc), threads=128
+            ) as (chunk, head, block):
                 sequence = T.cast(Metadata[chunk], "int32")
                 if sequence >= 0:
                     start = T.cast(Metadata[capacity + chunk], "int32")
@@ -232,56 +321,153 @@ def _compile_summary(sizes, dtypes, *, heads, rows, columns, total, width, capac
                     decay = T.alloc_fragment((bc,), "float32")
                     value_base = (block - linear_blocks) * bc
                     for r, c in T.Parallel(br, bc):
-                        matrix[r, c] = T.if_then_else((block < linear_blocks) & (r == block * bc + c), 1.0, 0.0)
+                        matrix[r, c] = T.if_then_else(
+                            (block < linear_blocks) & (r == block * bc + c), 1.0, 0.0
+                        )
                     T.fill(decay, 1.0)
                     for step in T.serial(chunk_size):
-                        token = start + chunk_size - 1 - step if reverse else start + step
+                        token = (
+                            start + chunk_size - 1 - step if reverse else start + step
+                        )
                         if token < end:
                             flat = token * heads + head
                             if reverse:
-                                output_flat = token * heads + head if packed else (sequence * heads + head) * length + token - T.cast(Offsets[sequence], "int32")
+                                output_flat = (
+                                    token * heads + head
+                                    if packed
+                                    else (sequence * heads + head) * length
+                                    + token
+                                    - T.cast(Offsets[sequence], "int32")
+                                )
                                 for readout in T.unroll(readouts):
                                     for r, c in T.Parallel(br, bc):
-                                        query = T.if_then_else(r < rows, T.cast(Q[(readout * total + flat) * rows + r], "float32"), 0.0)
-                                        dy = T.if_then_else((block >= linear_blocks) & (value_base + c < columns),
-                                            T.cast(DY[(readout * total + output_flat) * columns + value_base + c], "float32"), 0.0)
+                                        query = T.if_then_else(
+                                            r < rows,
+                                            T.cast(
+                                                Q[(readout * total + flat) * rows + r],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
+                                        dy = T.if_then_else(
+                                            (block >= linear_blocks)
+                                            & (value_base + c < columns),
+                                            T.cast(
+                                                DY[
+                                                    (readout * total + output_flat)
+                                                    * columns
+                                                    + value_base
+                                                    + c
+                                                ],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
                                         matrix[r, c] = matrix[r, c] + query * dy
                             for index in T.unroll(len(codes)):
                                 op = len(codes) - 1 - index if reverse else index
                                 code = _operation_code(T, codes, op)
                                 if code == 3:
-                                    apply(matrix, Left, Right, Coeff, flat, op, code, value_base, reverse)
+                                    apply(
+                                        matrix,
+                                        Left,
+                                        Right,
+                                        Coeff,
+                                        flat,
+                                        op,
+                                        code,
+                                        value_base,
+                                        reverse,
+                                    )
                                     for c in T.Parallel(bc):
-                                        gate = T.if_then_else((block >= linear_blocks) & (value_base + c < columns),
-                                            T.cast(Left[(op * total + flat) * width + value_base + c], "float32"), 1.0)
+                                        gate = T.if_then_else(
+                                            (block >= linear_blocks)
+                                            & (value_base + c < columns),
+                                            T.cast(
+                                                Left[
+                                                    (op * total + flat) * width
+                                                    + value_base
+                                                    + c
+                                                ],
+                                                "float32",
+                                            ),
+                                            1.0,
+                                        )
                                         decay[c] = decay[c] * gate
                                 else:
-                                    apply(matrix, Left, Right, Coeff, flat, op, code, value_base, reverse)
+                                    apply(
+                                        matrix,
+                                        Left,
+                                        Right,
+                                        Coeff,
+                                        flat,
+                                        op,
+                                        code,
+                                        value_base,
+                                        reverse,
+                                    )
                             if not reverse:
                                 for injection in T.unroll(injections):
                                     for r, c in T.Parallel(br, bc):
-                                        key = T.if_then_else(r < rows, T.cast(IK[(injection * total + flat) * rows + r], "float32"), 0.0)
-                                        value = T.if_then_else((block >= linear_blocks) & (value_base + c < columns),
-                                            T.cast(IV[(injection * total + flat) * columns + value_base + c], "float32"), 0.0)
+                                        key = T.if_then_else(
+                                            r < rows,
+                                            T.cast(
+                                                IK[
+                                                    (injection * total + flat) * rows
+                                                    + r
+                                                ],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
+                                        value = T.if_then_else(
+                                            (block >= linear_blocks)
+                                            & (value_base + c < columns),
+                                            T.cast(
+                                                IV[
+                                                    (injection * total + flat) * columns
+                                                    + value_base
+                                                    + c
+                                                ],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
                                         matrix[r, c] = matrix[r, c] + key * value
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
                         if r < rows:
                             if block < linear_blocks:
                                 if block * bc + c < rows:
-                                    Transform[(slot * rows + r) * rows + block * bc + c] = matrix[r, c]
+                                    Transform[
+                                        (slot * rows + r) * rows + block * bc + c
+                                    ] = matrix[r, c]
                             else:
                                 if value_base + c < columns:
-                                    Bias[(slot * rows + r) * columns + value_base + c] = matrix[r, c]
+                                    Bias[
+                                        (slot * rows + r) * columns + value_base + c
+                                    ] = matrix[r, c]
                     for c in T.Parallel(bc):
                         if (block >= linear_blocks) & (value_base + c < columns):
                             Decay[slot * columns + value_base + c] = decay[c]
+
         return kernel
+
     return build()
 
 
 @lru_cache(maxsize=None)
-def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, final_dtype, reverse, device_index):
+def _compile_carry(
+    sequences,
+    heads,
+    rows,
+    columns,
+    capacity,
+    initial_dtype,
+    final_dtype,
+    reverse,
+    device_index,
+):
     import tilelang
     import tilelang.language as T
 
@@ -295,14 +481,19 @@ def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, fin
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
         @T.prim_func
-        def kernel(Transform: T.Tensor((capacity * heads * rows * rows,), "float32"),
-                   Decay: T.Tensor((capacity * heads * columns,), "float32"),
-                   Bias: T.Tensor((capacity * heads * rows * columns,), "float32"),
-                   Initial: T.Tensor((sequences * heads * rows * columns,), initial_dtype),
-                   Prefix: T.Tensor((sequences + 1,), "int32"),
-                   Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
-                   Final: T.Tensor((sequences * heads * rows * columns,), final_dtype)):
-            with T.Kernel(sequences * heads, _ceildiv(columns, bc), threads=128) as (sh, block):
+        def kernel(
+            Transform: T.Tensor((capacity * heads * rows * rows,), "float32"),
+            Decay: T.Tensor((capacity * heads * columns,), "float32"),
+            Bias: T.Tensor((capacity * heads * rows * columns,), "float32"),
+            Initial: T.Tensor((sequences * heads * rows * columns,), initial_dtype),
+            Prefix: T.Tensor((sequences + 1,), "int32"),
+            Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
+            Final: T.Tensor((sequences * heads * rows * columns,), final_dtype),
+        ):
+            with T.Kernel(sequences * heads, _ceildiv(columns, bc), threads=128) as (
+                sh,
+                block,
+            ):
                 sequence, head = sh // heads, sh % heads
                 first, last = Prefix[sequence], Prefix[sequence + 1]
                 state = T.alloc_fragment((br, bc), "float32")
@@ -310,46 +501,95 @@ def _compile_carry(sequences, heads, rows, columns, capacity, initial_dtype, fin
                 next_state = T.alloc_fragment((br, bc), "float32")
                 transform_tile = T.alloc_shared((br, bk), "float32")
                 for r, c in T.Parallel(br, bc):
-                    state[r, c] = T.if_then_else((r < rows) & (block * bc + c < columns),
-                        T.cast(Initial[(sh * rows + r) * columns + block * bc + c], "float32"), 0.0)
+                    state[r, c] = T.if_then_else(
+                        (r < rows) & (block * bc + c < columns),
+                        T.cast(
+                            Initial[(sh * rows + r) * columns + block * bc + c],
+                            "float32",
+                        ),
+                        0.0,
+                    )
                 for index in T.serial(last - first):
                     chunk = last - 1 - index if reverse else first + index
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
                         if (r < rows) & (block * bc + c < columns):
-                            Checkpoints[(slot * rows + r) * columns + block * bc + c] = state[r, c]
+                            Checkpoints[
+                                (slot * rows + r) * columns + block * bc + c
+                            ] = state[r, c]
                     if reverse or index + 1 < last - first:
                         T.copy(state, previous)
                         T.clear(next_state)
                         if rows == 64:
                             for r, k in T.Parallel(br, bk):
-                                transform_tile[r, k] = Transform[(slot * rows + r) * rows + k]
+                                transform_tile[r, k] = Transform[
+                                    (slot * rows + r) * rows + k
+                                ]
                             gemm(transform_tile, previous, next_state)
                         else:
                             state_tile = T.alloc_shared((bk, bc), "float32")
                             for kb in T.serial(_ceildiv(rows, bk)):
                                 for k, c in T.Parallel(bk, bc):
-                                    state_tile[k, c] = T.if_then_else(kb * bk + k < rows, previous[kb * bk + k, c], 0.0)
+                                    state_tile[k, c] = T.if_then_else(
+                                        kb * bk + k < rows,
+                                        previous[kb * bk + k, c],
+                                        0.0,
+                                    )
                                 for r, k in T.Parallel(br, bk):
-                                    transform_tile[r, k] = T.if_then_else((r < rows) & (kb * bk + k < rows),
-                                        Transform[(slot * rows + r) * rows + kb * bk + k], 0.0)
+                                    transform_tile[r, k] = T.if_then_else(
+                                        (r < rows) & (kb * bk + k < rows),
+                                        Transform[
+                                            (slot * rows + r) * rows + kb * bk + k
+                                        ],
+                                        0.0,
+                                    )
                                 gemm(transform_tile, state_tile, next_state)
                         for r, c in T.Parallel(br, bc):
-                            decay = T.if_then_else(block * bc + c < columns, Decay[slot * columns + block * bc + c], 1.0)
-                            bias = T.if_then_else((r < rows) & (block * bc + c < columns),
-                                Bias[(slot * rows + r) * columns + block * bc + c], 0.0)
+                            decay = T.if_then_else(
+                                block * bc + c < columns,
+                                Decay[slot * columns + block * bc + c],
+                                1.0,
+                            )
+                            bias = T.if_then_else(
+                                (r < rows) & (block * bc + c < columns),
+                                Bias[(slot * rows + r) * columns + block * bc + c],
+                                0.0,
+                            )
                             state[r, c] = next_state[r, c] * decay + bias
                 if reverse or first == last:
                     for r, c in T.Parallel(br, bc):
                         if (r < rows) & (block * bc + c < columns):
-                            Final[(sh * rows + r) * columns + block * bc + c] = T.cast(state[r, c], final_dtype)
+                            Final[(sh * rows + r) * columns + block * bc + c] = T.cast(
+                                state[r, c], final_dtype
+                            )
+
         return kernel
+
     return build()
 
 
 @lru_cache(maxsize=None)
-def _compile_replay(sizes, dtypes, *, sequences, heads, rows, columns, total, width, capacity,
-                    codes, injections, readouts, length, packed, output_dtype, final_dtype, device_index, chunk_size=CHUNK_SIZE):
+def _compile_replay(
+    sizes,
+    dtypes,
+    *,
+    sequences,
+    heads,
+    rows,
+    columns,
+    total,
+    width,
+    capacity,
+    codes,
+    injections,
+    readouts,
+    length,
+    packed,
+    output_dtype,
+    final_dtype,
+    device_index,
+    chunk_size=CHUNK_SIZE,
+):
     import tilelang
     import tilelang.language as T
 
@@ -359,14 +599,24 @@ def _compile_replay(sizes, dtypes, *, sequences, heads, rows, columns, total, wi
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
         @T.prim_func
-        def kernel(Left: T.Tensor((sizes[0],), dtypes[0]), Right: T.Tensor((sizes[1],), dtypes[1]),
-                   Coeff: T.Tensor((sizes[2],), dtypes[2]), IK: T.Tensor((sizes[3],), dtypes[3]),
-                   IV: T.Tensor((sizes[4],), dtypes[4]), Q: T.Tensor((sizes[5],), dtypes[5]),
-                   Metadata: T.Tensor((3 * capacity,), "int64"), Offsets: T.Tensor((sizes[6],), dtypes[6]),
-                   Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
-                   Output: T.Tensor((readouts * total * columns,), output_dtype),
-                   Final: T.Tensor((sequences * heads * rows * columns,), final_dtype)):
-            with T.Kernel(capacity, heads, _ceildiv(columns, bc), threads=128) as (chunk, head, block):
+        def kernel(
+            Left: T.Tensor((sizes[0],), dtypes[0]),
+            Right: T.Tensor((sizes[1],), dtypes[1]),
+            Coeff: T.Tensor((sizes[2],), dtypes[2]),
+            IK: T.Tensor((sizes[3],), dtypes[3]),
+            IV: T.Tensor((sizes[4],), dtypes[4]),
+            Q: T.Tensor((sizes[5],), dtypes[5]),
+            Metadata: T.Tensor((3 * capacity,), "int64"),
+            Offsets: T.Tensor((sizes[6],), dtypes[6]),
+            Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
+            Output: T.Tensor((readouts * total * columns,), output_dtype),
+            Final: T.Tensor((sequences * heads * rows * columns,), final_dtype),
+        ):
+            with T.Kernel(capacity, heads, _ceildiv(columns, bc), threads=128) as (
+                chunk,
+                head,
+                block,
+            ):
                 sequence = T.cast(Metadata[chunk], "int32")
                 if sequence >= 0:
                     start = T.cast(Metadata[capacity + chunk], "int32")
@@ -376,39 +626,108 @@ def _compile_replay(sizes, dtypes, *, sequences, heads, rows, columns, total, wi
                     output = T.alloc_fragment((bc,), "float32")
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
-                        state[r, c] = T.if_then_else((r < rows) & (block * bc + c < columns),
-                            Checkpoints[(slot * rows + r) * columns + block * bc + c], 0.0)
+                        state[r, c] = T.if_then_else(
+                            (r < rows) & (block * bc + c < columns),
+                            Checkpoints[(slot * rows + r) * columns + block * bc + c],
+                            0.0,
+                        )
                     for step in T.serial(chunk_size):
                         token = start + step
                         if token < end:
                             flat = token * heads + head
                             for op in T.unroll(len(codes)):
-                                apply(state, Left, Right, Coeff, flat, op, _operation_code(T, codes, op), block * bc, False)
+                                apply(
+                                    state,
+                                    Left,
+                                    Right,
+                                    Coeff,
+                                    flat,
+                                    op,
+                                    _operation_code(T, codes, op),
+                                    block * bc,
+                                    False,
+                                )
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(r < rows, T.cast(IK[(injection * total + flat) * rows + r], "float32"), 0.0)
-                                    value = T.if_then_else(block * bc + c < columns, T.cast(IV[(injection * total + flat) * columns + block * bc + c], "float32"), 0.0)
+                                    key = T.if_then_else(
+                                        r < rows,
+                                        T.cast(
+                                            IK[(injection * total + flat) * rows + r],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
+                                    value = T.if_then_else(
+                                        block * bc + c < columns,
+                                        T.cast(
+                                            IV[
+                                                (injection * total + flat) * columns
+                                                + block * bc
+                                                + c
+                                            ],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     state[r, c] = state[r, c] + key * value
-                            output_flat = token * heads + head if packed else (sequence * heads + head) * length + token - T.cast(Offsets[sequence], "int32")
+                            output_flat = (
+                                token * heads + head
+                                if packed
+                                else (sequence * heads + head) * length
+                                + token
+                                - T.cast(Offsets[sequence], "int32")
+                            )
                             for readout in T.unroll(readouts):
                                 for r, c in T.Parallel(br, bc):
-                                    query = T.if_then_else(r < rows, T.cast(Q[(readout * total + flat) * rows + r], "float32"), 0.0)
+                                    query = T.if_then_else(
+                                        r < rows,
+                                        T.cast(
+                                            Q[(readout * total + flat) * rows + r],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     products[r, c] = state[r, c] * query
                                 T.reduce_sum(products, output, dim=0)
                                 for c in T.Parallel(bc):
                                     if block * bc + c < columns:
-                                        Output[(readout * total + output_flat) * columns + block * bc + c] = T.cast(output[c], output_dtype)
+                                        Output[
+                                            (readout * total + output_flat) * columns
+                                            + block * bc
+                                            + c
+                                        ] = T.cast(output[c], output_dtype)
                     if start + chunk_size >= end:
                         for r, c in T.Parallel(br, bc):
                             if (r < rows) & (block * bc + c < columns):
-                                Final[((sequence * heads + head) * rows + r) * columns + block * bc + c] = T.cast(state[r, c], final_dtype)
+                                Final[
+                                    ((sequence * heads + head) * rows + r) * columns
+                                    + block * bc
+                                    + c
+                                ] = T.cast(state[r, c], final_dtype)
+
         return kernel
+
     return build()
 
 
 @lru_cache(maxsize=None)
-def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, capacity,
-                       codes, injections, readouts, length, packed, device_index):
+def _compile_local_vjp(
+    sizes,
+    dtypes,
+    *,
+    heads,
+    rows,
+    columns,
+    total,
+    width,
+    capacity,
+    codes,
+    injections,
+    readouts,
+    length,
+    packed,
+    device_index,
+):
     import tilelang
     import tilelang.language as T
 
@@ -419,16 +738,25 @@ def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, cap
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
         @T.prim_func
-        def kernel(Left: T.Tensor((sizes[0],), dtypes[0]), Right: T.Tensor((sizes[1],), dtypes[1]),
-                   Coeff: T.Tensor((sizes[2],), dtypes[2]), IK: T.Tensor((sizes[3],), dtypes[3]),
-                   IV: T.Tensor((sizes[4],), dtypes[4]), Q: T.Tensor((sizes[5],), dtypes[5]),
-                   Metadata: T.Tensor((3 * capacity,), "int64"), Offsets: T.Tensor((sizes[6],), dtypes[6]),
-                   Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
-                   Carry: T.Tensor((capacity * heads * rows * columns,), "float32"),
-                   DY: T.Tensor((readouts * total * columns,), dtypes[7]),
-                   DL: T.Tensor((blocks * sizes[0],), "float32"), DR: T.Tensor((blocks * sizes[1],), "float32"),
-                   DC: T.Tensor((blocks * sizes[2],), "float32"), DIK: T.Tensor((blocks * sizes[3],), "float32"),
-                   DIV: T.Tensor((sizes[4],), "float32"), DQ: T.Tensor((blocks * sizes[5],), "float32")):
+        def kernel(
+            Left: T.Tensor((sizes[0],), dtypes[0]),
+            Right: T.Tensor((sizes[1],), dtypes[1]),
+            Coeff: T.Tensor((sizes[2],), dtypes[2]),
+            IK: T.Tensor((sizes[3],), dtypes[3]),
+            IV: T.Tensor((sizes[4],), dtypes[4]),
+            Q: T.Tensor((sizes[5],), dtypes[5]),
+            Metadata: T.Tensor((3 * capacity,), "int64"),
+            Offsets: T.Tensor((sizes[6],), dtypes[6]),
+            Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
+            Carry: T.Tensor((capacity * heads * rows * columns,), "float32"),
+            DY: T.Tensor((readouts * total * columns,), dtypes[7]),
+            DL: T.Tensor((blocks * sizes[0],), "float32"),
+            DR: T.Tensor((blocks * sizes[1],), "float32"),
+            DC: T.Tensor((blocks * sizes[2],), "float32"),
+            DIK: T.Tensor((blocks * sizes[3],), "float32"),
+            DIV: T.Tensor((sizes[4],), "float32"),
+            DQ: T.Tensor((blocks * sizes[5],), "float32"),
+        ):
             with T.Kernel(capacity, heads, blocks, threads=128) as (chunk, head, block):
                 sequence = T.cast(Metadata[chunk], "int32")
                 if sequence >= 0:
@@ -447,8 +775,11 @@ def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, cap
                     scalar_products = T.alloc_fragment((1, bc), "float32")
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
-                        state[r, c] = T.if_then_else((r < rows) & (block * bc + c < columns),
-                            Checkpoints[(slot * rows + r) * columns + block * bc + c], 0.0)
+                        state[r, c] = T.if_then_else(
+                            (r < rows) & (block * bc + c < columns),
+                            Checkpoints[(slot * rows + r) * columns + block * bc + c],
+                            0.0,
+                        )
                     for step in T.serial(CHUNK_SIZE):
                         for r, c in T.Parallel(br, bc):
                             history[step, r, c] = state[r, c]
@@ -456,15 +787,46 @@ def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, cap
                         if token < end:
                             flat = token * heads + head
                             for op in T.unroll(operations):
-                                apply(state, Left, Right, Coeff, flat, op, _operation_code(T, codes, op), block * bc, False)
+                                apply(
+                                    state,
+                                    Left,
+                                    Right,
+                                    Coeff,
+                                    flat,
+                                    op,
+                                    _operation_code(T, codes, op),
+                                    block * bc,
+                                    False,
+                                )
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(r < rows, T.cast(IK[(injection * total + flat) * rows + r], "float32"), 0.0)
-                                    value = T.if_then_else(block * bc + c < columns, T.cast(IV[(injection * total + flat) * columns + block * bc + c], "float32"), 0.0)
+                                    key = T.if_then_else(
+                                        r < rows,
+                                        T.cast(
+                                            IK[(injection * total + flat) * rows + r],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
+                                    value = T.if_then_else(
+                                        block * bc + c < columns,
+                                        T.cast(
+                                            IV[
+                                                (injection * total + flat) * columns
+                                                + block * bc
+                                                + c
+                                            ],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     state[r, c] = state[r, c] + key * value
                     for r, c in T.Parallel(br, bc):
-                        adjoint[r, c] = T.if_then_else((r < rows) & (block * bc + c < columns),
-                            Carry[(slot * rows + r) * columns + block * bc + c], 0.0)
+                        adjoint[r, c] = T.if_then_else(
+                            (r < rows) & (block * bc + c < columns),
+                            Carry[(slot * rows + r) * columns + block * bc + c],
+                            0.0,
+                        )
                     for reverse_step in T.serial(CHUNK_SIZE):
                         step = CHUNK_SIZE - 1 - reverse_step
                         token = start + step
@@ -474,50 +836,158 @@ def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, cap
                                 previous[r, c] = history[step, r, c]
                                 state[r, c] = previous[r, c]
                             for op in T.unroll(operations):
-                                apply(state, Left, Right, Coeff, flat, op, _operation_code(T, codes, op), block * bc, False)
+                                apply(
+                                    state,
+                                    Left,
+                                    Right,
+                                    Coeff,
+                                    flat,
+                                    op,
+                                    _operation_code(T, codes, op),
+                                    block * bc,
+                                    False,
+                                )
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(r < rows, T.cast(IK[(injection * total + flat) * rows + r], "float32"), 0.0)
-                                    value = T.if_then_else(block * bc + c < columns, T.cast(IV[(injection * total + flat) * columns + block * bc + c], "float32"), 0.0)
+                                    key = T.if_then_else(
+                                        r < rows,
+                                        T.cast(
+                                            IK[(injection * total + flat) * rows + r],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
+                                    value = T.if_then_else(
+                                        block * bc + c < columns,
+                                        T.cast(
+                                            IV[
+                                                (injection * total + flat) * columns
+                                                + block * bc
+                                                + c
+                                            ],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     state[r, c] = state[r, c] + key * value
-                            output_flat = token * heads + head if packed else (sequence * heads + head) * length + token - T.cast(Offsets[sequence], "int32")
+                            output_flat = (
+                                token * heads + head
+                                if packed
+                                else (sequence * heads + head) * length
+                                + token
+                                - T.cast(Offsets[sequence], "int32")
+                            )
                             for readout in T.unroll(readouts):
                                 for r, c in T.Parallel(br, bc):
-                                    dy = T.if_then_else(block * bc + c < columns,
-                                        T.cast(DY[(readout * total + output_flat) * columns + block * bc + c], "float32"), 0.0)
+                                    dy = T.if_then_else(
+                                        block * bc + c < columns,
+                                        T.cast(
+                                            DY[
+                                                (readout * total + output_flat)
+                                                * columns
+                                                + block * bc
+                                                + c
+                                            ],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     products[r, c] = state[r, c] * dy
                                 T.reduce_sum(products, row_sum, dim=1)
                                 for r in T.Parallel(br):
                                     if r < rows:
-                                        DQ[((block * readouts + readout) * total + flat) * rows + r] = row_sum[r]
+                                        DQ[
+                                            (
+                                                (block * readouts + readout) * total
+                                                + flat
+                                            )
+                                            * rows
+                                            + r
+                                        ] = row_sum[r]
                                 for r, c in T.Parallel(br, bc):
-                                    dy = T.if_then_else(block * bc + c < columns,
-                                        T.cast(DY[(readout * total + output_flat) * columns + block * bc + c], "float32"), 0.0)
-                                    query = T.if_then_else(r < rows, T.cast(Q[(readout * total + flat) * rows + r], "float32"), 0.0)
+                                    dy = T.if_then_else(
+                                        block * bc + c < columns,
+                                        T.cast(
+                                            DY[
+                                                (readout * total + output_flat)
+                                                * columns
+                                                + block * bc
+                                                + c
+                                            ],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
+                                    query = T.if_then_else(
+                                        r < rows,
+                                        T.cast(
+                                            Q[(readout * total + flat) * rows + r],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     adjoint[r, c] = adjoint[r, c] + query * dy
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    value = T.if_then_else(block * bc + c < columns,
-                                        T.cast(IV[(injection * total + flat) * columns + block * bc + c], "float32"), 0.0)
+                                    value = T.if_then_else(
+                                        block * bc + c < columns,
+                                        T.cast(
+                                            IV[
+                                                (injection * total + flat) * columns
+                                                + block * bc
+                                                + c
+                                            ],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     products[r, c] = adjoint[r, c] * value
                                 T.reduce_sum(products, row_sum, dim=1)
                                 for r in T.Parallel(br):
                                     if r < rows:
-                                        DIK[((block * injections + injection) * total + flat) * rows + r] = row_sum[r]
+                                        DIK[
+                                            (
+                                                (block * injections + injection) * total
+                                                + flat
+                                            )
+                                            * rows
+                                            + r
+                                        ] = row_sum[r]
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(r < rows, T.cast(IK[(injection * total + flat) * rows + r], "float32"), 0.0)
+                                    key = T.if_then_else(
+                                        r < rows,
+                                        T.cast(
+                                            IK[(injection * total + flat) * rows + r],
+                                            "float32",
+                                        ),
+                                        0.0,
+                                    )
                                     products[r, c] = adjoint[r, c] * key
                                 T.reduce_sum(products, column_sum, dim=0)
                                 for c in T.Parallel(bc):
                                     if block * bc + c < columns:
-                                        DIV[(injection * total + flat) * columns + block * bc + c] = column_sum[c]
+                                        DIV[
+                                            (injection * total + flat) * columns
+                                            + block * bc
+                                            + c
+                                        ] = column_sum[c]
                             for reverse_op in T.unroll(operations):
                                 op = operations - 1 - reverse_op
                                 code = _operation_code(T, codes, op)
                                 T.copy(previous, state)
                                 for earlier in T.unroll(operations):
                                     if earlier < op:
-                                        apply(state, Left, Right, Coeff, flat, earlier, _operation_code(T, codes, earlier), block * bc, False)
+                                        apply(
+                                            state,
+                                            Left,
+                                            Right,
+                                            Coeff,
+                                            flat,
+                                            earlier,
+                                            _operation_code(T, codes, earlier),
+                                            block * bc,
+                                            False,
+                                        )
                                 if code == 0:
                                     for r, c in T.Parallel(br, bc):
                                         products[r, c] = adjoint[r, c] * state[r, c]
@@ -525,32 +995,85 @@ def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, cap
                                     for c in T.Parallel(bc):
                                         scalar_products[0, c] = column_sum[c]
                                     T.reduce_sum(scalar_products, scalar, dim=1)
-                                    DC[(block * operations + op) * total + flat] = scalar[0]
+                                    DC[(block * operations + op) * total + flat] = (
+                                        scalar[0]
+                                    )
                                     for r, c in T.Parallel(br, bc):
-                                        adjoint[r, c] = adjoint[r, c] * T.cast(Coeff[op * total + flat], "float32")
+                                        adjoint[r, c] = adjoint[r, c] * T.cast(
+                                            Coeff[op * total + flat], "float32"
+                                        )
                                 elif code == 1:
                                     for r, c in T.Parallel(br, bc):
                                         products[r, c] = adjoint[r, c] * state[r, c]
                                     T.reduce_sum(products, row_sum, dim=1)
                                     for r in T.Parallel(br):
                                         if r < rows:
-                                            DL[((block * operations + op) * total + flat) * width + r] = row_sum[r]
-                                    apply(adjoint, Left, Right, Coeff, flat, op, code, block * bc, True)
+                                            DL[
+                                                (
+                                                    (block * operations + op) * total
+                                                    + flat
+                                                )
+                                                * width
+                                                + r
+                                            ] = row_sum[r]
+                                    apply(
+                                        adjoint,
+                                        Left,
+                                        Right,
+                                        Coeff,
+                                        flat,
+                                        op,
+                                        code,
+                                        block * bc,
+                                        True,
+                                    )
                                 elif code == 3:
                                     for r, c in T.Parallel(br, bc):
                                         products[r, c] = adjoint[r, c] * state[r, c]
                                     T.reduce_sum(products, column_sum, dim=0)
                                     for c in T.Parallel(bc):
                                         if block * bc + c < columns:
-                                            DL[((block * operations + op) * total + flat) * width + block * bc + c] = column_sum[c]
-                                    apply(adjoint, Left, Right, Coeff, flat, op, code, block * bc, True)
+                                            DL[
+                                                (
+                                                    (block * operations + op) * total
+                                                    + flat
+                                                )
+                                                * width
+                                                + block * bc
+                                                + c
+                                            ] = column_sum[c]
+                                    apply(
+                                        adjoint,
+                                        Left,
+                                        Right,
+                                        Coeff,
+                                        flat,
+                                        op,
+                                        code,
+                                        block * bc,
+                                        True,
+                                    )
                                 else:
                                     for r, c in T.Parallel(br, bc):
-                                        right = T.if_then_else(r < rows, T.cast(Right[(op * total + flat) * rows + r], "float32"), 0.0)
+                                        right = T.if_then_else(
+                                            r < rows,
+                                            T.cast(
+                                                Right[(op * total + flat) * rows + r],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
                                         products[r, c] = state[r, c] * right
                                     T.reduce_sum(products, projection, dim=0)
                                     for r, c in T.Parallel(br, bc):
-                                        left = T.if_then_else(r < rows, T.cast(Left[(op * total + flat) * width + r], "float32"), 0.0)
+                                        left = T.if_then_else(
+                                            r < rows,
+                                            T.cast(
+                                                Left[(op * total + flat) * width + r],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
                                         products[r, c] = adjoint[r, c] * left
                                     T.reduce_sum(products, adjoint_projection, dim=0)
                                     for r, c in T.Parallel(br, bc):
@@ -558,21 +1081,67 @@ def _compile_local_vjp(sizes, dtypes, *, heads, rows, columns, total, width, cap
                                     T.reduce_sum(products, row_sum, dim=1)
                                     for r in T.Parallel(br):
                                         if r < rows:
-                                            DL[((block * operations + op) * total + flat) * width + r] = T.cast(Coeff[op * total + flat], "float32") * row_sum[r]
+                                            DL[
+                                                (
+                                                    (block * operations + op) * total
+                                                    + flat
+                                                )
+                                                * width
+                                                + r
+                                            ] = (
+                                                T.cast(
+                                                    Coeff[op * total + flat], "float32"
+                                                )
+                                                * row_sum[r]
+                                            )
                                     for r, c in T.Parallel(br, bc):
-                                        products[r, c] = state[r, c] * adjoint_projection[c]
+                                        products[r, c] = (
+                                            state[r, c] * adjoint_projection[c]
+                                        )
                                     T.reduce_sum(products, row_sum, dim=1)
                                     for r in T.Parallel(br):
                                         if r < rows:
-                                            DR[((block * operations + op) * total + flat) * rows + r] = T.cast(Coeff[op * total + flat], "float32") * row_sum[r]
+                                            DR[
+                                                (
+                                                    (block * operations + op) * total
+                                                    + flat
+                                                )
+                                                * rows
+                                                + r
+                                            ] = (
+                                                T.cast(
+                                                    Coeff[op * total + flat], "float32"
+                                                )
+                                                * row_sum[r]
+                                            )
                                     for c in T.Parallel(bc):
-                                        scalar_products[0, c] = adjoint_projection[c] * projection[c]
+                                        scalar_products[0, c] = (
+                                            adjoint_projection[c] * projection[c]
+                                        )
                                     T.reduce_sum(scalar_products, scalar, dim=1)
-                                    DC[(block * operations + op) * total + flat] = scalar[0]
+                                    DC[(block * operations + op) * total + flat] = (
+                                        scalar[0]
+                                    )
                                     for r, c in T.Parallel(br, bc):
-                                        right = T.if_then_else(r < rows, T.cast(Right[(op * total + flat) * rows + r], "float32"), 0.0)
-                                        adjoint[r, c] = adjoint[r, c] + T.cast(Coeff[op * total + flat], "float32") * right * adjoint_projection[c]
+                                        right = T.if_then_else(
+                                            r < rows,
+                                            T.cast(
+                                                Right[(op * total + flat) * rows + r],
+                                                "float32",
+                                            ),
+                                            0.0,
+                                        )
+                                        adjoint[r, c] = (
+                                            adjoint[r, c]
+                                            + T.cast(
+                                                Coeff[op * total + flat], "float32"
+                                            )
+                                            * right
+                                            * adjoint_projection[c]
+                                        )
+
         return kernel
+
     return build()
 
 
@@ -584,19 +1153,26 @@ def _compile_reduce(size, blocks, device_index):
     @tilelang.jit(compile_flags=["-fmad=false"])
     def build():
         @T.prim_func
-        def kernel(Partial: T.Tensor((blocks * size,), "float32"), Result: T.Tensor((size,), "float32")):
+        def kernel(
+            Partial: T.Tensor((blocks * size,), "float32"),
+            Result: T.Tensor((size,), "float32"),
+        ):
             with T.Kernel(_ceildiv(size, 256), threads=128) as tile:
                 value = T.alloc_fragment((256,), "float32")
                 T.clear(value)
                 for block in T.serial(blocks):
                     for lane in T.Parallel(256):
                         index = tile * 256 + lane
-                        value[lane] = value[lane] + T.if_then_else(index < size, Partial[block * size + index], 0.0)
+                        value[lane] = value[lane] + T.if_then_else(
+                            index < size, Partial[block * size + index], 0.0
+                        )
                 for lane in T.Parallel(256):
                     index = tile * 256 + lane
                     if index < size:
                         Result[index] = value[lane]
+
         return kernel
+
     return build()
 
 
@@ -612,112 +1188,330 @@ def _layout(readout, initial_state, sequence_offsets):
     return sequences, heads, rows, columns, tokens, length, count, packed, shape
 
 
-def _parameters(factors, *, heads, rows, columns, tokens, capacity,
-                operation_codes, injections, readouts, length, packed, device):
-    return dict(heads=heads, rows=rows, columns=columns, total=tokens * heads,
-                width=factors[0].shape[-2], capacity=capacity,
-                codes=tuple(_CODES[code] for code in operation_codes), injections=injections,
-                readouts=readouts, length=length, packed=packed, device_index=device.index)
+def _parameters(
+    factors,
+    *,
+    heads,
+    rows,
+    columns,
+    tokens,
+    capacity,
+    operation_codes,
+    injections,
+    readouts,
+    length,
+    packed,
+    device,
+):
+    return dict(
+        heads=heads,
+        rows=rows,
+        columns=columns,
+        total=tokens * heads,
+        width=factors[0].shape[-2],
+        capacity=capacity,
+        codes=tuple(_CODES[code] for code in operation_codes),
+        injections=injections,
+        readouts=readouts,
+        length=length,
+        packed=packed,
+        device_index=device.index,
+    )
 
 
-def forward(*, operation_codes, left_factors, right_factors, coefficients,
-            injection_left, injection_right, readout, initial_state,
-            output_dtype, record=True, sequence_offsets=None, chunk_metadata=None):
+def forward(
+    *,
+    operation_codes,
+    left_factors,
+    right_factors,
+    coefficients,
+    injection_left,
+    injection_right,
+    readout,
+    initial_state,
+    output_dtype,
+    record=True,
+    sequence_offsets=None,
+    chunk_metadata=None,
+):
     """Return outputs, final State and FP32 entries; segmentation stays on device."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
-        readout, initial_state, sequence_offsets)
+        readout, initial_state, sequence_offsets
+    )
     # Long inference amortizes carry with 64-token chunks. Short dense sequences
     # retain Triton's 16-token replay granularity to expose enough independent
     # CTAs. Recorded/packed/supplied metadata keep the backward checkpoint ABI.
-    chunk_size = (64 if not record and chunk_metadata is None
-                  and sequence_offsets is None and length > 128 else CHUNK_SIZE)
-    offsets, prefix, chunks = (metadata(tokens, sequences, initial_state.device, sequence_offsets,
-                                       chunk_size=chunk_size)
-                               if chunk_metadata is None else chunk_metadata)
+    chunk_size = (
+        64
+        if not record
+        and chunk_metadata is None
+        and sequence_offsets is None
+        and length > 128
+        else CHUNK_SIZE
+    )
+    offsets, prefix, chunks = (
+        metadata(
+            tokens,
+            sequences,
+            initial_state.device,
+            sequence_offsets,
+            chunk_size=chunk_size,
+        )
+        if chunk_metadata is None
+        else chunk_metadata
+    )
     capacity, device = chunks.shape[1], initial_state.device
-    checkpoints = torch.empty((capacity, heads, rows, columns), device=device, dtype=torch.float32)
+    checkpoints = torch.empty(
+        (capacity, heads, rows, columns), device=device, dtype=torch.float32
+    )
     output = torch.empty(shape, device=device, dtype=output_dtype)
     final = torch.empty(initial_state.shape, device=device, dtype=initial_state.dtype)
     if not capacity:
         _copy(initial_state, final)
     else:
-        factors = (left_factors, right_factors, coefficients, injection_left, injection_right, readout)
+        factors = (
+            left_factors,
+            right_factors,
+            coefficients,
+            injection_left,
+            injection_right,
+            readout,
+        )
         flat_factors = tuple(_flat(value) for value in factors)
-        offsets_flat, prefix_flat, metadata_flat = _flat(offsets), _flat(prefix), _flat(chunks)
-        parameters = _parameters(factors, heads=heads, rows=rows, columns=columns,
-            tokens=tokens, capacity=capacity, operation_codes=operation_codes,
-            injections=injection_left.shape[0], readouts=count, length=length, packed=packed, device=device)
+        offsets_flat, prefix_flat, metadata_flat = (
+            _flat(offsets),
+            _flat(prefix),
+            _flat(chunks),
+        )
+        parameters = _parameters(
+            factors,
+            heads=heads,
+            rows=rows,
+            columns=columns,
+            tokens=tokens,
+            capacity=capacity,
+            operation_codes=operation_codes,
+            injections=injection_left.shape[0],
+            readouts=count,
+            length=length,
+            packed=packed,
+            device=device,
+        )
         parameters["chunk_size"] = chunk_size
-        transform = torch.empty((capacity, heads, rows, rows), device=device, dtype=torch.float32)
-        decay = torch.empty((capacity, heads, columns), device=device, dtype=torch.float32)
+        transform = torch.empty(
+            (capacity, heads, rows, rows), device=device, dtype=torch.float32
+        )
+        decay = torch.empty(
+            (capacity, heads, columns), device=device, dtype=torch.float32
+        )
         bias = torch.empty_like(checkpoints)
         summary_inputs = (*flat_factors, output.view(-1), offsets_flat)
-        _compile_summary(tuple(value.numel() for value in summary_inputs),
-            tuple(_dtype(value) for value in summary_inputs), **parameters, reverse=False)(
-            *flat_factors, output.view(-1), metadata_flat, offsets_flat,
-            transform.view(-1), decay.view(-1), bias.view(-1))
-        _compile_carry(sequences, heads, rows, columns, capacity, _dtype(initial_state),
-            _dtype(final), False, device.index)(transform.view(-1), decay.view(-1), bias.view(-1),
-            _flat(initial_state), prefix_flat, checkpoints.view(-1), final.view(-1))
+        _compile_summary(
+            tuple(value.numel() for value in summary_inputs),
+            tuple(_dtype(value) for value in summary_inputs),
+            **parameters,
+            reverse=False,
+        )(
+            *flat_factors,
+            output.view(-1),
+            metadata_flat,
+            offsets_flat,
+            transform.view(-1),
+            decay.view(-1),
+            bias.view(-1),
+        )
+        _compile_carry(
+            sequences,
+            heads,
+            rows,
+            columns,
+            capacity,
+            _dtype(initial_state),
+            _dtype(final),
+            False,
+            device.index,
+        )(
+            transform.view(-1),
+            decay.view(-1),
+            bias.view(-1),
+            _flat(initial_state),
+            prefix_flat,
+            checkpoints.view(-1),
+            final.view(-1),
+        )
         replay_inputs = (*flat_factors, offsets_flat)
-        _compile_replay(tuple(value.numel() for value in replay_inputs),
-            tuple(_dtype(value) for value in replay_inputs), **parameters, sequences=sequences,
-            output_dtype=_dtype(output), final_dtype=_dtype(final))(
-            *flat_factors, metadata_flat, offsets_flat, checkpoints.view(-1), output.view(-1), final.view(-1))
+        _compile_replay(
+            tuple(value.numel() for value in replay_inputs),
+            tuple(_dtype(value) for value in replay_inputs),
+            **parameters,
+            sequences=sequences,
+            output_dtype=_dtype(output),
+            final_dtype=_dtype(final),
+        )(
+            *flat_factors,
+            metadata_flat,
+            offsets_flat,
+            checkpoints.view(-1),
+            output.view(-1),
+            final.view(-1),
+        )
     if not packed:
-        checkpoints = checkpoints.reshape(sequences, _ceildiv(length, chunk_size), heads, rows, columns).permute(0, 2, 1, 3, 4)
+        checkpoints = checkpoints.reshape(
+            sequences, _ceildiv(length, chunk_size), heads, rows, columns
+        ).permute(0, 2, 1, 3, 4)
     if not record:
         checkpoints = checkpoints[:0]
     return output, final, checkpoints
 
 
-def backward(*, operation_codes, left_factors, right_factors, coefficients,
-             injection_left, injection_right, readout, checkpoints, initial_state,
-             grad_output, grad_final, sequence_offsets=None, chunk_metadata=None):
+def backward(
+    *,
+    operation_codes,
+    left_factors,
+    right_factors,
+    coefficients,
+    injection_left,
+    injection_right,
+    readout,
+    checkpoints,
+    initial_state,
+    grad_output,
+    grad_final,
+    sequence_offsets=None,
+    chunk_metadata=None,
+):
     """Reverse affine carry followed by parallel, inverse-free chunk-local VJPs."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
-        readout, initial_state, sequence_offsets)
-    offsets, prefix, chunks = (metadata(tokens, sequences, initial_state.device, sequence_offsets)
-                               if chunk_metadata is None else chunk_metadata)
+        readout, initial_state, sequence_offsets
+    )
+    offsets, prefix, chunks = (
+        metadata(tokens, sequences, initial_state.device, sequence_offsets)
+        if chunk_metadata is None
+        else chunk_metadata
+    )
     capacity, device = chunks.shape[1], initial_state.device
     if not packed:
         checkpoints = checkpoints.permute(0, 2, 1, 3, 4)
-    factors = (left_factors, right_factors, coefficients, injection_left, injection_right, readout)
-    gradients = [torch.zeros(value.shape, device=device, dtype=torch.float32) for value in factors]
+    factors = (
+        left_factors,
+        right_factors,
+        coefficients,
+        injection_left,
+        injection_right,
+        readout,
+    )
+    gradients = [
+        torch.zeros(value.shape, device=device, dtype=torch.float32)
+        for value in factors
+    ]
     di = torch.empty(initial_state.shape, device=device, dtype=torch.float32)
-    df = torch.zeros(initial_state.shape, device=device, dtype=torch.float32) if grad_final is None else grad_final
+    df = (
+        torch.zeros(initial_state.shape, device=device, dtype=torch.float32)
+        if grad_final is None
+        else grad_final
+    )
     if not capacity:
         _copy(df, di)
         return (*gradients, di)
-    dy = torch.zeros(shape, device=device, dtype=torch.float32) if grad_output is None else grad_output
+    dy = (
+        torch.zeros(shape, device=device, dtype=torch.float32)
+        if grad_output is None
+        else grad_output
+    )
     flat_factors = tuple(_flat(value) for value in factors)
-    offsets_flat, prefix_flat, metadata_flat = _flat(offsets), _flat(prefix), _flat(chunks)
+    offsets_flat, prefix_flat, metadata_flat = (
+        _flat(offsets),
+        _flat(prefix),
+        _flat(chunks),
+    )
     dy_flat = _flat(dy)
-    parameters = _parameters(factors, heads=heads, rows=rows, columns=columns,
-        tokens=tokens, capacity=capacity, operation_codes=operation_codes,
-        injections=injection_left.shape[0], readouts=count, length=length, packed=packed, device=device)
+    parameters = _parameters(
+        factors,
+        heads=heads,
+        rows=rows,
+        columns=columns,
+        tokens=tokens,
+        capacity=capacity,
+        operation_codes=operation_codes,
+        injections=injection_left.shape[0],
+        readouts=count,
+        length=length,
+        packed=packed,
+        device=device,
+    )
     blocks = _ceildiv(columns, 16)
-    transform = torch.empty((capacity, heads, rows, rows), device=device, dtype=torch.float32)
+    transform = torch.empty(
+        (capacity, heads, rows, rows), device=device, dtype=torch.float32
+    )
     decay = torch.empty((capacity, heads, columns), device=device, dtype=torch.float32)
-    source = torch.empty((capacity, heads, rows, columns), device=device, dtype=torch.float32)
+    source = torch.empty(
+        (capacity, heads, rows, columns), device=device, dtype=torch.float32
+    )
     carry = torch.empty_like(source)
     summary_inputs = (*flat_factors, dy_flat, offsets_flat)
-    _compile_summary(tuple(value.numel() for value in summary_inputs),
-        tuple(_dtype(value) for value in summary_inputs), **parameters, reverse=True)(
-        *flat_factors, dy_flat, metadata_flat, offsets_flat, transform.view(-1), decay.view(-1), source.view(-1))
-    _compile_carry(sequences, heads, rows, columns, capacity, _dtype(df), _dtype(di), True, device.index)(
-        transform.view(-1), decay.view(-1), source.view(-1), _flat(df), prefix_flat, carry.view(-1), di.view(-1))
+    _compile_summary(
+        tuple(value.numel() for value in summary_inputs),
+        tuple(_dtype(value) for value in summary_inputs),
+        **parameters,
+        reverse=True,
+    )(
+        *flat_factors,
+        dy_flat,
+        metadata_flat,
+        offsets_flat,
+        transform.view(-1),
+        decay.view(-1),
+        source.view(-1),
+    )
+    _compile_carry(
+        sequences,
+        heads,
+        rows,
+        columns,
+        capacity,
+        _dtype(df),
+        _dtype(di),
+        True,
+        device.index,
+    )(
+        transform.view(-1),
+        decay.view(-1),
+        source.view(-1),
+        _flat(df),
+        prefix_flat,
+        carry.view(-1),
+        di.view(-1),
+    )
     partial_indices = (0, 1, 2, 3, 5)
-    partials = {index: torch.zeros((blocks, factors[index].numel()), device=device, dtype=torch.float32)
-                for index in partial_indices}
+    partials = {
+        index: torch.zeros(
+            (blocks, factors[index].numel()), device=device, dtype=torch.float32
+        )
+        for index in partial_indices
+    }
     local_inputs = (*flat_factors, offsets_flat, dy_flat)
-    _compile_local_vjp(tuple(value.numel() for value in local_inputs),
-        tuple(_dtype(value) for value in local_inputs), **parameters)(
-        *flat_factors, metadata_flat, offsets_flat, _flat(checkpoints), carry.view(-1), dy_flat,
-        partials[0].view(-1), partials[1].view(-1), partials[2].view(-1), partials[3].view(-1),
-        gradients[4].view(-1), partials[5].view(-1))
+    _compile_local_vjp(
+        tuple(value.numel() for value in local_inputs),
+        tuple(_dtype(value) for value in local_inputs),
+        **parameters,
+    )(
+        *flat_factors,
+        metadata_flat,
+        offsets_flat,
+        _flat(checkpoints),
+        carry.view(-1),
+        dy_flat,
+        partials[0].view(-1),
+        partials[1].view(-1),
+        partials[2].view(-1),
+        partials[3].view(-1),
+        gradients[4].view(-1),
+        partials[5].view(-1),
+    )
     for index in partial_indices:
         size = factors[index].numel()
         if size:
-            _compile_reduce(size, blocks, device.index)(partials[index].view(-1), gradients[index].view(-1))
+            _compile_reduce(size, blocks, device.index)(
+                partials[index].view(-1), gradients[index].view(-1)
+            )
     return (*gradients, di)

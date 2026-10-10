@@ -9,6 +9,7 @@ The module also contains scalar-gated, feature-gated, lightning, forgetting,
 delta-rule, and explicit recurrent variants. Normalized linear attention uses
 the separate two-State Program in :mod:`examples.normalized_linear_attention`.
 """
+
 from __future__ import annotations
 
 import torch
@@ -62,15 +63,11 @@ def _operator(
         )
     elif gate == "feature":
         inputs.append(
-            TensorInput(
-                "gate", (Batch, VALUE_HEADS, Sequence, KEY), torch.float32
-            )
+            TensorInput("gate", (Batch, VALUE_HEADS, Sequence, KEY), torch.float32)
         )
     elif gate == "dual":
         inputs.append(
-            TensorInput(
-                "key_gate", (Batch, VALUE_HEADS, Sequence, KEY), torch.float32
-            )
+            TensorInput("key_gate", (Batch, VALUE_HEADS, Sequence, KEY), torch.float32)
         )
         inputs.append(
             TensorInput(
@@ -141,7 +138,9 @@ def linear_attention(
     """Build the ungated matrix-State recurrence."""
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
-    return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate=None)
+    return _operator(
+        batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate=None
+    )
 
 
 def simple_gla_attention(
@@ -157,7 +156,16 @@ def simple_gla_attention(
     """Build the scalar-gated matrix-State recurrence."""
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
-    return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="scalar")
+    return _operator(
+        batch,
+        heads,
+        seqlen,
+        dim,
+        dim_value,
+        kv_heads=kv_heads,
+        dtype=dtype,
+        gate="scalar",
+    )
 
 
 def gla_attention(
@@ -173,7 +181,16 @@ def gla_attention(
     """Build the feature-gated matrix-State recurrence."""
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
-    return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="feature")
+    return _operator(
+        batch,
+        heads,
+        seqlen,
+        dim,
+        dim_value,
+        kv_heads=kv_heads,
+        dtype=dtype,
+        gate="feature",
+    )
 
 
 def dual_gate_gla_attention(
@@ -192,7 +209,16 @@ def dual_gate_gla_attention(
     """
     kv_heads = heads if kv_heads is None else kv_heads
     _validate_kv_heads(heads, kv_heads)
-    return _operator(batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype, gate="dual")
+    return _operator(
+        batch,
+        heads,
+        seqlen,
+        dim,
+        dim_value,
+        kv_heads=kv_heads,
+        dtype=dtype,
+        gate="dual",
+    )
 
 
 def lightning_attention(

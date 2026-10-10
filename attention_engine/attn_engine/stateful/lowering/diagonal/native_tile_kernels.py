@@ -10,6 +10,7 @@ Replay retains one carry tile per independent chunk in row/column fragments.
 State transitions remain token-ordered; only the Feature-axis contraction is
 distributed across the CTA instead of serialized inside each column lane.
 """
+
 import hashlib
 import linecache
 from dataclasses import dataclass
@@ -29,27 +30,34 @@ def _dtype_name(dtype: torch.dtype) -> str:
     return str(dtype).removeprefix("torch.")
 
 
-
-
 def _storage_size(tensor: torch.Tensor) -> int:
     return int(tensor.untyped_storage().nbytes() // tensor.element_size())
 
 
 def _tensor_metadata(tensor: torch.Tensor) -> tuple:
     """Specialization metadata only; never retain a tensor or storage pointer."""
-    return (tensor.device, tensor.dtype, tuple(tensor.shape), tuple(tensor.stride()),
-            int(tensor.storage_offset()), _storage_size(tensor))
+    return (
+        tensor.device,
+        tensor.dtype,
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        int(tensor.storage_offset()),
+        _storage_size(tensor),
+    )
 
 
 def _loader_metadata(expressions, sources, maps, loaders) -> tuple:
     # Keep semantic use order, including repeated expressions and absent gates.
     recipes = tuple(
-        None if expression is None else
-        (loaders[id(expression)].cache_key, tuple(maps[id(expression)].items()))
+        None
+        if expression is None
+        else (loaders[id(expression)].cache_key, tuple(maps[id(expression)].items()))
         for expression in expressions
     )
-    bindings = tuple((_tensor_metadata(source.tensor), source.strides, source.group, source.offset)
-                     for source in sources)
+    bindings = tuple(
+        (_tensor_metadata(source.tensor), source.strides, source.group, source.offset)
+        for source in sources
+    )
     return recipes, bindings
 
 
@@ -66,6 +74,7 @@ def _raw_storage_view(tensor: torch.Tensor) -> torch.Tensor:
 def _expressions(items: Iterable[Any]) -> tuple[Any, ...]:
     result = []
     seen = set()
+
     def visit(item):
         if item is None:
             return
@@ -77,6 +86,7 @@ def _expressions(items: Iterable[Any]) -> tuple[Any, ...]:
         if key not in seen:
             seen.add(key)
             result.append(item)
+
     visit(tuple(items))
     return tuple(result)
 
@@ -108,18 +118,31 @@ def _bind(expressions: Iterable[Any], inputs: dict[str, torch.Tensor], heads: in
             if slot is None:
                 tensor, strides, group = binding.bind(inputs[binding.name], heads)
                 slot = len(source_specs)
-                source_specs.append(_RawSource(tensor, strides, int(group), int(tensor.storage_offset())))
+                source_specs.append(
+                    _RawSource(
+                        tensor, strides, int(group), int(tensor.storage_offset())
+                    )
+                )
                 bound_sources[binding] = slot
             source_maps[id(expression)][binding.name] = slot
     return tuple(source_specs), source_maps, loaders
 
+
 class RawLoaderContext:
     """Reusable raw-binding/code-generation context for native TileLang kernels."""
 
-    def __init__(self, expressions: Iterable[Any], inputs: dict[str, torch.Tensor], heads: int, sequence_length: int):
+    def __init__(
+        self,
+        expressions: Iterable[Any],
+        inputs: dict[str, torch.Tensor],
+        heads: int,
+        sequence_length: int,
+    ):
         self.sequence_length = int(sequence_length)
         self.sources, self.maps, self.loaders = _bind(expressions, inputs, int(heads))
-        self.pointers = tuple(_raw_storage_view(source.tensor) for source in self.sources)
+        self.pointers = tuple(
+            _raw_storage_view(source.tensor) for source in self.sources
+        )
         self._annotations = None
 
     @property
@@ -132,11 +155,21 @@ class RawLoaderContext:
             )
         return self._annotations
 
-
-    def emit_value(self, expression: Any, token: str = "token", head: str = "head", feature: str = "feature"):
+    def emit_value(
+        self,
+        expression: Any,
+        token: str = "token",
+        head: str = "head",
+        feature: str = "feature",
+    ):
         return emit_dense_loader(
-            self.loaders[id(expression)], self.maps[id(expression)], self.sources,
-            token=token, head=head, feature=feature, sequence_length=self.sequence_length,
+            self.loaders[id(expression)],
+            self.maps[id(expression)],
+            self.sources,
+            token=token,
+            head=head,
+            feature=feature,
+            sequence_length=self.sequence_length,
         )
 
     def specialization_key(self, expressions):
@@ -214,8 +247,6 @@ def emit_dense_loader(
     return values[loader.root]
 
 
-
-
 def _annotation_sources(sources: tuple[_RawSource, ...]) -> str:
     return ", ".join(
         f"X{i}: T.Tensor(({_storage_size(source.tensor)},), {_dtype_name(source.tensor.dtype)!r})"
@@ -243,23 +274,74 @@ def _kernel_source(body: str, annotations: str, name: str, device: torch.device)
     return namespace["build"]()
 
 
-
-def _expr_ref(expression: Any, sources, maps, loaders, *, token: str, head: str, feature: str, length: int):
+def _expr_ref(
+    expression: Any,
+    sources,
+    maps,
+    loaders,
+    *,
+    token: str,
+    head: str,
+    feature: str,
+    length: int,
+):
     if expression is None:
         return "1.0"
-    return emit_dense_loader(loaders[id(expression)], maps[id(expression)], sources,
-                             token=token, head=head, feature=feature, sequence_length=length)
+    return emit_dense_loader(
+        loaders[id(expression)],
+        maps[id(expression)],
+        sources,
+        token=token,
+        head=head,
+        feature=feature,
+        sequence_length=length,
+    )
 
-def _summary_kernel(sources, maps, loaders, row_gate, column_gate, injections, *, batch, length, heads, rows, columns, scale, bias):
 
-    rg = _expr_ref(row_gate, sources, maps, loaders, token="flat", head="head", feature="r", length=length)
-    cg = _expr_ref(column_gate, sources, maps, loaders, token="flat", head="head", feature="c", length=length)
+def _summary_kernel(
+    sources,
+    maps,
+    loaders,
+    row_gate,
+    column_gate,
+    injections,
+    *,
+    batch,
+    length,
+    heads,
+    rows,
+    columns,
+    scale,
+    bias,
+):
+
+    rg = _expr_ref(
+        row_gate,
+        sources,
+        maps,
+        loaders,
+        token="flat",
+        head="head",
+        feature="r",
+        length=length,
+    )
+    cg = _expr_ref(
+        column_gate,
+        sources,
+        maps,
+        loaders,
+        token="flat",
+        head="head",
+        feature="c",
+        length=length,
+    )
     terms = [
         " + ".join(
             f"({_expr_ref(key, sources, maps, loaders, token='flat', head='head', feature='r', length=length)} * "
             f"{_expr_ref(value, sources, maps, loaders, token='flat', head='head', feature='c', length=length)})"
             for key, value in injections
-        ) or "0.0"
+        )
+        or "0.0"
     ][0]
     body = f"""        with T.Kernel({batch * heads * ((length + _CHUNK - 1) // _CHUNK)}, T.ceildiv({rows * columns}, {_TILE}), threads={_TILE}) as (shc, tile):
             tid = T.get_thread_binding()
@@ -293,7 +375,9 @@ def _summary_kernel(sources, maps, loaders, row_gate, column_gate, injections, *
     if annotations:
         annotations += ", "
     annotations += f"Scale: T.StridedTensor({tuple(scale.shape)}, {tuple(scale.stride())}, 'float32'), "
-    annotations += f"Bias: T.StridedTensor({tuple(bias.shape)}, {tuple(bias.stride())}, 'float32')"
+    annotations += (
+        f"Bias: T.StridedTensor({tuple(bias.shape)}, {tuple(bias.stride())}, 'float32')"
+    )
     return _kernel_source(body, annotations, "summary", bias.device)
 
 
@@ -316,42 +400,121 @@ def launch_native_summary(
     expressions = _expressions((row_gate, column_gate, injections))
     sources, maps, loaders = _bind(expressions, inputs, heads)
     key = (
-        _loader_metadata((row_gate, column_gate, *(expression for pair in injections for expression in pair)),
-                         sources, maps, loaders),
-        batch_heads // heads, heads, sequence_length, chunks, rows, columns, _CHUNK, _TILE,
-        _tensor_metadata(scale), _tensor_metadata(bias),
+        _loader_metadata(
+            (
+                row_gate,
+                column_gate,
+                *(expression for pair in injections for expression in pair),
+            ),
+            sources,
+            maps,
+            loaders,
+        ),
+        batch_heads // heads,
+        heads,
+        sequence_length,
+        chunks,
+        rows,
+        columns,
+        _CHUNK,
+        _TILE,
+        _tensor_metadata(scale),
+        _tensor_metadata(bias),
     )
     kernel = _SUMMARY_KERNELS.get(key)
     if kernel is None:
         kernel = _summary_kernel(
-            sources, maps, loaders, row_gate, column_gate, injections,
-            batch=batch_heads // heads, length=sequence_length, heads=heads,
-            rows=rows, columns=columns, scale=scale, bias=bias,
+            sources,
+            maps,
+            loaders,
+            row_gate,
+            column_gate,
+            injections,
+            batch=batch_heads // heads,
+            length=sequence_length,
+            heads=heads,
+            rows=rows,
+            columns=columns,
+            scale=scale,
+            bias=bias,
         )
         _SUMMARY_KERNELS[key] = kernel
     kernel(*(_raw_storage_view(source.tensor) for source in sources), scale, bias)
 
 
-def launch_native_carry(scale, bias, initial, carry, final=None, *, identity=False, write_final=False):
+def launch_native_carry(
+    scale, bias, initial, carry, final=None, *, identity=False, write_final=False
+):
     """Run the existing native hierarchical affine carry without host indexing."""
     from .diagonal_scan import hierarchical_carry
 
-    return hierarchical_carry(scale, bias, initial, carry, final, identity=identity, write_final=write_final)
+    return hierarchical_carry(
+        scale, bias, initial, carry, final, identity=identity, write_final=write_final
+    )
 
 
-def _replay_kernel(sources, maps, loaders, row_gate, column_gate, injections, query_expression, *, batch, length, heads, rows, columns, prior, carry, query, output, final):
+def _replay_kernel(
+    sources,
+    maps,
+    loaders,
+    row_gate,
+    column_gate,
+    injections,
+    query_expression,
+    *,
+    batch,
+    length,
+    heads,
+    rows,
+    columns,
+    prior,
+    carry,
+    query,
+    output,
+    final,
+):
 
-    rg = _expr_ref(row_gate, sources, maps, loaders, token="flat", head="head", feature="r", length=length)
-    cg = _expr_ref(column_gate, sources, maps, loaders, token="flat", head="head", feature="c", length=length)
-    terms = " + ".join(
-        f"({_expr_ref(key, sources, maps, loaders, token='flat', head='head', feature='r', length=length)} * "
-        f"{_expr_ref(value, sources, maps, loaders, token='flat', head='head', feature='c', length=length)})"
-        for key, value in injections
-    ) or "0.0"
+    rg = _expr_ref(
+        row_gate,
+        sources,
+        maps,
+        loaders,
+        token="flat",
+        head="head",
+        feature="r",
+        length=length,
+    )
+    cg = _expr_ref(
+        column_gate,
+        sources,
+        maps,
+        loaders,
+        token="flat",
+        head="head",
+        feature="c",
+        length=length,
+    )
+    terms = (
+        " + ".join(
+            f"({_expr_ref(key, sources, maps, loaders, token='flat', head='head', feature='r', length=length)} * "
+            f"{_expr_ref(value, sources, maps, loaders, token='flat', head='head', feature='c', length=length)})"
+            for key, value in injections
+        )
+        or "0.0"
+    )
     if query_expression is None:
         query_load = "T.cast(Query[flat, head, r], 'float32')"
     else:
-        query_load = _expr_ref(query_expression, sources, maps, loaders, token="flat", head="head", feature="r", length=length)
+        query_load = _expr_ref(
+            query_expression,
+            sources,
+            maps,
+            loaders,
+            token="flat",
+            head="head",
+            feature="r",
+            length=length,
+        )
     chunks = (length + _CHUNK - 1) // _CHUNK
     padded = 1 << (rows - 1).bit_length()
     body = f"""        with T.Kernel({batch * heads * chunks}, T.ceildiv({columns}, {_TILE}), threads=128) as (shc, block):
@@ -424,27 +587,63 @@ def launch_native_replay(
     batch_heads, chunks, rows, columns = (int(x) for x in carry.shape)
     if batch_heads % heads:
         raise ValueError("carry batch/head extent is not divisible by heads")
-    if final is not None and (chunks != 1 or final.shape != (batch_heads // heads, heads, rows, columns)):
-        raise ValueError("direct replay final requires one chunk and a matching rank-two State")
+    if final is not None and (
+        chunks != 1 or final.shape != (batch_heads // heads, heads, rows, columns)
+    ):
+        raise ValueError(
+            "direct replay final requires one chunk and a matching rank-two State"
+        )
     query_expression = query if hasattr(query, "loader") else None
     injections = tuple(injections)
     expressions = _expressions((row_gate, column_gate, injections, query_expression))
     sources, maps, loaders = _bind(expressions, inputs, heads)
     query_tensor = None if query_expression is not None else query
     key = (
-        _loader_metadata((row_gate, column_gate, *(expression for pair in injections for expression in pair), query_expression),
-                         sources, maps, loaders),
-        batch_heads // heads, heads, sequence_length, chunks, rows, columns, _CHUNK, _TILE, bool(prior),
-        _tensor_metadata(carry), _tensor_metadata(output),
+        _loader_metadata(
+            (
+                row_gate,
+                column_gate,
+                *(expression for pair in injections for expression in pair),
+                query_expression,
+            ),
+            sources,
+            maps,
+            loaders,
+        ),
+        batch_heads // heads,
+        heads,
+        sequence_length,
+        chunks,
+        rows,
+        columns,
+        _CHUNK,
+        _TILE,
+        bool(prior),
+        _tensor_metadata(carry),
+        _tensor_metadata(output),
         _tensor_metadata(query_tensor) if query_expression is None else None,
         _tensor_metadata(final) if final is not None else None,
     )
     kernel = _REPLAY_KERNELS.get(key)
     if kernel is None:
         kernel = _replay_kernel(
-            sources, maps, loaders, row_gate, column_gate, injections, query_expression,
-            batch=batch_heads // heads, length=sequence_length, heads=heads, rows=rows,
-            columns=columns, prior=prior, carry=carry, query=query_tensor, output=output, final=final,
+            sources,
+            maps,
+            loaders,
+            row_gate,
+            column_gate,
+            injections,
+            query_expression,
+            batch=batch_heads // heads,
+            length=sequence_length,
+            heads=heads,
+            rows=rows,
+            columns=columns,
+            prior=prior,
+            carry=carry,
+            query=query_tensor,
+            output=output,
+            final=final,
         )
         _REPLAY_KERNELS[key] = kernel
     args = [*(_raw_storage_view(source.tensor) for source in sources)]
@@ -457,6 +656,9 @@ def launch_native_replay(
 
 
 __all__ = [
-    "emit_dense_loader", "RawLoaderContext", "launch_native_summary",
-    "launch_native_carry", "launch_native_replay",
+    "emit_dense_loader",
+    "RawLoaderContext",
+    "launch_native_summary",
+    "launch_native_carry",
+    "launch_native_replay",
 ]

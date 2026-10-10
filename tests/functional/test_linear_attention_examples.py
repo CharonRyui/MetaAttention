@@ -132,8 +132,12 @@ def test_linear_attention_dsl_matches_fp32_recurrence(
     # diagnostic. This also checks the tail after a non-chunk-aligned prefix.
     if gate_kind == "scalar":
         split = 64
-        prefix_inputs = {name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()}
-        suffix_inputs = {name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()}
+        prefix_inputs = {
+            name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()
+        }
+        suffix_inputs = {
+            name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()
+        }
         prefix = compiled(
             **prefix_inputs,
             initial_state=StateTuple(("memory",), (initial,)),
@@ -153,7 +157,10 @@ def test_linear_attention_dsl_matches_fp32_recurrence(
             atol=0.05,
         )
         torch.testing.assert_close(
-            suffix.final_state["memory"], result.final_state["memory"], rtol=0.01, atol=0.02
+            suffix.final_state["memory"],
+            result.final_state["memory"],
+            rtol=0.01,
+            atol=0.02,
         )
 
 
@@ -174,12 +181,16 @@ def test_gated_chunked_state_continuation(
     dtype = torch.bfloat16
     compiled = _compile(
         factory(batch, heads, seqlen, dim, dim_value, dtype=dtype),
-        heads, dim, dim_value,
+        heads,
+        dim,
+        dim_value,
     )
     query = torch.randn(batch, heads, seqlen, dim, device=gpu_device, dtype=dtype)
     key = torch.randn_like(query)
     value = torch.randn(batch, heads, seqlen, dim_value, device=gpu_device, dtype=dtype)
-    gate_shape = (batch, heads, seqlen) if gate_kind == "scalar" else (batch, heads, seqlen, dim)
+    gate_shape = (
+        (batch, heads, seqlen) if gate_kind == "scalar" else (batch, heads, seqlen, dim)
+    )
     gate = torch.randn(*gate_shape, device=gpu_device).clamp(-0.05, 0)
     gate[:, :, 63:66] = 0
     gate[:, :, 127:130] = 0
@@ -196,17 +207,21 @@ def test_gated_chunked_state_continuation(
     split = 64
     prefix = compiled(
         **{name: tensor[:, :, :split].contiguous() for name, tensor in inputs.items()},
-        initial_state=state, return_final_state=True,
+        initial_state=state,
+        return_final_state=True,
     )
     assert prefix.final_state is not None
     suffix = compiled(
         **{name: tensor[:, :, split:].contiguous() for name, tensor in inputs.items()},
-        initial_state=prefix.final_state, return_final_state=True,
+        initial_state=prefix.final_state,
+        return_final_state=True,
     )
     assert suffix.final_state is not None
     torch.testing.assert_close(
         torch.cat((prefix.outputs["output"], suffix.outputs["output"]), dim=2),
-        expected, rtol=0.02, atol=0.05,
+        expected,
+        rtol=0.02,
+        atol=0.05,
     )
     torch.testing.assert_close(
         suffix.final_state["memory"], expected_final, rtol=0.01, atol=0.02
@@ -261,7 +276,9 @@ def test_linear_attention_dsl_gradients_match_fp32_recurrence(
     reference = _reference(
         expected["query"], expected["key"], expected["value"], expected.get("gate")
     )[0]
-    torch.testing.assert_close(result.outputs["output"], reference, rtol=0.02, atol=0.05)
+    torch.testing.assert_close(
+        result.outputs["output"], reference, rtol=0.02, atol=0.05
+    )
 
     actual_gradients = torch.autograd.grad(
         result.outputs["output"].float().square().mean(), tuple(actual.values())

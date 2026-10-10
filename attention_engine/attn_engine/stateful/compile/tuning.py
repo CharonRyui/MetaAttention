@@ -74,7 +74,9 @@ class TuningResult:
     cached: bool = False
     policy_version: str = POLICY_VERSION
     environment: Any = None
-    config_measurements: Mapping[str, Mapping[tuple[tuple[str, int], ...], tuple[float, ...]]] = ()
+    config_measurements: Mapping[
+        str, Mapping[tuple[tuple[str, int], ...], tuple[float, ...]]
+    ] = ()
 
     @property
     def measurements(self) -> Mapping[str, tuple[float, ...]]:
@@ -129,7 +131,9 @@ class MeasurementCache:
                 except (OSError, ValueError, TypeError):
                     data = {}
             data[key] = dict(value)
-            fd, temporary = tempfile.mkstemp(prefix=self.path.name + ".", dir=self.path.parent)
+            fd, temporary = tempfile.mkstemp(
+                prefix=self.path.name + ".", dir=self.path.parent
+            )
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as stream:
                     json.dump(data, stream, sort_keys=True, separators=(",", ":"))
@@ -176,7 +180,9 @@ def workload_lengths(workload: Any) -> tuple[int, ...]:
     tokens = int(getattr(workload, "token_count"))
     distribution = str(getattr(workload, "distribution", "uniform"))
     if count < 1 or tokens < 0:
-        raise ValueError("workload sequence_count must be positive and token_count non-negative")
+        raise ValueError(
+            "workload sequence_count must be positive and token_count non-negative"
+        )
     if distribution == "empty-containing":
         if count == 1:
             return (0,)
@@ -207,7 +213,9 @@ def _is_generic(candidate: Any, generic: Any | None) -> bool:
     if generic is not None and candidate is generic:
         return True
     return bool(getattr(candidate, "generic", False)) or _candidate_id(candidate) in {
-        "generic", "generic-dense-affine", "tilelang-generic"
+        "generic",
+        "generic-dense-affine",
+        "tilelang-generic",
     }
 
 
@@ -218,7 +226,11 @@ def _config(value: Any) -> tuple[tuple[str, int], ...]:
         value = tuple(value.items())
     result: list[tuple[str, int]] = []
     for name, amount in value:
-        if not isinstance(name, str) or isinstance(amount, bool) or not isinstance(amount, int):
+        if (
+            not isinstance(name, str)
+            or isinstance(amount, bool)
+            or not isinstance(amount, int)
+        ):
             raise TypeError("kernel configurations must be tuple[(str, int)]")
         result.append((name, amount))
     return tuple(result)
@@ -228,20 +240,41 @@ def _canonical(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     if isinstance(value, Mapping):
-        return {str(key): _canonical(item) for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))}
+        return {
+            str(key): _canonical(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+        }
     if isinstance(value, (tuple, list)):
         return [_canonical(item) for item in value]
     return str(value)
 
 
-def _cache_key(candidate_ids: Sequence[str], configs: Mapping[str, Sequence[tuple[tuple[str, int], ...]]],
-               workloads: Sequence[Any], policy_version: str, mode: str, environment: Any) -> str:
-    identity = (tuple(candidate_ids), {key: tuple(configs[key]) for key in sorted(configs)},
-                tuple((_canonical(getattr(point, "sequence_count", None)),
-                       _canonical(getattr(point, "token_count", None)),
-                       _canonical(getattr(point, "distribution", None))) for point in workloads),
-                policy_version, mode, _canonical(environment))
-    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+def _cache_key(
+    candidate_ids: Sequence[str],
+    configs: Mapping[str, Sequence[tuple[tuple[str, int], ...]]],
+    workloads: Sequence[Any],
+    policy_version: str,
+    mode: str,
+    environment: Any,
+) -> str:
+    identity = (
+        tuple(candidate_ids),
+        {key: tuple(configs[key]) for key in sorted(configs)},
+        tuple(
+            (
+                _canonical(getattr(point, "sequence_count", None)),
+                _canonical(getattr(point, "token_count", None)),
+                _canonical(getattr(point, "distribution", None)),
+            )
+            for point in workloads
+        ),
+        policy_version,
+        mode,
+        _canonical(environment),
+    )
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
 
 def _cache_get(cache: Any, key: str) -> Any | None:
@@ -276,12 +309,16 @@ def _valid_latency(value: Any) -> float:
 def _geomean(values: Sequence[float]) -> float:
     if not values:
         raise ValueError("cannot score an empty workload")
-    return math.exp(sum(math.log(_valid_latency(value)) for value in values) / len(values))
+    return math.exp(
+        sum(math.log(_valid_latency(value)) for value in values) / len(values)
+    )
 
 
 def _cuda_measure(callable_: Callable[[], Any]) -> float:
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA timing requires a CUDA device; inject timer for CPU tests")
+        raise RuntimeError(
+            "CUDA timing requires a CUDA device; inject timer for CPU tests"
+        )
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
     start.record()
@@ -296,9 +333,13 @@ def _synchronize_if_cuda() -> None:
         torch.cuda.synchronize()
 
 
-def _invoke(factory: Callable[[Any, tuple[tuple[str, int], ...], Any], Callable[[], Any]],
-            candidate: Any, config: tuple[tuple[str, int], ...], workload: Any,
-            timer: Callable[[Callable[[], Any]], float] | None) -> tuple[float, float]:
+def _invoke(
+    factory: Callable[[Any, tuple[tuple[str, int], ...], Any], Callable[[], Any]],
+    candidate: Any,
+    config: tuple[tuple[str, int], ...],
+    workload: Any,
+    timer: Callable[[Callable[[], Any]], float] | None,
+) -> tuple[float, float]:
     started = time.perf_counter()
     executable = factory(candidate, config, workload)
     # Compilation and allocation are deliberately outside the timed invocation.
@@ -309,9 +350,21 @@ def _invoke(factory: Callable[[Any, tuple[tuple[str, int], ...], Any], Callable[
     return measurement, compilation
 
 
-def _failure(candidate: Any, stage: str, error: BaseException,
-             config: tuple[tuple[str, int], ...] | None = None, workload_index: int | None = None) -> TuningFailure:
-    return TuningFailure(_candidate_id(candidate), stage, type(error).__name__, str(error) or repr(error), config, workload_index)
+def _failure(
+    candidate: Any,
+    stage: str,
+    error: BaseException,
+    config: tuple[tuple[str, int], ...] | None = None,
+    workload_index: int | None = None,
+) -> TuningFailure:
+    return TuningFailure(
+        _candidate_id(candidate),
+        stage,
+        type(error).__name__,
+        str(error) or repr(error),
+        config,
+        workload_index,
+    )
 
 
 def _serialize_result(result: TuningResult) -> dict[str, Any]:
@@ -320,19 +373,31 @@ def _serialize_result(result: TuningResult) -> dict[str, Any]:
         "winner": _candidate_id(result.winner),
         "winner_config": [[name, value] for name, value in result.winner_config],
         "scores": dict(result.scores),
-        "latency_records": {key: list(value) for key, value in result.latency_records.items()},
-        "compilation_timings": {key: list(value) for key, value in result.compilation_timings.items()},
+        "latency_records": {
+            key: list(value) for key, value in result.latency_records.items()
+        },
+        "compilation_timings": {
+            key: list(value) for key, value in result.compilation_timings.items()
+        },
         "policy_version": result.policy_version,
         "environment": _canonical(result.environment),
         "config_measurements": {
-            candidate: {json.dumps(config): list(values) for config, values in configs.items()}
+            candidate: {
+                json.dumps(config): list(values) for config, values in configs.items()
+            }
             for candidate, configs in result.config_measurements.items()
         },
     }
 
 
-def _cached_result(value: Any, candidates: Sequence[Any], policy_version: str, environment: Any,
-                   workload_count: int, configs: Mapping[str, Sequence[tuple[tuple[str, int], ...]]]) -> TuningResult | None:
+def _cached_result(
+    value: Any,
+    candidates: Sequence[Any],
+    policy_version: str,
+    environment: Any,
+    workload_count: int,
+    configs: Mapping[str, Sequence[tuple[tuple[str, int], ...]]],
+) -> TuningResult | None:
     if not isinstance(value, Mapping) or value.get("policy_version") != policy_version:
         return None
     if _canonical(value.get("environment")) != _canonical(environment):
@@ -347,19 +412,36 @@ def _cached_result(value: Any, candidates: Sequence[Any], policy_version: str, e
         expected_configs = configs[str(winner_id)]
         if winner_config not in expected_configs:
             return None
-        records = {str(key): tuple(_valid_latency(item) for item in values)
-                   for key, values in dict(value["latency_records"]).items()}
-        if not records or any(len(values) != workload_count for values in records.values()):
+        records = {
+            str(key): tuple(_valid_latency(item) for item in values)
+            for key, values in dict(value["latency_records"]).items()
+        }
+        if not records or any(
+            len(values) != workload_count for values in records.values()
+        ):
             return None
-        scores = {str(key): _valid_latency(item) for key, item in dict(value["scores"]).items()}
+        scores = {
+            str(key): _valid_latency(item)
+            for key, item in dict(value["scores"]).items()
+        }
         if set(scores) != set(records):
             return None
-        compile_times = {str(key): tuple(float(item) for item in values)
-                         for key, values in dict(value.get("compilation_timings", {})).items()}
+        compile_times = {
+            str(key): tuple(float(item) for item in values)
+            for key, values in dict(value.get("compilation_timings", {})).items()
+        }
     except (KeyError, TypeError, ValueError):
         return None
-    return TuningResult(winner, winner_config, scores, records, compile_times,
-                        cached=True, policy_version=policy_version, environment=environment)
+    return TuningResult(
+        winner,
+        winner_config,
+        scores,
+        records,
+        compile_times,
+        cached=True,
+        policy_version=policy_version,
+        environment=environment,
+    )
 
 
 def _workloads(policy: Any, mode: str) -> tuple[Any, ...]:
@@ -373,7 +455,9 @@ def _workloads(policy: Any, mode: str) -> tuple[Any, ...]:
     if not points:
         raise ValueError("tuning workload policy must contain at least one point")
     for point in points:
-        workload_lengths(point)  # validate compiler-owned policy before compiling anything.
+        workload_lengths(
+            point
+        )  # validate compiler-owned policy before compiling anything.
     return points
 
 
@@ -423,9 +507,17 @@ def tune_candidates(
         if not configs:
             raise ValueError(f"candidate {identity!r} has no kernel configurations")
         normalized_configs[identity] = configs
-    key = _cache_key(identities, normalized_configs, workloads, POLICY_VERSION, mode, environment)
-    cached = _cached_result(_cache_get(cache, key), candidates, POLICY_VERSION, environment,
-                            len(workloads), normalized_configs)
+    key = _cache_key(
+        identities, normalized_configs, workloads, POLICY_VERSION, mode, environment
+    )
+    cached = _cached_result(
+        _cache_get(cache, key),
+        candidates,
+        POLICY_VERSION,
+        environment,
+        len(workloads),
+        normalized_configs,
+    )
     if cached is not None:
         return cached
     costs: dict[str, int] = {}
@@ -439,40 +531,69 @@ def tune_candidates(
                 provided = None
             if provided is None:
                 provided = static_costs.get(identity)
-        costs[identity] = int(provided if provided is not None else getattr(candidate, "static_cost", 0))
+        costs[identity] = int(
+            provided if provided is not None else getattr(candidate, "static_cost", 0)
+        )
     # Measure the strongest feasible candidates; no representation is privileged.
-    ranked = sorted(candidates, key=lambda item: (costs[_candidate_id(item)], _candidate_id(item)))
+    ranked = sorted(
+        candidates, key=lambda item: (costs[_candidate_id(item)], _candidate_id(item))
+    )
     measured_candidates = tuple(
-        next(candidate for candidate in candidates if _candidate_id(candidate) == identity)
+        next(
+            candidate
+            for candidate in candidates
+            if _candidate_id(candidate) == identity
+        )
         for identity in dict.fromkeys(_candidate_id(item) for item in ranked[:3])
     )
     failures: list[TuningFailure] = []
     records_by_candidate: dict[str, tuple[float, ...]] = {}
     compile_by_candidate: dict[str, tuple[float, ...]] = {}
-    all_config_records: dict[str, dict[tuple[tuple[str, int], ...], tuple[float, ...]]] = {}
+    all_config_records: dict[
+        str, dict[tuple[tuple[str, int], ...], tuple[float, ...]]
+    ] = {}
 
     if not autotune:
-        winner = min(candidates, key=lambda item: (costs[_candidate_id(item)], _candidate_id(item)))
+        winner = min(
+            candidates,
+            key=lambda item: (costs[_candidate_id(item)], _candidate_id(item)),
+        )
         winner_id = _candidate_id(winner)
         winner_config = normalized_configs[winner_id][0]
-        result = TuningResult(winner, winner_config, {}, {}, {}, tuple(failures), False,
-                              POLICY_VERSION, environment, {})
+        result = TuningResult(
+            winner,
+            winner_config,
+            {},
+            {},
+            {},
+            tuple(failures),
+            False,
+            POLICY_VERSION,
+            environment,
+            {},
+        )
         return result
 
     # Equal small probe budget for every measured candidate.
     for candidate in measured_candidates:
         identity = _candidate_id(candidate)
-        successful: list[tuple[tuple[tuple[str, int], ...], tuple[float, ...], tuple[float, ...]]] = []
+        successful: list[
+            tuple[tuple[tuple[str, int], ...], tuple[float, ...], tuple[float, ...]]
+        ] = []
         for config in normalized_configs[identity][:probe_budget]:
             latencies: list[float] = []
             compile_times: list[float] = []
             config_failed = False
             for index, workload in enumerate(workloads):
                 try:
-                    latency, compile_time = _invoke(factory, candidate, config, workload, timer)
+                    latency, compile_time = _invoke(
+                        factory, candidate, config, workload, timer
+                    )
                     latencies.append(latency)
                     compile_times.append(compile_time)
-                except BaseException as error:  # candidate failures are evidence, not process failures.
+                except (
+                    BaseException
+                ) as error:  # candidate failures are evidence, not process failures.
                     failures.append(_failure(candidate, "probe", error, config, index))
                     config_failed = True
                     break
@@ -488,13 +609,26 @@ def tune_candidates(
             compile_by_candidate[identity] = chosen[2]
     if not records_by_candidate:
         raise GenericBaselineError(tuple(failures))
-    best_per_workload = tuple(min(values[index] for values in records_by_candidate.values()) for index in range(len(workloads)))
+    best_per_workload = tuple(
+        min(values[index] for values in records_by_candidate.values())
+        for index in range(len(workloads))
+    )
     scores = {
-        identity: math.exp(sum(math.log(values[index] / best_per_workload[index]) for index in range(len(workloads))) / len(workloads))
+        identity: math.exp(
+            sum(
+                math.log(values[index] / best_per_workload[index])
+                for index in range(len(workloads))
+            )
+            / len(workloads)
+        )
         for identity, values in records_by_candidate.items()
     }
-    winner_id = min(scores, key=lambda identity: (scores[identity], costs[identity], identity))
-    winner = next(candidate for candidate in candidates if _candidate_id(candidate) == winner_id)
+    winner_id = min(
+        scores, key=lambda identity: (scores[identity], costs[identity], identity)
+    )
+    winner = next(
+        candidate for candidate in candidates if _candidate_id(candidate) == winner_id
+    )
 
     # Full configuration search is intentionally restricted to the winner.
     full_records = all_config_records.setdefault(winner_id, {})
@@ -507,7 +641,9 @@ def tune_candidates(
         failed = False
         for index, workload in enumerate(workloads):
             try:
-                latency, compile_time = _invoke(factory, winner, config, workload, timer)
+                latency, compile_time = _invoke(
+                    factory, winner, config, workload, timer
+                )
                 latencies.append(latency)
                 compile_times.append(compile_time)
             except BaseException as error:
@@ -518,8 +654,12 @@ def tune_candidates(
             full_records[config] = tuple(latencies)
             full_compile_records.extend(compile_times)
     if not full_records:
-        raise RuntimeError(f"winning candidate {winner_id!r} has no valid full configuration")
-    winner_config, winner_latencies = min(full_records.items(), key=lambda item: (_geomean(item[1]), item[0]))
+        raise RuntimeError(
+            f"winning candidate {winner_id!r} has no valid full configuration"
+        )
+    winner_config, winner_latencies = min(
+        full_records.items(), key=lambda item: (_geomean(item[1]), item[0])
+    )
     records_by_candidate[winner_id] = winner_latencies
     compile_by_candidate[winner_id] = tuple(full_compile_records)
     if failures:
@@ -532,9 +672,18 @@ def tune_candidates(
             RuntimeWarning,
             stacklevel=2,
         )
-    result = TuningResult(winner, winner_config, scores, records_by_candidate, compile_by_candidate,
-                          tuple(failures), False, POLICY_VERSION, environment,
-                          {key_: dict(value) for key_, value in all_config_records.items()})
+    result = TuningResult(
+        winner,
+        winner_config,
+        scores,
+        records_by_candidate,
+        compile_by_candidate,
+        tuple(failures),
+        False,
+        POLICY_VERSION,
+        environment,
+        {key_: dict(value) for key_, value in all_config_records.items()},
+    )
     _cache_publish(cache, key, _serialize_result(result))
     return result
 
@@ -546,7 +695,16 @@ tune = tune_candidates
 
 
 __all__ = [
-    "PROBE_BUDGET", "POLICY_VERSION", "WorkloadPoint", "CandidateSpec",
-    "TuningFailure", "TuningResult", "GenericBaselineError", "MeasurementCache",
-    "workload_lengths", "tune_candidates", "benchmark_candidates", "tune",
+    "PROBE_BUDGET",
+    "POLICY_VERSION",
+    "WorkloadPoint",
+    "CandidateSpec",
+    "TuningFailure",
+    "TuningResult",
+    "GenericBaselineError",
+    "MeasurementCache",
+    "workload_lengths",
+    "tune_candidates",
+    "benchmark_candidates",
+    "tune",
 ]

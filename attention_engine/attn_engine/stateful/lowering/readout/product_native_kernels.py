@@ -3,6 +3,7 @@
 Only chunk carries retain the expanded Feature axis. Local scores use the
 existing two-base-GEMM factorization; no quadratic sequence workspace is built.
 """
+
 import hashlib
 import linecache
 from functools import lru_cache
@@ -15,8 +16,13 @@ _READOUT_KERNELS = {}
 
 
 def _key(recipe, context, expressions, tensors, length, heads):
-    return (recipe, context.specialization_key(expressions), length, heads,
-            tuple((tuple(t.shape), tuple(t.stride()), t.dtype, t.device) for t in tensors))
+    return (
+        recipe,
+        context.specialization_key(expressions),
+        length,
+        heads,
+        tuple((tuple(t.shape), tuple(t.stride()), t.dtype, t.device) for t in tensors),
+    )
 
 
 def _annotation(name, tensor):
@@ -29,11 +35,13 @@ def _compile(body, annotations, device):
     import tilelang
     import tilelang.language as T
 
-    text = ("@tilelang.jit(compile_flags=['-fmad=false'])\n"
-            "def build():\n"
-            "    @T.prim_func\n"
-            f"    def kernel({annotations}):\n{body}\n"
-            "    return kernel\n")
+    text = (
+        "@tilelang.jit(compile_flags=['-fmad=false'])\n"
+        "def build():\n"
+        "    @T.prim_func\n"
+        f"    def kernel({annotations}):\n{body}\n"
+        "    return kernel\n"
+    )
     filename = f"<native-product-{hashlib.sha256(text.encode()).hexdigest()}>"
     linecache.cache[filename] = (len(text), None, text.splitlines(True), filename)
     namespace = {"tilelang": tilelang, "T": T, "gemm": fp32_gemm_macro(T)}
@@ -71,7 +79,11 @@ def launch_product_summary(recipe, inputs, summaries, *, sequence_length, heads)
             columns = 1 if denominator else recipe.columns
             tiles = ((pair.rows + 31) // 32) * ((columns + 31) // 32)
             key = _factor(context, pair.key, pair.right, "flat", "row")
-            value = "1.0" if denominator else context.emit_value(pair.value, "flat", "head", "column")
+            value = (
+                "1.0"
+                if denominator
+                else context.emit_value(pair.value, "flat", "head", "column")
+            )
             name = f"D{i}" if denominator else f"N{i}"
             tile_columns = (columns + 31) // 32
             tile_row = f"((tile - {offset}) // {tile_columns})"
@@ -105,14 +117,18 @@ def launch_product_summary(recipe, inputs, summaries, *, sequence_length, heads)
     kernel(*context.pointers, *arguments)
 
 
-def launch_product_normalized(recipe, inputs, carries, output, *, sequence_length, heads):
+def launch_product_normalized(
+    recipe, inputs, carries, output, *, sequence_length, heads
+):
     from ....stateful_operator import Add, Constant, Multiply, StateTerm
 
     expressions = tuple(e for p in recipe.pairs for e in (*p.key, *p.query, p.value))
     context = RawLoaderContext(expressions, inputs, heads, sequence_length)
     bh, chunks = carries[0][0].shape[:2]
     arguments = tuple(t for pair in carries for t in pair)
-    cache_key = _key(recipe, context, expressions, (*arguments, output), sequence_length, heads)
+    cache_key = _key(
+        recipe, context, expressions, (*arguments, output), sequence_length, heads
+    )
     kernel = _READOUT_KERNELS.get(cache_key)
     if kernel is not None:
         kernel(*context.pointers, *arguments, output)
@@ -124,7 +140,9 @@ def launch_product_normalized(recipe, inputs, carries, output, *, sequence_lengt
     declarations, sections, term_names = [], [], {}
     for i, (pair, terms) in enumerate(zip(recipe.pairs, recipe.terms)):
         declarations.append(f"            p{i} = T.alloc_fragment((64, 32), 'float32')")
-        declarations.append(f"            result{i} = T.alloc_shared((64, 32), 'float32')")
+        declarations.append(
+            f"            result{i} = T.alloc_shared((64, 32), 'float32')"
+        )
         term_names[terms[0]] = f"result{i}[t, c]"
         term_names[terms[1]] = f"result{i}[t, 16]"
         query = _factor(context, pair.query, pair.right, "flat", "row")
@@ -148,7 +166,11 @@ def launch_product_normalized(recipe, inputs, carries, output, *, sequence_lengt
             T.clear(score)
             T.clear(other)""")
         for factor_index, (key, query_part) in enumerate(zip(pair.key, pair.query)):
-            dimension = pair.rows if len(pair.key) == 1 else (pair.rows // pair.right if factor_index == 0 else pair.right)
+            dimension = (
+                pair.rows
+                if len(pair.key) == 1
+                else (pair.rows // pair.right if factor_index == 0 else pair.right)
+            )
             qexpr = context.emit_value(query_part, "flat", "head", "feature")
             kexpr = context.emit_value(key, "flat", "head", "feature")
             accumulator = "score" if factor_index == 0 else "other"
@@ -164,7 +186,13 @@ def launch_product_normalized(recipe, inputs, carries, output, *, sequence_lengt
                     feature = fb * 32 + r
                     k[r, t] = T.if_then_else((token < {sequence_length}) & (feature < {dimension}), {kexpr}, 0.0)
                 gemm(q, k, {accumulator})""")
-        local_score = "1.0" if not pair.key else "score[t, s]" if len(pair.key) == 1 else "score[t, s] * other[t, s]"
+        local_score = (
+            "1.0"
+            if not pair.key
+            else "score[t, s]"
+            if len(pair.key) == 1
+            else "score[t, s] * other[t, s]"
+        )
         causal = "s < t" if pair.prior else "s <= t"
         value = context.emit_value(pair.value, "flat", "head", "column")
         sections.append(f"""            for t, s in T.Parallel(64, 64):
@@ -187,10 +215,13 @@ def launch_product_normalized(recipe, inputs, carries, output, *, sequence_lengt
             return term_names[node]
         if isinstance(node, Constant):
             return f"T.cast({node.value!r}, 'float32')"
-        symbol = "+" if isinstance(node, Add) else "*" if isinstance(node, Multiply) else "/"
+        symbol = (
+            "+" if isinstance(node, Add) else "*" if isinstance(node, Multiply) else "/"
+        )
         return f"({emit(node.left)} {symbol} {emit(node.right)})"
 
-    body = f"""        with T.Kernel({bh}, {chunks}, T.ceildiv({recipe.columns}, 16), threads=128) as (sh, chunk, column_block):
+    body = (
+        f"""        with T.Kernel({bh}, {chunks}, T.ceildiv({recipe.columns}, 16), threads=128) as (sh, chunk, column_block):
             sequence = sh // {heads}
             head = sh % {heads}
             q = T.alloc_shared((64, 32), 'float32')
@@ -200,12 +231,15 @@ def launch_product_normalized(recipe, inputs, carries, output, *, sequence_lengt
             score_shared = T.alloc_shared((64, 64), 'float32')
             score = T.alloc_fragment((64, 64), 'float32')
             other = T.alloc_fragment((64, 64), 'float32')
-""" + "\n".join(declarations + sections) + f"""
+"""
+        + "\n".join(declarations + sections)
+        + f"""
             for t, c in T.Parallel(64, 16):
                 token = chunk * 64 + t
                 column = column_block * 16 + c
                 if (token < {sequence_length}) & (column < {recipe.columns}):
                     Output[sequence * {sequence_length} + token, head, column] = {emit(recipe.expression)}"""
+    )
     kernel = _compile(body, ", ".join(annotations), output.device)
     _READOUT_KERNELS[cache_key] = kernel
     kernel(*context.pointers, *arguments, output)

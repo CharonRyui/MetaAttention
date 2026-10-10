@@ -4,9 +4,11 @@ The Stateful IR and mathematical plans are target-independent.  This module owns
 hardware facts and the small, lowering-facing default schedule space.  It does
 not select a winner; measurement remains the responsibility of ``tuning.py``.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
+
 
 @dataclass(frozen=True)
 class DeviceProfile:
@@ -73,7 +75,11 @@ def resolve_device_profile(target: Any) -> DeviceProfile:
     device_type = getattr(target, "device_type", "cuda")
     product_family = str(getattr(target, "product_family", "H20"))
     capability = tuple(getattr(target, "capability", (9, 0)))
-    if device_type == "cuda" and product_family.upper() == "H20" and capability == (9, 0):
+    if (
+        device_type == "cuda"
+        and product_family.upper() == "H20"
+        and capability == (9, 0)
+    ):
         return _H20
     if device_type == "cpu":
         return _CPU
@@ -100,8 +106,10 @@ class ScheduleConfig:
         names = tuple(name for name, _ in self.values)
         if names != tuple(sorted(set(names))):
             raise ValueError("schedule configuration names must be unique and sorted")
-        if any(isinstance(value, bool) or not isinstance(value, int) or value <= 0
-               for _, value in self.values):
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+            for _, value in self.values
+        ):
             raise ValueError("schedule configuration values must be positive integers")
 
     @property
@@ -109,7 +117,9 @@ class ScheduleConfig:
         return self.values
 
 
-def schedule_configurations(candidate: Any, profile: DeviceProfile) -> tuple[ScheduleConfig, ...]:
+def schedule_configurations(
+    candidate: Any, profile: DeviceProfile
+) -> tuple[ScheduleConfig, ...]:
     """Return the legal first-generation schedule domain for one candidate."""
     if getattr(candidate, "lowerer", None) == "tilelang-elementwise":
         return tuple(

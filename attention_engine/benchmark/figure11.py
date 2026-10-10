@@ -611,7 +611,6 @@ def bench_gated_retention(
     g.detach_().requires_grad_(require_grad)
     v.detach_().requires_grad_(require_grad)
 
-
     # ours
     attention_module = gated_retention(B, H, S, D, DV, dtype=dtype)
     attention_module = _compile_factory_profile(
@@ -631,7 +630,6 @@ def bench_gated_retention(
         bwd_lat = timer(lambda: o.backward(do, retain_graph=True))
 
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
-
 
     return result_dict
 
@@ -665,7 +663,6 @@ def bench_retnet_recurrent(
     g.detach_().requires_grad_(False)
     v.detach_().requires_grad_(require_grad)
 
-
     # ours
     attention_module = retnet_recurrent(B, H, S, D, DV, dtype=dtype)
     attention_module = _compile_factory_profile(
@@ -685,7 +682,6 @@ def bench_retnet_recurrent(
         bwd_lat = timer(lambda: o.backward(do, retain_graph=True))
 
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
-
 
     return result_dict
 
@@ -816,7 +812,6 @@ def bench_mamba2_ssm(
         ).outputs["output"]
         bwd_lat = timer(lambda: o.backward(do_ours, retain_graph=True))
     result_dict["MetaAttention"] = (fwd_lat, bwd_lat)
-
 
     # torch inductor
     try:
@@ -1049,7 +1044,6 @@ def bench_mla_decode(
     attention_module = mla_decode(B, HQ, SKV, D, DV, HK=HKV, HV=HKV, dtype=dtype)
     fwd_lat = timer(lambda: attention_module(q, KV))
     result_dict["MetaAttention"] = (fwd_lat, None)
-
 
     return result_dict
 

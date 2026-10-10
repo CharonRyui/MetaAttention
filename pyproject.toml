@@ -57,6 +57,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.ruff]
 exclude = [
+  "3rd_parties",
   "attention_engine/core/template/cute_template",
   "attention_engine/core/template/cute_template_v2",
   "attention_engine/core/template/cute_template_kvshared",

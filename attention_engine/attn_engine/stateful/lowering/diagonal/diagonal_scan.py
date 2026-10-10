@@ -1,4 +1,5 @@
 """TileLang hierarchical affine prefixes for diagonal chunk summaries."""
+
 from functools import lru_cache
 
 import torch
@@ -9,7 +10,11 @@ _GROUP = 32
 
 
 def _metadata(tensor):
-    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype).removeprefix("torch."),
+    )
 
 
 def _state_view(state):
@@ -25,8 +30,14 @@ def _state_view(state):
 
 @lru_cache(maxsize=None)
 def _compile_affine_scan(
-    scale_meta, bias_meta, initial_meta, carry_meta, final_meta,
-    mode: str, write_final: bool, device_index: int,
+    scale_meta,
+    bias_meta,
+    initial_meta,
+    carry_meta,
+    final_meta,
+    mode: str,
+    write_final: bool,
+    device_index: int,
 ):
     import tilelang
     import tilelang.language as T
@@ -71,8 +82,12 @@ def _compile_affine_scan(
             if mode == "direct":
                 state[lane] = T.if_then_else(
                     x < elements,
-                    Initial[sh // Initial.shape[1], sh % Initial.shape[1],
-                            x // columns, x % columns],
+                    Initial[
+                        sh // Initial.shape[1],
+                        sh % Initial.shape[1],
+                        x // columns,
+                        x % columns,
+                    ],
                     0.0,
                 )
             else:
@@ -99,27 +114,36 @@ def _compile_affine_scan(
             for lane in T.Parallel(_BLOCK):
                 x = block * _BLOCK + lane
                 if x < elements and (mode == "direct" or group == groups - 1):
-                    Final[sh // Final.shape[1], sh % Final.shape[1],
-                          x // columns, x % columns] = state[lane]
+                    Final[
+                        sh // Final.shape[1],
+                        sh % Final.shape[1],
+                        x // columns,
+                        x % columns,
+                    ] = state[lane]
 
     scale_shape, scale_strides, scale_dtype = scale_meta
     bias_shape, bias_strides, bias_dtype = bias_meta
     initial_shape, initial_strides, initial_dtype = initial_meta
     carry_shape, carry_strides, carry_dtype = carry_meta
     final_shape, final_strides, final_dtype = final_meta
+
     @tilelang.jit
     def build_kernel():
         if mode == "local":
+
             @T.prim_func
             def kernel(
                 Scale: T.StridedTensor(scale_shape, scale_strides, scale_dtype),
                 Bias: T.StridedTensor(bias_shape, bias_strides, bias_dtype),
-                GroupScale: T.StridedTensor(initial_shape, initial_strides, initial_dtype),
+                GroupScale: T.StridedTensor(
+                    initial_shape, initial_strides, initial_dtype
+                ),
                 GroupBias: T.StridedTensor(carry_shape, carry_strides, carry_dtype),
             ):
                 with T.Kernel(bh, groups, blocks, threads=128) as (sh, group, block):
                     scan(Scale, Bias, None, GroupScale, GroupBias, sh, group, block)
         else:
+
             @T.prim_func
             def kernel(
                 Scale: T.StridedTensor(scale_shape, scale_strides, scale_dtype),
@@ -130,6 +154,7 @@ def _compile_affine_scan(
             ):
                 with T.Kernel(bh, groups, blocks, threads=128) as (sh, group, block):
                     scan(Scale, Bias, Initial, Carry, Final, sh, group, block)
+
         return kernel
 
     return build_kernel()
@@ -143,14 +168,26 @@ def _launch(mode, scale, bias, initial, carry, final, *, write_final):
         device_index = torch.cuda.current_device()
     if mode == "local":
         kernel = _compile_affine_scan(
-            _metadata(scale), _metadata(bias), _metadata(initial),
-            _metadata(carry), _metadata(carry), mode, write_final, device_index,
+            _metadata(scale),
+            _metadata(bias),
+            _metadata(initial),
+            _metadata(carry),
+            _metadata(carry),
+            mode,
+            write_final,
+            device_index,
         )
         kernel(scale, bias, initial, carry)
         return
     kernel = _compile_affine_scan(
-        _metadata(scale), _metadata(bias), _metadata(initial),
-        _metadata(carry), _metadata(final), mode, write_final, device_index,
+        _metadata(scale),
+        _metadata(bias),
+        _metadata(initial),
+        _metadata(carry),
+        _metadata(final),
+        mode,
+        write_final,
+        device_index,
     )
     kernel(scale, bias, initial, carry, final)
 
@@ -161,7 +198,11 @@ def hierarchical_carry(scale, bias, initial, carry, final, *, identity, write_fi
         from .identity_scan import identity_hierarchical_carry
 
         return identity_hierarchical_carry(
-            bias, initial, carry, final, write_final=write_final,
+            bias,
+            initial,
+            carry,
+            final,
+            write_final=write_final,
         )
     _, chunks, rows, columns = bias.shape
     if chunks <= 64:
@@ -169,13 +210,22 @@ def hierarchical_carry(scale, bias, initial, carry, final, *, identity, write_fi
         return
     groups = (chunks + _GROUP - 1) // _GROUP
     group_scale = torch.empty(
-        (bias.shape[0], groups, rows, columns), device=bias.device, dtype=torch.float32,
+        (bias.shape[0], groups, rows, columns),
+        device=bias.device,
+        dtype=torch.float32,
     )
     group_bias = torch.empty_like(group_scale)
     group_carry = torch.empty_like(group_scale)
-    _launch("local", scale, bias, group_scale, group_bias, group_bias, write_final=False)
+    _launch(
+        "local", scale, bias, group_scale, group_bias, group_bias, write_final=False
+    )
     hierarchical_carry(
-        group_scale, group_bias, initial, group_carry, final,
-        identity=False, write_final=False,
+        group_scale,
+        group_bias,
+        initial,
+        group_carry,
+        final,
+        identity=False,
+        write_final=False,
     )
     _launch("apply", scale, bias, group_carry, carry, final, write_final=write_final)

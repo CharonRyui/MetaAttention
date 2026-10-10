@@ -52,30 +52,50 @@ def make_profile(kind: str, *, renamed: bool = False) -> CompositionProfile:
         "coefficient": "weight" if renamed else "coefficient",
     }
     inputs = [
-        TensorInput(names["query"], (Batch, query_heads, Sequence, row), torch.bfloat16),
+        TensorInput(
+            names["query"], (Batch, query_heads, Sequence, row), torch.bfloat16
+        ),
     ]
     if kind != "axis":
         inputs.append(
-            TensorInput(names["auxiliary"], (Batch, query_heads, Sequence, row), torch.bfloat16)
+            TensorInput(
+                names["auxiliary"], (Batch, query_heads, Sequence, row), torch.bfloat16
+            )
         )
     inputs.extend(
         [
-            TensorInput(names["left"], (Batch, source_heads, Sequence, row), torch.bfloat16),
-            TensorInput(names["value"], (Batch, source_heads, Sequence, column), torch.bfloat16),
+            TensorInput(
+                names["left"], (Batch, source_heads, Sequence, row), torch.bfloat16
+            ),
+            TensorInput(
+                names["value"], (Batch, source_heads, Sequence, column), torch.bfloat16
+            ),
         ]
     )
     if kind in {"axis", "mixed"}:
         inputs.extend(
             [
-                TensorInput(names["row_gate"], (Batch, state_heads, Sequence, row), torch.float32),
-                TensorInput(names["column_gate"], (Batch, state_heads, Sequence, column), torch.float32),
+                TensorInput(
+                    names["row_gate"],
+                    (Batch, state_heads, Sequence, row),
+                    torch.float32,
+                ),
+                TensorInput(
+                    names["column_gate"],
+                    (Batch, state_heads, Sequence, column),
+                    torch.float32,
+                ),
             ]
         )
     if kind in {"mixed", "injections", "rank-one"}:
         inputs.extend(
             [
-                TensorInput(names["right"], (Batch, source_heads, Sequence, row), torch.bfloat16),
-                TensorInput(names["coefficient"], (Batch, state_heads, Sequence), torch.float32),
+                TensorInput(
+                    names["right"], (Batch, source_heads, Sequence, row), torch.bfloat16
+                ),
+                TensorInput(
+                    names["coefficient"], (Batch, state_heads, Sequence), torch.float32
+                ),
             ]
         )
     state = StateSpec("state", (Batch, state_heads, row, column))
@@ -108,7 +128,9 @@ def make_profile(kind: str, *, renamed: bool = False) -> CompositionProfile:
             ProductInjection(
                 (
                     ProductFactor(Input(names["right"]), (row,)),
-                    ProductFactor(Input(names["value"]) * Input(names["coefficient"]), (column,)),
+                    ProductFactor(
+                        Input(names["value"]) * Input(names["coefficient"]), (column,)
+                    ),
                 )
             )
         )
@@ -117,7 +139,9 @@ def make_profile(kind: str, *, renamed: bool = False) -> CompositionProfile:
             ProductInjection(
                 (
                     ProductFactor(Input(names["right"]), (row,)),
-                    ProductFactor(Input(names["value"]) * Input(names["coefficient"]), (column,)),
+                    ProductFactor(
+                        Input(names["value"]) * Input(names["coefficient"]), (column,)
+                    ),
                 )
             )
         )
@@ -135,12 +159,16 @@ def make_profile(kind: str, *, renamed: bool = False) -> CompositionProfile:
     ]
     if kind != "axis":
         readouts.append(
-            StateContraction("auxiliary", "state", Input(names["auxiliary"]), row, torch.bfloat16)
+            StateContraction(
+                "auxiliary", "state", Input(names["auxiliary"]), row, torch.bfloat16
+            )
         )
     algorithm = AlgorithmIR(
         inputs=tuple(inputs),
         states=(state,),
-        transition=StateTransition("state", propagations=tuple(propagations), injections=tuple(injections)),
+        transition=StateTransition(
+            "state", propagations=tuple(propagations), injections=tuple(injections)
+        ),
         readouts=tuple(readouts),
         head_mapping=HeadMapping({query_heads: state_heads, source_heads: state_heads}),
     )
@@ -151,17 +179,27 @@ def make_profile(kind: str, *, renamed: bool = False) -> CompositionProfile:
     )
 
 
-def make_inputs(profile: CompositionProfile, *, batch: int, length: int, device: torch.device):
+def make_inputs(
+    profile: CompositionProfile, *, batch: int, length: int, device: torch.device
+):
     generator = torch.Generator(device=device).manual_seed(1701 + length)
     values = {}
     for spec in profile.operator.algorithm.inputs:
         shape = tuple(
-            batch if role == Batch else length if role == Sequence else profile.role_sizes[role]
+            batch
+            if role == Batch
+            else length
+            if role == Sequence
+            else profile.role_sizes[role]
             for role in spec.roles
         )
         if spec.dtype == torch.float32:
-            tensor = 0.01 * torch.randn(shape, device=device, dtype=spec.dtype, generator=generator)
+            tensor = 0.01 * torch.randn(
+                shape, device=device, dtype=spec.dtype, generator=generator
+            )
         else:
-            tensor = 0.05 * torch.randn(shape, device=device, dtype=spec.dtype, generator=generator)
+            tensor = 0.05 * torch.randn(
+                shape, device=device, dtype=spec.dtype, generator=generator
+            )
         values[spec.name] = tensor
     return values

@@ -1,4 +1,5 @@
 """Compiler-owned workloads exercised through the ordinary compiled callable."""
+
 from dataclasses import replace
 import math
 
@@ -8,7 +9,12 @@ import torch
 def invocation_factory(operator, compilation, base_executable, plans, device):
     from .plan import KernelConfig, WorkspacePolicy, _digest
     from ...stateful_operator import (
-        Batch, Sequence, One, CompiledStatefulOperator, StatefulOperator, StateTuple,
+        Batch,
+        Sequence,
+        One,
+        CompiledStatefulOperator,
+        StatefulOperator,
+        StateTuple,
     )
 
     roles = dict(compilation.role_sizes)
@@ -23,8 +29,14 @@ def invocation_factory(operator, compilation, base_executable, plans, device):
         shapes = {}
         for spec in operator.algorithm.inputs:
             if compilation.mode == "packed":
-                shape = (sum(lengths), *(roles[role] if role != One else 1
-                    for role in spec.roles if role not in (Batch, Sequence)))
+                shape = (
+                    sum(lengths),
+                    *(
+                        roles[role] if role != One else 1
+                        for role in spec.roles
+                        if role not in (Batch, Sequence)
+                    ),
+                )
             else:
                 shape = tuple(sizes[role] for role in spec.roles)
             shapes[spec.name] = shape
@@ -32,28 +44,41 @@ def invocation_factory(operator, compilation, base_executable, plans, device):
         elements = sum(math.prod(shape) for shape in shapes.values())
         estimate = dict(base_executable.plan.candidate_estimates)[candidate.identity]
         workspace = WorkspacePolicy(
-            estimate.workspace_bytes_per_token, compilation.target.workspace_bytes,
+            estimate.workspace_bytes_per_token,
+            compilation.target.workspace_bytes,
             aligned_bytes_per_token=estimate.aligned_workspace_bytes_per_token,
             alignment_tokens=estimate.alignment_tokens,
             bytes_per_chunk=estimate.workspace_bytes_per_chunk,
         )
-        required = workspace.required_bytes(sum(lengths), sequence_count=len(lengths),
-                                            sequence_length=max(lengths))
+        required = workspace.required_bytes(
+            sum(lengths), sequence_count=len(lengths), sequence_length=max(lengths)
+        )
         required += elements * 8
-        required += 8 * len(lengths) * sum(roles[spec.head_role] * math.prod(roles[role] for role in spec.feature_roles)
-                                         for spec in states)
+        required += (
+            8
+            * len(lengths)
+            * sum(
+                roles[spec.head_role]
+                * math.prod(roles[role] for role in spec.feature_roles)
+                for spec in states
+            )
+        )
         free, _ = torch.cuda.mem_get_info(device)
         if required > min(compilation.target.workspace_bytes, free // 2):
             raise RuntimeError("tuning workload exceeds safe resource envelope")
         inputs = {
-            spec.name: torch.full(shapes[spec.name], 0.001, device=device, dtype=spec.dtype)
+            spec.name: torch.full(
+                shapes[spec.name], 0.001, device=device, dtype=spec.dtype
+            )
             for spec in operator.algorithm.inputs
         }
         initial_tensors = []
         for spec in states:
             feature_shape = tuple(roles[role] for role in spec.feature_roles)
             initial_tensors.append(
-                torch.zeros(len(lengths), roles[spec.head_role], *feature_shape, device=device)
+                torch.zeros(
+                    len(lengths), roles[spec.head_role], *feature_shape, device=device
+                )
             )
         initial = StateTuple(
             tuple(spec.name for spec in states), tuple(initial_tensors)
@@ -63,19 +88,34 @@ def invocation_factory(operator, compilation, base_executable, plans, device):
             offsets = [0]
             for length in lengths:
                 offsets.append(offsets[-1] + length)
-            kwargs["sequence_offsets"] = torch.tensor(offsets, dtype=torch.int32, device=device)
-        kernel_config = KernelConfig(_digest((candidate.identity, config)), tuple(config))
-        selected = next(plan for plan in plans if plan.identity == candidate.plan_identity)
+            kwargs["sequence_offsets"] = torch.tensor(
+                offsets, dtype=torch.int32, device=device
+            )
+        kernel_config = KernelConfig(
+            _digest((candidate.identity, config)), tuple(config)
+        )
+        selected = next(
+            plan for plan in plans if plan.identity == candidate.plan_identity
+        )
         rank_one = (
             base_executable.rank_one_factored
             if candidate.lowerer == "tilelang-factored-recurrence"
             else None
         )
-        executable = replace(base_executable, plan=replace(
-            base_executable.plan, candidate=candidate, mathematical_plan=selected,
-            kernel_config=kernel_config, workspace=workspace,
-        ), rank_one_factored=rank_one,
-            chunked_recipe=select_chunked_schedule(base_executable.chunked_recipe, candidate.lowerer))
+        executable = replace(
+            base_executable,
+            plan=replace(
+                base_executable.plan,
+                candidate=candidate,
+                mathematical_plan=selected,
+                kernel_config=kernel_config,
+                workspace=workspace,
+            ),
+            rank_one_factored=rank_one,
+            chunked_recipe=select_chunked_schedule(
+                base_executable.chunked_recipe, candidate.lowerer
+            ),
+        )
         # An isolated invocation owner avoids mutating a live user's specialization.
         owner = StatefulOperator(operator.algorithm)
         key = candidate.identity + kernel_config.identity

@@ -51,8 +51,19 @@ def test_matrix_rejects_unsupported_or_invalid_axes():
 
 def test_extended_family_defaults_are_registered():
     assert set(P0_FAMILIES) == {
-        "linear", "normalized-linear", "simple-gla", "gla", "retention",
-        "retnet", "rwkv6", "rwkv7", "gdn", "gsa", "hgrn", "based", "rebased",
+        "linear",
+        "normalized-linear",
+        "simple-gla",
+        "gla",
+        "retention",
+        "retnet",
+        "rwkv6",
+        "rwkv7",
+        "gdn",
+        "gsa",
+        "hgrn",
+        "based",
+        "rebased",
     }
 
 
@@ -65,6 +76,8 @@ def test_idle_gpu_selection_rejects_busy_and_selects_most_free():
     assert choose_idle_gpu(gpus).index == 2
     with pytest.raises(RuntimeError, match="no GPU"):
         choose_idle_gpu((gpus[0],))
+
+
 def test_fla_baseline_records_non_comparable_family(monkeypatch):
     import torch
     from testing.benchmark_fla_stateful import _fla_call
@@ -78,12 +91,21 @@ def test_fla_baseline_records_non_comparable_family(monkeypatch):
     assert adapter.comparable is False
     assert "native a/b" in adapter.note
 
+
 def test_meta_failure_status_distinguishes_runtime_resource():
     from testing.benchmark_fla_stateful import _meta_failure_status
 
-    assert _meta_failure_status(RuntimeError("RUNTIME_RESOURCE at workspace")) == "META_RUNTIME_REJECTED"
-    assert _meta_failure_status(RuntimeError("COMPILE_RESOURCE at workspace")) == "META_COMPILE_REJECTED"
+    assert (
+        _meta_failure_status(RuntimeError("RUNTIME_RESOURCE at workspace"))
+        == "META_RUNTIME_REJECTED"
+    )
+    assert (
+        _meta_failure_status(RuntimeError("COMPILE_RESOURCE at workspace"))
+        == "META_COMPILE_REJECTED"
+    )
     assert _meta_failure_status(ValueError("bad input")) == "META_FAILED"
+
+
 def test_valid_pair_requires_all_correctness_and_statuses():
     from testing.benchmark_fla_stateful import _valid_pair
 
@@ -106,15 +128,23 @@ def test_csv_rows_hide_measurements_for_invalid_pairs():
     from testing.benchmark_fla_stateful import _csv_rows
 
     record = {
-        "schema_version": 5, "family": "linear", "batch": 1, "heads": 1,
-        "seqlen": 3, "contract": "output-only", "status": "OK", "fla_status": "FAILED",
-        "meta": {"public_cuda_event_ms": 1.0}, "fla": {"public_cuda_event_ms": 2.0},
+        "schema_version": 5,
+        "family": "linear",
+        "batch": 1,
+        "heads": 1,
+        "seqlen": 3,
+        "contract": "output-only",
+        "status": "OK",
+        "fla_status": "FAILED",
+        "meta": {"public_cuda_event_ms": 1.0},
+        "fla": {"public_cuda_event_ms": 2.0},
         "speedup_public_cuda_event_ms": 2.0,
     }
     row = _csv_rows([record])[0]
     assert row["meta_ms"] is None
     assert row["fla_ms"] is None
     assert row["speedup"] is None
+
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("family", ["linear", "retention", "retnet"])
@@ -126,8 +156,12 @@ def test_long_scalar_families_use_safe_schedule(gpu_device, family):
     case = case.__class__(**{**case.__dict__, "batch": 2, "heads": 16})
     operator = case.factory(**case.kwargs(8192))
     sizes = benchmark.role_sizes_for(operator, case, 8192)
-    compiled = operator.compile(role_sizes=sizes, target=benchmark.Target(), mode="dense", optimized=True)
+    compiled = operator.compile(
+        role_sizes=sizes, target=benchmark.Target(), mode="dense", optimized=True
+    )
     inputs = benchmark.inputs_for(operator, case, 8192, gpu_device)
     actual, _ = benchmark._meta_call(compiled, [inputs], "output-only")()
     expected, _ = benchmark._token_oracle(operator, inputs, sizes)
-    assert torch.allclose(actual["output"].cpu().float(), expected["output"], rtol=0.02, atol=0.05)
+    assert torch.allclose(
+        actual["output"].cpu().float(), expected["output"], rtol=0.02, atol=0.05
+    )

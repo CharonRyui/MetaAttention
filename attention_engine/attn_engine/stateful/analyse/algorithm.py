@@ -73,6 +73,7 @@ class RankOneFactoredIR:
     ``symmetric_rank_one`` proves that every rank-one propagation uses the same
     feature expression on both sides of its contraction.
     """
+
     operations: tuple[FactoredOperationIR, ...]
     injection_count: int
     readout_roles: tuple[Any, ...]

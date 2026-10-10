@@ -12,35 +12,125 @@ ContextEntry = tuple[str, str, tuple[str, ...], str]
 
 
 _DENSE_CONTEXT: tuple[ContextEntry, ...] = (
-    ("transition.left", "runtime", ("head", "row", "feature"), "[tokens,heads,rows,inner]"),
-    ("transition.right", "runtime", ("head", "feature", "column"), "[tokens,heads,inner,columns]"),
+    (
+        "transition.left",
+        "runtime",
+        ("head", "row", "feature"),
+        "[tokens,heads,rows,inner]",
+    ),
+    (
+        "transition.right",
+        "runtime",
+        ("head", "feature", "column"),
+        "[tokens,heads,inner,columns]",
+    ),
     ("transition.segment", "int32", ("token",), "[tokens]"),
-    ("transition.initial_state", "runtime", ("head", "row", "column"), "[sequences,heads,rows,columns]"),
-    ("transition.states", "runtime", ("token", "head", "row", "column"), "[tokens,heads,rows,columns]"),
+    (
+        "transition.initial_state",
+        "runtime",
+        ("head", "row", "column"),
+        "[sequences,heads,rows,columns]",
+    ),
+    (
+        "transition.states",
+        "runtime",
+        ("token", "head", "row", "column"),
+        "[tokens,heads,rows,columns]",
+    ),
 )
 _ELEMENTWISE_CONTEXT: tuple[ContextEntry, ...] = (
-    ("transition.scale", "runtime", ("head", "row", "column"), "[tokens,heads,scale_rows,scale_columns]"),
+    (
+        "transition.scale",
+        "runtime",
+        ("head", "row", "column"),
+        "[tokens,heads,scale_rows,scale_columns]",
+    ),
     # the pair slots hold the second State axis factor, or None when the Program
     # scales one axis only
-    ("transition.second", "runtime", ("head", "row", "column"), "[tokens,heads,1,columns]"),
-    ("transition.output_second", "runtime", ("token", "head", "row", "column"), "[tokens,heads,1,columns]"),
+    (
+        "transition.second",
+        "runtime",
+        ("head", "row", "column"),
+        "[tokens,heads,1,columns]",
+    ),
+    (
+        "transition.output_second",
+        "runtime",
+        ("token", "head", "row", "column"),
+        "[tokens,heads,1,columns]",
+    ),
     ("transition.segment", "int32", ("token",), "[tokens]"),
-    ("transition.output_scale", "runtime", ("token", "head", "row", "column"), "[tokens,heads,scale_rows,scale_columns]"),
-    ("transition.output_bias", "runtime", ("token", "head", "row", "column"), "[tokens,heads,rows,columns]"),
-    ("transition.initial_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
+    (
+        "transition.output_scale",
+        "runtime",
+        ("token", "head", "row", "column"),
+        "[tokens,heads,scale_rows,scale_columns]",
+    ),
+    (
+        "transition.output_bias",
+        "runtime",
+        ("token", "head", "row", "column"),
+        "[tokens,heads,rows,columns]",
+    ),
+    (
+        "transition.initial_state",
+        "runtime",
+        ("sequence", "head", "row", "column"),
+        "[sequences,heads,rows,columns]",
+    ),
 )
 
 
 _FACTORED_CONTEXT: tuple[ContextEntry, ...] = (
-    ("factored.left", "runtime", ("operation", "token", "head", "row"), "[operations,tokens,heads,rows,1]"),
-    ("factored.right", "runtime", ("operation", "token", "head", "row"), "[operations,tokens,heads,rows,1]"),
-    ("factored.coefficient", "runtime", ("operation", "token", "head"), "[operations,tokens,heads,1,1]"),
-    ("factored.injection_left", "runtime", ("injection", "token", "head", "row"), "[injections,tokens,heads,rows,1]"),
-    ("factored.injection_right", "runtime", ("injection", "token", "head", "column"), "[injections,tokens,heads,1,columns]"),
+    (
+        "factored.left",
+        "runtime",
+        ("operation", "token", "head", "row"),
+        "[operations,tokens,heads,rows,1]",
+    ),
+    (
+        "factored.right",
+        "runtime",
+        ("operation", "token", "head", "row"),
+        "[operations,tokens,heads,rows,1]",
+    ),
+    (
+        "factored.coefficient",
+        "runtime",
+        ("operation", "token", "head"),
+        "[operations,tokens,heads,1,1]",
+    ),
+    (
+        "factored.injection_left",
+        "runtime",
+        ("injection", "token", "head", "row"),
+        "[injections,tokens,heads,rows,1]",
+    ),
+    (
+        "factored.injection_right",
+        "runtime",
+        ("injection", "token", "head", "column"),
+        "[injections,tokens,heads,1,columns]",
+    ),
     ("factored.readout", "runtime", ("token", "head", "row"), "[tokens,heads,rows,1]"),
-    ("factored.recorded", "float32", ("sequence", "head", "chunk", "row", "column"), "[sequences,heads,chunks,rows,columns]"),
-    ("factored.initial_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
-    ("factored.final_state", "runtime", ("sequence", "head", "row", "column"), "[sequences,heads,rows,columns]"),
+    (
+        "factored.recorded",
+        "float32",
+        ("sequence", "head", "chunk", "row", "column"),
+        "[sequences,heads,chunks,rows,columns]",
+    ),
+    (
+        "factored.initial_state",
+        "runtime",
+        ("sequence", "head", "row", "column"),
+        "[sequences,heads,rows,columns]",
+    ),
+    (
+        "factored.final_state",
+        "runtime",
+        ("sequence", "head", "row", "column"),
+        "[sequences,heads,rows,columns]",
+    ),
 )
 
 
@@ -109,7 +199,9 @@ class BackwardBinding:
         saved_context: Mapping[str, torch.Tensor],
         grad_states: torch.Tensor | None,
     ) -> tuple[torch.Tensor | None, ...]:
-        missing = [name for name, *_ in self.context_values if name not in saved_context]
+        missing = [
+            name for name, *_ in self.context_values if name not in saved_context
+        ]
         if missing:
             raise RuntimeError(f"compiler backward context missing: {tuple(missing)!r}")
         if self.family == "dense":
@@ -121,9 +213,11 @@ class BackwardBinding:
         raise RuntimeError(f"unknown backward runtime family: {self.family}")
 
 
-
-def default_backward(family: str, config: tuple[tuple[str, int], ...] | int = ()) -> BackwardBinding:
+def default_backward(
+    family: str, config: tuple[tuple[str, int], ...] | int = ()
+) -> BackwardBinding:
     """Construct the direct-prefix binding when no compiler plan is supplied."""
+
     class _DirectBackwardIR:
         reverse_steps = ()
 
@@ -137,6 +231,8 @@ def default_backward(family: str, config: tuple[tuple[str, int], ...] | int = ()
             "factored": _FACTORED_CONTEXT,
         }[family],
     )
+
+
 def bind_backward(
     backward_ir: Any,
     family: str,
@@ -261,7 +357,9 @@ def _elementwise_vjp(
     previous_scale = torch.ones_like(output_scale)
     previous_bias = torch.zeros_like(output_bias)
     same_segment = (segment[1:] == segment[:-1]).view(-1, 1, 1, 1)
-    previous_scale[1:] = torch.where(same_segment, output_scale[:-1], previous_scale[1:])
+    previous_scale[1:] = torch.where(
+        same_segment, output_scale[:-1], previous_scale[1:]
+    )
     previous_bias[1:] = torch.where(same_segment, output_bias[:-1], previous_bias[1:])
     elementwise_gradient = adjoint_scale * previous_scale + adjoint_bias * previous_bias
     if second is None:

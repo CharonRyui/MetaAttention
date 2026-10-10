@@ -782,6 +782,7 @@ class CompileOptions:
 @dataclass(frozen=True)
 class _InputValidation:
     """Immutable declaration metadata used by every compiled invocation."""
+
     name: str
     roles: tuple[LogicalRole, ...]
     dtype: torch.dtype
@@ -790,10 +791,10 @@ class _InputValidation:
     packed_roles: tuple[LogicalRole, ...]
 
 
-
 @dataclass(frozen=True)
 class _StateValidation:
     """Immutable State role metadata used by runtime shape validation."""
+
     name: str
     head_role: HeadRole
     feature_roles: tuple[FeatureRole, ...]
@@ -802,6 +803,7 @@ class _StateValidation:
 @dataclass(frozen=True)
 class _ValidationRecipe:
     """Compiled structural contract; it contains no runtime tensor data."""
+
     expected_input_names: tuple[str, ...]
     state_names: tuple[str, ...]
     output_names: tuple[str, ...]
@@ -818,6 +820,7 @@ class _Compilation:
     mode: str
     options: CompileOptions
     validation: _ValidationRecipe
+
 
 @dataclass(frozen=True)
 class _Runtime:
@@ -977,11 +980,7 @@ class StatefulOperator:
         )
         requires_grad_inputs = any(tensor.requires_grad for tensor in inputs.values())
         if not compiled.compilation.options.backward and (
-            torch.is_grad_enabled()
-            and (
-                requires_grad_state
-                or requires_grad_inputs
-            )
+            torch.is_grad_enabled() and (requires_grad_state or requires_grad_inputs)
         ):
             raise StatefulCompilationError(
                 "RUNTIME_GRAD", "inputs", {"backward": "not compiled"}
@@ -998,7 +997,8 @@ class StatefulOperator:
                 "RUNTIME_RESOURCE", "workspace", {"reason": str(error)}
             ) from error
         if (
-            plan.runtime_family in {
+            plan.runtime_family
+            in {
                 "chunked-stateful",
                 "product-feature-chunked",
                 "rank-one-diagonal",
@@ -1025,8 +1025,14 @@ class StatefulOperator:
             )
         ):
             return self._execute_chunked_stateful(
-                runtime, role_sizes, inputs, initial_states, return_final_state,
-                plan.chunked_recipe, plan.runtime_family, validation,
+                runtime,
+                role_sizes,
+                inputs,
+                initial_states,
+                return_final_state,
+                plan.chunked_recipe,
+                plan.runtime_family,
+                validation,
             )
         if validation.reference_required:
             return self._execute_reference(
@@ -1470,7 +1476,10 @@ class StatefulOperator:
         validation: _ValidationRecipe,
     ) -> ExecutionResult:
         """Execute compiler-proven dense inference without reference plumbing."""
-        from .stateful.lowering.chunked import bind_chunked_inputs, execute_chunked_states
+        from .stateful.lowering.chunked import (
+            bind_chunked_inputs,
+            execute_chunked_states,
+        )
 
         assert runtime.uniform_length is not None
         if runtime_family == "rank-one-diagonal":
@@ -1479,39 +1488,54 @@ class StatefulOperator:
             from .stateful.lowering.scan.rank1 import execute_rank_one
 
             output, final = execute_rank_one(
-                recipe.rank_one, inputs, initial_states[recipe.rank_one.state],
+                recipe.rank_one,
+                inputs,
+                initial_states[recipe.rank_one.state],
                 sequence_count=runtime.sequence_count,
-                sequence_length=runtime.uniform_length, heads=runtime.state_heads,
+                sequence_length=runtime.uniform_length,
+                heads=runtime.state_heads,
                 return_final_state=return_final_state,
             )
             return ExecutionResult(
                 NamedOutputTuple._unchecked(validation.output_names, (output,)),
                 StateTuple._unchecked(validation.state_names, (final,))
-                if final is not None else None,
+                if final is not None
+                else None,
             )
         if recipe.rank_one is not None:
             raise RuntimeError("rank-one recipe is not selected by the plan")
         values = bind_chunked_inputs(recipe, inputs, runtime)
         result = execute_chunked_states(
-            self.algorithm, values=values, initial_states=initial_states,
-            segment=None, role_sizes=role_sizes, heads=runtime.state_heads,
-            token_count=runtime.token_count, device=runtime.device,
+            self.algorithm,
+            values=values,
+            initial_states=initial_states,
+            segment=None,
+            role_sizes=role_sizes,
+            heads=runtime.state_heads,
+            token_count=runtime.token_count,
+            device=runtime.device,
             return_final_state=return_final_state,
-            sequence_length=runtime.uniform_length, recipe=recipe,
+            sequence_length=runtime.uniform_length,
+            recipe=recipe,
         )
         assert result is not None
         outputs, finals = result
         ordered = tuple(
-            outputs[readout.name].reshape(
+            outputs[readout.name]
+            .reshape(
                 runtime.sequence_count, runtime.uniform_length, runtime.state_heads, -1
-            ).permute(0, 2, 1, 3)
+            )
+            .permute(0, 2, 1, 3)
             for readout in self.algorithm.readouts
         )
         return ExecutionResult(
             NamedOutputTuple._unchecked(validation.output_names, ordered),
-            StateTuple._unchecked(validation.state_names,
-                                  tuple(finals[name] for name in validation.state_names))
-            if finals is not None else None,
+            StateTuple._unchecked(
+                validation.state_names,
+                tuple(finals[name] for name in validation.state_names),
+            )
+            if finals is not None
+            else None,
         )
 
     def _execute_reference(
@@ -2277,9 +2301,7 @@ class StatefulOperator:
                 return_final_state=return_final_state,
             )
             final_state = (
-                StateTuple((state_spec.name,), (final,))
-                if return_final_state
-                else None
+                StateTuple((state_spec.name,), (final,)) if return_final_state else None
             )
             return outputs, final_state
         if backward_path:

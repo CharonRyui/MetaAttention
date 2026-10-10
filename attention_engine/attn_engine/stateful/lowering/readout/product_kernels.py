@@ -7,7 +7,6 @@ and adds the causal local value contribution. Both kernels use FP32
 accumulation and preserve the public token-major ABI.
 """
 
-
 from functools import lru_cache
 
 import torch
@@ -20,11 +19,28 @@ _BLOCK = 32
 
 
 def _metadata(tensor):
-    return tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).removeprefix("torch.")
+    return (
+        tuple(tensor.shape),
+        tuple(tensor.stride()),
+        str(tensor.dtype).removeprefix("torch."),
+    )
 
 
 @lru_cache(maxsize=None)
-def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_meta, scores_meta, *, length, heads, left, right, prior, device_index):
+def _compile_scores(
+    key_left_meta,
+    key_right_meta,
+    query_left_meta,
+    query_right_meta,
+    scores_meta,
+    *,
+    length,
+    heads,
+    left,
+    right,
+    prior,
+    device_index,
+):
     import tilelang
     import tilelang.language as T
 
@@ -57,7 +73,10 @@ def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_
                         coordinate = block * _BLOCK + feature
                         query_shared[token, feature] = T.if_then_else(
                             (index < length) & (coordinate < left),
-                            T.cast(QueryLeft[sequence * length + index, head, coordinate], "float32"),
+                            T.cast(
+                                QueryLeft[sequence * length + index, head, coordinate],
+                                "float32",
+                            ),
                             0.0,
                         )
                     for feature, token in T.Parallel(_BLOCK, CHUNK):
@@ -65,7 +84,10 @@ def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_
                         coordinate = block * _BLOCK + feature
                         key_shared[feature, token] = T.if_then_else(
                             (index < length) & (coordinate < left),
-                            T.cast(KeyLeft[sequence * length + index, head, coordinate], "float32"),
+                            T.cast(
+                                KeyLeft[sequence * length + index, head, coordinate],
+                                "float32",
+                            ),
                             0.0,
                         )
                     gemm(query_shared, key_shared, left_scores)
@@ -75,7 +97,10 @@ def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_
                         coordinate = block * _BLOCK + feature
                         query_shared[token, feature] = T.if_then_else(
                             (index < length) & (coordinate < right),
-                            T.cast(QueryRight[sequence * length + index, head, coordinate], "float32"),
+                            T.cast(
+                                QueryRight[sequence * length + index, head, coordinate],
+                                "float32",
+                            ),
                             0.0,
                         )
                     for feature, token in T.Parallel(_BLOCK, CHUNK):
@@ -83,7 +108,10 @@ def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_
                         coordinate = block * _BLOCK + feature
                         key_shared[feature, token] = T.if_then_else(
                             (index < length) & (coordinate < right),
-                            T.cast(KeyRight[sequence * length + index, head, coordinate], "float32"),
+                            T.cast(
+                                KeyRight[sequence * length + index, head, coordinate],
+                                "float32",
+                            ),
                             0.0,
                         )
                     gemm(query_shared, key_shared, right_scores)
@@ -96,6 +124,7 @@ def _compile_scores(key_left_meta, key_right_meta, query_left_meta, query_right_
                         left_scores[token, source] * right_scores[token, source],
                         0.0,
                     )
+
         return kernel
 
     return build_kernel()
@@ -105,10 +134,17 @@ def product_chunk_scores(key, query, *, sequence_length, prior=False):
     """Return causal local ProductFeature scores in ``[BH, chunks, 64, 64]``."""
     key_left, key_right = key
     query_left, query_right = query
-    if key_left.shape[-1] != query_left.shape[-1] or key_right.shape[-1] != query_right.shape[-1]:
-        raise ValueError("ProductFeature key and query factors must have matching dimensions")
+    if (
+        key_left.shape[-1] != query_left.shape[-1]
+        or key_right.shape[-1] != query_right.shape[-1]
+    ):
+        raise ValueError(
+            "ProductFeature key and query factors must have matching dimensions"
+        )
     if key_left.shape[0] % sequence_length:
-        raise ValueError("token-major ProductFeature factors require a uniform sequence length")
+        raise ValueError(
+            "token-major ProductFeature factors require a uniform sequence length"
+        )
     heads = key_left.shape[1]
     chunks = (sequence_length + CHUNK - 1) // CHUNK
     scores = torch.empty(
@@ -120,21 +156,41 @@ def product_chunk_scores(key, query, *, sequence_length, prior=False):
         dtype=torch.float32,
     )
     _compile_scores(
-        _metadata(key_left), _metadata(key_right), _metadata(query_left),
-        _metadata(query_right), _metadata(scores), length=sequence_length,
-        heads=heads, left=key_left.shape[-1], right=key_right.shape[-1],
-        prior=prior, device_index=key_left.device.index,
+        _metadata(key_left),
+        _metadata(key_right),
+        _metadata(query_left),
+        _metadata(query_right),
+        _metadata(scores),
+        length=sequence_length,
+        heads=heads,
+        left=key_left.shape[-1],
+        right=key_right.shape[-1],
+        prior=prior,
+        device_index=key_left.device.index,
     )(key_left, key_right, query_left, query_right, scores)
     return scores
 
 
 @lru_cache(maxsize=None)
 def _compile_readout(
-    query_left_meta, query_right_meta, value_meta, carry_meta, scores_meta, output_meta,
-    *, length, heads, left, right, columns, tile_width, device_index,
+    query_left_meta,
+    query_right_meta,
+    value_meta,
+    carry_meta,
+    scores_meta,
+    output_meta,
+    *,
+    length,
+    heads,
+    left,
+    right,
+    columns,
+    tile_width,
+    device_index,
 ):
     import tilelang
     import tilelang.language as T
+
     gemm = fp32_gemm_macro(T)
     batch = query_left_meta[0][0] // length
     chunks = carry_meta[0][1]
@@ -169,8 +225,22 @@ def _compile_readout(
                         valid = (index < length) & (product_index < product)
                         query_product[token, feature] = T.if_then_else(
                             valid,
-                            T.cast(QueryLeft[sequence * length + index, head, product_index // right], "float32")
-                            * T.cast(QueryRight[sequence * length + index, head, product_index % right], "float32"),
+                            T.cast(
+                                QueryLeft[
+                                    sequence * length + index,
+                                    head,
+                                    product_index // right,
+                                ],
+                                "float32",
+                            )
+                            * T.cast(
+                                QueryRight[
+                                    sequence * length + index,
+                                    head,
+                                    product_index % right,
+                                ],
+                                "float32",
+                            ),
                             0.0,
                         )
                     for feature, column in T.Parallel(_BLOCK, tile_width):
@@ -178,7 +248,10 @@ def _compile_readout(
                         column_index = column_tile * tile_width + column
                         state_shared[feature, column] = T.if_then_else(
                             (product_index < product) & (column_index < columns),
-                            T.cast(Carry[batch_head, chunk, product_index, column_index], "float32"),
+                            T.cast(
+                                Carry[batch_head, chunk, product_index, column_index],
+                                "float32",
+                            ),
                             0.0,
                         )
                     gemm(query_product, state_shared, output)
@@ -189,7 +262,10 @@ def _compile_readout(
                     column_index = column_tile * tile_width + column
                     value_shared[token, column] = T.if_then_else(
                         (index < length) & (column_index < columns),
-                        T.cast(Value[sequence * length + index, head, column_index], "float32"),
+                        T.cast(
+                            Value[sequence * length + index, head, column_index],
+                            "float32",
+                        ),
                         0.0,
                     )
                 gemm(scores, value_shared, output)
@@ -197,8 +273,12 @@ def _compile_readout(
                     index = chunk * CHUNK + token
                     column_index = column_tile * tile_width + column
                     if (index < length) & (column_index < columns):
-                        Output[sequence * length + index, head, column_index] = output[token, column]
+                        Output[sequence * length + index, head, column_index] = output[
+                            token, column
+                        ]
+
         return kernel
+
     return build_kernel()
 
 
@@ -209,7 +289,9 @@ def read_product_state(
     key_left, key_right = key
     query_left, query_right = query
     if scores is None:
-        scores = product_chunk_scores(key, query, sequence_length=sequence_length, prior=prior)
+        scores = product_chunk_scores(
+            key, query, sequence_length=sequence_length, prior=prior
+        )
     batch_heads, chunks, product, columns = carry.shape
     heads = key_left.shape[1]
     if product != key_left.shape[-1] * key_right.shape[-1]:
@@ -218,10 +300,17 @@ def read_product_state(
         key_left.shape[0], heads, columns, device=key_left.device, dtype=torch.float32
     )
     _compile_readout(
-        _metadata(query_left), _metadata(query_right), _metadata(value),
-        _metadata(carry), _metadata(scores), _metadata(output),
-        length=sequence_length, heads=heads, left=key_left.shape[-1],
-        right=key_right.shape[-1], columns=columns,
+        _metadata(query_left),
+        _metadata(query_right),
+        _metadata(value),
+        _metadata(carry),
+        _metadata(scores),
+        _metadata(output),
+        length=sequence_length,
+        heads=heads,
+        left=key_left.shape[-1],
+        right=key_right.shape[-1],
+        columns=columns,
         tile_width=16 if columns <= 16 else _BLOCK,
         device_index=key_left.device.index,
     )(query_left, query_right, value, carry, scores, output)

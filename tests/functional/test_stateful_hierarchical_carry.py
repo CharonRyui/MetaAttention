@@ -1,4 +1,5 @@
 """Long diagonal sequences retain zero factors and cross-group State carries."""
+
 from __future__ import annotations
 
 import pytest
@@ -21,13 +22,24 @@ def test_hierarchical_carry_matches_ordered_recurrence(gpu_device, identity):
     initial = torch.randn(2, 3, 5, device=gpu_device, generator=generator)
     carry = torch.empty_like(bias)
     final = torch.empty_like(initial)
-    hierarchical_carry(None if identity else scale, bias, initial, carry, final,
-                       identity=identity, write_final=True)
+    hierarchical_carry(
+        None if identity else scale,
+        bias,
+        initial,
+        carry,
+        final,
+        identity=identity,
+        write_final=True,
+    )
     state = initial.clone()
     expected = []
     for chunk in range(shape[1]):
         expected.append(state.clone())
-        state = state + bias[:, chunk] if identity else scale[:, chunk] * state + bias[:, chunk]
+        state = (
+            state + bias[:, chunk]
+            if identity
+            else scale[:, chunk] * state + bias[:, chunk]
+        )
     torch.testing.assert_close(carry, torch.stack(expected, 1), atol=2e-6, rtol=2e-5)
     torch.testing.assert_close(final, state, atol=2e-6, rtol=2e-5)
 
@@ -37,7 +49,10 @@ def test_hierarchical_carry_does_not_write_unrequested_final(gpu_device):
     bias = torch.ones(shape, device=gpu_device)
     initial = torch.full((1, 1, 1), 7.0, device=gpu_device)
     carry = torch.empty_like(bias)
-    hierarchical_carry(None, bias, initial, carry, initial,
-                       identity=True, write_final=False)
+    hierarchical_carry(
+        None, bias, initial, carry, initial, identity=True, write_final=False
+    )
     torch.testing.assert_close(initial, torch.full_like(initial, 7.0))
-    torch.testing.assert_close(carry.flatten(), torch.arange(7, 72, device=gpu_device).float())
+    torch.testing.assert_close(
+        carry.flatten(), torch.arange(7, 72, device=gpu_device).float()
+    )

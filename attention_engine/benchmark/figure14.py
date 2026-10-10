@@ -334,7 +334,6 @@ def bench_retnet_recurrent(
         bwd_lat = None
     result_dict = {"MetaAttention": (fwd_lat, bwd_lat)}
 
-
     return result_dict
 
 

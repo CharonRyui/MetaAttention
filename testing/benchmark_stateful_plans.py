@@ -97,7 +97,6 @@ class Case:
         return values
 
 
-
 CASES = (
     Case("linear", linear_attention),
     Case("simple-gla", simple_gla_attention),
@@ -274,12 +273,18 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
 
     algorithm = operator.algorithm
     batch = next(value.shape[0] for value in inputs.values())
-    length = next(inputs[spec.name].shape[spec.roles.index(Sequence)]
-                  for spec in algorithm.inputs if Sequence in spec.roles)
+    length = next(
+        inputs[spec.name].shape[spec.roles.index(Sequence)]
+        for spec in algorithm.inputs
+        if Sequence in spec.roles
+    )
     heads = sizes[algorithm.states[0].head_role]
     states = {
-        spec.name: (torch.zeros(batch, heads, *(sizes[r] for r in spec.feature_roles))
-                    if initial_state is None else initial_state[spec.name].cpu().float().clone())
+        spec.name: (
+            torch.zeros(batch, heads, *(sizes[r] for r in spec.feature_roles))
+            if initial_state is None
+            else initial_state[spec.name].cpu().float().clone()
+        )
         for spec in algorithm.states
     }
     specs = {spec.name: spec for spec in algorithm.states}
@@ -288,8 +293,13 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
     def align(value, roles, target):
         ordered = tuple(role for role in target if role in roles)
         value = value.permute(0, 1, *(2 + roles.index(role) for role in ordered))
-        return value.reshape(*value.shape[:2], *(value.shape[2 + ordered.index(role)]
-                             if role in ordered else 1 for role in target))
+        return value.reshape(
+            *value.shape[:2],
+            *(
+                value.shape[2 + ordered.index(role)] if role in ordered else 1
+                for role in target
+            ),
+        )
 
     def evaluate(node, token, prior):
         if isinstance(node, ir.Input):
@@ -302,9 +312,11 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
             features = tuple(r for r in roles if isinstance(r, FeatureRole))
             head = next((r for r in roles if isinstance(r, HeadRole)), None)
             leading = Batch if Batch in roles else One
-            value = value.permute(roles.index(leading),
-                                  *([roles.index(head)] if head else []),
-                                  *(roles.index(r) for r in features))
+            value = value.permute(
+                roles.index(leading),
+                *([roles.index(head)] if head else []),
+                *(roles.index(r) for r in features),
+            )
             if head is None:
                 value = value.unsqueeze(1)
             if heads % value.shape[1]:
@@ -332,27 +344,42 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
             for axis in reversed(range(len(remaining))):
                 if result.shape[2 + axis] == 1:
                     result = result.squeeze(2 + axis)
-                    remaining = remaining[:axis] + remaining[axis + 1:]
+                    remaining = remaining[:axis] + remaining[axis + 1 :]
             return result, remaining
         if isinstance(node, (ir.Add, ir.Multiply, ir.Divide, ir.Outer, ir.Contract)):
             left, lr = evaluate(node.left, token, prior)
             right, rr = evaluate(node.right, token, prior)
             roles = tuple(dict.fromkeys((*lr, *rr)))
             if isinstance(node, ir.Outer):
-                return (left.unsqueeze(-1) * right.unsqueeze(-2)).flatten(2), (node.role,)
+                return (left.unsqueeze(-1) * right.unsqueeze(-2)).flatten(2), (
+                    node.role,
+                )
             left, right = align(left, lr, roles), align(right, rr, roles)
             if isinstance(node, ir.Contract):
-                return (left * right).sum(2 + roles.index(node.role)), tuple(r for r in roles if r != node.role)
-            value = left + right if isinstance(node, ir.Add) else left * right if isinstance(node, ir.Multiply) else left / right
+                return (left * right).sum(2 + roles.index(node.role)), tuple(
+                    r for r in roles if r != node.role
+                )
+            value = (
+                left + right
+                if isinstance(node, ir.Add)
+                else left * right
+                if isinstance(node, ir.Multiply)
+                else left / right
+            )
             return value, roles
         value, roles = evaluate(node.operand, token, prior)
         if isinstance(node, ir.Softmax):
             return value.softmax(2 + roles.index(node.role)), roles
         if isinstance(node, ir.Clamp):
             return value.clamp(node.minimum, node.maximum), roles
-        unary = {ir.Negate: torch.neg, ir.Exp: torch.exp, ir.Log: torch.log,
-                 ir.Sigmoid: torch.sigmoid, ir.Sqrt: torch.sqrt,
-                 ir.Reciprocal: torch.reciprocal}
+        unary = {
+            ir.Negate: torch.neg,
+            ir.Exp: torch.exp,
+            ir.Log: torch.log,
+            ir.Sigmoid: torch.sigmoid,
+            ir.Sqrt: torch.sqrt,
+            ir.Reciprocal: torch.reciprocal,
+        }
         return unary[type(node)](value), roles
 
     outputs = {readout.name: [] for readout in algorithm.readouts}
@@ -370,10 +397,19 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
                     right, rr = evaluate(propagation.right, token, prior)
                     coefficient, cr = evaluate(propagation.coefficient, token, prior)
                     axis = 2 + spec.feature_roles.index(propagation.role)
-                    contraction = (state * align(right, rr, spec.feature_roles)).sum(axis, keepdim=True)
-                    state = state + align(coefficient, cr, spec.feature_roles) * align(left, lr, spec.feature_roles) * contraction
+                    contraction = (state * align(right, rr, spec.feature_roles)).sum(
+                        axis, keepdim=True
+                    )
+                    state = (
+                        state
+                        + align(coefficient, cr, spec.feature_roles)
+                        * align(left, lr, spec.feature_roles)
+                        * contraction
+                    )
                 else:
-                    raise TypeError(f"unsupported oracle propagation {type(propagation).__name__}")
+                    raise TypeError(
+                        f"unsupported oracle propagation {type(propagation).__name__}"
+                    )
             for injection in transition.injections:
                 product = torch.ones(1, 1, *([1] * spec.rank))
                 for factor in injection.factors:
@@ -382,22 +418,31 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
                 state = state + product
             states[spec.name] = state
         for readout in algorithm.readouts:
-            expression = (ir.StateTerm(readout.state, readout.operand, readout.role)
-                          if isinstance(readout, ir.StateContraction) else readout.expression)
+            expression = (
+                ir.StateTerm(readout.state, readout.operand, readout.role)
+                if isinstance(readout, ir.StateContraction)
+                else readout.expression
+            )
             value, roles = evaluate(expression, token, prior)
             if not roles:
                 value = value.unsqueeze(-1)
             outputs[readout.name].append(value)
-    return {name: torch.stack(values, dim=2) for name, values in outputs.items()}, states
+    return {
+        name: torch.stack(values, dim=2) for name, values in outputs.items()
+    }, states
 
 
 def _correctness(outputs, states, expected, expected_states, contract):
     errors = {}
     valid = True
-    pairs = [(f"output:{name}", outputs.get(name), value) for name, value in expected.items()]
+    pairs = [
+        (f"output:{name}", outputs.get(name), value) for name, value in expected.items()
+    ]
     if contract != "output-only":
-        pairs.extend((f"state:{name}", None if states is None else states.get(name), value)
-                     for name, value in expected_states.items())
+        pairs.extend(
+            (f"state:{name}", None if states is None else states.get(name), value)
+            for name, value in expected_states.items()
+        )
     tolerances = {}
     for name, actual, reference in pairs:
         if actual is None or actual.shape != reference.shape:
@@ -411,8 +456,12 @@ def _correctness(outputs, states, expected, expected_states, contract):
         rtol, atol = (0.01, 0.02) if name.startswith("state:") else (0.02, 0.05)
         tolerances[name] = {"rtol": rtol, "atol": atol}
         valid = valid and torch.allclose(actual, reference, rtol=rtol, atol=atol)
-    return {"status": "VALID" if valid else "INVALID", "max_abs_errors": errors,
-            "oracle": "independent authored-order FP32 CPU token recurrence", "tolerances": tolerances}
+    return {
+        "status": "VALID" if valid else "INVALID",
+        "max_abs_errors": errors,
+        "oracle": "independent authored-order FP32 CPU token recurrence",
+        "tolerances": tolerances,
+    }
 
 
 def _cpu_wall_time(call, warmup, repetitions):
@@ -454,8 +503,6 @@ def _graph_time(call, warmup: int, repetitions: int) -> float:
     return _median_time(graph.replay, warmup, repetitions)
 
 
-
-
 def _kernel_profile(call, attempts: int = 2) -> tuple[float, int, int]:
     """Return (kernel milliseconds, kernel launches, other launches).
 
@@ -470,15 +517,16 @@ def _kernel_profile(call, attempts: int = 2) -> tuple[float, int, int]:
         with profile(activities=[ProfilerActivity.CUDA]) as profiler:
             call()
             torch.cuda.synchronize()
-        events = [event for event in profiler.events()
-                  if event.device_type == torch.autograd.DeviceType.CUDA]
+        events = [
+            event
+            for event in profiler.events()
+            if event.device_type == torch.autograd.DeviceType.CUDA
+        ]
         if events or attempt == attempts - 1:
             break
     kernel_ms = sum(event.device_time_total for event in events) / 1000.0
     launches = len(events)
-    tilelang = sum(
-        1 for event in events if event.name in ("kernel_kernel", "kernel")
-    )
+    tilelang = sum(1 for event in events if event.name in ("kernel_kernel", "kernel"))
     return kernel_ms, tilelang, launches - tilelang
 
 
@@ -489,7 +537,9 @@ def _split_inputs(operator, inputs, split):
         if Sequence in spec.roles:
             axis = spec.roles.index(Sequence)
             parts[0][spec.name] = value.narrow(axis, 0, split).contiguous()
-            parts[1][spec.name] = value.narrow(axis, split, value.shape[axis] - split).contiguous()
+            parts[1][spec.name] = value.narrow(
+                axis, split, value.shape[axis] - split
+            ).contiguous()
         else:
             parts[0][spec.name] = parts[1][spec.name] = value
     return parts
@@ -500,16 +550,23 @@ def _meta_call(compiled, parts, contract):
         prefix = compiled(**parts[0], return_final_state=contract != "output-only")
         result = prefix
         if contract == "continuation":
-            result = compiled(**parts[1], initial_state=prefix.final_state, return_final_state=True)
+            result = compiled(
+                **parts[1], initial_state=prefix.final_state, return_final_state=True
+            )
         outputs = {name: result.outputs[name] for name in result.outputs.names}
         if contract == "continuation":
-            outputs = {name: torch.cat((prefix.outputs[name], output), dim=2)
-                       for name, output in outputs.items()}
-        states = None if result.final_state is None else {name: result.final_state[name] for name in result.final_state.names}
+            outputs = {
+                name: torch.cat((prefix.outputs[name], output), dim=2)
+                for name, output in outputs.items()
+            }
+        states = (
+            None
+            if result.final_state is None
+            else {name: result.final_state[name] for name in result.final_state.names}
+        )
         return outputs, states
+
     return run
-
-
 
 
 def _measure_call(call, warmup, repetitions, timing="both"):
@@ -534,13 +591,23 @@ def _measure_call(call, warmup, repetitions, timing="both"):
     del result
     try:
         kernel_ms, kernels, others = _kernel_profile(call)
-        record.update(kernel_ms=kernel_ms or None, kernel_launches=kernels if kernel_ms else None,
-                      other_launches=others if kernel_ms else None,
-                      total_launches=kernels + others if kernel_ms else None)
+        record.update(
+            kernel_ms=kernel_ms or None,
+            kernel_launches=kernels if kernel_ms else None,
+            other_launches=others if kernel_ms else None,
+            total_launches=kernels + others if kernel_ms else None,
+        )
     except RuntimeError as error:
-        record.update(kernel_ms=None, kernel_launches=None, other_launches=None,
-                      total_launches=None, profiler_error=str(error))
-    record["launch_source"] = "CUPTI CUDA activity events (kernels and device copies); unavailable when foreign launches are not captured"
+        record.update(
+            kernel_ms=None,
+            kernel_launches=None,
+            other_launches=None,
+            total_launches=None,
+            profiler_error=str(error),
+        )
+    record["launch_source"] = (
+        "CUPTI CUDA activity events (kernels and device copies); unavailable when foreign launches are not captured"
+    )
     if timing in ("graph", "both"):
         try:
             record["graph_ms"] = _graph_time(call, 0, repetitions)
@@ -549,40 +616,65 @@ def _measure_call(call, warmup, repetitions, timing="both"):
     return record
 
 
-
-
 def measure(
-    case: Case, seqlen: int, device: torch.device, warmup: int, repetitions: int,
-    *, contract: str = "final-state", timing: str = "both",
+    case: Case,
+    seqlen: int,
+    device: torch.device,
+    warmup: int,
+    repetitions: int,
+    *,
+    contract: str = "final-state",
+    timing: str = "both",
 ) -> dict:
     if device.type != "cuda" or not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
     if contract not in CONTRACTS:
         raise ValueError(f"unknown contract: {contract}")
-    if seqlen < (2 if contract == "continuation" else 1) or warmup < 0 or repetitions < 1:
-        raise ValueError("positive sequence/repetitions and nonnegative warmup required; continuation needs >=2 tokens")
+    if (
+        seqlen < (2 if contract == "continuation" else 1)
+        or warmup < 0
+        or repetitions < 1
+    ):
+        raise ValueError(
+            "positive sequence/repetitions and nonnegative warmup required; continuation needs >=2 tokens"
+        )
     operator = case.factory(**case.kwargs(seqlen))
     sizes = role_sizes_for(operator, case, seqlen)
-    record = {"family": case.name, "seqlen": seqlen, "heads": case.heads,
-              "batch": case.batch, "dim": case.dim, "dim_value": case.dim_value,
-              "contract": contract, "continuation_split": seqlen // 2 if contract == "continuation" else None,
-              "device": torch.cuda.get_device_name(device), "torch_version": torch.__version__,
-              "timing_units": "milliseconds",
-              "input_layout": "B,H,T,features; preparation inside public-call intervals",
-              "initial_state": "zero; continuation suffix receives actual prefix final-State"}
+    record = {
+        "family": case.name,
+        "seqlen": seqlen,
+        "heads": case.heads,
+        "batch": case.batch,
+        "dim": case.dim,
+        "dim_value": case.dim_value,
+        "contract": contract,
+        "continuation_split": seqlen // 2 if contract == "continuation" else None,
+        "device": torch.cuda.get_device_name(device),
+        "torch_version": torch.__version__,
+        "timing_units": "milliseconds",
+        "input_layout": "B,H,T,features; preparation inside public-call intervals",
+        "initial_state": "zero; continuation suffix receives actual prefix final-State",
+    }
     record["contract_scope"] = (
-        "one public call; output only" if contract == "output-only" else
-        "one public call; all declared final States" if contract == "final-state" else
-        "prefix + suffix public calls; actual prefix State passed to suffix; output concatenation timed"
+        "one public call; output only"
+        if contract == "output-only"
+        else "one public call; all declared final States"
+        if contract == "final-state"
+        else "prefix + suffix public calls; actual prefix State passed to suffix; output concatenation timed"
     )
     try:
-        compiled = operator.compile(role_sizes=sizes, target=Target(), mode="dense", optimized=True)
+        compiled = operator.compile(
+            role_sizes=sizes, target=Target(), mode="dense", optimized=True
+        )
     except StatefulCompilationError as error:
-        record.update(status="COMPILE_REJECTED", error=f"{error.category} at {error.path}")
+        record.update(
+            status="COMPILE_REJECTED", error=f"{error.category} at {error.path}"
+        )
         return record
     plan = compiled.operator._plans[compiled.specialization]
     selected_estimate = next(
-        estimate for identity, estimate in plan.plan.candidate_estimates
+        estimate
+        for identity, estimate in plan.plan.candidate_estimates
         if identity == plan.plan.candidate.identity
     )
     record.update(
@@ -593,26 +685,41 @@ def measure(
         static_estimate=asdict(selected_estimate),
     )
     workspace = plan.plan.workspace
-    record.update(workspace_bytes_per_token=workspace.bytes_per_token,
-                  workspace_bytes_per_chunk=workspace.bytes_per_chunk,
-                  workspace_limit_bytes=workspace.maximum_bytes)
+    record.update(
+        workspace_bytes_per_token=workspace.bytes_per_token,
+        workspace_bytes_per_chunk=workspace.bytes_per_chunk,
+        workspace_limit_bytes=workspace.maximum_bytes,
+    )
     inputs = inputs_for(operator, case, seqlen, device)
-    parts = _split_inputs(operator, inputs, seqlen // 2) if contract == "continuation" else [inputs]
+    parts = (
+        _split_inputs(operator, inputs, seqlen // 2)
+        if contract == "continuation"
+        else [inputs]
+    )
     call = _meta_call(compiled, parts, contract)
     try:
-        record["workspace_bytes"] = workspace.required_bytes(case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen)
+        record["workspace_bytes"] = workspace.required_bytes(
+            case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen
+        )
         actual, states = call()
     except (StatefulCompilationError, RuntimeError) as error:
         record.update(status="RUNTIME_REJECTED", error=str(error))
         return record
     expected, expected_states = _token_oracle(operator, inputs, sizes)
-    record["meta_correctness"] = _correctness(actual, states, expected, expected_states, contract)
+    record["meta_correctness"] = _correctness(
+        actual, states, expected, expected_states, contract
+    )
     del actual, states
     record.update(_measure_call(call, warmup, repetitions, timing))
-    record["status"] = "OK" if record["meta_correctness"]["status"] == "VALID" else "META_INVALID"
-    record["meta_native_layout"] = {"layout": "public authored layout", "preparation_cpu_wall_ms": 0.0,
-                                    "preparation_cuda_event_ms": 0.0,
-                                    "note": "no separate native-layout public interface; internal normalization remains timed"}
+    record["status"] = (
+        "OK" if record["meta_correctness"]["status"] == "VALID" else "META_INVALID"
+    )
+    record["meta_native_layout"] = {
+        "layout": "public authored layout",
+        "preparation_cpu_wall_ms": 0.0,
+        "preparation_cuda_event_ms": 0.0,
+        "note": "no separate native-layout public interface; internal normalization remains timed",
+    }
     return record
 
 
@@ -625,16 +732,28 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seqlen", type=int, nargs="+", default=[512, 2048, 8192])
     parser.add_argument("--families", help="comma separated family names")
-    parser.add_argument("--matrix-families", dest="matrix_families", help="matrix-only comma separated family names")
-    parser.add_argument("--matrix-cases", dest="matrix_families", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--matrix-families",
+        dest="matrix_families",
+        help="matrix-only comma separated family names",
+    )
+    parser.add_argument(
+        "--matrix-cases", dest="matrix_families", help=argparse.SUPPRESS
+    )
     parser.add_argument("--heads", type=int, default=None)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repetitions", type=int, default=10)
     parser.add_argument("--json", type=Path, help="write the records as JSON")
-    parser.add_argument("--contract", choices=(*CONTRACTS, "all"), default="final-state")
+    parser.add_argument(
+        "--contract", choices=(*CONTRACTS, "all"), default="final-state"
+    )
     parser.add_argument("--matrix-contract", choices=(*CONTRACTS, "all"), default=None)
     parser.add_argument("--timing", choices=("e2e", "graph", "both"), default="both")
-    parser.add_argument("--matrix", action="store_true", help="run the deterministic B/H/T matrix (opt-in)")
+    parser.add_argument(
+        "--matrix",
+        action="store_true",
+        help="run the deterministic B/H/T matrix (opt-in)",
+    )
     parser.add_argument("--matrix-batches", type=int, nargs="+", default=MATRIX_BATCHES)
     parser.add_argument("--matrix-heads", type=int, nargs="+", default=MATRIX_HEADS)
     parser.add_argument("--matrix-seqlens", type=int, nargs="+", default=MATRIX_SEQLENS)
@@ -643,12 +762,16 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     device = torch.device("cuda")
-    family_arg = args.matrix_families if args.matrix and args.matrix_families else args.families
+    family_arg = (
+        args.matrix_families if args.matrix and args.matrix_families else args.families
+    )
     wanted = set(family_arg.split(",")) if family_arg else None
     known = {case.name for case in CASES}
     if wanted is not None and not wanted <= known:
         parser.error(f"unknown families: {sorted(wanted - known)}")
-    contract_arg = args.matrix_contract if args.matrix and args.matrix_contract else args.contract
+    contract_arg = (
+        args.matrix_contract if args.matrix and args.matrix_contract else args.contract
+    )
     contracts = CONTRACTS if contract_arg == "all" else (contract_arg,)
     if args.warmup < 0 or args.repetitions < 1:
         parser.error("positive repetitions and nonnegative warmup required")
@@ -664,7 +787,9 @@ def main() -> None:
             seqlens=args.matrix_seqlens,
         )
     else:
-        if any(length < (2 if "continuation" in contracts else 1) for length in args.seqlen):
+        if any(
+            length < (2 if "continuation" in contracts else 1) for length in args.seqlen
+        ):
             parser.error("positive lengths; continuation needs >=2 tokens")
         workloads = tuple(
             (replace(case, heads=args.heads) if args.heads else case, seqlen)
@@ -679,16 +804,25 @@ def main() -> None:
                 parser.error("positive lengths; continuation needs >=2 tokens")
             torch.manual_seed(42)
             record = measure(
-                case, seqlen, device, args.warmup, args.repetitions,
-                contract=contract, timing=args.timing,
+                case,
+                seqlen,
+                device,
+                args.warmup,
+                args.repetitions,
+                contract=contract,
+                timing=args.timing,
             )
             records.append(record)
             _print_record(matrix_record_schema(record) if args.matrix else record)
     if args.json is not None:
-        args.json.write_text(json.dumps(
-            [matrix_record_schema(record) for record in records] if args.matrix else records,
-            indent=2,
-        ))
+        args.json.write_text(
+            json.dumps(
+                [matrix_record_schema(record) for record in records]
+                if args.matrix
+                else records,
+                indent=2,
+            )
+        )
     if any(record["status"] != "OK" for record in records):
         raise SystemExit("Meta measurement failed; see records")
 

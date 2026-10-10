@@ -35,7 +35,9 @@ def _compile_vector_propagation(
     def build_kernel():
         @T.prim_func
         def vector_propagation_kernel(
-            log_gate: T.Tensor((sequence_count * sequence_length, heads, rows), "float32"),
+            log_gate: T.Tensor(
+                (sequence_count * sequence_length, heads, rows), "float32"
+            ),
             key: T.Tensor((sequence_count * sequence_length, heads, rows), "float32"),
             value: T.Tensor(
                 (sequence_count * sequence_length, heads, columns), "float32"
@@ -116,7 +118,9 @@ def vector_propagation_dense(
         raise ValueError("vector propagation requires CUDA tensors")
     sequence_count, heads, rows, columns = initial_state.shape
     if any(tensor.ndim != 3 for tensor in (log_gate, key, value, query)):
-        raise ValueError("vector propagation inputs must be token-major rank-three tensors")
+        raise ValueError(
+            "vector propagation inputs must be token-major rank-three tensors"
+        )
     token_count = log_gate.shape[0]
     if any(tensor.shape[0] != token_count for tensor in (key, value, query)):
         raise ValueError("vector propagation inputs must have equal token counts")
@@ -149,5 +153,7 @@ def vector_propagation_dense(
         dtype=output_dtype,
     )
     final = torch.empty_like(initial_state, dtype=torch.float32)
-    kernel(log_gate, key, value, query, initial_state.float().contiguous(), output, final)
+    kernel(
+        log_gate, key, value, query, initial_state.float().contiguous(), output, final
+    )
     return output, final

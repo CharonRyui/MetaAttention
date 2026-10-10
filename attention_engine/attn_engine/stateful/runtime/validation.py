@@ -10,9 +10,9 @@ from ...stateful_operator import StatefulCompilationError
 
 # Successful entries only: unsupported hardware and constraint failures must be
 # rechecked and continue to raise their existing structured errors.
-_VALIDATED_TARGETS: set[
-    tuple[int, str | None, str | None, tuple[int, int] | None]
-] = set()
+_VALIDATED_TARGETS: set[tuple[int, str | None, str | None, tuple[int, int] | None]] = (
+    set()
+)
 
 
 def _validated_target_key(index: int, target):
@@ -28,8 +28,7 @@ def _validated_target_key(index: int, target):
         and isinstance(capability, tuple)
         and len(capability) == 2
         and all(
-            isinstance(item, int) and not isinstance(item, bool)
-            for item in capability
+            isinstance(item, int) and not isinstance(item, bool) for item in capability
         )
     ):
         return None
@@ -54,6 +53,7 @@ def validate_input_names(
         raise StatefulCompilationError(
             "RUNTIME_BINDING", "inputs", {"unknown": sorted(unknown)}
         )
+
 
 def validate_target(device: torch.device, target) -> None:
     if device.type == "cpu" and os.environ.get("STATEFUL_OPERATOR_TEST_CPU") == "1":
@@ -96,8 +96,10 @@ def validate_aliases(inputs: Mapping[str, torch.Tensor]) -> None:
     # Public layout validation has already established contiguous tensors, so
     # each input occupies one byte interval. Read storage metadata once per
     # input, not twice for every pair; still inspect current pointers each call.
-    tensors = tuple((name, tensor, tensor.untyped_storage().data_ptr())
-                    for name, tensor in inputs.items())
+    tensors = tuple(
+        (name, tensor, tensor.untyped_storage().data_ptr())
+        for name, tensor in inputs.items()
+    )
     intervals = {}
     for index, (left_name, left, left_pointer) in enumerate(tensors):
         for right_name, right, right_pointer in tensors[index + 1 :]:
@@ -114,4 +116,3 @@ def validate_aliases(inputs: Mapping[str, torch.Tensor]) -> None:
                 raise StatefulCompilationError(
                     "RUNTIME_ALIAS", "inputs", {"overlapping": [left_name, right_name]}
                 )
-

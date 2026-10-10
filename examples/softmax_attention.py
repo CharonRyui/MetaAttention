@@ -54,7 +54,9 @@ def softmax_attention(
             return (scores - final_rowscales["lse"]).exp()
 
         @staticmethod
-        def backward(dp, scores, final_rowscales, doosum_rowscales, b, h, q_idx, kv_idx):
+        def backward(
+            dp, scores, final_rowscales, doosum_rowscales, b, h, q_idx, kv_idx
+        ):
             return (dp - doosum_rowscales) * scores
 
     return AttentionEngine(

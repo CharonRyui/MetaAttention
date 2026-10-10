@@ -72,7 +72,11 @@ def test_whole_state_scale_composes_with_a_first_feature_scale():
 def test_whole_state_scale_composes_with_both_axis_scales():
     values = _values()
     left, right, rows, columns = _summary(
-        (_whole_scale(), _row_scale(), AxisScale(Exp(Input("columns")), (FeatureRole("value_dim"),))),
+        (
+            _whole_scale(),
+            _row_scale(),
+            AxisScale(Exp(Input("columns")), (FeatureRole("value_dim"),)),
+        ),
         values,
     )
     assert left is None and right is None
@@ -85,7 +89,9 @@ def test_whole_state_scale_composes_with_both_axis_scales():
 def test_generic_two_axis_backward_reads_the_elementwise_context():
     operator = dual_gate_gla_attention(1, HEADS, TOKENS, KEY, VALUE)
     candidate = LoweredCandidate("c", "p", "tilelang-generic", "forward")
-    assert backward_context_family(operator.algorithm, candidate, False) == "elementwise"
+    assert (
+        backward_context_family(operator.algorithm, candidate, False) == "elementwise"
+    )
     assert backward_context_family(operator.algorithm, candidate, True) == "dense"
 
 

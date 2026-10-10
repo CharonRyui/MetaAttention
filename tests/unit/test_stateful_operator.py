@@ -110,11 +110,15 @@ def test_backward_compilation_publishes_compiler_owned_backward_candidate():
         == executable.plan.context_contract.produced
     )
 
+
 def test_backward_binding_reuses_selected_forward_schedule():
     operator = StatefulOperator(_accumulator_ir())
     compiled = _compile(operator, backward=True)
     executable = operator._plans[compiled.specialization]
-    assert executable.plan.backward_kernel_config.values == executable.plan.kernel_config.values
+    assert (
+        executable.plan.backward_kernel_config.values
+        == executable.plan.kernel_config.values
+    )
 
 
 def test_forward_scan_uses_forward_kernel_configuration():
@@ -125,6 +129,7 @@ def test_forward_scan_uses_forward_kernel_configuration():
         (("threads", 128),),
         (("block_tokens", 128),),
     )
+
 
 def test_context_contract_rejects_dtype_role_and_shape_mismatches():
     from attn_engine.stateful.compile.plan import ContextContract, ContextValue
@@ -197,7 +202,10 @@ def test_static_selector_prefers_specialized_candidate_and_keeps_generic_fallbac
 
 
 def test_workload_policy_covers_dense_and_packed_shapes_and_scores_geomean():
-    from attn_engine.stateful.compile.plan import WORKLOAD_POLICY, normalized_geometric_mean
+    from attn_engine.stateful.compile.plan import (
+        WORKLOAD_POLICY,
+        normalized_geometric_mean,
+    )
 
     assert {point.distribution for point in WORKLOAD_POLICY.points("packed")} >= {
         "uniform",
@@ -645,13 +653,17 @@ def test_structured_plans_and_kernel_config_have_separate_identities():
     )
     assert structured_plan.candidate.identity != structured_plan.kernel_config.identity
 
+
 def test_h20_profile_exposes_existing_schedule_domain_and_plan_identity():
     from attn_engine.stateful.compile.device import (
         DEFAULT_DEVICE_PROFILE,
         ScheduleConfig,
         schedule_configurations,
     )
-    from attn_engine.stateful.compile.plan import LoweredCandidate, kernel_configurations
+    from attn_engine.stateful.compile.plan import (
+        LoweredCandidate,
+        kernel_configurations,
+    )
 
     candidate = LoweredCandidate("candidate", "plan", "tilelang-elementwise", "forward")
     assert DEFAULT_DEVICE_PROFILE.identity == "nvidia-h20-sm90"

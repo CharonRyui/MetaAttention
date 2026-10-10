@@ -39,10 +39,18 @@ def _oracle(profile, inputs, *, initial):
     values = {}
     for spec in algorithm.inputs:
         value = inputs[spec.name].float()
-        head_axis = next((index for index, role in enumerate(spec.roles)
-                          if isinstance(role, type(state_spec.head_role))), None)
+        head_axis = next(
+            (
+                index
+                for index, role in enumerate(spec.roles)
+                if isinstance(role, type(state_spec.head_role))
+            ),
+            None,
+        )
         if head_axis is not None:
-            value = value.repeat_interleave(heads // value.shape[head_axis], dim=head_axis)
+            value = value.repeat_interleave(
+                heads // value.shape[head_axis], dim=head_axis
+            )
         values[spec.name] = value
     states = initial.float().clone()
     outputs = {readout.name: [] for readout in algorithm.readouts}
@@ -62,7 +70,12 @@ def _oracle(profile, inputs, *, initial):
                 right = _evaluate_input(node.right, values, token)
                 coefficient = _evaluate_input(node.coefficient, values, token)
                 contraction = (states * right[:, :, :, None]).sum(dim=2)
-                states = states + coefficient[:, :, None, None] * left[:, :, :, None] * contraction[:, :, None, :]
+                states = (
+                    states
+                    + coefficient[:, :, None, None]
+                    * left[:, :, :, None]
+                    * contraction[:, :, None, :]
+                )
         for injection in algorithm.transitions[0].injections:
             product = states.new_ones(states.shape)
             for factor in injection.factors:
@@ -76,7 +89,9 @@ def _oracle(profile, inputs, *, initial):
             states = states + product
         for readout in algorithm.readouts:
             query = _evaluate_input(readout.operand, values, token)
-            outputs[readout.name].append(torch.einsum("bhr,bhrc->bhc", query, states).to(readout.output_dtype))
+            outputs[readout.name].append(
+                torch.einsum("bhr,bhrc->bhc", query, states).to(readout.output_dtype)
+            )
     return {name: torch.stack(items, dim=2) for name, items in outputs.items()}, states
 
 
@@ -97,18 +112,26 @@ def test_unseen_composition_matches_independent_oracle_and_uses_parallel_plan(ki
     compiled, executable = _compile(profile, optimized=True)
     values = make_inputs(profile, batch=2, length=9, device=torch.device("cpu"))
     initial = 0.05 * torch.randn(2, 4, 64, 128)
-    actual = compiled(**values, initial_state=StateTuple(("state",), (initial,)), return_final_state=True)
+    actual = compiled(
+        **values,
+        initial_state=StateTuple(("state",), (initial,)),
+        return_final_state=True,
+    )
     expected_outputs, expected_state = _oracle(profile, values, initial=initial)
     for name, expected in expected_outputs.items():
         torch.testing.assert_close(actual.outputs[name], expected, rtol=0.04, atol=0.1)
     assert actual.final_state is not None
-    torch.testing.assert_close(actual.final_state["state"], expected_state, rtol=0.04, atol=0.1)
+    torch.testing.assert_close(
+        actual.final_state["state"], expected_state, rtol=0.04, atol=0.1
+    )
 
     if torch.cuda.is_available():
         plan = executable.plan
         assert plan.candidate_estimates
         selected = dict(plan.candidate_estimates)[plan.candidate.identity]
-        assert selected.cost == min(estimate.cost for _, estimate in plan.candidate_estimates)
+        assert selected.cost == min(
+            estimate.cost for _, estimate in plan.candidate_estimates
+        )
     assert executable.runtime_family != "stateful-reference"
 
     _, generic = _compile(profile, optimized=False)
@@ -121,4 +144,7 @@ def test_renaming_roles_and_inputs_does_not_change_selected_runtime_family():
     _, original_executable = _compile(original, optimized=True)
     _, renamed_executable = _compile(renamed, optimized=True)
     assert renamed_executable.runtime_family == original_executable.runtime_family
-    assert renamed_executable.plan.mathematical_plan.representation == original_executable.plan.mathematical_plan.representation
+    assert (
+        renamed_executable.plan.mathematical_plan.representation
+        == original_executable.plan.mathematical_plan.representation
+    )

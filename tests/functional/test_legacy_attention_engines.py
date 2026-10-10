@@ -438,9 +438,7 @@ def test_legacy_sparse_gqa_decode(gpu_device, seed):
 def test_legacy_retnet_recurrent(gpu_device, seed):
     batch, heads, seqlen, dim, dim_value = 1, 2, 128, 64, 128
     dtype = torch.bfloat16
-    module = retnet_recurrent(
-        batch, heads, seqlen, dim, dim_value, dtype=dtype
-    )
+    module = retnet_recurrent(batch, heads, seqlen, dim, dim_value, dtype=dtype)
     module = _compile_stateful(
         module,
         query_heads=heads,

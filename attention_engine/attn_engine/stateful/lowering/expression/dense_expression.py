@@ -1,4 +1,5 @@
 """Authored pointwise expressions represented for TileLang lowering."""
+
 from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
@@ -15,6 +16,7 @@ class DenseLoader:
     rather than dynamically generating source preserves authored node rounding
     and lets each lowering select its own TileLang load primitive.
     """
+
     nodes: tuple[tuple[Any, ...], ...]
     root: int
     feature: Any
@@ -39,7 +41,21 @@ class DenseExpression:
 
 
 def compile_dense_expression(expression, specs, feature, *, factors=()):
-    from ....stateful_operator import Add, Clamp, Constant, Divide, Exp, Input, Log, Multiply, Negate, Reciprocal, Sigmoid, Sqrt
+    from ....stateful_operator import (
+        Add,
+        Clamp,
+        Constant,
+        Divide,
+        Exp,
+        Input,
+        Log,
+        Multiply,
+        Negate,
+        Reciprocal,
+        Sigmoid,
+        Sqrt,
+    )
+
     sources, records, nodes = [], [], {}
 
     def visit(node):
@@ -52,7 +68,10 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
         if isinstance(node, Input):
             spec = specs[node.name]
             from ....stateful_operator import FeatureRole
-            if any(isinstance(role, FeatureRole) and role != feature for role in spec.roles):
+
+            if any(
+                isinstance(role, FeatureRole) and role != feature for role in spec.roles
+            ):
                 raise ValueError("expression carries a different Feature")
             if spec not in sources:
                 sources.append(spec)
@@ -66,8 +85,20 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
         elif isinstance(node, (Add, Multiply, Divide)):
             left, ld, ls = visit(node.left)
             right, rd, rs = visit(node.right)
-            dtype = rd if ls and not rs else ld if rs and not ls else torch.promote_types(ld, rd)
-            symbol = "+" if isinstance(node, Add) else "*" if isinstance(node, Multiply) else "/"
+            dtype = (
+                rd
+                if ls and not rs
+                else ld
+                if rs and not ls
+                else torch.promote_types(ld, rd)
+            )
+            symbol = (
+                "+"
+                if isinstance(node, Add)
+                else "*"
+                if isinstance(node, Multiply)
+                else "/"
+            )
             records.append(("binary", left, right, dtype, symbol))
             index = len(records) - 1
             result = (index, dtype, ls and rs)
@@ -78,8 +109,23 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
                 index = len(records) - 1
                 result = (index, dtype, scalar)
             else:
-                kind = {Exp: "exp", Log: "log", Sigmoid: "sigmoid", Sqrt: "sqrt", Reciprocal: "reciprocal", Clamp: "clamp"}[type(node)]
-                records.append(("unary", operand, kind, getattr(node, "minimum", None), getattr(node, "maximum", None)))
+                kind = {
+                    Exp: "exp",
+                    Log: "log",
+                    Sigmoid: "sigmoid",
+                    Sqrt: "sqrt",
+                    Reciprocal: "reciprocal",
+                    Clamp: "clamp",
+                }[type(node)]
+                records.append(
+                    (
+                        "unary",
+                        operand,
+                        kind,
+                        getattr(node, "minimum", None),
+                        getattr(node, "maximum", None),
+                    )
+                )
                 index = len(records) - 1
                 result = (index, torch.float32, scalar)
         else:
@@ -98,5 +144,9 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
         return None
     digest = hashlib.sha256(repr((records, root_index, feature)).encode()).hexdigest()
     loader = DenseLoader(tuple(records), root_index, feature, digest)
-    return DenseExpression(loader, tuple(sources), feature,
-                           tuple(compile_dense_binding(spec, feature) for spec in sources))
+    return DenseExpression(
+        loader,
+        tuple(sources),
+        feature,
+        tuple(compile_dense_binding(spec, feature) for spec in sources),
+    )

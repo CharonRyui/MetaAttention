@@ -59,10 +59,12 @@ def _compile_scalar_factorized_dense_raw(
                 (sequence_count, left_heads, sequence_length, rows), dtype=left_dtype
             ),
             right: T.Tensor(
-                (sequence_count, right_heads, sequence_length, columns), dtype=right_dtype
+                (sequence_count, right_heads, sequence_length, columns),
+                dtype=right_dtype,
             ),
             readout: T.Tensor(
-                (sequence_count, readout_heads, sequence_length, rows), dtype=readout_dtype
+                (sequence_count, readout_heads, sequence_length, rows),
+                dtype=readout_dtype,
             ),
             initial: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
             output: T.Tensor(
@@ -71,7 +73,13 @@ def _compile_scalar_factorized_dense_raw(
             final: T.Tensor((sequence_count, heads, rows, columns), dtype="float32"),
         ):
             if False:
-                _ = (propagation_dtype, left_dtype, right_dtype, readout_dtype, output_dtype)
+                _ = (
+                    propagation_dtype,
+                    left_dtype,
+                    right_dtype,
+                    readout_dtype,
+                    output_dtype,
+                )
                 _ = propagation_shape
             with T.Kernel(
                 sequence_count * heads,
@@ -176,7 +184,9 @@ def _compile_scalar_factorized_dense_raw(
                                     if logical_token < sequence_length:
                                         propagation_value = T.cast(
                                             propagation[
-                                                sequence, propagation_head, logical_token
+                                                sequence,
+                                                propagation_head,
+                                                logical_token,
                                             ],
                                             "float32",
                                         )
@@ -325,6 +335,7 @@ def _compile_scalar_factorized_dense_raw(
 
     return build_kernel()
 
+
 def tilelang_scalar_factorized_dense_raw(
     raw_inputs: dict[str, torch.Tensor],
     initial_state: torch.Tensor,
@@ -337,6 +348,7 @@ def tilelang_scalar_factorized_dense_raw(
     threads: int = 128,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     identity_propagation = recipe.propagation[0].name == "__identity_propagation__"
+
     def bind(binding):
         # All schedules erase identity propagation loads at compile time. Reuse
         # a live FP32 pointer rather than launching a dense tensor of ones.

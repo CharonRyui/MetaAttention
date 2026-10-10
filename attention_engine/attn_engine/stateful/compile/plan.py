@@ -13,7 +13,12 @@ from typing import Any, Mapping
 
 import torch
 
-from .device import DEFAULT_DEVICE_PROFILE, DeviceProfile, resolve_device_profile, schedule_configurations
+from .device import (
+    DEFAULT_DEVICE_PROFILE,
+    DeviceProfile,
+    resolve_device_profile,
+    schedule_configurations,
+)
 
 
 class PlanRepresentation(str, Enum):
@@ -226,10 +231,22 @@ class EstimationShape:
         columns = feature_sizes[1] if len(feature_sizes) > 1 else 1
         total = state_total_elements or state_count * rows * columns
         return cls(
-            heads, rows, columns, dense_summary, state_count, total,
-            dense_total_elements or total, live_state_elements or total,
-            backward, chunked, chunked_states, chunked_states_workspace,
-            chunked_states_chunk_bytes, factored_workspace, factored_chunk_bytes, native_resources,
+            heads,
+            rows,
+            columns,
+            dense_summary,
+            state_count,
+            total,
+            dense_total_elements or total,
+            live_state_elements or total,
+            backward,
+            chunked,
+            chunked_states,
+            chunked_states_workspace,
+            chunked_states_chunk_bytes,
+            factored_workspace,
+            factored_chunk_bytes,
+            native_resources,
         )
 
     @property
@@ -239,7 +256,11 @@ class EstimationShape:
     @property
     def summary_elements(self) -> int:
         if self.dense_summary:
-            return self.rows * self.rows + self.columns * self.columns + self.state_elements
+            return (
+                self.rows * self.rows
+                + self.columns * self.columns
+                + self.state_elements
+            )
         return self.state_elements
 
 
@@ -436,9 +457,12 @@ class CandidateLowerer:
                 elif resources.cut_bytes and not resources.fused_softmax:
                     token_bytes += resources.cut_bytes
                 return CandidateEstimate(
-                    True, token_bytes + chunk_bytes // 64,
-                    resources.flops_per_token, launches,
-                    token_bytes, workspace_bytes_per_chunk=chunk_bytes,
+                    True,
+                    token_bytes + chunk_bytes // 64,
+                    resources.flops_per_token,
+                    launches,
+                    token_bytes,
+                    workspace_bytes_per_chunk=chunk_bytes,
                 )
             # The chunked schedule keeps boundary carries and contracted
             # outputs; it does not materialize a token-sized State history.
@@ -587,6 +611,7 @@ LOWERERS = (
     ),
 )
 
+
 def _backward_configuration(
     forward_values: tuple[tuple[str, int], ...],
     family: str,
@@ -639,7 +664,9 @@ def kernel_configurations(
 ) -> tuple[tuple[tuple[str, int], ...], ...]:
     """Return lowering-owned schedule candidates for a target profile."""
     profile = DEFAULT_DEVICE_PROFILE if profile is None else profile
-    return tuple(config.values for config in schedule_configurations(candidate, profile))
+    return tuple(
+        config.values for config in schedule_configurations(candidate, profile)
+    )
 
 
 def select_candidate(
@@ -653,6 +680,7 @@ def select_candidate(
         candidates,
         key=lambda item: (estimates[item].cost, item.lowerer, item.identity),
     )
+
 
 @dataclass(frozen=True)
 class ContextValue:
@@ -851,7 +879,9 @@ class TileLangExecutable:
     _runtime_family: str = field(init=False, repr=False)
 
     def __post_init__(self):
-        object.__setattr__(self, "_runtime_family", runtime_family_for(self.plan.candidate))
+        object.__setattr__(
+            self, "_runtime_family", runtime_family_for(self.plan.candidate)
+        )
 
     @property
     def runtime_family(self) -> str:
@@ -1020,8 +1050,11 @@ def compile_plan(
     device_profile = resolve_device_profile(target)
     from ..lowering.chunked import compile_chunked_recipe
 
-    chunked_recipe = (compile_chunked_recipe(operator.algorithm, dict(compilation.role_sizes))
-                      if mode == "dense" else None)
+    chunked_recipe = (
+        compile_chunked_recipe(operator.algorithm, dict(compilation.role_sizes))
+        if mode == "dense"
+        else None
+    )
     from ..lowering.reference import requires_reference_lowering
     from ..lowering.structured import product_feature_chunked_eligibility
 
@@ -1045,10 +1078,17 @@ def compile_plan(
     rewrites = _structured_rewrites(structural_features) if optimized else ()
     representations: list[PlanRepresentation] = []
     special_representation = None
-    if optimized and target.device_type == "cuda" and mode == "dense" and backward_ir is None:
+    if (
+        optimized
+        and target.device_type == "cuda"
+        and mode == "dense"
+        and backward_ir is None
+    ):
         if chunked_recipe is not None and chunked_recipe.rank_one is not None:
             special_representation = PlanRepresentation.RANK_ONE_DIAGONAL
-        elif chunked_recipe is not None and chunked_recipe.native_normalized is not None:
+        elif (
+            chunked_recipe is not None and chunked_recipe.native_normalized is not None
+        ):
             special_representation = PlanRepresentation.NATIVE_NORMALIZED
         elif chunked_recipe is not None and chunked_recipe.native_diagonal is not None:
             special_representation = PlanRepresentation.NATIVE_DIAGONAL
@@ -1104,23 +1144,37 @@ def compile_plan(
         else (0, 0)
     )
     if optimized and chunked_recipe is not None and chunked_recipe.rank_one is not None:
-        elements = fixed_sizes[state.head_role] * fixed_sizes[chunked_recipe.rank_one.feature]
+        elements = (
+            fixed_sizes[state.head_role] * fixed_sizes[chunked_recipe.rank_one.feature]
+        )
         # Three FP32 chunk vectors plus recursive groups; the extra chunk
         # conservatively covers final State.
         state_workspace, state_chunk_bytes = 4 * elements, 16 * elements
-    if optimized and chunked_recipe is not None and chunked_recipe.native_normalized is not None:
+    if (
+        optimized
+        and chunked_recipe is not None
+        and chunked_recipe.native_normalized is not None
+    ):
         native = chunked_recipe.native_normalized
-        memory = next(spec for spec in operator.algorithm.states if spec.name == native.memory)
+        memory = next(
+            spec for spec in operator.algorithm.states if spec.name == native.memory
+        )
         heads = fixed_sizes[memory.head_role]
         rows, columns = (fixed_sizes[role] for role in memory.feature_roles)
         state_workspace = 4 * heads * columns
         state_chunk_bytes = 12 * heads * rows * (columns + 1)
     native_resources = None
-    if optimized and chunked_recipe is not None and chunked_recipe.native_product_normalized is not None:
+    if (
+        optimized
+        and chunked_recipe is not None
+        and chunked_recipe.native_product_normalized is not None
+    ):
         from ..lowering.readout.product_native import native_product_estimate
 
         native_resources = native_product_estimate(
-            chunked_recipe.native_product_normalized, fixed_sizes, fixed_sizes[state.head_role],
+            chunked_recipe.native_product_normalized,
+            fixed_sizes,
+            fixed_sizes[state.head_role],
         )
         state_workspace = native_resources.output_bytes
         state_chunk_bytes = native_resources.chunk_bytes
@@ -1128,7 +1182,9 @@ def compile_plan(
         from ..lowering.diagonal.diagonal_native import native_diagonal_resources
 
         native_resources = native_diagonal_resources(
-            chunked_recipe.native_diagonal, fixed_sizes, fixed_sizes[state.head_role],
+            chunked_recipe.native_diagonal,
+            fixed_sizes,
+            fixed_sizes[state.head_role],
         )
         state_workspace = native_resources.output_bytes
         state_chunk_bytes = native_resources.chunk_bytes
@@ -1154,15 +1210,27 @@ def compile_plan(
                     * (rows + columns)
                 )
             )
-            factored_chunk_bytes = 4 * heads * (rows * rows + 2 * rows * columns + columns)
-            from ..lowering.lowrank.wy_kernels import eligible as wy_eligible, scratch_bytes_per_chunk
+            factored_chunk_bytes = (
+                4 * heads * (rows * rows + 2 * rows * columns + columns)
+            )
+            from ..lowering.lowrank.wy_kernels import (
+                eligible as wy_eligible,
+                scratch_bytes_per_chunk,
+            )
 
-            operation_codes = tuple(operation.kind for operation in rank_one_factored.operations)
+            operation_codes = tuple(
+                operation.kind for operation in rank_one_factored.operations
+            )
             if wy_eligible(operation_codes, injection_count, rows, columns):
                 factored_chunk_bytes = max(
                     factored_chunk_bytes,
-                    heads * scratch_bytes_per_chunk(
-                        operation_codes, injection_count, readout_count, rows, columns,
+                    heads
+                    * scratch_bytes_per_chunk(
+                        operation_codes,
+                        injection_count,
+                        readout_count,
+                        rows,
+                        columns,
                     ),
                 )
     state_total = 0
@@ -1177,13 +1245,19 @@ def compile_plan(
         state_total_elements=state_total,
         dense_total_elements=sum(
             fixed_sizes[spec.feature_roles[0]] ** 2
-            + (fixed_sizes[spec.feature_roles[1]] ** 2 if len(spec.feature_roles) > 1 else 0)
+            + (
+                fixed_sizes[spec.feature_roles[1]] ** 2
+                if len(spec.feature_roles) > 1
+                else 0
+            )
             + (state_total // max(1, len(operator.algorithm.states)))
             for spec in operator.algorithm.states
         ),
         chunked_states_workspace=state_workspace,
         chunked_states_chunk_bytes=(
-            state_chunk_bytes if optimized and (chunked_stateful or product_feature_chunked) else 0
+            state_chunk_bytes
+            if optimized and (chunked_stateful or product_feature_chunked)
+            else 0
         ),
         factored_workspace=factored_token_bytes,
         factored_chunk_bytes=factored_chunk_bytes,
@@ -1192,7 +1266,9 @@ def compile_plan(
     candidate_list: list[LoweredCandidate] = []
     estimates: dict[LoweredCandidate, CandidateEstimate] = {}
     for item in mathematical_plans:
-        native_diagonal = None if chunked_recipe is None else chunked_recipe.native_diagonal
+        native_diagonal = (
+            None if chunked_recipe is None else chunked_recipe.native_diagonal
+        )
         for lowerer in LOWERERS:
             if lowerer.name == "tilelang-chunked-shared-scores" and (
                 native_diagonal is None
@@ -1202,7 +1278,8 @@ def compile_plan(
             ):
                 continue
             if lowerer.name == "tilelang-chunked-readout-cut" and (
-                native_diagonal is None or native_diagonal.softmax is None
+                native_diagonal is None
+                or native_diagonal.softmax is None
                 or not native_diagonal.fused_softmax
             ):
                 continue
@@ -1228,13 +1305,17 @@ def compile_plan(
                 and backward_ir is not None
                 and (
                     rank_one_factored is None
-                    or any(operation.kind not in {"column-scale", "row-scale", "scale", "rank-one"}
-                           for operation in rank_one_factored.operations)
+                    or any(
+                        operation.kind
+                        not in {"column-scale", "row-scale", "scale", "rank-one"}
+                        for operation in rank_one_factored.operations
+                    )
                 )
             ):
                 continue
             if (
-                item.representation not in {
+                item.representation
+                not in {
                     PlanRepresentation.GENERIC_DENSE_AFFINE,
                     PlanRepresentation.RANK_ONE_DIAGONAL,
                     PlanRepresentation.NATIVE_NORMALIZED,
@@ -1335,7 +1416,9 @@ def compile_plan(
             if item.identity == candidate.plan_identity
         )
         values = tuning_result.winner_config
-    kernel_config = KernelConfig(_digest((device_profile.target_identity, candidate.identity, values)), values)
+    kernel_config = KernelConfig(
+        _digest((device_profile.target_identity, candidate.identity, values)), values
+    )
     toolchain = _toolchain_fingerprint()
     environment = _target_fingerprint(target)
     fixed_roles = tuple((str(role), size) for role, size in compilation.role_sizes)
@@ -1375,7 +1458,10 @@ def compile_plan(
             toolchain,
             WORKLOAD_POLICY.version,
             mode,
-            tuple((item.identity, kernel_configurations(item, device_profile)) for item in candidates),
+            tuple(
+                (item.identity, kernel_configurations(item, device_profile))
+                for item in candidates
+            ),
         )
     )
     selected_estimate = estimates[candidate]
@@ -1387,7 +1473,9 @@ def compile_plan(
         bytes_per_chunk=selected_estimate.workspace_bytes_per_chunk,
         # Factored inference can use 16-token WY/short replay chunks. Charge
         # that worst case even when long non-WY calls select 64-token chunks.
-        chunk_tokens=16 if selected_plan.representation == PlanRepresentation.FACTORED_RECURRENCE else 64,
+        chunk_tokens=16
+        if selected_plan.representation == PlanRepresentation.FACTORED_RECURRENCE
+        else 64,
     )
     backward_candidate = None
     backward_kernel_config = None
