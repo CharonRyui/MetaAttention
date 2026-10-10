@@ -178,4 +178,3 @@ The bug that took longest is worth recording because its symptom was subtle: the
 Evidence: `rebased` matches FLA; the per-State bound is published (`133120` bytes/token aligned against `25559040` per token at heads=8, dim=64; `2080` at heads=2, dim=16); the entry test covers a rank-1 State beside a dense one with `rows != columns`; the functional gate is 30 passed and the unit suite 153.
 
 **Still open in this ticket:** the latency and envelope evidence at length for the v2/v3 families (the charge is published and T=2048 fits the envelope on paper, but the runtime acceptance and the measured latency are not yet on record), and the packed form.
-
