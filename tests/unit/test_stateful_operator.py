@@ -924,3 +924,86 @@ def test_ir_requires_exactly_one_matrix_state():
         )
     assert captured.value.category == "IR_SCHEMA"
     assert captured.value.path == "states"
+
+
+@pytest.mark.parametrize(
+    "slot", ["propagation", "left_factor", "right_factor", "readout"]
+)
+@pytest.mark.parametrize("scales", [(0.5, 0.5), (0.1, 0.3, 0.7)])
+def test_nested_constant_scales_keep_raw_dense_recipe(slot, scales):
+    base = _accumulator_ir()
+    transition = base.transition
+    readouts = base.readouts
+
+    def scaled(name):
+        expression = Input(name)
+        for scale in scales:
+            expression = expression * scale
+        return expression
+
+    if slot == "propagation":
+        transition = dataclasses.replace(
+            transition, propagations=(AxisScale(Exp(scaled("gate"))),)
+        )
+    elif slot == "readout":
+        readouts = (dataclasses.replace(readouts[0], operand=scaled("query")),)
+    else:
+        index = 0 if slot == "left_factor" else 1
+        factors = list(transition.injections[0].factors)
+        factors[index] = ProductFactor(
+            scaled("key" if index == 0 else "value"), factors[index].roles
+        )
+        transition = dataclasses.replace(
+            transition, injections=(ProductInjection(tuple(factors)),)
+        )
+    algorithm = AlgorithmIR(
+        base.inputs, base.states, transition, readouts, base.head_mapping
+    )
+    dense = algorithm._analysis.scalar_factorized.dense
+    assert dense is not None
+    recipe = getattr(dense, slot)[1]
+    assert recipe.scale_steps == tuple(Constant(scale).value for scale in scales)
+    operator = StatefulOperator(algorithm)
+    compiled = _compile(operator)
+    assert operator._plans[compiled.specialization].plan.candidate.lowerer == (
+        "tilelang-scalar-factorized"
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        (Input("query") * Constant(0.5, torch.bfloat16)) * 0.5,
+        (Input("query") * Input("key")) * 0.5,
+    ],
+)
+def test_nested_scalar_matching_keeps_dtype_and_input_boundaries(expression):
+    base = _accumulator_ir()
+    algorithm = AlgorithmIR(
+        base.inputs,
+        base.states,
+        base.transition,
+        (dataclasses.replace(base.readouts[0], operand=expression),),
+        base.head_mapping,
+    )
+    assert algorithm._analysis.scalar_factorized.dense is None
+    assert algorithm.readouts[0].operand == expression
+
+
+def test_nested_scalar_matching_preserves_authored_identity():
+    base = _accumulator_ir()
+    algorithms = [
+        AlgorithmIR(
+            base.inputs,
+            base.states,
+            base.transition,
+            (dataclasses.replace(base.readouts[0], operand=expression),),
+            base.head_mapping,
+        )
+        for expression in (
+            (Input("query") * 0.5) * 0.5,
+            Input("query") * 0.25,
+        )
+    ]
+    assert all(algorithm._analysis.scalar_factorized.dense for algorithm in algorithms)
+    assert algorithms[0]._structural_identity != algorithms[1]._structural_identity

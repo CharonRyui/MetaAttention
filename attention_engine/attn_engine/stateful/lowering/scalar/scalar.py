@@ -41,6 +41,7 @@ def _compile_scalar_factorized_dense_raw(
     return_final_state: bool,
     threads: int,
     identity_propagation: bool,
+    scale_steps: tuple[tuple[float, ...], ...] = ((), (), (), ()),
 ):
     import tilelang
     import tilelang.language as T
@@ -54,7 +55,40 @@ def _compile_scalar_factorized_dense_raw(
         else (sequence_count, propagation_heads, sequence_length)
     )
 
-    @tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True})
+    from .scalar_kernels import _transform
+
+    propagation_transform = _transform(
+        T,
+        (
+            propagation_operation,
+            propagation_scale,
+            False,
+            propagation_offset,
+            scale_steps[0],
+        ),
+    )
+    left_transform = _transform(
+        T, (left_operation, left_scale, left_is_log_scale, left_offset, scale_steps[1])
+    )
+    right_transform = _transform(
+        T, (right_operation, right_scale, right_is_log_scale, right_offset, scale_steps[2])
+    )
+    readout_transform = _transform(
+        T,
+        (
+            readout_operation,
+            readout_scale,
+            readout_is_log_scale,
+            readout_offset,
+            scale_steps[3],
+        ),
+    )
+    preserve_scales = any(scale_steps)
+
+    @tilelang.jit(
+        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: not preserve_scales},
+        compile_flags=["-fmad=false"] if preserve_scales else None,
+    )
     def build_kernel():
         @T.prim_func
         def kernel(
@@ -140,18 +174,8 @@ def _compile_scalar_factorized_dense_raw(
                             left_value = T.cast(
                                 left[sequence, left_head, logical_token, row], "float32"
                             )
-                            if readout_operation == "exp":
-                                readout_value = T.exp(readout_value)
-                            if left_operation == "exp":
-                                left_value = T.exp(left_value)
-                            readout_value = readout_value * readout_scale
-                            left_value = left_value * left_scale
-                            if readout_is_log_scale:
-                                readout_value = T.exp(readout_value)
-                            if left_is_log_scale:
-                                left_value = T.exp(left_value)
-                            readout_value = readout_value + readout_offset
-                            left_value = left_value + left_offset
+                            readout_value = readout_transform(readout_value)
+                            left_value = left_transform(left_value)
                             readout_shared[token, row] = readout_value
                             left_shared[token, row] = left_value
                         else:
@@ -172,12 +196,7 @@ def _compile_scalar_factorized_dense_raw(
                                 ],
                                 "float32",
                             )
-                            if right_operation == "exp":
-                                right_value = T.exp(right_value)
-                            right_value = right_value * right_scale
-                            if right_is_log_scale:
-                                right_value = T.exp(right_value)
-                            right_value = right_value + right_offset
+                            right_value = right_transform(right_value)
                             right_shared[token, column] = right_value
                         else:
                             right_shared[token, column] = 0.0
@@ -197,11 +216,8 @@ def _compile_scalar_factorized_dense_raw(
                                             ],
                                             "float32",
                                         )
-                                        if propagation_operation == "exp":
-                                            propagation_value = T.exp(propagation_value)
-                                        running_log[0] += (
-                                            propagation_value * propagation_scale
-                                            + propagation_offset
+                                        running_log[0] += propagation_transform(
+                                            propagation_value
                                         )
                                     prefix[token] = running_log[0]
                         else:
@@ -216,11 +232,8 @@ def _compile_scalar_factorized_dense_raw(
                                         ],
                                         "float32",
                                     )
-                                    if propagation_operation == "exp":
-                                        propagation_value = T.exp(propagation_value)
-                                    gates[token] = (
-                                        propagation_value * propagation_scale
-                                        + propagation_offset
+                                    gates[token] = propagation_transform(
+                                        propagation_value
                                     )
                             T.sync_threads()
                             if T.get_thread_binding() == 0:
@@ -448,6 +461,7 @@ def tilelang_scalar_factorized_dense_raw(
         return_final_state,
         threads,
         identity_propagation,
+        tuple(getattr(expression, "scale_steps", ()) for expression in expressions),
     )
     kernel(propagation, left, right, readout, initial_state, output, final)
     return output, final if return_final_state else None
