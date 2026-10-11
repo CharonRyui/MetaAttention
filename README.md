@@ -6,6 +6,10 @@
 
 MetaAttention provides users with pythonic interface to define customized attention flexibly and automatically generate device code with high performance. Examples of various attention mechanisms (e.g., softmax attention, RetNet, Mamba2, MLA) are provided in the examples/ folder.
 
+The [Stateful example guide](examples/README.md) documents Delta Rule, KDA,
+GDN2, ComBa, IPLR/DPLR, Gated Oja, fixed-step Delta Product, and ABC, including
+input conventions, state continuation, numerical limits, and validation.
+
 # 1. Getting Started Guide
 
 ## Hardware Requirements
@@ -54,7 +58,7 @@ Run the unified pytest suite from the repository root. The unit suite is CPU-saf
 ```bash
 uv run --extra test pytest -q tests/unit
 
-# imports for all 14 official example factories
+# imports for official example factories
 uv run --extra test pytest -q -m examples tests/unit/test_example_imports.py
 ```
 

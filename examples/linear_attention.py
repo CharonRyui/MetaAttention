@@ -267,12 +267,14 @@ def delta_rule_attention(
     kv_heads: int | None = None,
     dtype: torch.dtype = torch.bfloat16,
 ) -> StatefulOperator:
-    """Build a matrix-state delta-rule-shaped recurrence.
+    """Build Delta Rule: S <- S + beta k (v - k^T S)^T.
 
-    This keeps the rank-one matrix-state interface available for experiments;
-    the current one-state schema represents the plain additive update.
+    This compatibility entry point delegates to the self-contained Delta Rule
+    example. Invocation requires a scalar FP32 ``beta`` input per head/token.
     """
-    return linear_attention(
+    from examples.delta_rule import delta_rule_attention as build_delta_rule
+
+    return build_delta_rule(
         batch, heads, seqlen, dim, dim_value, kv_heads=kv_heads, dtype=dtype
     )
 

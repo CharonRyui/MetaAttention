@@ -9,7 +9,16 @@ pytestmark = [pytest.mark.unit, pytest.mark.examples]
 
 
 EXAMPLE_FACTORIES = (
+    ("examples.abc_attention", "abc_attention"),
     ("examples.based_attention", "based_attention"),
+    ("examples.comba", "comba"),
+    ("examples.delta_rule", "delta_rule_attention"),
+    ("examples.gated_delta_product", "gated_delta_product"),
+    ("examples.gated_oja_rule", "gated_oja_rule"),
+    ("examples.gdn2", "gdn2"),
+    ("examples.generalized_delta_rule", "iplr_delta_rule"),
+    ("examples.generalized_delta_rule", "dplr_delta_rule"),
+    ("examples.kda", "kda"),
     ("examples.gated_delta_rule", "gated_delta_rule"),
     ("examples.gated_retention", "gated_retention"),
     ("examples.gated_slot_attention", "gated_slot_attention"),
