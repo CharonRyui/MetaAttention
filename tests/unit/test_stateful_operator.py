@@ -256,7 +256,9 @@ def test_metadata_only_compile_rejects_runtime_roles_and_tensor_arguments():
         )
 
 
-def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
+def _accumulator_ir(
+    dtype: torch.dtype = torch.float32, *, key_offset: float = 0.0
+) -> AlgorithmIR:
     return AlgorithmIR(
         inputs=(
             TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
@@ -271,7 +273,7 @@ def _accumulator_ir(dtype: torch.dtype = torch.float32) -> AlgorithmIR:
             injections=(
                 ProductInjection(
                     (
-                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("key") + key_offset, (KEY,)),
                         ProductFactor(Input("value"), (VALUE,)),
                     )
                 ),
@@ -782,6 +784,12 @@ def test_analysis_derives_raw_dense_recipe_from_structure():
     assert dense.left_factor[0].name == "key"
     assert dense.right_factor[0].name == "value"
     assert dense.readout[0].name == "query"
+
+def test_analysis_accepts_constant_offset_in_scalar_factorized_injection():
+    operator = StatefulOperator(_accumulator_ir(key_offset=0.1))
+    dense = operator.algorithm._analysis.scalar_factorized.dense
+    assert dense is not None
+    assert dense.left_factor[1].offset == pytest.approx(0.1)
 
 
 def test_runtime_revalidates_metadata():

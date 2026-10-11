@@ -1900,12 +1900,16 @@ class StatefulOperator:
                 factor.roles[0]: _evaluate(factor.expression, values)
                 for factor in injection_term.factors
             }
+            dense_recipe = scalar_profile.dense
+            assert dense_recipe is not None
+            left_offset = dense_recipe.left_factor[1].offset
+            right_offset = dense_recipe.right_factor[1].offset
+            readout_offset = dense_recipe.readout[1].offset
             readout = _feature_vector(
                 _evaluate(self.algorithm.readouts[0].operand, values),
                 self.algorithm.readouts[0].role,
                 state_spec,
             )
-            assert elementwise is not None
             if runtime.packed:
                 assert runtime.offsets is not None
                 max_sequence_length = max(runtime.token_count, 1)
@@ -1920,6 +1924,9 @@ class StatefulOperator:
                     max_sequence_length=max_sequence_length,
                     output_dtype=self.algorithm.readouts[0].output_dtype,
                     return_final_state=return_final_state,
+                    left_offset=left_offset,
+                    right_offset=right_offset,
+                    readout_offset=readout_offset,
                 )
             else:
                 output, fused_final = executable.scalar_factorized_dense(
@@ -1932,6 +1939,9 @@ class StatefulOperator:
                     sequence_length=runtime.uniform_length,
                     output_dtype=self.algorithm.readouts[0].output_dtype,
                     return_final_state=return_final_state,
+                    left_offset=left_offset,
+                    right_offset=right_offset,
+                    readout_offset=readout_offset,
                 )
             output_values = [output]
             final_state = (

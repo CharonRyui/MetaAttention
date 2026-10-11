@@ -132,7 +132,7 @@ def test_rank_one_metadata_records_symmetric_and_asymmetric_proofs():
     assert asymmetric_executable.symmetric_rank_one is False
 
 
-def test_scalar_decay_keeps_the_factorized_selection():
+def test_scalar_decay_with_constant_key_offset_keeps_factorized_selection():
     plan = _plan(simple_gla_attention)
     assert plan.candidate.lowerer == "tilelang-scalar-factorized"
     costs = [estimate.cost for _, estimate in plan.candidate_estimates]

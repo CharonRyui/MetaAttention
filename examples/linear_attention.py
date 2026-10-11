@@ -98,7 +98,7 @@ def _operator(
             injections=(
                 ProductInjection(
                     (
-                        ProductFactor(Input("key"), (KEY,)),
+                        ProductFactor(Input("key") + 0.1, (KEY,)),
                         ProductFactor(Input("value"), (VALUE,)),
                     )
                 ),

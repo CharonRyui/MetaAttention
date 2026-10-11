@@ -24,7 +24,7 @@ class ScalarExpressionIR:
     operation: str
     scale: float = 1.0
     is_log_scale: bool = False
-
+    offset: float = 0.0
 
 @dataclass(frozen=True)
 class DenseInputIR:
@@ -1017,6 +1017,7 @@ def _dense_scalar_binding(
     require_exp: bool = False,
 ) -> tuple[DenseInputIR, ScalarExpressionIR] | None:
     from ...stateful_operator import (
+        Add,
         Batch,
         Constant,
         Exp,
@@ -1029,7 +1030,17 @@ def _dense_scalar_binding(
 
     operation = "identity"
     scale = 1.0
+    offset = 0.0
     is_log_scale = False
+    if isinstance(expression, Add):
+        if isinstance(expression.left, Constant):
+            offset += expression.left.value
+            expression = expression.right
+        elif isinstance(expression.right, Constant):
+            offset += expression.right.value
+            expression = expression.left
+        else:
+            return None
     if isinstance(expression, Exp):
         expression = expression.operand
         is_log_scale = True
@@ -1078,4 +1089,6 @@ def _dense_scalar_binding(
         spec.roles.index(Sequence),
         feature_axis,
     )
-    return binding, ScalarExpressionIR(spec.name, operation, scale, is_log_scale)
+    return binding, ScalarExpressionIR(
+        spec.name, operation, scale, is_log_scale, offset
+    )

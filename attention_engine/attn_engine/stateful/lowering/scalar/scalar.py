@@ -34,6 +34,10 @@ def _compile_scalar_factorized_dense_raw(
     left_scale: float,
     right_scale: float,
     readout_scale: float,
+    propagation_offset: float,
+    left_offset: float,
+    right_offset: float,
+    readout_offset: float,
     return_final_state: bool,
     threads: int,
     identity_propagation: bool,
@@ -146,6 +150,8 @@ def _compile_scalar_factorized_dense_raw(
                                 readout_value = T.exp(readout_value)
                             if left_is_log_scale:
                                 left_value = T.exp(left_value)
+                            readout_value = readout_value + readout_offset
+                            left_value = left_value + left_offset
                             readout_shared[token, row] = readout_value
                             left_shared[token, row] = left_value
                         else:
@@ -171,6 +177,7 @@ def _compile_scalar_factorized_dense_raw(
                             right_value = right_value * right_scale
                             if right_is_log_scale:
                                 right_value = T.exp(right_value)
+                            right_value = right_value + right_offset
                             right_shared[token, column] = right_value
                         else:
                             right_shared[token, column] = 0.0
@@ -194,6 +201,7 @@ def _compile_scalar_factorized_dense_raw(
                                             propagation_value = T.exp(propagation_value)
                                         running_log[0] += (
                                             propagation_value * propagation_scale
+                                            + propagation_offset
                                         )
                                     prefix[token] = running_log[0]
                         else:
@@ -210,7 +218,10 @@ def _compile_scalar_factorized_dense_raw(
                                     )
                                     if propagation_operation == "exp":
                                         propagation_value = T.exp(propagation_value)
-                                    gates[token] = propagation_value * propagation_scale
+                                    gates[token] = (
+                                        propagation_value * propagation_scale
+                                        + propagation_offset
+                                    )
                             T.sync_threads()
                             if T.get_thread_binding() == 0:
                                 running = T.alloc_local((1,), dtype="float32")
@@ -430,6 +441,10 @@ def tilelang_scalar_factorized_dense_raw(
         expressions[1].scale,
         expressions[2].scale,
         expressions[3].scale,
+        getattr(expressions[0], "offset", 0.0),
+        getattr(expressions[1], "offset", 0.0),
+        getattr(expressions[2], "offset", 0.0),
+        getattr(expressions[3], "offset", 0.0),
         return_final_state,
         threads,
         identity_propagation,
@@ -451,6 +466,9 @@ def _compile_scalar_factorized_forward(
     device_index: int,
     return_final_state: bool,
     threads: int,
+    left_offset: float,
+    right_offset: float,
+    readout_offset: float,
 ):
     import tilelang
     import tilelang.language as T
@@ -520,13 +538,15 @@ def _compile_scalar_factorized_forward(
                         logical_token = chunk_start + token
                         physical_token = sequence_start + logical_token
                         if logical_token < sequence_length:
-                            query_shared[token, row] = readout[
-                                head, physical_token, row
-                            ]
-                            readout_float[token, row] = readout[
-                                head, physical_token, row
-                            ]
-                            key_shared[token, row] = left[head, physical_token, row]
+                            query_shared[token, row] = (
+                                readout[head, physical_token, row] + readout_offset
+                            )
+                            readout_float[token, row] = (
+                                readout[head, physical_token, row] + readout_offset
+                            )
+                            key_shared[token, row] = (
+                                left[head, physical_token, row] + left_offset
+                            )
                         else:
                             query_shared[token, row] = 0.0
                             key_shared[token, row] = 0.0
@@ -538,9 +558,10 @@ def _compile_scalar_factorized_forward(
                             logical_token < sequence_length
                             and column_start + column < columns
                         ):
-                            value_shared[token, column] = right[
-                                head, physical_token, column_start + column
-                            ]
+                            value_shared[token, column] = (
+                                right[head, physical_token, column_start + column]
+                                + right_offset
+                            )
                         else:
                             value_shared[token, column] = 0.0
                     if T.get_thread_binding() == 0:
@@ -645,6 +666,9 @@ def tilelang_scalar_factorized_forward(
     output_dtype: torch.dtype,
     return_final_state: bool,
     threads: int = 128,
+    left_offset: float = 0.0,
+    right_offset: float = 0.0,
+    readout_offset: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     heads, rows, columns = initial_state.shape[1:]
     token_count = scale.shape[0]
@@ -667,6 +691,9 @@ def tilelang_scalar_factorized_forward(
         device_index,
         return_final_state,
         threads,
+        left_offset,
+        right_offset,
+        readout_offset,
     )
     kernel(
         scale.reshape(token_count, heads).transpose(0, 1).contiguous(),
@@ -706,7 +733,10 @@ def tilelang_scalar_factorized_dense(
     output_dtype: torch.dtype,
     return_final_state: bool,
     threads: int = 128,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
+    left_offset: float = 0.0,
+    right_offset: float = 0.0,
+    readout_offset: float = 0.0,
+):
     device_index = scale.device.index
     if device_index is None:
         device_index = torch.cuda.current_device()
@@ -723,6 +753,9 @@ def tilelang_scalar_factorized_dense(
         output_dtype=output_dtype,
         return_final_state=return_final_state,
         threads=threads,
+        left_offset=left_offset,
+        right_offset=right_offset,
+        readout_offset=readout_offset,
     )
     output = output.reshape(
         sequence_count, sequence_length, output.shape[1], output.shape[2]

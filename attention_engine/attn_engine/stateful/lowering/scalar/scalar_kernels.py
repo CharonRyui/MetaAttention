@@ -25,7 +25,8 @@ def _metadata(tensor: torch.Tensor):
 
 
 def _transform(T, expression):
-    operation, scale, is_log = expression
+    operation, scale, is_log = expression[:3]
+    offset = expression[3] if len(expression) > 3 else 0.0
 
     def transform(value):
         if operation == "exp":
@@ -33,7 +34,7 @@ def _transform(T, expression):
         value = value * scale
         if is_log:
             value = T.exp(value)
-        return value
+        return value + offset
 
     return transform
 
@@ -543,7 +544,12 @@ def scalar_chunked_dense_raw(
         )
     )
     expression_meta = tuple(
-        (expression.operation, expression.scale, expression.is_log_scale)
+        (
+            expression.operation,
+            expression.scale,
+            expression.is_log_scale,
+            getattr(expression, "offset", 0.0),
+        )
         for expression in expressions
     )
     device_index = initial.device.index
