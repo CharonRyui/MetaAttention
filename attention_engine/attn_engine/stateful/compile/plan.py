@@ -1105,7 +1105,10 @@ def compile_plan(
     if (
         optimized
         and rank_one_factored is not None
-        and mode == "dense"
+        and (
+            mode == "dense"
+            or (target.device_type == "cuda" and rank_one_factored.transpose_state)
+        )
         and (not reference_required or target.device_type == "cuda")
     ):
         representations.append(PlanRepresentation.FACTORED_RECURRENCE)
@@ -1195,9 +1198,11 @@ def compile_plan(
         state_workspace = native_resources.output_bytes
         state_chunk_bytes = native_resources.chunk_bytes
     factored_token_bytes = factored_chunk_bytes = 0
-    if rank_one_factored is not None and mode == "dense":
+    if rank_one_factored is not None:
         heads = fixed_sizes[state.head_role]
         rows, columns = feature_sizes
+        if rank_one_factored.transpose_state:
+            rows, columns = columns, rows
         if backward_ir is not None:
             factored_token_bytes = (
                 2 * heads * rows * columns
@@ -1211,6 +1216,8 @@ def compile_plan(
             injection_count = rank_one_factored.injection_count
             scalar_count = rank_one_factored.injection_scalar_count
             readout_count = len(rank_one_factored.readout_roles)
+            query_width = columns if rank_one_factored.readout_axis else rows
+            output_width = rows if rank_one_factored.readout_axis else columns
             factored_token_bytes = (
                 4
                 * heads
@@ -1218,7 +1225,7 @@ def compile_plan(
                     operation_count * (2 * rows + columns + 1)
                     + injection_count * (rows + columns)
                     + 5 * scalar_count
-                    + readout_count * (rows + 2 * columns)
+                    + readout_count * (query_width + 2 * output_width)
                     + 4
                     * (operation_count + injection_count + readout_count)
                     * (rows + columns)
@@ -1235,8 +1242,11 @@ def compile_plan(
             operation_codes = tuple(
                 operation.kind for operation in rank_one_factored.operations
             )
-            if not scalar_count and wy_eligible(
-                operation_codes, injection_count, rows, columns
+            if (
+                mode == "dense"
+                and not rank_one_factored.readout_axis
+                and not scalar_count
+                and wy_eligible(operation_codes, injection_count, rows, columns)
             ):
                 factored_chunk_bytes = max(
                     factored_chunk_bytes,

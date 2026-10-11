@@ -340,6 +340,7 @@ def _compile_summary(
     packed,
     reverse,
     device_index,
+    readout_axis=0,
     chunk_size=CHUNK_SIZE,
 ):
     import tilelang
@@ -399,22 +400,44 @@ def _compile_summary(
                                 for readout in T.unroll(readouts):
                                     for r, c in T.Parallel(br, bc):
                                         query = T.if_then_else(
-                                            r < rows,
+                                            (value_base + c < columns)
+                                            & (block >= linear_blocks)
+                                            if readout_axis
+                                            else r < rows,
                                             T.cast(
-                                                Q[(readout * total + flat) * rows + r],
+                                                Q[
+                                                    (readout * total + flat) * columns
+                                                    + value_base
+                                                    + c
+                                                ]
+                                                if readout_axis
+                                                else Q[
+                                                    (readout * total + flat) * rows + r
+                                                ],
                                                 "float32",
                                             ),
                                             0.0,
                                         )
                                         dy = T.if_then_else(
                                             (block >= linear_blocks)
-                                            & (value_base + c < columns),
+                                            & (
+                                                (r < rows)
+                                                if readout_axis
+                                                else (value_base + c < columns)
+                                            ),
                                             T.cast(
                                                 DY[
                                                     (readout * total + output_flat)
-                                                    * columns
-                                                    + value_base
-                                                    + c
+                                                    * (
+                                                        rows
+                                                        if readout_axis
+                                                        else columns
+                                                    )
+                                                    + (
+                                                        r
+                                                        if readout_axis
+                                                        else value_base + c
+                                                    )
                                                 ],
                                                 "float32",
                                             ),
@@ -638,12 +661,14 @@ def _compile_replay(
     output_dtype,
     final_dtype,
     device_index,
+    readout_axis=0,
     chunk_size=CHUNK_SIZE,
 ):
     import tilelang
     import tilelang.language as T
 
-    br, bc = max(16, 1 << (rows - 1).bit_length()), 16
+    br = max(16, 1 << (rows - 1).bit_length())
+    bc = max(16, 1 << (columns - 1).bit_length()) if readout_axis else 16
     apply = _apply_macro(T, rows, columns, width, total, br, bc)
 
     @tilelang.jit(compile_flags=["-fmad=false"])
@@ -660,7 +685,9 @@ def _compile_replay(
             Metadata: T.Tensor((3 * capacity,), "int64"),
             Offsets: T.Tensor((sizes[7],), dtypes[7]),
             Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
-            Output: T.Tensor((readouts * total * columns,), output_dtype),
+            Output: T.Tensor(
+                (readouts * total * (rows if readout_axis else columns),), output_dtype
+            ),
             Final: T.Tensor((sequences * heads * rows * columns,), final_dtype),
         ):
             with T.Kernel(capacity, heads, _ceildiv(columns, bc), threads=128) as (
@@ -674,7 +701,7 @@ def _compile_replay(
                     end = T.cast(Metadata[2 * capacity + chunk], "int32")
                     state = T.alloc_fragment((br, bc), "float32")
                     products = T.alloc_fragment((br, bc), "float32")
-                    output = T.alloc_fragment((bc,), "float32")
+                    output = T.alloc_fragment((br if readout_axis else bc,), "float32")
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
                         state[r, c] = T.if_then_else(
@@ -724,22 +751,34 @@ def _compile_replay(
                             for readout in T.unroll(readouts):
                                 for r, c in T.Parallel(br, bc):
                                     query = T.if_then_else(
-                                        r < rows,
+                                        c < columns if readout_axis else r < rows,
                                         T.cast(
-                                            Q[(readout * total + flat) * rows + r],
+                                            Q[(readout * total + flat) * columns + c]
+                                            if readout_axis
+                                            else Q[(readout * total + flat) * rows + r],
                                             "float32",
                                         ),
                                         0.0,
                                     )
                                     products[r, c] = state[r, c] * query
-                                T.reduce_sum(products, output, dim=0)
-                                for c in T.Parallel(bc):
-                                    if block * bc + c < columns:
-                                        Output[
-                                            (readout * total + output_flat) * columns
-                                            + block * bc
-                                            + c
-                                        ] = T.cast(output[c], output_dtype)
+                                if readout_axis:
+                                    T.reduce_sum(products, output, dim=1)
+                                    for r in T.Parallel(br):
+                                        if r < rows:
+                                            Output[
+                                                (readout * total + output_flat) * rows
+                                                + r
+                                            ] = T.cast(output[r], output_dtype)
+                                else:
+                                    T.reduce_sum(products, output, dim=0)
+                                    for c in T.Parallel(bc):
+                                        if block * bc + c < columns:
+                                            Output[
+                                                (readout * total + output_flat)
+                                                * columns
+                                                + block * bc
+                                                + c
+                                            ] = T.cast(output[c], output_dtype)
                     if start + chunk_size >= end:
                         for r, c in T.Parallel(br, bc):
                             if (r < rows) & (block * bc + c < columns):
@@ -772,6 +811,7 @@ def _compile_local_vjp(
     length,
     packed,
     device_index,
+    readout_axis=0,
 ):
     import tilelang
     import tilelang.language as T
@@ -795,7 +835,9 @@ def _compile_local_vjp(
             Offsets: T.Tensor((sizes[7],), dtypes[7]),
             Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
             Carry: T.Tensor((capacity * heads * rows * columns,), "float32"),
-            DY: T.Tensor((readouts * total * columns,), dtypes[8]),
+            DY: T.Tensor(
+                (readouts * total * (rows if readout_axis else columns),), dtypes[8]
+            ),
             DL: T.Tensor((blocks * sizes[0],), "float32"),
             DR: T.Tensor((blocks * sizes[1],), "float32"),
             DC: T.Tensor((blocks * sizes[2],), "float32"),
@@ -913,48 +955,80 @@ def _compile_local_vjp(
                             for readout in T.unroll(readouts):
                                 for r, c in T.Parallel(br, bc):
                                     dy = T.if_then_else(
-                                        block * bc + c < columns,
+                                        r < rows
+                                        if readout_axis
+                                        else block * bc + c < columns,
                                         T.cast(
                                             DY[
                                                 (readout * total + output_flat)
-                                                * columns
-                                                + block * bc
-                                                + c
+                                                * (rows if readout_axis else columns)
+                                                + (
+                                                    r
+                                                    if readout_axis
+                                                    else block * bc + c
+                                                )
                                             ],
                                             "float32",
                                         ),
                                         0.0,
                                     )
                                     products[r, c] = state[r, c] * dy
-                                T.reduce_sum(products, row_sum, dim=1)
-                                for r in T.Parallel(br):
-                                    if r < rows:
-                                        DQ[
-                                            (
-                                                (block * readouts + readout) * total
-                                                + flat
-                                            )
-                                            * rows
-                                            + r
-                                        ] = row_sum[r]
-                                for r, c in T.Parallel(br, bc):
-                                    dy = T.if_then_else(
-                                        block * bc + c < columns,
-                                        T.cast(
-                                            DY[
-                                                (readout * total + output_flat)
+                                if readout_axis:
+                                    T.reduce_sum(products, column_sum, dim=0)
+                                    for c in T.Parallel(bc):
+                                        if block * bc + c < columns:
+                                            DQ[
+                                                (
+                                                    (block * readouts + readout) * total
+                                                    + flat
+                                                )
                                                 * columns
                                                 + block * bc
                                                 + c
+                                            ] = column_sum[c]
+                                else:
+                                    T.reduce_sum(products, row_sum, dim=1)
+                                    for r in T.Parallel(br):
+                                        if r < rows:
+                                            DQ[
+                                                (
+                                                    (block * readouts + readout) * total
+                                                    + flat
+                                                )
+                                                * rows
+                                                + r
+                                            ] = row_sum[r]
+                                for r, c in T.Parallel(br, bc):
+                                    dy = T.if_then_else(
+                                        r < rows
+                                        if readout_axis
+                                        else block * bc + c < columns,
+                                        T.cast(
+                                            DY[
+                                                (readout * total + output_flat)
+                                                * (rows if readout_axis else columns)
+                                                + (
+                                                    r
+                                                    if readout_axis
+                                                    else block * bc + c
+                                                )
                                             ],
                                             "float32",
                                         ),
                                         0.0,
                                     )
                                     query = T.if_then_else(
-                                        r < rows,
+                                        block * bc + c < columns
+                                        if readout_axis
+                                        else r < rows,
                                         T.cast(
-                                            Q[(readout * total + flat) * rows + r],
+                                            Q[
+                                                (readout * total + flat) * columns
+                                                + block * bc
+                                                + c
+                                            ]
+                                            if readout_axis
+                                            else Q[(readout * total + flat) * rows + r],
                                             "float32",
                                         ),
                                         0.0,
@@ -1242,13 +1316,18 @@ def _compile_reduce(size, blocks, device_index):
     return build()
 
 
-def _layout(readout, initial_state, sequence_offsets):
+def _layout(readout, initial_state, sequence_offsets, readout_axis=0):
     sequences, heads, rows, columns = initial_state.shape
     tokens = readout.shape[-4]
     packed = sequence_offsets is not None
     length = 0 if packed or not sequences else tokens // sequences
     count = readout.shape[0] if readout.ndim == 5 else 1
-    shape = (tokens, heads, columns) if packed else (sequences, heads, length, columns)
+    output_width = rows if readout_axis else columns
+    shape = (
+        (tokens, heads, output_width)
+        if packed
+        else (sequences, heads, length, output_width)
+    )
     if readout.ndim == 5:
         shape = (count, *shape)
     return sequences, heads, rows, columns, tokens, length, count, packed, shape
@@ -1269,6 +1348,7 @@ def _parameters(
     packed,
     device,
     injection_orders=None,
+    readout_axis=0,
 ):
     return dict(
         heads=heads,
@@ -1285,6 +1365,7 @@ def _parameters(
             else ((-1, -2),) * injections
         ),
         readouts=readouts,
+        readout_axis=readout_axis,
         length=length,
         packed=packed,
         device_index=device.index,
@@ -1307,10 +1388,11 @@ def forward(
     chunk_metadata=None,
     injection_scalars=None,
     injection_orders=None,
+    readout_axis=0,
 ):
     """Return outputs, final State and FP32 entries; segmentation stays on device."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
-        readout, initial_state, sequence_offsets
+        readout, initial_state, sequence_offsets, readout_axis
     )
     # Long inference amortizes carry with 64-token chunks. Short dense sequences
     # retain Triton's 16-token replay granularity to expose enough independent
@@ -1374,6 +1456,7 @@ def forward(
             packed=packed,
             device=device,
             injection_orders=injection_orders,
+            readout_axis=readout_axis,
         )
         parameters["chunk_size"] = chunk_size
         transform = torch.empty(
@@ -1459,10 +1542,11 @@ def backward(
     chunk_metadata=None,
     injection_scalars=None,
     injection_orders=None,
+    readout_axis=0,
 ):
     """Reverse affine carry followed by parallel, inverse-free chunk-local VJPs."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
-        readout, initial_state, sequence_offsets
+        readout, initial_state, sequence_offsets, readout_axis
     )
     offsets, prefix, chunks = (
         metadata(tokens, sequences, initial_state.device, sequence_offsets)
@@ -1525,6 +1609,7 @@ def backward(
         packed=packed,
         device=device,
         injection_orders=injection_orders,
+        readout_axis=readout_axis,
     )
     blocks = _ceildiv(columns, 16)
     transform = torch.empty(

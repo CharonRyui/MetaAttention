@@ -53,6 +53,7 @@ def factored_recurrence_chunked(
     symmetric_rank_one: bool = False,
     injection_scalars: list[torch.Tensor] | None = None,
     injection_orders: tuple[tuple[int, ...], ...] | None = None,
+    readout_axis: int = 0,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Execute scalar/rank-one schedules or ordered affine chunk replay."""
     from .lowrank_kernels import execute
@@ -70,6 +71,7 @@ def factored_recurrence_chunked(
         symmetric_rank_one=symmetric_rank_one,
         injection_scalars=injection_scalars,
         injection_orders=injection_orders,
+        readout_axis=readout_axis,
     )
 
 
@@ -89,6 +91,7 @@ def factored_recurrence_backward(
     threads: int = 128,
     injection_scalars: torch.Tensor | None = None,
     injection_orders: tuple[tuple[int, ...], ...] | None = None,
+    readout_axis: int = 0,
 ) -> tuple[torch.Tensor, ...]:
     """Return factor/State gradients, with a final slot for supplied scalar factors.
 
@@ -115,6 +118,7 @@ def factored_recurrence_backward(
         grad_final=grad_final,
         injection_scalars=injection_scalars,
         injection_orders=injection_orders,
+        readout_axis=readout_axis,
     )
 
 
@@ -134,6 +138,7 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
         initial_state,
         injection_scalars,
         injection_orders,
+        readout_axis,
         output_dtypes,
         backward,
         config,
@@ -153,7 +158,9 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
             record=backward is not None,
             injection_scalars=injection_scalars,
             injection_orders=injection_orders,
+            readout_axis=readout_axis,
         )
+        ctx.readout_axis = readout_axis
         ctx.injection_orders = injection_orders
         ctx.backward_binding = backward
         ctx.operation_codes = operation_codes
@@ -188,7 +195,7 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
                 final_shape[0],
                 final_shape[1],
                 query.shape[1] // final_shape[0],
-                final_shape[3],
+                final_shape[2] if ctx.readout_axis else final_shape[3],
             )
             grad_output = torch.stack(
                 [
@@ -221,6 +228,7 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
             "factored.injection_right": injection_right,
             "factored.injection_scalars": injection_scalars,
             "factored.injection_orders": ctx.injection_orders,
+            "factored.readout_axis": ctx.readout_axis,
             "factored.readout": readout,
             "factored.recorded": recorded,
             "factored.initial_state": initial_state,
@@ -230,7 +238,7 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
         if len(gradients) == 7 and not injection_scalars.numel():
             # Existing internal bindings may omit the empty scalar-gradient slot.
             gradients = (*gradients, None)
-        return (None, *gradients, None, None, None, None)
+        return (None, *gradients, None, None, None, None, None)
 
 
 def factored_recurrence_dense(
@@ -249,6 +257,7 @@ def factored_recurrence_dense(
     threads: int = 128,
     injection_scalars: list[torch.Tensor] | None = None,
     injection_orders: tuple[tuple[int, ...], ...] | None = None,
+    readout_axis: int = 0,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Run authored operations and readouts, saving only FP32 chunk entries."""
     if not readouts or len(readouts) != len(output_dtypes):
@@ -263,7 +272,9 @@ def factored_recurrence_dense(
     left = _stack_left(left_factors, operation_codes, tokens, heads, rows, columns)
     if left is None:
         left = _stack([], shape, device)
-    query = _stack(readouts, shape, device)
+    query = _stack(
+        readouts, (tokens, heads, columns if readout_axis else rows, 1), device
+    )
     result = _TileLangFactoredRecurrence.apply(
         tuple(operation_codes),
         left,
@@ -275,6 +286,7 @@ def factored_recurrence_dense(
         initial_state.contiguous(),
         _stack(injection_scalars or [], scalar_shape, device),
         injection_orders,
+        readout_axis,
         tuple(output_dtypes),
         backward,
         tuple(config),

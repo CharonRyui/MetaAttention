@@ -409,6 +409,7 @@ def _factored_vjp(
         injection_right=context["factored.injection_right"],
         injection_scalars=context["factored.injection_scalars"],
         injection_orders=context["factored.injection_orders"],
+        readout_axis=context.get("factored.readout_axis", 0),
         readout=context["factored.readout"],
         recorded=context["factored.recorded"],
         initial_state=context["factored.initial_state"],

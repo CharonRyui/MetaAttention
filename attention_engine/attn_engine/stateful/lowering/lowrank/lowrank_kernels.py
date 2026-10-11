@@ -22,6 +22,7 @@ def execute(
     symmetric_rank_one=False,
     injection_scalars=None,
     injection_orders=None,
+    readout_axis=0,
 ):
     batch, heads, rows, columns = initial_state.shape
     tokens = readouts[0].shape[0]
@@ -41,8 +42,10 @@ def execute(
 
     from .wy_kernels import eligible, execute as execute_wy
 
-    if not injection_scalars and eligible(
-        tuple(operation_codes), len(injection_left), rows, columns
+    if (
+        readout_axis == 0
+        and not injection_scalars
+        and eligible(tuple(operation_codes), len(injection_left), rows, columns)
     ):
         rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
         return execute_wy(
@@ -89,7 +92,7 @@ def execute(
 
     il = stack(injection_left, rows).unsqueeze(-1)
     ir = stack(injection_right, columns).unsqueeze(-2)
-    query = stack(readouts, rows).unsqueeze(-1)
+    query = stack(readouts, columns if readout_axis else rows).unsqueeze(-1)
     output, final, _ = forward(
         operation_codes=operation_codes,
         left_factors=left,
@@ -103,6 +106,7 @@ def execute(
         record=False,
         injection_scalars=stack(injection_scalars or [], 1).unsqueeze(-1),
         injection_orders=injection_orders,
+        readout_axis=readout_axis,
     )
     return tuple(
         output[i].to(dtype) for i, dtype in enumerate(output_dtypes)

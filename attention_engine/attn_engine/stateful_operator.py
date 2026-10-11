@@ -2248,6 +2248,11 @@ class StatefulOperator:
 
         state_spec = self._program.states[0]
         first_role, second_role = state_spec.feature_roles
+        recipe = executable.rank_one_factored
+        assert recipe is not None
+        if recipe.transpose_state:
+            first_role, second_role = second_role, first_role
+            initial_state = initial_state.transpose(-1, -2).contiguous()
         backward_path = (
             executable.backward_binding is not None
             and torch.is_grad_enabled()
@@ -2258,34 +2263,34 @@ class StatefulOperator:
         )
         if backward_path:
             token_count, heads = runtime.token_count, runtime.state_heads
-            rows, _ = runtime.feature_sizes
+            rows = initial_state.shape[-2]
             ones_row = torch.ones(token_count, heads, rows, 1, device=runtime.device)
             ones_scalar = torch.ones(token_count, heads, 1, 1, device=runtime.device)
-        recipe = executable.rank_one_factored
-        assert recipe is not None
         codes: list[str] = []
         left: list[torch.Tensor | None] = []
         right: list[torch.Tensor | None] = []
         coefficient: list[torch.Tensor | None] = []
-        for node in self._program.transition.propagations:
+        for node, operation in zip(
+            self._program.transition.propagations, recipe.operations, strict=True
+        ):
             if isinstance(node, AxisScale):
                 if not node.roles:
-                    codes.append("scale")
+                    codes.append(operation.kind)
                     left.append(None)
                     right.append(None)
                     coefficient.append(_evaluate(node.factor, values).float())
                 elif tuple(node.roles) == (first_role,):
-                    codes.append("row-scale")
+                    codes.append(operation.kind)
                     left.append(_evaluate(node.factor, values).float())
                     right.append(None)
                     coefficient.append(None)
                 else:
-                    codes.append("column-scale")
+                    codes.append(operation.kind)
                     left.append(_evaluate(node.factor, values).float())
                     right.append(None)
                     coefficient.append(None)
             else:
-                codes.append("rank-one")
+                codes.append(operation.kind)
                 left.append(_evaluate(node.left, values).float())
                 right.append(_evaluate(node.right, values).float())
                 coefficient.append(_evaluate(node.coefficient, values).float())
@@ -2333,12 +2338,15 @@ class StatefulOperator:
                 injection_right=injection_right,
                 injection_scalars=injection_scalars,
                 injection_orders=tuple(injection_orders),
+                readout_axis=recipe.readout_axis,
                 readouts=readouts,
                 initial_state=initial_state,
                 sequence_offsets=runtime.offsets,
                 output_dtypes=tuple(dtypes),
                 return_final_state=return_final_state,
             )
+            if final is not None and recipe.transpose_state:
+                final = final.transpose(-1, -2).contiguous()
             final_state = (
                 StateTuple((state_spec.name,), (final,)) if return_final_state else None
             )
@@ -2358,6 +2366,7 @@ class StatefulOperator:
                 injection_right=injection_right,
                 injection_scalars=injection_scalars,
                 injection_orders=tuple(injection_orders),
+                readout_axis=recipe.readout_axis,
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
@@ -2372,11 +2381,14 @@ class StatefulOperator:
                 injection_right=injection_right,
                 injection_scalars=injection_scalars,
                 injection_orders=tuple(injection_orders),
+                readout_axis=recipe.readout_axis,
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
                 symmetric_rank_one=executable.symmetric_rank_one,
             )
+        if recipe.transpose_state:
+            final = final.transpose(-1, -2).contiguous()
         final_state = (
             StateTuple((state_spec.name,), (final,)) if return_final_state else None
         )

@@ -100,7 +100,7 @@ def _seq(value):
 
 
 def _token_count(values):
-    counts = [value.shape[0] for value in values if value.ndim]
+    counts = [value.shape[0] for value in values if value is not None and value.ndim]
     # A broadcast [1,...] factor must not turn an all-empty binding into T=1.
     return (
         max(counts, default=0)
@@ -113,7 +113,9 @@ def _stack(parts, tokens, heads, width, device):
     """Use differentiable broadcast/padding; autograd reduces grouped bindings."""
     values = []
     for value in parts:
-        if value.ndim == 0:
+        if value is None:
+            current = torch.zeros((1, 1, 1), device=device)
+        elif value.ndim == 0:
             current = value.reshape(1, 1, 1)
         else:
             current = value.reshape(
@@ -156,6 +158,7 @@ class _PackedRecurrence(torch.autograd.Function):
         dtypes,
         injection_scalars,
         injection_orders,
+        readout_axis,
     ):
         from .lowrank.checkpoint import forward
 
@@ -176,7 +179,9 @@ class _PackedRecurrence(torch.autograd.Function):
             chunk_metadata=segmentation,
             injection_scalars=injection_scalars,
             injection_orders=injection_orders,
+            readout_axis=readout_axis,
         )
+        ctx.readout_axis = readout_axis
         ctx.codes = codes
         ctx.injection_orders = injection_orders
         ctx.output_shape = output.shape[1:]
@@ -247,8 +252,9 @@ class _PackedRecurrence(torch.autograd.Function):
             chunk_metadata=(offsets, prefix, chunks),
             injection_scalars=injection_scalars,
             injection_orders=ctx.injection_orders,
+            readout_axis=ctx.readout_axis,
         )
-        return (None, *gradients[:7], None, None, gradients[7], None)
+        return (None, *gradients[:7], None, None, gradients[7], None, None)
 
 
 def execute_lowrank_packed(
@@ -266,6 +272,7 @@ def execute_lowrank_packed(
     return_final_state=False,
     injection_scalars=None,
     injection_orders=None,
+    readout_axis=0,
 ):
     """Return per-readout [T,H,V] outputs and optional final, with all VJPs."""
     if initial_state.device.type != "cuda":
@@ -311,7 +318,9 @@ def execute_lowrank_packed(
     coeff = _stack(coefficients, tokens, heads, 1, device).unsqueeze(-1)
     keys = _stack(il, tokens, heads, rows, device).unsqueeze(-1)
     values = _stack(ir, tokens, heads, columns, device).unsqueeze(-2)
-    queries = _stack(reads, tokens, heads, rows, device).unsqueeze(-1)
+    queries = _stack(
+        reads, tokens, heads, columns if readout_axis else rows, device
+    ).unsqueeze(-1)
     dtypes = (
         tuple(value.dtype for value in reads)
         if output_dtypes is None
@@ -332,6 +341,7 @@ def execute_lowrank_packed(
         dtypes,
         _stack(injection_scalars or [], tokens, heads, 1, device).unsqueeze(-1),
         injection_orders,
+        readout_axis,
     )
     return tuple(result[:-1]), result[-1] if return_final_state else None
 

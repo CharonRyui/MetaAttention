@@ -89,7 +89,10 @@ class RankOneFactoredIR:
     ``operations`` preserves authored order and ``readout_roles`` records every
     independent contraction fused by the inference chunk schedule.
     ``symmetric_rank_one`` proves that every rank-one propagation uses the same
-    feature expression on both sides of its contraction.
+    feature expression on both sides of its contraction. ``transpose_state``
+    maps the public second-axis updates onto internal rows; ``readout_axis``
+    identifies the homogeneous readout reduction axis in that internal layout.
+    Mixed update axes or mixed readout axes retain the general affine fallback.
     """
 
     operations: tuple[FactoredOperationIR, ...]
@@ -97,6 +100,8 @@ class RankOneFactoredIR:
     readout_roles: tuple[Any, ...]
     symmetric_rank_one: bool = False
     injections: tuple[WeightedOuterProductIR, ...] = ()
+    transpose_state: bool = False
+    readout_axis: int = 0
 
     @property
     def injection_scalar_count(self) -> int:
@@ -1074,6 +1079,19 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         return None
     state = algorithm.states[0]
     first_role, second_role = state.feature_roles
+    update_roles = {
+        node.role
+        for node in algorithm.transitions[0].propagations
+        if isinstance(node, RankOnePropagation)
+    }
+    if len(update_roles) != 1:
+        return None
+    update_role = next(iter(update_roles))
+    if update_role not in state.feature_roles:
+        return None
+    transpose_state = update_role == second_role
+    if transpose_state:
+        first_role, second_role = second_role, first_role
     readouts = algorithm.readouts
     if not readouts or not all(
         isinstance(readout, StateContraction) for readout in readouts
@@ -1082,8 +1100,12 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     if any(readout.state != state.name for readout in readouts):
         return None
     readout_roles = tuple(readout.role for readout in readouts)
-    if any(role != first_role for role in readout_roles):
+    if len(set(readout_roles)) != 1:
         return None
+    readout_role = readout_roles[0]
+    if readout_role not in (first_role, second_role):
+        return None
+    readout_axis = int(readout_role == second_role)
     operations: list[FactoredOperationIR] = []
     for node in algorithm.transitions[0].propagations:
         if isinstance(node, AxisScale):
@@ -1142,6 +1164,8 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         readout_roles,
         symmetric_rank_one,
         tuple(writes),
+        transpose_state,
+        readout_axis,
     )
 
 
