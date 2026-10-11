@@ -2267,7 +2267,7 @@ class StatefulOperator:
         left: list[torch.Tensor | None] = []
         right: list[torch.Tensor | None] = []
         coefficient: list[torch.Tensor | None] = []
-        for node in recipe.propagations:
+        for node in self._program.transition.propagations:
             if isinstance(node, AxisScale):
                 if not node.roles:
                     codes.append("scale")
@@ -2291,16 +2291,32 @@ class StatefulOperator:
                 coefficient.append(_evaluate(node.coefficient, values).float())
         injection_left: list[torch.Tensor] = []
         injection_right: list[torch.Tensor] = []
-        injection_weights = []
-        for injection in recipe.injections:
-            injection_left.append(_evaluate(injection.left, values).float())
-            injection_right.append(_evaluate(injection.right, values).float())
-            injection_weights.append(
-                tuple(_evaluate(weight, values).float() for weight in injection.weights)
+        injection_scalars: list[torch.Tensor] = []
+        injection_orders: list[tuple[int, ...]] = []
+        for injection, write in zip(
+            self._program.transition.injections, recipe.injections, strict=True
+        ):
+            factors = injection.factors
+            injection_left.append(
+                _evaluate(factors[write.left_factor].expression, values).float()
+            )
+            injection_right.append(
+                _evaluate(factors[write.right_factor].expression, values).float()
+            )
+            scalar_base = len(injection_scalars)
+            injection_scalars.extend(
+                _evaluate(factors[index].expression, values).float()
+                for index in write.scalar_factors
+            )
+            injection_orders.append(
+                tuple(
+                    index if index < 0 else scalar_base + index
+                    for index in write.factor_order
+                )
             )
         readouts: list[torch.Tensor] = []
         dtypes: list[torch.dtype] = []
-        for readout in recipe.readouts:
+        for readout in self._program.readouts:
             assert isinstance(readout, StateContraction)
             readouts.append(_evaluate(readout.operand, values).float())
             dtypes.append(readout.output_dtype)
@@ -2315,6 +2331,8 @@ class StatefulOperator:
                 coefficients=coefficient,
                 injection_left=injection_left,
                 injection_right=injection_right,
+                injection_scalars=injection_scalars,
+                injection_orders=tuple(injection_orders),
                 readouts=readouts,
                 initial_state=initial_state,
                 sequence_offsets=runtime.offsets,
@@ -2338,6 +2356,8 @@ class StatefulOperator:
                 coefficients=dense_coeff,
                 injection_left=injection_left,
                 injection_right=injection_right,
+                injection_scalars=injection_scalars,
+                injection_orders=tuple(injection_orders),
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
@@ -2350,11 +2370,12 @@ class StatefulOperator:
                 coefficients=coefficient,
                 injection_left=injection_left,
                 injection_right=injection_right,
+                injection_scalars=injection_scalars,
+                injection_orders=tuple(injection_orders),
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
                 symmetric_rank_one=executable.symmetric_rank_one,
-                injection_weights=tuple(injection_weights),
             )
         final_state = (
             StateTuple((state_spec.name,), (final,)) if return_final_state else None

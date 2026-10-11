@@ -68,12 +68,18 @@ class FactoredOperationIR:
 
 
 @dataclass(frozen=True)
-class FactoredInjectionIR:
-    """Two vector factors followed by ordered feature-free FP32 factors."""
+class WeightedOuterProductIR:
+    """Two vector factors and feature-free factors in authored product order.
 
-    left: Any
-    right: Any
-    weights: tuple[Any, ...] = ()
+    ``factor_order`` uses -1/-2 for the first/second State Feature vectors and
+    nonnegative local indices for scalar factors. No coefficients are folded
+    into vectors, so FP32 product association and expression rounding survive.
+    """
+
+    left_factor: int
+    right_factor: int
+    scalar_factors: tuple[int, ...]
+    factor_order: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -90,13 +96,11 @@ class RankOneFactoredIR:
     injection_count: int
     readout_roles: tuple[Any, ...]
     symmetric_rank_one: bool = False
-    propagations: tuple[Any, ...] = ()
-    injections: tuple[FactoredInjectionIR, ...] = ()
-    readouts: tuple[Any, ...] = ()
+    injections: tuple[WeightedOuterProductIR, ...] = ()
 
     @property
-    def weighted_injections(self) -> bool:
-        return any(injection.weights for injection in self.injections)
+    def injection_scalar_count(self) -> int:
+        return sum(len(term.scalar_factors) for term in self.injections)
 
 
 @dataclass(frozen=True)
@@ -685,7 +689,7 @@ def _requires_reference(algorithm: AlgorithmIR) -> bool:
     """Prove whether the normalized program fits the matrix-summary executor.
 
     This describes semantic capabilities, not authored readout spellings. A
-    separate factored proof may admit an inference schedule for weighted writes.
+    separate factored proof may admit a compiled schedule for weighted writes.
     """
     from ...stateful_operator import Shift, StateContraction, _expressions
 
@@ -696,8 +700,8 @@ def _requires_reference(algorithm: AlgorithmIR) -> bool:
     if any(isinstance(expression, Shift) for expression in _expressions(algorithm)):
         return True
     # The matrix-summary path assumes two feature factors. General products
-    # retain reference binding/broadcast semantics; the factored inference
-    # proof separately admits weighted outer writes.
+    # retain reference binding/broadcast semantics; the factored proof
+    # separately admits weighted outer writes.
     features = algorithm.states[0].feature_roles
     for injection in algorithm.transitions[0].injections:
         if len(injection.factors) != 2 or {
@@ -1106,24 +1110,27 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     injections = algorithm.transitions[0].injections
     if not injections:
         return None
-    factored_injections = []
+    writes: list[WeightedOuterProductIR] = []
     for injection in injections:
-        if len(injection.factors) < 2:
+        left = right = None
+        scalars: list[int] = []
+        order: list[int] = []
+        for index, factor in enumerate(injection.factors):
+            roles = tuple(factor.roles)
+            if roles == (first_role,) and left is None:
+                left = index
+                order.append(-1)
+            elif roles == (second_role,) and right is None:
+                right = index
+                order.append(-2)
+            elif not roles:
+                order.append(len(scalars))
+                scalars.append(index)
+            else:
+                return None
+        if left is None or right is None:
             return None
-        first, second, *weights = injection.factors
-        if {tuple(first.roles), tuple(second.roles)} != {(first_role,), (second_role,)}:
-            return None
-        if any(factor.roles for factor in weights):
-            return None
-        if tuple(first.roles) == (second_role,):
-            first, second = second, first
-        factored_injections.append(
-            FactoredInjectionIR(
-                first.expression,
-                second.expression,
-                tuple(factor.expression for factor in weights),
-            )
-        )
+        writes.append(WeightedOuterProductIR(left, right, tuple(scalars), tuple(order)))
     symmetric_rank_one = all(
         node.left == node.right
         for node in algorithm.transitions[0].propagations
@@ -1134,9 +1141,7 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         len(injections),
         readout_roles,
         symmetric_rank_one,
-        tuple(algorithm.transitions[0].propagations),
-        tuple(factored_injections),
-        tuple(readouts),
+        tuple(writes),
     )
 
 

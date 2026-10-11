@@ -1,5 +1,14 @@
 # Mathematical structure recovery on H20
 
+Integration update: this document records the original experiment. The merged
+implementation subsequently normalizes proved matrix readouts before planning,
+uses the shared weighted outer-product recipe, and supports its zero-safe scalar
+VJP. Delta Product can therefore use compiled factored backward. CPU, packed,
+and unoptimized calls select paths from the normalized program's capabilities.
+See [readout normalization and precision measurements](measurements/readout-normalization-h20/README.md)
+and [weighted-write measurements](measurements/weighted-outer-products-h20/README.md)
+for the subsequent results.
+
 This experiment recovers low-rank execution for GDN2, IPLR, DPLR and Delta
 Product without changing the authored examples or the public IR. All eight
 long-sequence comparison points pass the independent FP32 token oracle and

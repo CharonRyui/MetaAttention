@@ -69,3 +69,7 @@ CUDA_VISIBLE_DEVICES=0 PYTHONPATH="$PWD/attention_engine:$PWD" \
   /mnt/nvme/linyanxuan/MetaAttentionImpl/.venv/bin/python -m pytest -q --run-gpu \
   tests/functional/test_stateful_affine_precision.py
 ```
+
+## Integration validation
+
+The merge with the weighted outer-product implementation preserves its ordered scalar factors and zero-safe VJP. Normalized Delta Product readouts now select compiled factored training as well as inference. Validation after resolving overlapping analysis, planning, and low-rank execution changes: the full unit suite passed (315 passed, 69 GPU tests skipped); the selected GPU suite passed (100 passed, 9 inapplicable cases skipped). GPU coverage includes equivalent readouts in dense/packed execution with gradients, recovered forward/continuation cases, FP32/BF16 Delta Product backward, weighted-write factor order and zero gradients, and affine precision regressions.

@@ -20,7 +20,8 @@ def execute(
     initial_state,
     output_dtypes,
     symmetric_rank_one=False,
-    injection_weights=(),
+    injection_scalars=None,
+    injection_orders=None,
 ):
     batch, heads, rows, columns = initial_state.shape
     tokens = readouts[0].shape[0]
@@ -40,7 +41,7 @@ def execute(
 
     from .wy_kernels import eligible, execute as execute_wy
 
-    if not any(injection_weights) and eligible(
+    if not injection_scalars and eligible(
         tuple(operation_codes), len(injection_left), rows, columns
     ):
         rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
@@ -89,18 +90,6 @@ def execute(
     il = stack(injection_left, rows).unsqueeze(-1)
     ir = stack(injection_right, columns).unsqueeze(-2)
     query = stack(readouts, rows).unsqueeze(-1)
-    weight_counts = tuple(len(weights) for weights in injection_weights)
-    weight_width = max(weight_counts, default=0)
-    weights = None
-    if weight_width:
-        weights = torch.ones(
-            (len(injection_left), weight_width, tokens, heads),
-            device=device,
-            dtype=torch.float32,
-        )
-        for injection, factors in enumerate(injection_weights):
-            for factor, value in enumerate(factors):
-                weights[injection, factor].copy_(binding(value, 1).squeeze(-1))
     output, final, _ = forward(
         operation_codes=operation_codes,
         left_factors=left,
@@ -112,8 +101,8 @@ def execute(
         initial_state=initial_state,
         output_dtype=torch.float32,
         record=False,
-        injection_weights=weights,
-        injection_weight_counts=weight_counts if weight_width else (),
+        injection_scalars=stack(injection_scalars or [], 1).unsqueeze(-1),
+        injection_orders=injection_orders,
     )
     return tuple(
         output[i].to(dtype) for i, dtype in enumerate(output_dtypes)

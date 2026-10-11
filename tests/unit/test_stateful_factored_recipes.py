@@ -153,7 +153,7 @@ def test_cpu_compilation_preserves_authored_ir_and_uses_normalized_program(
     assert isinstance(operator._program.readouts[0], StateContraction)
 
 
-def test_weighted_injection_training_keeps_reference_backward():
+def test_weighted_injection_training_selects_compiled_factored_backward():
     case = next(case for case in benchmark.CASES if case.name == "delta-product")
     operator = case.factory(**case.kwargs(65))
     compiled = operator.compile(
@@ -162,10 +162,10 @@ def test_weighted_injection_training_keeps_reference_backward():
         mode="dense",
         backward=True,
     )
-    assert (
-        operator._plans[compiled.specialization].plan.candidate.lowerer
-        == "reference-stateful"
-    )
+    executable = operator._plans[compiled.specialization]
+    assert executable.plan.candidate.lowerer == "tilelang-factored-recurrence"
+    assert executable.backward_binding is not None
+    assert executable.plan.backward_candidate is not None
 
 
 @pytest.mark.gpu
@@ -258,7 +258,7 @@ def test_weighted_outer_product_keeps_authored_multiplication_order(gpu_device):
 
 
 @pytest.mark.gpu
-@pytest.mark.parametrize("kind", ("gdn2", "iplr", "dplr"))
+@pytest.mark.parametrize("kind", ("gdn2", "iplr", "dplr", "delta_product"))
 @pytest.mark.parametrize("dtype", (torch.float32, torch.bfloat16))
 def test_recovered_backward_crosses_chunks_and_batches(kind, dtype, gpu_device):
     from test_delta_family_examples import _case, _reference

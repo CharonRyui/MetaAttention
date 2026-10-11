@@ -51,7 +51,8 @@ def factored_recurrence_chunked(
     initial_state: torch.Tensor,
     output_dtypes: tuple[torch.dtype, ...],
     symmetric_rank_one: bool = False,
-    injection_weights: tuple[tuple[torch.Tensor, ...], ...] = (),
+    injection_scalars: list[torch.Tensor] | None = None,
+    injection_orders: tuple[tuple[int, ...], ...] | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Execute scalar/rank-one schedules or ordered affine chunk replay."""
     from .lowrank_kernels import execute
@@ -67,7 +68,8 @@ def factored_recurrence_chunked(
         initial_state=initial_state,
         output_dtypes=output_dtypes,
         symmetric_rank_one=symmetric_rank_one,
-        injection_weights=injection_weights,
+        injection_scalars=injection_scalars,
+        injection_orders=injection_orders,
     )
 
 
@@ -85,8 +87,12 @@ def factored_recurrence_backward(
     grad_output: torch.Tensor | None,
     grad_final: torch.Tensor | None,
     threads: int = 128,
+    injection_scalars: torch.Tensor | None = None,
+    injection_orders: tuple[tuple[int, ...], ...] | None = None,
 ) -> tuple[torch.Tensor, ...]:
-    """Return all seven gradient slots; ``recorded`` now holds FP32 checkpoints.
+    """Return factor/State gradients, with a final slot for supplied scalar factors.
+
+    ``recorded`` holds FP32 checkpoints.
 
     Factors use [B*T,H,...], output cotangents [B,H,T,V], and recorded
     chunk-entry States [B,H,ceil(T/16),R,V]. Multiple readouts add a leading
@@ -107,6 +113,8 @@ def factored_recurrence_backward(
         initial_state=initial_state,
         grad_output=grad_output,
         grad_final=grad_final,
+        injection_scalars=injection_scalars,
+        injection_orders=injection_orders,
     )
 
 
@@ -124,6 +132,8 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
         injection_right,
         readout,
         initial_state,
+        injection_scalars,
+        injection_orders,
         output_dtypes,
         backward,
         config,
@@ -141,7 +151,10 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
             initial_state=initial_state,
             output_dtype=torch.float32,
             record=backward is not None,
+            injection_scalars=injection_scalars,
+            injection_orders=injection_orders,
         )
+        ctx.injection_orders = injection_orders
         ctx.backward_binding = backward
         ctx.operation_codes = operation_codes
         ctx.output_dtypes = output_dtypes
@@ -155,6 +168,7 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
             readout,
             recorded,
             initial_state,
+            injection_scalars,
             final,
         )
         return (
@@ -193,6 +207,7 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
             readout,
             recorded,
             initial_state,
+            injection_scalars,
             final,
         ) = ctx.saved_tensors
         if ctx.backward_binding is None:
@@ -204,13 +219,18 @@ class _TileLangFactoredRecurrence(torch.autograd.Function):
             "factored.coefficient": coefficient,
             "factored.injection_left": injection_left,
             "factored.injection_right": injection_right,
+            "factored.injection_scalars": injection_scalars,
+            "factored.injection_orders": ctx.injection_orders,
             "factored.readout": readout,
             "factored.recorded": recorded,
             "factored.initial_state": initial_state,
             "factored.final_state": final,
         }
         gradients = ctx.backward_binding(context, (grad_output, grad_final))
-        return (None, *gradients, None, None, None)
+        if len(gradients) == 7 and not injection_scalars.numel():
+            # Existing internal bindings may omit the empty scalar-gradient slot.
+            gradients = (*gradients, None)
+        return (None, *gradients, None, None, None, None)
 
 
 def factored_recurrence_dense(
@@ -227,6 +247,8 @@ def factored_recurrence_dense(
     backward=None,
     config: tuple[tuple[str, int], ...] = (),
     threads: int = 128,
+    injection_scalars: list[torch.Tensor] | None = None,
+    injection_orders: tuple[tuple[int, ...], ...] | None = None,
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Run authored operations and readouts, saving only FP32 chunk entries."""
     if not readouts or len(readouts) != len(output_dtypes):
@@ -251,6 +273,8 @@ def factored_recurrence_dense(
         _stack(injection_right, columns_shape, device),
         query,
         initial_state.contiguous(),
+        _stack(injection_scalars or [], scalar_shape, device),
+        injection_orders,
         tuple(output_dtypes),
         backward,
         tuple(config),
