@@ -83,18 +83,25 @@ def _run_nvidia_smi(args: list[str]) -> subprocess.CompletedProcess[str]:
         raise RuntimeError(f"failed to query nvidia-smi: {error}") from error
 
 
-def _provenance(torch, fla_source: Path) -> dict:
+def _provenance(torch, fla_source: Path | None) -> dict:
+    import fla
+
+    fla_module = Path(fla.__file__).resolve()
     root = Path(__file__).resolve().parents[1]
     revision = _git_revision(root)
     versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
-    for distribution in ("tilelang", "flash-linear-attention"):
+    for distribution in ("tilelang", "flash-linear-attention", "fla-core"):
         try:
             versions[distribution] = importlib.metadata.version(distribution)
         except importlib.metadata.PackageNotFoundError:
             versions[distribution] = None
     digest = hashlib.sha256()
     # Identify actual measured sources, including uncommitted implementation.
-    for directory in (root / "attention_engine" / "attn_engine", root / "testing"):
+    for directory in (
+        root / "attention_engine" / "attn_engine",
+        root / "testing",
+        root / "examples",
+    ):
         for path in sorted(directory.rglob("*.py")):
             digest.update(str(path.relative_to(root)).encode() + b"\0")
             digest.update(path.read_bytes() + b"\0")
@@ -102,8 +109,9 @@ def _provenance(torch, fla_source: Path) -> dict:
         "git_commit": revision,
         "source_sha256": digest.hexdigest(),
         "versions": versions,
-        "fla_source": str(fla_source),
-        "fla_git_commit": _git_revision(fla_source),
+        "fla_source": str(fla_source) if fla_source else None,
+        "fla_module": str(fla_module),
+        "fla_git_commit": _git_revision(fla_source) if fla_source else None,
     }
 
 
@@ -240,10 +248,10 @@ def choose_idle_gpu(
     return max(candidates, key=lambda gpu: (gpu.free_memory_mib or -1, -gpu.index))
 
 
-def _configure_fla_source(source: Path | None) -> Path:
-    """Prefer the requested FLA checkout over an installed distribution."""
-    root = Path(__file__).resolve().parents[1]
-    source = source or root.parent / "flash-linear-attention"
+def _configure_fla_source(source: Path | None) -> Path | None:
+    """Use the pinned release unless a checkout is explicitly requested."""
+    if source is None:
+        return None
     source = source.expanduser().resolve()
     if not (source / "fla").is_dir():
         raise RuntimeError(f"FLA source does not contain a fla package: {source}")
@@ -324,7 +332,7 @@ def _baseline_call(torch, adapter, parts, contract):
 
 
 def _fla_call(case, inputs):
-    """Return a historical FLA adapter for a directly mapped example."""
+    """Return an FLA 0.5.2 adapter for a directly mapped example."""
     name = case.name
     if name == "hgrn":
         from fla.ops.hgrn import fused_recurrent_hgrn
@@ -362,29 +370,33 @@ def _fla_call(case, inputs):
             preprocessing="flatten B,H into FLA batch; timed in public call",
         )
 
-    state_contract = name not in {
-        "linear",
-        "retention",
-        "retnet",
-        "based",
-        "rebased",
-        "gsa",
-        "gdn",
-    }
-    state_names = ("memory", "key_sum") if name == "normalized-linear" else ("memory",)
+    state_contract = name not in {"based", "rebased"}
+    state_names = (
+        ("memory", "key_sum")
+        if name == "normalized-linear"
+        else ("key_slot", "slot_value")
+        if name == "gsa"
+        else ("memory",)
+    )
 
     def prepare(values):
         native = {
             key: value.transpose(1, 2).contiguous() for key, value in values.items()
         }
+        if name in {"linear", "simple-gla", "gla"}:
+            # These examples inject (key + 0.1) * value in FP32.
+            native["key"] = native["key"].float() + 0.1
         if name == "retnet":
             native["gate"] = native["gate"].log()
         if name == "rwkv6":
             native["bonus"] = values["bonus"][0, :, 0].float().contiguous()
         if name == "rwkv7":
             beta = native["beta"].unsqueeze(-1)
-            native["a"] = (-native["removal"]).to(native["removal"].dtype)
-            native["b"] = (native["key"] * beta).to(native["key"].dtype)
+            # FLA contracts a with the prior State; the authored propagation
+            # contracts removal with the already decayed State.
+            native["a"] = -native["removal"].float() * native["decay"].exp()
+            native["b"] = native["key"].float() * beta
+            native["value"] = native["value"].float() * beta
         return native
 
     if name == "linear":
@@ -410,27 +422,7 @@ def _fla_call(case, inputs):
         )
     elif name == "rwkv7":
         from fla.ops.generalized_delta_rule.dplr import (
-            chunk_dplr_delta_rule as function,
-        )
-
-        return FLABaseline(
-            prepare,
-            lambda values, initial, final: function(
-                values["query"],
-                values["key"],
-                values["value"],
-                values["a"],
-                values["b"],
-                values["decay"],
-                scale=1.0,
-                initial_state=initial,
-                output_final_state=final,
-            ),
-            ("memory",),
-            state_contract=True,
-            comparable=False,
-            note="FLA RWKV7 API expects native a/b DPLR factors; this example exposes authored removal/beta inputs and is not a direct semantic mapping.",
-            preprocessing="transpose/contiguous; excluded from pairwise benchmark",
+            fused_recurrent_dplr_delta_rule as function,
         )
     elif name == "based":
         from fla.ops.based import fused_chunk_based as function
@@ -447,16 +439,19 @@ def _fla_call(case, inputs):
         # releases accepted head_first, but passing it breaks the checkout
         # selected by --fla-source.
         kwargs = {}
-        if state_contract or name == "normalized-linear":
-            if name == "normalized-linear" and initial is not None:
-                initial = (initial[0], initial[1].unsqueeze(1))
-            kwargs.update(initial_state=initial, output_final_state=final)
+        if state_contract:
+            memory = (
+                initial[0]
+                if name == "normalized-linear" and initial is not None
+                else initial
+            )
+            kwargs.update(initial_state=memory, output_final_state=final)
         if name in ("linear", "normalized-linear"):
             result = function(
                 query,
                 key,
                 value,
-                normalize=name == "normalized-linear",
+                normalize=False,
                 **kwargs,
             )
         elif name == "retention":
@@ -489,8 +484,8 @@ def _fla_call(case, inputs):
                 query,
                 key,
                 value,
-                values["gate"],
-                values["beta"],
+                g=values["gate"],
+                beta=values["beta"],
                 use_qk_l2norm_in_kernel=False,
                 **kwargs,
             )
@@ -510,17 +505,26 @@ def _fla_call(case, inputs):
             if isinstance(result, (tuple, list))
             else (result, None)
         )
-        if name == "normalized-linear" and state is not None:
-            state = (state[0], state[1].squeeze(1))
+        if name == "normalized-linear":
+            key_sum = key.float().cumsum(dim=1)
+            if initial is not None:
+                key_sum = key_sum + initial[1].unsqueeze(1)
+            denominator = (query.float() * query.shape[-1] ** -0.5 * key_sum).sum(
+                -1, keepdim=True
+            )
+            output = (output.float() / (denominator + 1e-10)).to(query.dtype)
+            state = (state, key_sum[:, -1]) if final else None
         return output.transpose(1, 2), state
 
     preprocessing = "transpose/contiguous"
-    if name == "normalized-linear":
-        preprocessing += (
-            "; disable FLA normalize_output and apply sequence-axis denominator"
-        )
+    if name in {"linear", "simple-gla", "gla"}:
+        preprocessing += "; FP32 authored key + 0.1"
+    elif name == "normalized-linear":
+        preprocessing += "; FP32 key cumsum/denominator with continuation key_sum"
     elif name == "rwkv7":
-        preprocessing += "; map DPLR a=-removal and b=beta*key"
+        preprocessing += (
+            "; FP32 DPLR factors with decay-before-removal and beta injection"
+        )
     elif name == "rwkv6":
         preprocessing += "; FP32 bonus materialization"
     elif name == "retnet":
@@ -640,7 +644,16 @@ def _meta_failure_status(error: Exception) -> str:
 
 
 def _measure_pair(
-    benchmark, torch, case, seqlen, device, warmup, repetitions, contract, timing
+    benchmark,
+    torch,
+    case,
+    seqlen,
+    device,
+    warmup,
+    repetitions,
+    contract,
+    timing,
+    workspace_bytes=1 << 30,
 ):
     operator = case.factory(**case.kwargs(seqlen))
     sizes = benchmark.role_sizes_for(operator, case, seqlen)
@@ -656,6 +669,7 @@ def _measure_pair(
         "fla_status": "NOT_RUN",
         "timing_units": "milliseconds",
         "compile_timed": False,
+        "workspace_limit_bytes": workspace_bytes,
         "ratio_direction": "FLA / MetaAttention (>1 means MetaAttention faster)",
         "measurement_contract": {
             "public_cuda_event": "median warmed invocation",
@@ -667,7 +681,10 @@ def _measure_pair(
     }
     try:
         compiled = operator.compile(
-            role_sizes=sizes, target=benchmark.Target(), mode="dense", optimized=True
+            role_sizes=sizes,
+            target=benchmark.Target(workspace_bytes=workspace_bytes),
+            mode="dense",
+            optimized=True,
         )
         plan = compiled.operator._plans[compiled.specialization]
         estimate = next(
@@ -954,10 +971,16 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
+        "--workspace-gib",
+        type=float,
+        default=1.0,
+        help="Meta workspace budget in GiB (default: 1)",
+    )
+    parser.add_argument(
         "--fla-source",
         type=Path,
         default=None,
-        help="FLA checkout; defaults to ../flash-linear-attention",
+        help="optional FLA checkout override; defaults to installed FLA 0.5.2",
     )
     parser.add_argument(
         "--gpu",
@@ -978,6 +1001,8 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = _parse_args()
+    if not 0 < args.workspace_gib < float("inf"):
+        raise SystemExit("workspace-gib must be finite and positive")
     if (
         args.warmup < 0
         or args.repetitions < 1
@@ -1050,6 +1075,7 @@ def main() -> None:
                 args.repetitions,
                 contract,
                 args.timing,
+                workspace_bytes=int(args.workspace_gib * (1 << 30)),
             )
         except Exception as error:
             record = {
@@ -1097,6 +1123,7 @@ def main() -> None:
         "timing": args.timing,
         "warmup": args.warmup,
         "repetitions": args.repetitions,
+        "workspace_limit_bytes": int(args.workspace_gib * (1 << 30)),
         "provenance": _provenance(torch, fla_source),
         "correctness": {
             "meta": "measured against independent authored-order FP32 oracle",

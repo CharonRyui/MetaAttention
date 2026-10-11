@@ -79,7 +79,7 @@ Stateful Operator correctness and performance diagnostics use
 is the correctness oracle for output-only, final-State, and continuation contracts.
 ### Compare Stateful Operator with FLA
 
-Install the optional FLA baseline in its isolated uv dependency group:
+Install the FLA 0.5.2 release in its optional uv dependency group:
 
 ```bash
 uv sync --group fla-benchmark
@@ -89,14 +89,19 @@ Run the conservative first-phase matrix on an otherwise idle NVIDIA GPU:
 
 ```bash
 uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
-  --fla-source ../flash-linear-attention \
   --families linear,simple-gla,gla,normalized-linear,retention,rwkv6,gsa,hgrn \
-  --contract all --timing both --output-dir benchmark_results/stateful_fla
+  --contract all --timing both --workspace-gib 8 \
+  --output-dir benchmark_results/stateful_fla
 ```
 
-The runner selects a physical GPU before importing CUDA, uses the local
-`../flash-linear-attention` checkout by default, includes public-call preparation
-in both sides, validates MetaAttention against its independent authored-order
+The runner selects a physical GPU before importing CUDA and uses the installed
+FLA 0.5.2 release by default. To compare a local checkout explicitly, pass
+`--fla-source ../flash-linear-attention`. The manifest records the actual FLA
+import path, package versions and checkout revision when supplied.
+`--workspace-gib` sets the Meta compilation budget (default: 1 GiB); 8 GiB
+allows the larger matrix points on an otherwise idle H20 with sufficient free
+memory. This is a budget, not a reservation. The runner includes public-call
+preparation in both sides, validates MetaAttention against its independent authored-order
 recurrence, validates directly comparable FLA outputs, and only then reports
 `FLA / MetaAttention` speedups. Families without a semantic FLA mapping, or
 contracts for which FLA does not expose the same State, are recorded as

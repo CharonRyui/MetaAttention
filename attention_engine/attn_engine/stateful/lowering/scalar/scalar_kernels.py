@@ -29,11 +29,17 @@ def _transform(T, expression):
     offset = expression[3] if len(expression) > 3 else 0.0
 
     def transform(value):
+        # The fast exp intrinsic can differ by one ULP near one. Repeated
+        # weak decay amplifies that error in long FP32 State recurrences.
         if operation == "exp":
-            value = T.exp(value)
+            value = T.cast(
+                T.call_extern("float64", "exp", T.cast(value, "float64")), "float32"
+            )
         value = value * scale
         if is_log:
-            value = T.exp(value)
+            value = T.cast(
+                T.call_extern("float64", "exp", T.cast(value, "float64")), "float32"
+            )
         return value + offset
 
     return transform

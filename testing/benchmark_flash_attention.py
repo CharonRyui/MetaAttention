@@ -3,7 +3,8 @@
 The former implementation compared softmax attention with FlashAttention.  That
 is not a semantic comparison for the linear-attention examples in this
 repository.  The canonical benchmark is now ``benchmark_fla_stateful.py`` and
-uses the local ``../flash-linear-attention`` checkout by default.
+uses the installed FLA 0.5.2 release by default. Pass ``--fla-source`` to
+select a local checkout explicitly.
 
 Examples::
 

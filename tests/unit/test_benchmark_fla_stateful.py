@@ -78,7 +78,7 @@ def test_idle_gpu_selection_rejects_busy_and_selects_most_free():
         choose_idle_gpu((gpus[0],))
 
 
-def test_fla_baseline_records_non_comparable_family(monkeypatch):
+def test_rwkv7_adapter_maps_decay_before_removal():
     import torch
     from testing.benchmark_fla_stateful import _fla_call
     from testing import benchmark_stateful_plans as benchmark
@@ -88,8 +88,39 @@ def test_fla_baseline_records_non_comparable_family(monkeypatch):
     inputs = benchmark.inputs_for(operator, case, 2, torch.device("cpu"))
     adapter = _fla_call(case, inputs)
     assert adapter is not None
-    assert adapter.comparable is False
-    assert "native a/b" in adapter.note
+    assert adapter.comparable is True
+    values = adapter.prepare(inputs)
+    native = {name: value.transpose(1, 2) for name, value in inputs.items()}
+    torch.testing.assert_close(
+        values["a"], -native["removal"].float() * native["decay"].exp()
+    )
+    torch.testing.assert_close(
+        values["b"], native["key"].float() * native["beta"].unsqueeze(-1)
+    )
+    torch.testing.assert_close(
+        values["value"], native["value"].float() * native["beta"].unsqueeze(-1)
+    )
+
+
+def test_gdn_adapter_passes_gate_and_beta_by_name(monkeypatch):
+    import torch
+    import fla.ops.gated_delta_rule as fla_gdn
+    from testing.benchmark_fla_stateful import _fla_call
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = next(item for item in benchmark.CASES if item.name == "gdn")
+    operator = case.factory(**case.kwargs(2))
+    inputs = benchmark.inputs_for(operator, case, 2, torch.device("cpu"))
+
+    def recurrent(q, k, v, g=None, gk=None, gv=None, beta=None, **kwargs):
+        assert gk is None and gv is None
+        torch.testing.assert_close(g, inputs["gate"].transpose(1, 2))
+        torch.testing.assert_close(beta, inputs["beta"].transpose(1, 2))
+        return v, None
+
+    monkeypatch.setattr(fla_gdn, "fused_recurrent_gated_delta_rule", recurrent)
+    adapter = _fla_call(case, inputs)
+    adapter.invoke(adapter.prepare(inputs), None, False)
 
 
 def test_meta_failure_status_distinguishes_runtime_resource():
@@ -144,6 +175,39 @@ def test_csv_rows_hide_measurements_for_invalid_pairs():
     assert row["meta_ms"] is None
     assert row["fla_ms"] is None
     assert row["speedup"] is None
+
+
+@pytest.mark.gpu
+def test_retention_long_final_state_and_continuation(gpu_device):
+    import torch
+    from dataclasses import replace
+    from testing import benchmark_stateful_plans as benchmark
+
+    torch.set_num_threads(1)
+    torch.manual_seed(42)
+    case = replace(
+        next(item for item in benchmark.CASES if item.name == "retention"),
+        batch=2,
+        heads=16,
+    )
+    operator = case.factory(**case.kwargs(8192))
+    sizes = benchmark.role_sizes_for(operator, case, 8192)
+    compiled = operator.compile(
+        role_sizes=sizes, target=benchmark.Target(), mode="dense", optimized=True
+    )
+    inputs = benchmark.inputs_for(operator, case, 8192, gpu_device)
+    expected, expected_states = benchmark._token_oracle(operator, inputs, sizes)
+    for contract in ("final-state", "continuation"):
+        parts = (
+            benchmark._split_inputs(operator, inputs, 4096)
+            if contract == "continuation"
+            else [inputs]
+        )
+        outputs, states = benchmark._meta_call(compiled, parts, contract)()
+        correctness = benchmark._correctness(
+            outputs, states, expected, expected_states, contract
+        )
+        assert correctness["status"] == "VALID", correctness
 
 
 @pytest.mark.gpu
