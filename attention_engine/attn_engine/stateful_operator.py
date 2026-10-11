@@ -867,10 +867,15 @@ class StatefulOperator:
         self._zero_states: dict[tuple[Any, ...], torch.Tensor] = {}
 
     @property
+    def _program(self) -> AlgorithmIR:
+        """Typed, normalized program shared by planning and every executor."""
+        return self.algorithm._analysis.normalized
+
+    @property
     def _structural_identity(self) -> str:
         return hashlib.sha256(
             json.dumps(
-                (SCHEMA_VERSION, self.algorithm._structural_identity), sort_keys=True
+                (SCHEMA_VERSION, self._program._structural_identity), sort_keys=True
             ).encode()
         ).hexdigest()
 
@@ -901,25 +906,25 @@ class StatefulOperator:
             return self._plans[specialization]
         from .stateful.compile.plan import compile_plan
 
-        state = self.algorithm.states[0]
+        state = self._program.states[0]
         role_sizes = dict(compilation.role_sizes)
-        needs_dense = _dense_summary_required(self.algorithm)
+        needs_dense = _dense_summary_required(self._program)
         plan = compile_plan(
             mode=compilation.mode,
-            source_identity=self.algorithm._analysis.simplified.identity,
+            source_identity=self._program._analysis.simplified.identity,
             feature_sizes=tuple(role_sizes[role] for role in state.feature_roles),
             target=compilation.target,
             backward_ir=(
-                self.algorithm._analysis.backward
+                self._program._analysis.backward
                 if compilation.options.backward
                 else None
             ),
             dense_summary=needs_dense,
-            scalar_factorized=self.algorithm._analysis.scalar_factorized,
-            rank_one_factored=self.algorithm._analysis.rank_one_factored,
+            scalar_factorized=self._program._analysis.scalar_factorized,
+            rank_one_factored=self._program._analysis.rank_one_factored,
             optimized=compilation.options.optimized,
             autotune=compilation.options.autotune,
-            structural_features=self.algorithm._analysis.structural_features,
+            structural_features=self._program._analysis.structural_features,
             operator=self,
             compilation=compilation,
         )
@@ -1034,31 +1039,18 @@ class StatefulOperator:
                 plan.runtime_family,
                 validation,
             )
-        if (
+        if plan.runtime_family == "stateful-reference" or (
             validation.reference_required
-            and plan.rank_one_factored is not None
-            and runtime.device.type == "cuda"
-            and runtime.token_count > 0
+            and not (
+                plan.runtime_family == "factored-recurrence"
+                and runtime.device.type == "cuda"
+                and runtime.token_count > 0
+            )
         ):
-            values = self._normalize_inputs(inputs, runtime, role_sizes)
-            outputs, final_state = self._lower_factored_recurrence(
-                values,
-                initial_states[self.algorithm.states[0].name],
-                runtime,
-                return_final_state,
-                plan,
-            )
-            return ExecutionResult(
-                NamedOutputTuple(
-                    tuple(readout.name for readout in self.algorithm.readouts), outputs
-                ),
-                final_state,
-            )
-        if validation.reference_required:
             return self._execute_reference(
                 runtime, role_sizes, inputs, initial_states, return_final_state
             )
-        state = initial_states[self.algorithm.states[0].name]
+        state = initial_states[self._program.states[0].name]
         scalar_profile = getattr(plan, "scalar_factorized", None)
         raw_dense = (
             plan.runtime_family == "scalar-factorized"
@@ -1076,12 +1068,12 @@ class StatefulOperator:
                 state,
                 sequence_count=runtime.sequence_count,
                 sequence_length=runtime.uniform_length,
-                output_dtype=self.algorithm.readouts[0].output_dtype,
+                output_dtype=self._program.readouts[0].output_dtype,
                 return_final_state=return_final_state,
             )
             outputs = (output,)
             final_state = (
-                StateTuple((self.algorithm.states[0].name,), (fused_final,))
+                StateTuple((self._program.states[0].name,), (fused_final,))
                 if return_final_state
                 else None
             )
@@ -1092,7 +1084,7 @@ class StatefulOperator:
             )
         return ExecutionResult(
             NamedOutputTuple(
-                tuple(readout.name for readout in self.algorithm.readouts), outputs
+                tuple(readout.name for readout in self._program.readouts), outputs
             ),
             final_state,
         )
@@ -1112,13 +1104,13 @@ class StatefulOperator:
             )
         declared = {
             role
-            for spec in self.algorithm.inputs
+            for spec in self._program.inputs
             for role in spec.roles
             if isinstance(role, (HeadRole, FeatureRole))
         }
         declared.update(
             role
-            for state in self.algorithm.states
+            for state in self._program.states
             for role in state.roles
             if isinstance(role, (HeadRole, FeatureRole))
         )
@@ -1146,8 +1138,8 @@ class StatefulOperator:
                 raise StatefulCompilationError(
                     "COMPILE_ROLE_SIZE", f"role_sizes.{role}", {"size": size}
                 )
-        state = self.algorithm.states[0]
-        head_roles = {spec.head_role for spec in self.algorithm.states}
+        state = self._program.states[0]
+        head_roles = {spec.head_role for spec in self._program.states}
         if len(head_roles) != 1:
             raise StatefulCompilationError(
                 "IR_SCHEMA",
@@ -1159,16 +1151,14 @@ class StatefulOperator:
             )
         _verify_product_roles(dict(role_sizes), "role_sizes")
         # The {64,128} pair is a capability of the specialized matrix kernels; a
-        # v2 Program is executed by the reference lowering, which has no such
-        # block constraint.
-        from .stateful.lowering.reference import requires_reference_lowering
-
+        # general programs can use the reference executor without that block
+        # constraint, as determined by analysis of the normalized IR.
         if (
             target.device_type == "cuda"
-            and not requires_reference_lowering(self.algorithm)
+            and not self._program._analysis.reference_required
             and os.environ.get("STATEFUL_OPERATOR_TEST_CPU") != "1"
         ):
-            for spec in self.algorithm.states:
+            for spec in self._program.states:
                 feature_sizes = tuple(role_sizes[role] for role in spec.feature_roles)
                 if any(size not in (64, 128) for size in feature_sizes):
                     raise StatefulCompilationError(
@@ -1181,16 +1171,16 @@ class StatefulOperator:
                         },
                     )
         state_heads = role_sizes[state.head_role]
-        for source, mapped_target in self.algorithm.head_mapping.mappings:
+        for source, mapped_target in self._program.head_mapping.mappings:
             if mapped_target != state.head_role or state_heads % role_sizes[source]:
                 raise StatefulCompilationError(
                     "COMPILE_ROLE_SIZE", "head_mapping", {"source": source}
                 )
         ordered = tuple(sorted(role_sizes.items(), key=lambda item: _identity(item[0])))
         validation = _ValidationRecipe(
-            expected_input_names=tuple(spec.name for spec in self.algorithm.inputs),
-            state_names=tuple(spec.name for spec in self.algorithm.states),
-            output_names=tuple(readout.name for readout in self.algorithm.readouts),
+            expected_input_names=tuple(spec.name for spec in self._program.inputs),
+            state_names=tuple(spec.name for spec in self._program.states),
+            output_names=tuple(readout.name for readout in self._program.readouts),
             inputs=tuple(
                 _InputValidation(
                     spec.name,
@@ -1200,14 +1190,14 @@ class StatefulOperator:
                     spec.roles.index(Sequence) if Sequence in spec.roles else None,
                     tuple(role for role in spec.roles if role not in (Batch, Sequence)),
                 )
-                for spec in self.algorithm.inputs
+                for spec in self._program.inputs
             ),
             states=tuple(
                 _StateValidation(spec.name, spec.head_role, spec.feature_roles)
-                for spec in self.algorithm.states
+                for spec in self._program.states
             ),
-            reference_required=requires_reference_lowering(self.algorithm),
-            head_mapping=self.algorithm.head_mapping.mappings,
+            reference_required=self._program._analysis.reference_required,
+            head_mapping=self._program.head_mapping.mappings,
         )
         return _Compilation(ordered, target, mode, options, validation)
 
@@ -1526,7 +1516,7 @@ class StatefulOperator:
             raise RuntimeError("rank-one recipe is not selected by the plan")
         values = bind_chunked_inputs(recipe, inputs, runtime)
         result = execute_chunked_states(
-            self.algorithm,
+            self._program,
             values=values,
             initial_states=initial_states,
             segment=None,
@@ -1546,7 +1536,7 @@ class StatefulOperator:
                 runtime.sequence_count, runtime.uniform_length, runtime.state_heads, -1
             )
             .permute(0, 2, 1, 3)
-            for readout in self.algorithm.readouts
+            for readout in self._program.readouts
         )
         return ExecutionResult(
             NamedOutputTuple._unchecked(validation.output_names, ordered),
@@ -1569,7 +1559,7 @@ class StatefulOperator:
         """Execute a schema-v2 Program through the reference lowering."""
         from .stateful.lowering.reference import execute_reference, normalize_inputs
 
-        algorithm = self.algorithm
+        algorithm = self._program
         heads = runtime.state_heads
         if runtime.packed:
             assert runtime.offsets is not None
@@ -1640,10 +1630,10 @@ class StatefulOperator:
         runtime: _Runtime,
         role_sizes: Mapping[str, int],
     ) -> dict[str, torch.Tensor]:
-        state = self.algorithm.states[0]
+        state = self._program.states[0]
         features = state.feature_roles
         result: dict[str, torch.Tensor] = {}
-        for spec in self.algorithm.inputs:
+        for spec in self._program.inputs:
             tensor = inputs[spec.name]
             if runtime.packed and Sequence in spec.roles:
                 physical_roles = tuple(
@@ -1750,7 +1740,7 @@ class StatefulOperator:
         heads = runtime.state_heads
         left_size, right_size = runtime.feature_sizes
         device = runtime.device
-        state_spec = self.algorithm.states[0]
+        state_spec = self._program.states[0]
         if runtime.packed:
             assert runtime.offsets is not None
             lengths = runtime.offsets[1:] - runtime.offsets[:-1]
@@ -1775,7 +1765,7 @@ class StatefulOperator:
                     device=device,
                     dtype=readout.output_dtype,
                 )
-                for readout in self.algorithm.readouts
+                for readout in self._program.readouts
             )
             final = (
                 StateTuple((state_spec.name,), (initial_state,))
@@ -1804,12 +1794,12 @@ class StatefulOperator:
             )
         if family == "vector-propagation":
             family = "axis-scale"
-        identity_only = not self.algorithm.transition.propagations
+        identity_only = not self._program.transition.propagations
         needs_dense_transform = bool(getattr(executable, "dense_summary", False))
         second_factor: torch.Tensor | None = None
         if family == "axis-scale":
             left, right, elementwise, second_factor = _axis_scale_summary(
-                self.algorithm.transition.propagations,
+                self._program.transition.propagations,
                 evaluate=_evaluate,
                 values=values,
                 state_spec=state_spec,
@@ -1824,7 +1814,7 @@ class StatefulOperator:
             identity_right = right if needs_dense_transform else None
         elif family == "rank-one-factorized":
             left, right, elementwise = rank_one_summary(
-                self.algorithm.transition.propagations,
+                self._program.transition.propagations,
                 evaluate=_evaluate,
                 feature_vector=_feature_vector,
                 values=values,
@@ -1862,7 +1852,7 @@ class StatefulOperator:
                 if identity_only
                 else None
             )
-            for node in self.algorithm.transition.propagations:
+            for node in self._program.transition.propagations:
                 if isinstance(node, Identity):
                     continue
                 if isinstance(node, AxisScale):
@@ -1888,9 +1878,7 @@ class StatefulOperator:
                     right_vector = _feature_vector(
                         _evaluate(node.right, values), node.role, state_spec
                     )
-                    coefficient = _evaluate(node.coefficient, values).float()[
-                        ..., :1, :1
-                    ]
+                    coefficient = _evaluate(node.coefficient, values).float()
                     assert identity_left is not None and identity_right is not None
                     assert left is not None and right is not None
                     if node.role == state_spec.feature_roles[0]:
@@ -1915,7 +1903,7 @@ class StatefulOperator:
             and not initial_state.requires_grad
         )
         if can_fuse_scalar:
-            injection_term = self.algorithm.transition.injections[0]
+            injection_term = self._program.transition.injections[0]
             factors = {
                 factor.roles[0]: _evaluate(factor.expression, values)
                 for factor in injection_term.factors
@@ -1926,8 +1914,8 @@ class StatefulOperator:
             right_offset = dense_recipe.right_factor[1].offset
             readout_offset = dense_recipe.readout[1].offset
             readout = _feature_vector(
-                _evaluate(self.algorithm.readouts[0].operand, values),
-                self.algorithm.readouts[0].role,
+                _evaluate(self._program.readouts[0].operand, values),
+                self._program.readouts[0].role,
                 state_spec,
             )
             if runtime.packed:
@@ -1942,7 +1930,7 @@ class StatefulOperator:
                     runtime.offsets,
                     sequence_count=runtime.sequence_count,
                     max_sequence_length=max_sequence_length,
-                    output_dtype=self.algorithm.readouts[0].output_dtype,
+                    output_dtype=self._program.readouts[0].output_dtype,
                     return_final_state=return_final_state,
                     left_offset=left_offset,
                     right_offset=right_offset,
@@ -1957,7 +1945,7 @@ class StatefulOperator:
                     initial_state,
                     sequence_count=runtime.sequence_count,
                     sequence_length=runtime.uniform_length,
-                    output_dtype=self.algorithm.readouts[0].output_dtype,
+                    output_dtype=self._program.readouts[0].output_dtype,
                     return_final_state=return_final_state,
                     left_offset=left_offset,
                     right_offset=right_offset,
@@ -1989,7 +1977,7 @@ class StatefulOperator:
                 return (output,), final_state
         if executable.runtime_family == "product-injection-gemm":
             injection = product_injection_terms(
-                self.algorithm.transition.injections,
+                self._program.transition.injections,
                 evaluate=_evaluate,
                 values=values,
                 feature_roles=state_spec.feature_roles,
@@ -2001,7 +1989,7 @@ class StatefulOperator:
             )
         else:
             injection = None
-            for term in self.algorithm.transition.injections:
+            for term in self._program.transition.injections:
                 product: torch.Tensor | float = 1.0
                 for factor in term.factors:
                     product = product * _evaluate(factor.expression, values).float()
@@ -2053,7 +2041,7 @@ class StatefulOperator:
         output_values: list[torch.Tensor] = []
         shared = (
             shared_readouts(
-                self.algorithm.readouts,
+                self._program.readouts,
                 evaluate=_evaluate,
                 feature_vector=_feature_vector,
                 values=values,
@@ -2063,7 +2051,7 @@ class StatefulOperator:
             if executable.runtime_family == "shared-state-contraction"
             else {}
         )
-        for readout in self.algorithm.readouts:
+        for readout in self._program.readouts:
             if readout.name in shared:
                 output = shared[readout.name]
                 if not runtime.packed:
@@ -2133,9 +2121,9 @@ class StatefulOperator:
             or initial_state.requires_grad
         ):
             raise RuntimeError("vector-propagation requires dense inference inputs")
-        state_spec = self.algorithm.states[0]
+        state_spec = self._program.states[0]
         first_role, second_role = state_spec.feature_roles
-        transition = self.algorithm.transition
+        transition = self._program.transition
         gate_expression = transition.propagations[0].factor
         if runtime.uniform_length >= 64:
             # Independent chunk replay also handles batches and nonaligned tails.
@@ -2164,7 +2152,7 @@ class StatefulOperator:
         gate = _feature_vector(
             _evaluate(gate_expression.operand, values), first_role, state_spec
         )
-        readout = self.algorithm.readouts[0]
+        readout = self._program.readouts[0]
         query = _feature_vector(
             _evaluate(readout.operand, values), readout.role, state_spec
         )
@@ -2205,22 +2193,22 @@ class StatefulOperator:
             or runtime.packed
             or runtime.uniform_length is None
             or runtime.uniform_length * runtime.sequence_count != runtime.token_count
-            or len(self.algorithm.transition.injections) != 1
-            or len(self.algorithm.readouts) != 1
+            or len(self._program.transition.injections) != 1
+            or len(self._program.readouts) != 1
             or any(tensor.requires_grad for tensor in values.values())
             or initial_state.requires_grad
         ):
             return None
-        state_spec = self.algorithm.states[0]
+        state_spec = self._program.states[0]
         first_role, second_role = state_spec.feature_roles
-        injection_term = self.algorithm.transition.injections[0]
+        injection_term = self._program.transition.injections[0]
         factors = {
             factor.roles[0]: _evaluate(factor.expression, values)
             for factor in injection_term.factors
         }
         if set(factors) != {first_role, second_role}:
             return None
-        readout = self.algorithm.readouts[0]
+        readout = self._program.readouts[0]
         if not isinstance(readout, StateContraction) or readout.role != first_role:
             return None
         outputs, finals = executable.chunked_elementwise_dense(
@@ -2258,7 +2246,7 @@ class StatefulOperator:
         """Lower inference through chunks; retain the compiled backward path."""
         from .stateful.lowering.lowrank.factored import factored_recurrence_chunked
 
-        state_spec = self.algorithm.states[0]
+        state_spec = self._program.states[0]
         first_role, second_role = state_spec.feature_roles
         backward_path = (
             executable.backward_binding is not None
@@ -2386,7 +2374,7 @@ class StatefulOperator:
             if torch.is_grad_enabled() and tensor.requires_grad
         )
         if torch.is_grad_enabled() and state.requires_grad:
-            active.append(f"state:{self.algorithm.states[0].name}")
+            active.append(f"state:{self._program.states[0].name}")
         metadata = [
             (name, tuple(tensor.shape), str(tensor.dtype), tensor.device.type)
             for name, tensor in sorted(inputs.items())
@@ -2729,7 +2717,12 @@ def _evaluate(
         )
         # keep one singleton axis so the result broadcasts against a
         # Feature-carrying term, exactly like a rank-1 State Term
-        return (left.float() * right.float()).sum(dim=-1, keepdim=True)
+        contracted = (left.float() * right.float()).sum(dim=-1, keepdim=True)
+        if not squeeze_features and feature_axes is None:
+            # The single-matrix evaluator keeps both State axes, including
+            # feature-free reductions. Readout evaluation uses vector space.
+            return contracted.unsqueeze(-1)
+        return contracted
     if isinstance(expression, Softmax):
         operand = _evaluate(
             expression.operand,

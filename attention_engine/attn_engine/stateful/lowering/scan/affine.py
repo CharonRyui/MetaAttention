@@ -23,6 +23,11 @@ def _compile_dense_matmul_step(
     import tilelang
     import tilelang.language as T
 
+    from ..diagonal.identity import fp32_gemm_macro
+
+    # Affine maps can be I plus a small correction. Single-TF32 GEMM loses
+    # that correction on every composition, including the reverse scan.
+    gemm = fp32_gemm_macro(T)
     block_rows = 32
     block_columns = 32
     block_inner = 32
@@ -87,7 +92,7 @@ def _compile_dense_matmul_step(
                             ],
                             right_shared,
                         )
-                        T.gemm(left_shared, right_shared, accumulator)
+                        gemm(left_shared, right_shared, accumulator)
                     if addend:
                         for row, column in T.Parallel(block_rows, block_columns):
                             accumulator[row, column] += extra[

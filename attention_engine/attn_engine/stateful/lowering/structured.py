@@ -128,9 +128,7 @@ def shared_state_contraction_eligibility(algorithm: Any) -> Eligibility:
 
 def factored_recurrence_eligibility(algorithm: Any) -> Eligibility:
     """Return whether the factored recurrent kernel can replay the Program."""
-    from ..analyse.algorithm import rank_one_factored_eligible
-
-    if rank_one_factored_eligible(algorithm) is None:
+    if algorithm._analysis.rank_one_factored is None:
         return False, "not-a-factored-recurrence"
     return True, None
 
@@ -325,7 +323,7 @@ def rank_one_summary(
             right_vector = feature_vector(
                 evaluate(node.right, values), node.role, state_spec
             )
-            coefficient = evaluate(node.coefficient, values).float()[..., :1, :1]
+            coefficient = evaluate(node.coefficient, values).float()
             if node.role == state_spec.feature_roles[0]:
                 update = torch.eye(left_size, device=device).expand(
                     token_count, heads, left_size, left_size

@@ -41,66 +41,6 @@ from ...stateful_operator import (
 )
 
 
-def requires_reference_lowering(algorithm: Any) -> bool:
-    """Whether a Program needs the schema-v2 reference lowering.
-
-    Programs outside the original single-State matrix interface need this
-    semantic fallback unless the compiler selected a direct structured executor.
-    """
-    if (
-        len(algorithm.states) != 1
-        or any(state.rank != 2 for state in algorithm.states)
-        or any(isinstance(readout, Readout) for readout in algorithm.readouts)
-    ):
-        return True
-    for transition in algorithm.transitions:
-        for node in transition.propagations:
-            for expression in _node_expressions(node):
-                if _contains_shift(expression):
-                    return True
-        for injection in transition.injections:
-            for factor in injection.factors:
-                if _contains_shift(factor.expression):
-                    return True
-    return False
-
-
-def _node_expressions(node: Any):
-    if type(node).__name__ == "AxisScale":
-        yield node.factor
-    elif type(node).__name__ == "RankOnePropagation":
-        yield node.left
-        yield node.right
-        yield node.coefficient
-
-
-def _contains_shift(expression: Any) -> bool:
-    from ...stateful_operator import (
-        Add,
-        Clamp,
-        Divide,
-        Exp,
-        Log,
-        Multiply,
-        Negate,
-        Reciprocal,
-        Shift,
-        Sigmoid,
-        Sqrt,
-        StateTerm,
-    )
-
-    if isinstance(expression, Shift):
-        return True
-    if isinstance(expression, (Add, Multiply, Divide)):
-        return _contains_shift(expression.left) or _contains_shift(expression.right)
-    if isinstance(expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
-        return _contains_shift(expression.operand)
-    if isinstance(expression, StateTerm):
-        return _contains_shift(expression.operand)
-    return False
-
-
 def feature_layout(
     algorithm: Any,
 ) -> tuple[tuple[FeatureRole, ...], dict[FeatureRole, int]]:

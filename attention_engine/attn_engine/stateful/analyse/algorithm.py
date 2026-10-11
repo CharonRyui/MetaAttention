@@ -161,6 +161,8 @@ class Analysis:
     simplified: SimplifiedIR
     structural_features: StructuralFeatures
     canonical_identity: str
+    normalized: AlgorithmIR
+    reference_required: bool
 
 
 def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
@@ -459,10 +461,13 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     for index, readout in enumerate(algorithm.readouts):
         path = f"readouts[{index}]"
         if isinstance(readout, StateContraction):
+            spec = states.get(readout.state)
+            if spec is None:
+                raise StatefulCompilationError(
+                    "IR_TYPE", path, {"unknown_state": readout.state}
+                )
             operand = type_expression(readout.operand, f"{path}.operand")
-            actual = tuple(
-                role for role in operand.roles if role in state.feature_roles
-            )
+            actual = tuple(role for role in operand.roles if role in spec.feature_roles)
             if actual != (readout.role,):
                 raise StatefulCompilationError(
                     "IR_TYPE",
@@ -475,6 +480,24 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         else:
             type_expression(readout.expression, f"{path}.expression")
             reverse.append(VJPStep(path, "readout", _input_names(readout.expression)))
+
+    normalized_readouts = _normalize_readouts(algorithm)
+    if normalized_readouts != algorithm.readouts:
+        from ...stateful_operator import AlgorithmIR
+
+        normalized = AlgorithmIR(
+            inputs=algorithm.inputs,
+            states=algorithm.states,
+            transition=algorithm.transitions,
+            readouts=normalized_readouts,
+            head_mapping=algorithm.head_mapping,
+        )
+        return replace(
+            normalized._analysis,
+            canonical_identity=_canonical_identity(algorithm),
+            expression_types=tuple(types),
+            normalized=normalized,
+        )
 
     reverse.extend(
         VJPStep(f"head_mapping[{index}]", "head_reduce", (str(source),))
@@ -653,7 +676,70 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         simplified,
         structural_features,
         canonical_identity,
+        algorithm,
+        _requires_reference(algorithm),
     )
+
+
+def _requires_reference(algorithm: AlgorithmIR) -> bool:
+    """Prove whether the normalized program fits the matrix-summary executor.
+
+    This describes semantic capabilities, not authored readout spellings. A
+    separate factored proof may admit an inference schedule for weighted writes.
+    """
+    from ...stateful_operator import Shift, StateContraction, _expressions
+
+    if len(algorithm.states) != 1 or algorithm.states[0].rank != 2:
+        return True
+    if any(not isinstance(readout, StateContraction) for readout in algorithm.readouts):
+        return True
+    if any(isinstance(expression, Shift) for expression in _expressions(algorithm)):
+        return True
+    # The matrix-summary path assumes two feature factors. General products
+    # retain reference binding/broadcast semantics; the factored inference
+    # proof separately admits weighted outer writes.
+    features = algorithm.states[0].feature_roles
+    for injection in algorithm.transitions[0].injections:
+        if len(injection.factors) != 2 or {
+            factor.roles for factor in injection.factors
+        } != {
+            (features[0],),
+            (features[1],),
+        }:
+            return True
+    return False
+
+
+def _normalize_readouts(algorithm: AlgorithmIR) -> tuple[Any, ...]:
+    """Canonicalize proved post-transition matrix contractions after typing.
+
+    The operand DAG and output cast are preserved. General arithmetic, prior
+    reads and operands depending on another State remain expression readouts.
+    This pass is independent of target, optimization flags and kernel family.
+    """
+    from ...stateful_operator import Readout, StateContraction, StateTerm
+
+    states = {state.name: state for state in algorithm.states}
+    readouts = []
+    for readout in algorithm.readouts:
+        if isinstance(readout, Readout):
+            term = readout.expression
+            if (
+                isinstance(term, StateTerm)
+                and not term.prior
+                and states[term.state].rank == 2
+                and term.role in states[term.state].feature_roles
+                and not any(_all_state_terms(term.operand))
+            ):
+                readout = StateContraction(
+                    readout.name,
+                    term.state,
+                    term.operand,
+                    term.role,
+                    readout.output_dtype,
+                )
+        readouts.append(readout)
+    return tuple(readouts)
 
 
 def _promote(left: torch.dtype, right: torch.dtype) -> torch.dtype:
@@ -971,10 +1057,8 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     from ...stateful_operator import (
         AxisScale,
         RankOnePropagation,
-        Readout,
         Shift,
         StateContraction,
-        StateTerm,
         _expressions,
     )
 
@@ -986,21 +1070,10 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         return None
     state = algorithm.states[0]
     first_role, second_role = state.feature_roles
-    readouts = []
-    for readout in algorithm.readouts:
-        if isinstance(readout, Readout):
-            term = readout.expression
-            if not isinstance(term, StateTerm) or term.prior:
-                return None
-            if any(_all_state_terms(term.operand)):
-                return None
-            readout = StateContraction(
-                readout.name, term.state, term.operand, term.role, readout.output_dtype
-            )
-        if not isinstance(readout, StateContraction):
-            return None
-        readouts.append(readout)
-    if not readouts:
+    readouts = algorithm.readouts
+    if not readouts or not all(
+        isinstance(readout, StateContraction) for readout in readouts
+    ):
         return None
     if any(readout.state != state.name for readout in readouts):
         return None

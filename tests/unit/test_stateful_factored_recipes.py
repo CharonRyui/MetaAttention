@@ -31,7 +31,7 @@ def test_simple_readout_and_weighted_writes_recover_factored_candidate(family):
 
 @pytest.mark.parametrize("family", RECOVERED)
 @pytest.mark.parametrize("options", [{"optimized": False}, {"mode": "packed"}])
-def test_unoptimized_and_packed_programs_keep_reference(family, options):
+def test_unoptimized_and_packed_programs_use_normalized_capabilities(family, options):
     case = next(case for case in benchmark.CASES if case.name == family)
     operator = case.factory(**case.kwargs(65))
     compiled = operator.compile(
@@ -39,10 +39,12 @@ def test_unoptimized_and_packed_programs_keep_reference(family, options):
         target=Target(),
         **{"mode": "dense", **options},
     )
-    assert (
-        operator._plans[compiled.specialization].plan.candidate.lowerer
-        == "reference-stateful"
-    )
+    executable = operator._plans[compiled.specialization]
+    assert executable.rank_one_factored is None
+    if family == "delta-product":
+        assert executable.plan.candidate.lowerer == "reference-stateful"
+    else:
+        assert executable.plan.candidate.lowerer != "reference-stateful"
 
 
 @pytest.mark.parametrize("kind", ["prior", "nonlinear"])
@@ -133,7 +135,9 @@ def test_recovered_path_matches_oracle_and_continuation(
 
 
 @pytest.mark.parametrize("family", RECOVERED)
-def test_cpu_compilation_keeps_authored_reference_program(family, monkeypatch):
+def test_cpu_compilation_preserves_authored_ir_and_uses_normalized_program(
+    family, monkeypatch
+):
     monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "1")
     case = next(case for case in benchmark.CASES if case.name == family)
     operator = case.factory(**case.kwargs(65))
@@ -142,8 +146,11 @@ def test_cpu_compilation_keeps_authored_reference_program(family, monkeypatch):
         target=Target(device_type="cpu"),
         mode="dense",
     )
-    assert operator._plans[compiled.specialization].rank_one_factored is None
+    from attn_engine import StateContraction
+
+    assert compiled.operator is operator
     assert isinstance(operator.algorithm.readouts[0], Readout)
+    assert isinstance(operator._program.readouts[0], StateContraction)
 
 
 def test_weighted_injection_training_keeps_reference_backward():

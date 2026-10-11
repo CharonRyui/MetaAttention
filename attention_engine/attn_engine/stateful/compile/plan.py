@@ -1051,11 +1051,10 @@ def compile_plan(
     from ..lowering.chunked import compile_chunked_recipe
 
     chunked_recipe = (
-        compile_chunked_recipe(operator.algorithm, dict(compilation.role_sizes))
+        compile_chunked_recipe(operator._program, dict(compilation.role_sizes))
         if mode == "dense"
         else None
     )
-    from ..lowering.reference import requires_reference_lowering
     from ..lowering.structured import product_feature_chunked_eligibility
 
     product_feature_chunked = (
@@ -1063,7 +1062,7 @@ def compile_plan(
         and mode == "dense"
         and backward_ir is None
         and target.device_type == "cuda"
-        and product_feature_chunked_eligibility(operator.algorithm)[0]
+        and product_feature_chunked_eligibility(operator._program)[0]
     )
 
     chunked_stateful = (
@@ -1074,7 +1073,7 @@ def compile_plan(
         and chunked_recipe is not None
         and not product_feature_chunked
     )
-    reference_required = requires_reference_lowering(operator.algorithm)
+    reference_required = operator._program._analysis.reference_required
     rewrites = _structured_rewrites(structural_features) if optimized else ()
     representations: list[PlanRepresentation] = []
     special_representation = None
@@ -1133,7 +1132,7 @@ def compile_plan(
     from ..lowering.structured import RUNTIME_FAMILY_ELIGIBILITY
 
     fixed_sizes = dict(compilation.role_sizes)
-    state = operator.algorithm.states[0]
+    state = operator._program.states[0]
     from ..lowering.chunked import chunked_states_workspace
 
     chunked_states = (
@@ -1144,7 +1143,7 @@ def compile_plan(
     )
     state_workspace, state_chunk_bytes = (
         chunked_states_workspace(
-            operator.algorithm, fixed_sizes, fixed_sizes[state.head_role]
+            operator._program, fixed_sizes, fixed_sizes[state.head_role]
         )
         if chunked_states
         else (0, 0)
@@ -1163,7 +1162,7 @@ def compile_plan(
     ):
         native = chunked_recipe.native_normalized
         memory = next(
-            spec for spec in operator.algorithm.states if spec.name == native.memory
+            spec for spec in operator._program.states if spec.name == native.memory
         )
         heads = fixed_sizes[memory.head_role]
         rows, columns = (fixed_sizes[role] for role in memory.feature_roles)
@@ -1247,14 +1246,14 @@ def compile_plan(
                     ),
                 )
     state_total = 0
-    for spec in operator.algorithm.states:
+    for spec in operator._program.states:
         sizes = [fixed_sizes[role] for role in spec.feature_roles]
         state_total += sizes[0] if len(sizes) == 1 else sizes[0] * sizes[1]
     shape = EstimationShape.of(
         fixed_sizes[state.head_role],
         feature_sizes,
         dense_summary,
-        state_count=len(operator.algorithm.states),
+        state_count=len(operator._program.states),
         state_total_elements=state_total,
         dense_total_elements=sum(
             fixed_sizes[spec.feature_roles[0]] ** 2
@@ -1263,8 +1262,8 @@ def compile_plan(
                 if len(spec.feature_roles) > 1
                 else 0
             )
-            + (state_total // max(1, len(operator.algorithm.states)))
-            for spec in operator.algorithm.states
+            + (state_total // max(1, len(operator._program.states)))
+            for spec in operator._program.states
         ),
         chunked_states_workspace=state_workspace,
         chunked_states_chunk_bytes=(
@@ -1336,7 +1335,7 @@ def compile_plan(
                 }
                 and not RUNTIME_FAMILY_ELIGIBILITY.get(
                     lowerer.runtime_family, lambda _: (True, None)
-                )(operator.algorithm)[0]
+                )(operator._program)[0]
             ):
                 continue
             candidate = lowerer.lower(
@@ -1437,12 +1436,10 @@ def compile_plan(
     fixed_roles = tuple((str(role), size) for role, size in compilation.role_sizes)
     backward_binding = None
     backward_values: tuple[tuple[str, int], ...] = ()
-    if backward_ir is not None and (
-        candidate.lowerer == "tilelang-factored-recurrence" or not reference_required
-    ):
+    if backward_ir is not None and not reference_required:
         from ..lowering.backward import bind_backward
 
-        family = backward_context_family(operator.algorithm, candidate, dense_summary)
+        family = backward_context_family(operator._program, candidate, dense_summary)
         backward_values = _backward_configuration(values, family, device_profile)
         backward_binding = bind_backward(backward_ir, family, backward_values)
     context_values = (
@@ -1494,9 +1491,7 @@ def compile_plan(
     )
     backward_candidate = None
     backward_kernel_config = None
-    if backward_ir is not None and (
-        candidate.lowerer == "tilelang-factored-recurrence" or not reference_required
-    ):
+    if backward_ir is not None and not reference_required:
         backward_candidate = LoweredCandidate(
             _digest((source_identity, "tilelang-generic-backward", "backward")),
             source_identity,
