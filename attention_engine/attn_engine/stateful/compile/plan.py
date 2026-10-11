@@ -1107,7 +1107,13 @@ def compile_plan(
         and rank_one_factored is not None
         and (
             mode == "dense"
-            or (target.device_type == "cuda" and rank_one_factored.transpose_state)
+            or (
+                target.device_type == "cuda"
+                and (
+                    rank_one_factored.transpose_state
+                    or rank_one_factored.injection_scalar_count
+                )
+            )
         )
         and (not reference_required or target.device_type == "cuda")
     ):

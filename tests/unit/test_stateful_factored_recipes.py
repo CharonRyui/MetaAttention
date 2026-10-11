@@ -40,11 +40,15 @@ def test_unoptimized_and_packed_programs_use_normalized_capabilities(family, opt
         **{"mode": "dense", **options},
     )
     executable = operator._plans[compiled.specialization]
-    assert executable.rank_one_factored is None
-    if family == "delta-product":
-        assert executable.plan.candidate.lowerer == "reference-stateful"
+    if family == "delta-product" and options.get("mode") == "packed":
+        assert executable.rank_one_factored is not None
+        assert executable.plan.candidate.lowerer == "tilelang-factored-recurrence"
     else:
-        assert executable.plan.candidate.lowerer != "reference-stateful"
+        assert executable.rank_one_factored is None
+        if family == "delta-product":
+            assert executable.plan.candidate.lowerer == "reference-stateful"
+        else:
+            assert executable.plan.candidate.lowerer != "reference-stateful"
 
 
 @pytest.mark.parametrize("kind", ["prior", "nonlinear"])

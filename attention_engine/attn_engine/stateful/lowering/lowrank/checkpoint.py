@@ -668,7 +668,23 @@ def _compile_replay(
     import tilelang.language as T
 
     br = max(16, 1 << (rows - 1).bit_length())
-    bc = max(16, 1 << (columns - 1).bit_length()) if readout_axis else 16
+    # Weighted multi-update inference reuses each row reduction across more
+    # value columns. Bound the fragment at 128 rows so register pressure stays
+    # comparable to the opposite-axis replay already supported here.
+    wide_replay = (
+        chunk_size == 64
+        and codes.count(2) > 1
+        and any(factor >= 0 for order in injection_orders for factor in order)
+        and rows <= 128
+        and columns >= 64
+    )
+    bc = (
+        max(16, 1 << (columns - 1).bit_length())
+        if readout_axis
+        else 64
+        if wide_replay
+        else 16
+    )
     apply = _apply_macro(T, rows, columns, width, total, br, bc)
 
     @tilelang.jit(compile_flags=["-fmad=false"])
