@@ -27,6 +27,7 @@ def _metadata(tensor: torch.Tensor):
 def _transform(T, expression):
     operation, scale, is_log = expression[:3]
     offset = expression[3] if len(expression) > 3 else 0.0
+    scale_steps = expression[4] if len(expression) > 4 else ()
 
     def transform(value):
         # The fast exp intrinsic can differ by one ULP near one. Repeated
@@ -35,7 +36,13 @@ def _transform(T, expression):
             value = T.cast(
                 T.call_extern("float64", "exp", T.cast(value, "float64")), "float32"
             )
-        value = value * scale
+        if scale_steps:
+            for factor in scale_steps:
+                # Keep each authored FP32 rounding point through TIR/CUDA
+                # optimization; an ordinary Mul can be reassociated.
+                value = T.ieee_mul(value, factor)
+        else:
+            value = value * scale
         if is_log:
             value = T.cast(
                 T.call_extern("float64", "exp", T.cast(value, "float64")), "float32"
@@ -555,6 +562,7 @@ def scalar_chunked_dense_raw(
             expression.scale,
             expression.is_log_scale,
             getattr(expression, "offset", 0.0),
+            getattr(expression, "scale_steps", ()),
         )
         for expression in expressions
     )

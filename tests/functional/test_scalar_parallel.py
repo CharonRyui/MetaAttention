@@ -431,3 +431,234 @@ def test_raw_scalar_parallel_row_column_tails_and_continuation(
     for state in (final, suffix_final):
         torch.testing.assert_close(state.cpu(), expected_final, rtol=0.01, atol=0.02)
     torch.testing.assert_close(initial, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length", [65, 130])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("gate_kind", ["direct", "log"])
+def test_nested_scales_public_scalar_execution(length, dtype, gate_kind, gpu_device):
+    from dataclasses import replace
+
+    original = _compile(
+        heads=2,
+        key_heads=1,
+        value_heads=1,
+        rows=64,
+        columns=64,
+        dtype=dtype,
+        gate_kind=gate_kind,
+    )
+    base = original.operator.algorithm
+    transition = base.transition
+    gate = (Input("gate") * 0.5) * 0.5
+    factors = transition.injections[0].factors
+    algorithm = AlgorithmIR(
+        base.inputs,
+        base.states,
+        replace(
+            transition,
+            propagations=(AxisScale(Exp(gate) if gate_kind == "log" else gate),),
+            injections=(
+                ProductInjection(
+                    (
+                        ProductFactor((Input("key") * 0.1) * 0.3, factors[0].roles),
+                        ProductFactor((Input("value") * 0.3) * 0.1, factors[1].roles),
+                    )
+                ),
+            ),
+        ),
+        (replace(base.readouts[0], operand=(Input("query") * 0.5) * 0.5),),
+        base.head_mapping,
+    )
+    operator = StatefulOperator(algorithm)
+    compiled = operator.compile(
+        role_sizes={
+            QUERY_HEADS: 2,
+            KEY_HEADS: 1,
+            VALUE_HEADS: 1,
+            STATE_HEADS: 2,
+            KEY: 64,
+            VALUE: 64,
+        },
+        target=Target(),
+        mode="dense",
+        optimized=True,
+    )
+    assert operator._plans[compiled.specialization].plan.candidate.lowerer == (
+        "tilelang-scalar-factorized"
+    )
+    inputs, initial = _inputs(
+        1,
+        2,
+        1,
+        1,
+        length,
+        64,
+        64,
+        dtype,
+        gate_kind,
+        gpu_device,
+    )
+    # Evaluate each authored multiplication separately with rounded FP32 literals.
+    query = (inputs["query"].cpu().float() * 0.5) * 0.5
+    key = (inputs["key"].cpu().float() * torch.tensor(0.1)) * torch.tensor(0.3)
+    value = (inputs["value"].cpu().float() * torch.tensor(0.3)) * torch.tensor(0.1)
+    key = key.repeat_interleave(2, dim=1)
+    value = value.repeat_interleave(2, dim=1)
+    gate = (inputs["gate"].cpu().float() * 0.5) * 0.5
+    if gate_kind == "log":
+        gate = gate.exp()
+    gate = gate.repeat_interleave(2, dim=1)
+    state = initial.cpu().clone()
+    outputs = []
+    for token in range(length):
+        state = gate[:, :, token, None, None] * state
+        state = state + key[:, :, token, :, None] * value[:, :, token, None, :]
+        outputs.append(torch.einsum("bhr,bhrc->bhc", query[:, :, token], state))
+    expected = torch.stack(outputs, dim=2).to(dtype)
+    with torch.no_grad():
+        result = compiled(
+            **inputs,
+            initial_state=StateTuple(("memory",), (initial,)),
+            return_final_state=True,
+        )
+    _assert_result(result, expected, state)
+
+
+@pytest.mark.parametrize("scales", [(0.1, 0.3), (1e10, 1e-10)])
+def test_nested_scale_transform_preserves_fp32_rounding(scales, gpu_device):
+    import tilelang
+    import tilelang.language as T
+    from attn_engine import Constant
+    from attn_engine.stateful.lowering.scalar.scalar_kernels import _transform
+
+    steps = tuple(Constant(scale).value for scale in scales)
+    transform = _transform(T, ("identity", 1.0, False, 0.0, steps))
+
+    @tilelang.jit(compile_flags=["-fmad=false"])
+    def build_kernel():
+        @T.prim_func
+        def kernel(
+            Input: T.Tensor((128,), "float32"), Output: T.Tensor((128,), "float32")
+        ):
+            with T.Kernel(1, threads=128):
+                for index in T.Parallel(128):
+                    Output[index] = transform(Input[index])
+
+        return kernel
+
+    generator = torch.Generator().manual_seed(0)
+    values = torch.randn(128, generator=generator, dtype=torch.float32)
+    if scales[0] == 1e10:
+        values *= 1e30
+    expected = values.clone()
+    for step in steps:
+        expected = expected * step
+    folded = values * torch.tensor(steps[0] * steps[1])
+    assert not torch.equal(expected, folded)
+    output = torch.empty_like(values, device=gpu_device)
+    build_kernel()(values.to(gpu_device), output)
+    torch.testing.assert_close(output.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("length", [65, 130])
+def test_nested_scale_public_rounding_and_cache_identity(length, gpu_device):
+    from dataclasses import replace
+    from attn_engine import Constant
+
+    original = _compile(
+        heads=1,
+        key_heads=1,
+        value_heads=1,
+        rows=64,
+        columns=64,
+        dtype=torch.float32,
+        gate_kind=None,
+    )
+    base = original.operator.algorithm
+    values = torch.randn(length, generator=torch.Generator().manual_seed(0))
+    inputs = {
+        name: torch.zeros(1, 1, length, 64, device=gpu_device)
+        for name in ("query", "key", "value")
+    }
+    inputs["query"][0, 0, :, 0] = values.to(gpu_device)
+    initial = torch.zeros(1, 1, 64, 64, device=gpu_device)
+    initial[0, 0, 0, 0] = 1.0
+    role_sizes = {
+        QUERY_HEADS: 1,
+        KEY_HEADS: 1,
+        VALUE_HEADS: 1,
+        STATE_HEADS: 1,
+        KEY: 64,
+        VALUE: 64,
+    }
+    # The contraction uses the existing TensorFloat GEMM approximation. Compare
+    # with that same contraction over independently precomputed authored scales,
+    # rather than expecting the contraction itself to be a bitwise identity.
+    reference_operator = StatefulOperator(
+        AlgorithmIR(
+            base.inputs,
+            base.states,
+            base.transition,
+            (replace(base.readouts[0], operand=Input("query")),),
+            base.head_mapping,
+        )
+    )
+    reference = reference_operator.compile(
+        role_sizes=role_sizes,
+        target=Target(),
+        mode="dense",
+        optimized=True,
+    )
+    results = []
+    for scales in ((0.1, 0.3), (0.3, 0.2)):
+        algorithm = AlgorithmIR(
+            base.inputs,
+            base.states,
+            base.transition,
+            (
+                replace(
+                    base.readouts[0], operand=(Input("query") * scales[0]) * scales[1]
+                ),
+            ),
+            base.head_mapping,
+        )
+        operator = StatefulOperator(algorithm)
+        compiled = operator.compile(
+            role_sizes={
+                QUERY_HEADS: 1,
+                KEY_HEADS: 1,
+                VALUE_HEADS: 1,
+                STATE_HEADS: 1,
+                KEY: 64,
+                VALUE: 64,
+            },
+            target=Target(),
+            mode="dense",
+            optimized=True,
+        )
+        assert operator._plans[compiled.specialization].plan.candidate.lowerer == (
+            "tilelang-scalar-factorized"
+        )
+        with torch.no_grad():
+            result = (
+                compiled(**inputs, initial_state=StateTuple(("memory",), (initial,)))
+                .outputs["output"][0, 0, :, 0]
+                .cpu()
+            )
+        scaled = (values * Constant(scales[0]).value) * Constant(scales[1]).value
+        reference_inputs = dict(inputs)
+        reference_inputs["query"] = torch.zeros_like(inputs["query"])
+        reference_inputs["query"][0, 0, :, 0] = scaled.to(gpu_device)
+        with torch.no_grad():
+            expected = (
+                reference(
+                    **reference_inputs,
+                    initial_state=StateTuple(("memory",), (initial,)),
+                )
+                .outputs["output"][0, 0, :, 0]
+                .cpu()
+            )
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        results.append(result)
+    assert not torch.equal(*results)

@@ -25,6 +25,8 @@ class ScalarExpressionIR:
     scale: float = 1.0
     is_log_scale: bool = False
     offset: float = 0.0
+    # Nested FP32 multiplies execute from the Input outward, without folding.
+    scale_steps: tuple[float, ...] = ()
 
 @dataclass(frozen=True)
 class DenseInputIR:
@@ -1049,15 +1051,28 @@ def _dense_scalar_binding(
     if isinstance(expression, Negate):
         expression = expression.operand
         scale = -scale
-    if isinstance(expression, Multiply):
+    constants = []
+    while isinstance(expression, Multiply):
         if isinstance(expression.left, Constant):
-            scale *= expression.left.value
+            constants.append(expression.left)
             expression = expression.right
         elif isinstance(expression.right, Constant):
-            scale *= expression.right.value
+            constants.append(expression.right)
             expression = expression.left
         else:
             return None
+    scale_steps = ()
+    if len(constants) > 1:
+        # The raw kernels evaluate in FP32. A BF16 intermediate would require
+        # an explicit rounding step before the next multiply.
+        if any(constant.dtype != torch.float32 for constant in constants):
+            return None
+        scale_steps = tuple(constant.value for constant in reversed(constants))
+        if scale == -1.0:
+            scale_steps += (-1.0,)
+        scale = 1.0
+    elif constants:
+        scale *= constants[0].value
     if not isinstance(expression, Input):
         return None
     spec = next(item for item in algorithm.inputs if item.name == expression.name)
@@ -1090,5 +1105,5 @@ def _dense_scalar_binding(
         feature_axis,
     )
     return binding, ScalarExpressionIR(
-        spec.name, operation, scale, is_log_scale, offset
+        spec.name, operation, scale, is_log_scale, offset, scale_steps
     )
