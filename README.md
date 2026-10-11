@@ -89,17 +89,22 @@ Run the conservative first-phase matrix on an otherwise idle NVIDIA GPU:
 
 ```bash
 uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
+  --fla-source ../flash-linear-attention \
   --families linear,simple-gla,gla,normalized-linear,retention,rwkv6,gsa,hgrn \
   --contract all --timing both --output-dir benchmark_results/stateful_fla
 ```
 
-The runner selects a physical GPU before importing CUDA, includes public-call
-preparation in both sides, validates MetaAttention against its independent
-authored-order recurrence, validates directly comparable FLA outputs, and only
-then reports `FLA / MetaAttention` speedups. Families without a semantic FLA
-mapping are recorded as non-comparable rather than included in the ratio. The
-JSON, CSV, and plots are artifacts; benchmark results require a fixed GPU,
-software environment, warmup/repetition count, and idle-device record.
+The runner selects a physical GPU before importing CUDA, uses the local
+`../flash-linear-attention` checkout by default, includes public-call preparation
+in both sides, validates MetaAttention against its independent authored-order
+recurrence, validates directly comparable FLA outputs, and only then reports
+`FLA / MetaAttention` speedups. Families without a semantic FLA mapping, or
+contracts for which FLA does not expose the same State, are recorded as
+non-comparable rather than included in the ratio. The legacy
+`testing/benchmark_flash_attention.py` entry point now forwards to this runner;
+it no longer compares the unrelated softmax FlashAttention package. The JSON,
+CSV, and plots are artifacts; benchmark results require a fixed GPU, software
+environment, warmup/repetition count, and idle-device record.
 The standalone Stateful plan runner measures those contracts without external baseline adapters.
 
 

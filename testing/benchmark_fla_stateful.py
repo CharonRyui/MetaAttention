@@ -83,19 +83,9 @@ def _run_nvidia_smi(args: list[str]) -> subprocess.CompletedProcess[str]:
         raise RuntimeError(f"failed to query nvidia-smi: {error}") from error
 
 
-def _provenance(torch) -> dict:
+def _provenance(torch, fla_source: Path) -> dict:
     root = Path(__file__).resolve().parents[1]
-    try:
-        revision = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=root,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
-        revision = None
+    revision = _git_revision(root)
     versions = {"torch": torch.__version__, "cuda": torch.version.cuda}
     for distribution in ("tilelang", "flash-linear-attention"):
         try:
@@ -112,6 +102,8 @@ def _provenance(torch) -> dict:
         "git_commit": revision,
         "source_sha256": digest.hexdigest(),
         "versions": versions,
+        "fla_source": str(fla_source),
+        "fla_git_commit": _git_revision(fla_source),
     }
 
 
@@ -248,6 +240,34 @@ def choose_idle_gpu(
     return max(candidates, key=lambda gpu: (gpu.free_memory_mib or -1, -gpu.index))
 
 
+def _configure_fla_source(source: Path | None) -> Path:
+    """Prefer the requested FLA checkout over an installed distribution."""
+    root = Path(__file__).resolve().parents[1]
+    source = source or root.parent / "flash-linear-attention"
+    source = source.expanduser().resolve()
+    if not (source / "fla").is_dir():
+        raise RuntimeError(f"FLA source does not contain a fla package: {source}")
+    source_string = str(source)
+    if source_string in sys.path:
+        sys.path.remove(source_string)
+    sys.path.insert(0, source_string)
+    return source
+
+
+def _git_revision(path: Path) -> str | None:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=path,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def _load_benchmark_api():
     """Import torch-dependent benchmark helpers after CUDA visibility is fixed."""
     root = Path(__file__).resolve().parents[1]
@@ -351,7 +371,7 @@ def _fla_call(case, inputs):
         "gsa",
         "gdn",
     }
-    state_names = ("memory",)
+    state_names = ("memory", "key_sum") if name == "normalized-linear" else ("memory",)
 
     def prepare(values):
         native = {
@@ -405,7 +425,6 @@ def _fla_call(case, inputs):
                 scale=1.0,
                 initial_state=initial,
                 output_final_state=final,
-                head_first=False,
             ),
             ("memory",),
             state_contract=True,
@@ -424,11 +443,22 @@ def _fla_call(case, inputs):
 
     def invoke(values, initial, final):
         query, key, value = (values[key] for key in ("query", "key", "value"))
-        kwargs = {"head_first": False}
+        # Current FLA recurrent APIs use B,T,H,... inputs directly. Older
+        # releases accepted head_first, but passing it breaks the checkout
+        # selected by --fla-source.
+        kwargs = {}
         if state_contract or name == "normalized-linear":
+            if name == "normalized-linear" and initial is not None:
+                initial = (initial[0], initial[1].unsqueeze(1))
             kwargs.update(initial_state=initial, output_final_state=final)
         if name in ("linear", "normalized-linear"):
-            result = function(query, key, value, normalize=False, **kwargs)
+            result = function(
+                query,
+                key,
+                value,
+                normalize=name == "normalized-linear",
+                **kwargs,
+            )
         elif name == "retention":
             result = function(
                 query,
@@ -480,10 +510,8 @@ def _fla_call(case, inputs):
             if isinstance(result, (tuple, list))
             else (result, None)
         )
-        if name == "normalized-linear":
-            scale = query.shape[-1] ** -0.5
-            denominator = (query * scale * key.cumsum(dim=1)).sum(dim=-1, keepdim=True)
-            output = output / (denominator + 1e-10)
+        if name == "normalized-linear" and state is not None:
+            state = (state[0], state[1].squeeze(1))
         return output.transpose(1, 2), state
 
     preprocessing = "transpose/contiguous"
@@ -926,6 +954,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
+        "--fla-source",
+        type=Path,
+        default=None,
+        help="FLA checkout; defaults to ../flash-linear-attention",
+    )
+    parser.add_argument(
         "--gpu",
         type=int,
         default=None,
@@ -986,6 +1020,10 @@ def main() -> None:
     if args.dry_run:
         return
     os.environ["CUDA_VISIBLE_DEVICES"] = str(selected.index)
+    try:
+        fla_source = _configure_fla_source(args.fla_source)
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from error
     torch, benchmark = _load_benchmark_api()
     if not torch.cuda.is_available():
         raise SystemExit("CUDA became unavailable after selecting the GPU")
@@ -1059,7 +1097,7 @@ def main() -> None:
         "timing": args.timing,
         "warmup": args.warmup,
         "repetitions": args.repetitions,
-        "provenance": _provenance(torch),
+        "provenance": _provenance(torch, fla_source),
         "correctness": {
             "meta": "measured against independent authored-order FP32 oracle",
             "fla": "measured when adapter execution succeeds",
