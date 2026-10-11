@@ -1101,8 +1101,14 @@ def compile_plan(
         representations.extend(rewrites)
         if optimized and scalar_factorized is not None:
             representations.append(PlanRepresentation.SCALAR_FACTORIZED)
-        if optimized and rank_one_factored is not None and mode == "dense":
-            representations.append(PlanRepresentation.FACTORED_RECURRENCE)
+    if (
+        optimized
+        and rank_one_factored is not None
+        and mode == "dense"
+        and (not reference_required or target.device_type == "cuda")
+        and not (backward_ir is not None and rank_one_factored.weighted_injections)
+    ):
+        representations.append(PlanRepresentation.FACTORED_RECURRENCE)
     if special_representation is not None:
         representations.append(special_representation)
     if reference_required:
@@ -1204,6 +1210,11 @@ def compile_plan(
                 * (
                     operation_count * (2 * rows + columns + 1)
                     + injection_count * (rows + columns)
+                    + injection_count
+                    * max(
+                        (len(term.weights) for term in rank_one_factored.injections),
+                        default=0,
+                    )
                     + readout_count * (rows + 2 * columns)
                     + 4
                     * (operation_count + injection_count + readout_count)
@@ -1221,7 +1232,9 @@ def compile_plan(
             operation_codes = tuple(
                 operation.kind for operation in rank_one_factored.operations
             )
-            if wy_eligible(operation_codes, injection_count, rows, columns):
+            if not rank_one_factored.weighted_injections and wy_eligible(
+                operation_codes, injection_count, rows, columns
+            ):
                 factored_chunk_bytes = max(
                     factored_chunk_bytes,
                     heads
@@ -1424,7 +1437,9 @@ def compile_plan(
     fixed_roles = tuple((str(role), size) for role, size in compilation.role_sizes)
     backward_binding = None
     backward_values: tuple[tuple[str, int], ...] = ()
-    if backward_ir is not None and not requires_reference_lowering(operator.algorithm):
+    if backward_ir is not None and (
+        candidate.lowerer == "tilelang-factored-recurrence" or not reference_required
+    ):
         from ..lowering.backward import bind_backward
 
         family = backward_context_family(operator.algorithm, candidate, dense_summary)
@@ -1479,7 +1494,9 @@ def compile_plan(
     )
     backward_candidate = None
     backward_kernel_config = None
-    if backward_ir is not None and not requires_reference_lowering(operator.algorithm):
+    if backward_ir is not None and (
+        candidate.lowerer == "tilelang-factored-recurrence" or not reference_required
+    ):
         backward_candidate = LoweredCandidate(
             _digest((source_identity, "tilelang-generic-backward", "backward")),
             source_identity,

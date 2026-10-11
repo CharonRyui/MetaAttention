@@ -1034,6 +1034,26 @@ class StatefulOperator:
                 plan.runtime_family,
                 validation,
             )
+        if (
+            validation.reference_required
+            and plan.rank_one_factored is not None
+            and runtime.device.type == "cuda"
+            and runtime.token_count > 0
+        ):
+            values = self._normalize_inputs(inputs, runtime, role_sizes)
+            outputs, final_state = self._lower_factored_recurrence(
+                values,
+                initial_states[self.algorithm.states[0].name],
+                runtime,
+                return_final_state,
+                plan,
+            )
+            return ExecutionResult(
+                NamedOutputTuple(
+                    tuple(readout.name for readout in self.algorithm.readouts), outputs
+                ),
+                final_state,
+            )
         if validation.reference_required:
             return self._execute_reference(
                 runtime, role_sizes, inputs, initial_states, return_final_state
@@ -2253,11 +2273,13 @@ class StatefulOperator:
             rows, _ = runtime.feature_sizes
             ones_row = torch.ones(token_count, heads, rows, 1, device=runtime.device)
             ones_scalar = torch.ones(token_count, heads, 1, 1, device=runtime.device)
+        recipe = executable.rank_one_factored
+        assert recipe is not None
         codes: list[str] = []
         left: list[torch.Tensor | None] = []
         right: list[torch.Tensor | None] = []
         coefficient: list[torch.Tensor | None] = []
-        for node in self.algorithm.transition.propagations:
+        for node in recipe.propagations:
             if isinstance(node, AxisScale):
                 if not node.roles:
                     codes.append("scale")
@@ -2281,15 +2303,16 @@ class StatefulOperator:
                 coefficient.append(_evaluate(node.coefficient, values).float())
         injection_left: list[torch.Tensor] = []
         injection_right: list[torch.Tensor] = []
-        for injection in self.algorithm.transition.injections:
-            first, second = injection.factors
-            if tuple(first.roles) == (second_role,):
-                first, second = second, first
-            injection_left.append(_evaluate(first.expression, values).float())
-            injection_right.append(_evaluate(second.expression, values).float())
+        injection_weights = []
+        for injection in recipe.injections:
+            injection_left.append(_evaluate(injection.left, values).float())
+            injection_right.append(_evaluate(injection.right, values).float())
+            injection_weights.append(
+                tuple(_evaluate(weight, values).float() for weight in injection.weights)
+            )
         readouts: list[torch.Tensor] = []
         dtypes: list[torch.dtype] = []
-        for readout in self.algorithm.readouts:
+        for readout in recipe.readouts:
             assert isinstance(readout, StateContraction)
             readouts.append(_evaluate(readout.operand, values).float())
             dtypes.append(readout.output_dtype)
@@ -2343,6 +2366,7 @@ class StatefulOperator:
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
                 symmetric_rank_one=executable.symmetric_rank_one,
+                injection_weights=tuple(injection_weights),
             )
         final_state = (
             StateTuple((state_spec.name,), (final,)) if return_final_state else None

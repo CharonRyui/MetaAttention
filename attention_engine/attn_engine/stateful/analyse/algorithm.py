@@ -28,6 +28,7 @@ class ScalarExpressionIR:
     # Nested FP32 multiplies execute from the Input outward, without folding.
     scale_steps: tuple[float, ...] = ()
 
+
 @dataclass(frozen=True)
 class DenseInputIR:
     """Physical axes needed to load one dense Tensor Input directly."""
@@ -67,6 +68,15 @@ class FactoredOperationIR:
 
 
 @dataclass(frozen=True)
+class FactoredInjectionIR:
+    """Two vector factors followed by ordered feature-free FP32 factors."""
+
+    left: Any
+    right: Any
+    weights: tuple[Any, ...] = ()
+
+
+@dataclass(frozen=True)
 class RankOneFactoredIR:
     """Structural proof for one ordered matrix-State recurrence.
 
@@ -80,6 +90,13 @@ class RankOneFactoredIR:
     injection_count: int
     readout_roles: tuple[Any, ...]
     symmetric_rank_one: bool = False
+    propagations: tuple[Any, ...] = ()
+    injections: tuple[FactoredInjectionIR, ...] = ()
+    readouts: tuple[Any, ...] = ()
+
+    @property
+    def weighted_injections(self) -> bool:
+        return any(injection.weights for injection in self.injections)
 
 
 @dataclass(frozen=True)
@@ -951,18 +968,39 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     either feature axis; injections and readouts remain independent terms over
     the same State.
     """
-    from ...stateful_operator import AxisScale, RankOnePropagation, StateContraction
+    from ...stateful_operator import (
+        AxisScale,
+        RankOnePropagation,
+        Readout,
+        Shift,
+        StateContraction,
+        StateTerm,
+        _expressions,
+    )
 
+    if any(isinstance(expression, Shift) for expression in _expressions(algorithm)):
+        return None
     if len(algorithm.states) != 1 or algorithm.states[0].rank != 2:
         return None
     if len(algorithm.transitions) != 1:
         return None
     state = algorithm.states[0]
     first_role, second_role = state.feature_roles
-    readouts = algorithm.readouts
-    if not readouts or not all(
-        isinstance(readout, StateContraction) for readout in readouts
-    ):
+    readouts = []
+    for readout in algorithm.readouts:
+        if isinstance(readout, Readout):
+            term = readout.expression
+            if not isinstance(term, StateTerm) or term.prior:
+                return None
+            if any(_all_state_terms(term.operand)):
+                return None
+            readout = StateContraction(
+                readout.name, term.state, term.operand, term.role, readout.output_dtype
+            )
+        if not isinstance(readout, StateContraction):
+            return None
+        readouts.append(readout)
+    if not readouts:
         return None
     if any(readout.state != state.name for readout in readouts):
         return None
@@ -995,19 +1033,37 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     injections = algorithm.transitions[0].injections
     if not injections:
         return None
+    factored_injections = []
     for injection in injections:
-        if len(injection.factors) != 2:
+        if len(injection.factors) < 2:
             return None
-        roles = {tuple(factor.roles) for factor in injection.factors}
-        if roles != {(first_role,), (second_role,)}:
+        first, second, *weights = injection.factors
+        if {tuple(first.roles), tuple(second.roles)} != {(first_role,), (second_role,)}:
             return None
+        if any(factor.roles for factor in weights):
+            return None
+        if tuple(first.roles) == (second_role,):
+            first, second = second, first
+        factored_injections.append(
+            FactoredInjectionIR(
+                first.expression,
+                second.expression,
+                tuple(factor.expression for factor in weights),
+            )
+        )
     symmetric_rank_one = all(
         node.left == node.right
         for node in algorithm.transitions[0].propagations
         if isinstance(node, RankOnePropagation)
     )
     return RankOneFactoredIR(
-        tuple(operations), len(injections), readout_roles, symmetric_rank_one
+        tuple(operations),
+        len(injections),
+        readout_roles,
+        symmetric_rank_one,
+        tuple(algorithm.transitions[0].propagations),
+        tuple(factored_injections),
+        tuple(readouts),
     )
 
 

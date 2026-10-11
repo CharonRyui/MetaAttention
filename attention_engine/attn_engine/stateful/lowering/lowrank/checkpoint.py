@@ -285,6 +285,7 @@ def _compile_summary(
     reverse,
     device_index,
     chunk_size=CHUNK_SIZE,
+    injection_weight_width=0,
 ):
     import tilelang
     import tilelang.language as T
@@ -306,6 +307,7 @@ def _compile_summary(
             DY: T.Tensor((sizes[6],), dtypes[6]),
             Metadata: T.Tensor((3 * capacity,), "int64"),
             Offsets: T.Tensor((sizes[7],), dtypes[7]),
+            IW: T.Tensor((sizes[8],), dtypes[8]),
             Transform: T.Tensor((capacity * heads * rows * rows,), "float32"),
             Decay: T.Tensor((capacity * heads * columns,), "float32"),
             Bias: T.Tensor((capacity * heads * rows * columns,), "float32"),
@@ -433,7 +435,22 @@ def _compile_summary(
                                             ),
                                             0.0,
                                         )
-                                        matrix[r, c] = matrix[r, c] + key * value
+                                        product = T.alloc_var("float32")
+                                        product = key * value
+                                        for weight in T.unroll(injection_weight_width):
+                                            product = (
+                                                product
+                                                * IW[
+                                                    (
+                                                        injection
+                                                        * injection_weight_width
+                                                        + weight
+                                                    )
+                                                    * total
+                                                    + flat
+                                                ]
+                                            )
+                                        matrix[r, c] = matrix[r, c] + product
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
                         if r < rows:
@@ -589,6 +606,7 @@ def _compile_replay(
     final_dtype,
     device_index,
     chunk_size=CHUNK_SIZE,
+    injection_weight_width=0,
 ):
     import tilelang
     import tilelang.language as T
@@ -608,6 +626,7 @@ def _compile_replay(
             Q: T.Tensor((sizes[5],), dtypes[5]),
             Metadata: T.Tensor((3 * capacity,), "int64"),
             Offsets: T.Tensor((sizes[6],), dtypes[6]),
+            IW: T.Tensor((sizes[7],), dtypes[7]),
             Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
             Output: T.Tensor((readouts * total * columns,), output_dtype),
             Final: T.Tensor((sequences * heads * rows * columns,), final_dtype),
@@ -669,7 +688,21 @@ def _compile_replay(
                                         ),
                                         0.0,
                                     )
-                                    state[r, c] = state[r, c] + key * value
+                                    product = T.alloc_var("float32")
+                                    product = key * value
+                                    for weight in T.unroll(injection_weight_width):
+                                        product = (
+                                            product
+                                            * IW[
+                                                (
+                                                    injection * injection_weight_width
+                                                    + weight
+                                                )
+                                                * total
+                                                + flat
+                                            ]
+                                        )
+                                    state[r, c] = state[r, c] + product
                             output_flat = (
                                 token * heads + head
                                 if packed
@@ -1233,6 +1266,8 @@ def forward(
     record=True,
     sequence_offsets=None,
     chunk_metadata=None,
+    injection_weights=None,
+    injection_weight_counts=(),
 ):
     """Return outputs, final State and FP32 entries; segmentation stays on device."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
@@ -1305,7 +1340,14 @@ def forward(
             (capacity, heads, columns), device=device, dtype=torch.float32
         )
         bias = torch.empty_like(checkpoints)
-        summary_inputs = (*flat_factors, output.view(-1), offsets_flat)
+        weight_width = max(injection_weight_counts, default=0)
+        weights = (
+            torch.empty((0,), device=device, dtype=torch.float32)
+            if injection_weights is None
+            else _flat(injection_weights)
+        )
+        parameters["injection_weight_width"] = weight_width
+        summary_inputs = (*flat_factors, output.view(-1), offsets_flat, weights)
         _compile_summary(
             tuple(value.numel() for value in summary_inputs),
             tuple(_dtype(value) for value in summary_inputs),
@@ -1316,6 +1358,7 @@ def forward(
             output.view(-1),
             metadata_flat,
             offsets_flat,
+            weights,
             transform.view(-1),
             decay.view(-1),
             bias.view(-1),
@@ -1339,7 +1382,7 @@ def forward(
             checkpoints.view(-1),
             final.view(-1),
         )
-        replay_inputs = (*flat_factors, offsets_flat)
+        replay_inputs = (*flat_factors, offsets_flat, weights)
         _compile_replay(
             tuple(value.numel() for value in replay_inputs),
             tuple(_dtype(value) for value in replay_inputs),
@@ -1351,6 +1394,7 @@ def forward(
             *flat_factors,
             metadata_flat,
             offsets_flat,
+            weights,
             checkpoints.view(-1),
             output.view(-1),
             final.view(-1),
@@ -1448,7 +1492,8 @@ def backward(
         (capacity, heads, rows, columns), device=device, dtype=torch.float32
     )
     carry = torch.empty_like(source)
-    summary_inputs = (*flat_factors, dy_flat, offsets_flat)
+    weights = torch.empty((0,), device=device, dtype=torch.float32)
+    summary_inputs = (*flat_factors, dy_flat, offsets_flat, weights)
     _compile_summary(
         tuple(value.numel() for value in summary_inputs),
         tuple(_dtype(value) for value in summary_inputs),
@@ -1459,6 +1504,7 @@ def backward(
         dy_flat,
         metadata_flat,
         offsets_flat,
+        weights,
         transform.view(-1),
         decay.view(-1),
         source.view(-1),

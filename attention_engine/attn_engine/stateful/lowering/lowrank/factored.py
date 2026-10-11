@@ -13,7 +13,17 @@ def _stack(parts: list[torch.Tensor], shape: tuple[int, ...], device) -> torch.T
     if not parts:
         return torch.empty((0, *shape), device=device, dtype=torch.float32)
     return (
-        torch.stack([part.reshape(shape) for part in parts], dim=0).float().contiguous()
+        torch.stack(
+            [
+                part.reshape((1,) * len(shape)).expand(shape)
+                if part.numel() == 1
+                else part.reshape(shape)
+                for part in parts
+            ],
+            dim=0,
+        )
+        .float()
+        .contiguous()
     )
 
 
@@ -41,6 +51,7 @@ def factored_recurrence_chunked(
     initial_state: torch.Tensor,
     output_dtypes: tuple[torch.dtype, ...],
     symmetric_rank_one: bool = False,
+    injection_weights: tuple[tuple[torch.Tensor, ...], ...] = (),
 ) -> tuple[tuple[torch.Tensor, ...], torch.Tensor]:
     """Execute scalar/rank-one schedules or ordered affine chunk replay."""
     from .lowrank_kernels import execute
@@ -56,6 +67,7 @@ def factored_recurrence_chunked(
         initial_state=initial_state,
         output_dtypes=output_dtypes,
         symmetric_rank_one=symmetric_rank_one,
+        injection_weights=injection_weights,
     )
 
 
