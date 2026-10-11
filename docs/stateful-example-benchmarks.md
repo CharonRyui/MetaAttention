@@ -6,7 +6,9 @@ KDA and ComBa faster than the FLA fused recurrent baselines. ABC has similar
 CUDA Graph latency to FLA's chunk implementation, but higher public-call
 latency. GDN2, IPLR, DPLR and Delta Product select the reference path; Oja selects
 a dense product/GEMM path. These paths remain substantially slower and use
-much more memory than their FLA baselines.
+much more memory than their FLA baselines. The follow-up
+[execution-path analysis](stateful-specialized-paths.md) records structural
+probes and proposes reusable compiler recipes for these bottlenecks.
 
 ## Workload and measurement
 
