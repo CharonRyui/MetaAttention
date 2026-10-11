@@ -374,7 +374,9 @@ class CandidateLowerer:
                 heads * (shape.rows + 2 * shape.columns) * 4,
                 4 * heads * state,
                 1 if shape.backward else 3,
-                heads * state * 2 if shape.backward else shape.factored_workspace,
+                max(heads * state * 2, shape.factored_workspace)
+                if shape.backward
+                else shape.factored_workspace,
                 workspace_bytes_per_chunk=0
                 if shape.backward
                 else shape.factored_chunk_bytes,
@@ -1193,10 +1195,17 @@ def compile_plan(
         heads = fixed_sizes[state.head_role]
         rows, columns = feature_sizes
         if backward_ir is not None:
-            factored_token_bytes = 2 * heads * rows * columns
+            factored_token_bytes = (
+                2 * heads * rows * columns
+                + 4
+                * heads
+                * rank_one_factored.injection_scalar_count
+                * (4 + (columns + 15) // 16)
+            )
         else:
             operation_count = len(rank_one_factored.operations)
             injection_count = rank_one_factored.injection_count
+            scalar_count = rank_one_factored.injection_scalar_count
             readout_count = len(rank_one_factored.readout_roles)
             factored_token_bytes = (
                 4
@@ -1204,6 +1213,7 @@ def compile_plan(
                 * (
                     operation_count * (2 * rows + columns + 1)
                     + injection_count * (rows + columns)
+                    + 5 * scalar_count
                     + readout_count * (rows + 2 * columns)
                     + 4
                     * (operation_count + injection_count + readout_count)
@@ -1221,7 +1231,9 @@ def compile_plan(
             operation_codes = tuple(
                 operation.kind for operation in rank_one_factored.operations
             )
-            if wy_eligible(operation_codes, injection_count, rows, columns):
+            if not scalar_count and wy_eligible(
+                operation_codes, injection_count, rows, columns
+            ):
                 factored_chunk_bytes = max(
                     factored_chunk_bytes,
                     heads

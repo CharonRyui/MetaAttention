@@ -35,6 +35,7 @@ def packed_workspace_bound(
     chunk_size: int = CHUNK_SIZE,
     operations: int = 0,
     injections: int = 0,
+    injection_scalars: int = 0,
     readouts: int = 0,
     left_width: int | None = None,
     offset_bytes: int = 8,
@@ -58,12 +59,18 @@ def packed_workspace_bound(
     factors = total * (
         operations * (width + rows + 1)
         + injections * (rows + columns)
+        + injection_scalars
         + readouts * rows
     )
     partials = (
         ((columns + 15) // 16)
         * total
-        * (operations * (width + rows + 1) + injections * rows + readouts * rows)
+        * (
+            operations * (width + rows + 1)
+            + injections * rows
+            + injection_scalars
+            + readouts * rows
+        )
     )
     outputs = readouts * total * columns
     return {
@@ -136,7 +143,19 @@ def _stack(parts, tokens, heads, width, device):
 class _PackedRecurrence(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, codes, left, right, coefficient, ik, iv, query, initial, offsets, dtypes
+        ctx,
+        codes,
+        left,
+        right,
+        coefficient,
+        ik,
+        iv,
+        query,
+        initial,
+        offsets,
+        dtypes,
+        injection_scalars,
+        injection_orders,
     ):
         from .lowrank.checkpoint import forward
 
@@ -155,12 +174,24 @@ class _PackedRecurrence(torch.autograd.Function):
             output_dtype=torch.float32,
             sequence_offsets=offsets,
             chunk_metadata=segmentation,
+            injection_scalars=injection_scalars,
+            injection_orders=injection_orders,
         )
         ctx.codes = codes
+        ctx.injection_orders = injection_orders
         ctx.output_shape = output.shape[1:]
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(
-            left, right, coefficient, ik, iv, query, initial, checkpoints, *segmentation
+            left,
+            right,
+            coefficient,
+            ik,
+            iv,
+            query,
+            initial,
+            checkpoints,
+            injection_scalars,
+            *segmentation,
         )
         return (
             *tuple(output[index].to(dtype) for index, dtype in enumerate(dtypes)),
@@ -181,6 +212,7 @@ class _PackedRecurrence(torch.autograd.Function):
             query,
             initial,
             checkpoints,
+            injection_scalars,
             offsets,
             prefix,
             chunks,
@@ -213,8 +245,10 @@ class _PackedRecurrence(torch.autograd.Function):
             grad_final=final,
             sequence_offsets=offsets,
             chunk_metadata=(offsets, prefix, chunks),
+            injection_scalars=injection_scalars,
+            injection_orders=ctx.injection_orders,
         )
-        return (None, *gradients, None, None)
+        return (None, *gradients[:7], None, None, gradients[7], None)
 
 
 def execute_lowrank_packed(
@@ -230,6 +264,8 @@ def execute_lowrank_packed(
     sequence_offsets,
     output_dtypes=None,
     return_final_state=False,
+    injection_scalars=None,
+    injection_orders=None,
 ):
     """Return per-readout [T,H,V] outputs and optional final, with all VJPs."""
     if initial_state.device.type != "cuda":
@@ -294,6 +330,8 @@ def execute_lowrank_packed(
         initial_state.float().contiguous(),
         sequence_offsets,
         dtypes,
+        _stack(injection_scalars or [], tokens, heads, 1, device).unsqueeze(-1),
+        injection_orders,
     )
     return tuple(result[:-1]), result[-1] if return_final_state else None
 

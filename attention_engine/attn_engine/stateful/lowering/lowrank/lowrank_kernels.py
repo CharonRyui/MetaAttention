@@ -20,6 +20,8 @@ def execute(
     initial_state,
     output_dtypes,
     symmetric_rank_one=False,
+    injection_scalars=None,
+    injection_orders=None,
 ):
     batch, heads, rows, columns = initial_state.shape
     tokens = readouts[0].shape[0]
@@ -39,7 +41,9 @@ def execute(
 
     from .wy_kernels import eligible, execute as execute_wy
 
-    if eligible(tuple(operation_codes), len(injection_left), rows, columns):
+    if not injection_scalars and eligible(
+        tuple(operation_codes), len(injection_left), rows, columns
+    ):
         rank_ops = tuple(i for i, code in enumerate(codes) if code == 2)
         return execute_wy(
             codes=codes,
@@ -97,6 +101,8 @@ def execute(
         initial_state=initial_state,
         output_dtype=torch.float32,
         record=False,
+        injection_scalars=stack(injection_scalars or [], 1).unsqueeze(-1),
+        injection_orders=injection_orders,
     )
     return tuple(
         output[i].to(dtype) for i, dtype in enumerate(output_dtypes)

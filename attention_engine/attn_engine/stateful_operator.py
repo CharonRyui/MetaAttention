@@ -2281,12 +2281,30 @@ class StatefulOperator:
                 coefficient.append(_evaluate(node.coefficient, values).float())
         injection_left: list[torch.Tensor] = []
         injection_right: list[torch.Tensor] = []
-        for injection in self.algorithm.transition.injections:
-            first, second = injection.factors
-            if tuple(first.roles) == (second_role,):
-                first, second = second, first
-            injection_left.append(_evaluate(first.expression, values).float())
-            injection_right.append(_evaluate(second.expression, values).float())
+        injection_scalars: list[torch.Tensor] = []
+        injection_orders: list[tuple[int, ...]] = []
+        recipe = executable.rank_one_factored
+        for injection, write in zip(
+            self.algorithm.transition.injections, recipe.injections, strict=True
+        ):
+            factors = injection.factors
+            injection_left.append(
+                _evaluate(factors[write.left_factor].expression, values).float()
+            )
+            injection_right.append(
+                _evaluate(factors[write.right_factor].expression, values).float()
+            )
+            scalar_base = len(injection_scalars)
+            injection_scalars.extend(
+                _evaluate(factors[index].expression, values).float()
+                for index in write.scalar_factors
+            )
+            injection_orders.append(
+                tuple(
+                    index if index < 0 else scalar_base + index
+                    for index in write.factor_order
+                )
+            )
         readouts: list[torch.Tensor] = []
         dtypes: list[torch.dtype] = []
         for readout in self.algorithm.readouts:
@@ -2304,6 +2322,8 @@ class StatefulOperator:
                 coefficients=coefficient,
                 injection_left=injection_left,
                 injection_right=injection_right,
+                injection_scalars=injection_scalars,
+                injection_orders=tuple(injection_orders),
                 readouts=readouts,
                 initial_state=initial_state,
                 sequence_offsets=runtime.offsets,
@@ -2327,6 +2347,8 @@ class StatefulOperator:
                 coefficients=dense_coeff,
                 injection_left=injection_left,
                 injection_right=injection_right,
+                injection_scalars=injection_scalars,
+                injection_orders=tuple(injection_orders),
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),
@@ -2339,6 +2361,8 @@ class StatefulOperator:
                 coefficients=coefficient,
                 injection_left=injection_left,
                 injection_right=injection_right,
+                injection_scalars=injection_scalars,
+                injection_orders=tuple(injection_orders),
                 readouts=readouts,
                 initial_state=initial_state,
                 output_dtypes=tuple(dtypes),

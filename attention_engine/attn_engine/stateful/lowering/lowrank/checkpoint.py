@@ -39,6 +39,61 @@ def _operation_code(T, codes, op):
     return code
 
 
+def _scalar_derivative(
+    T, IK, IV, IS, orders, total, rows, columns, scalar_index, flat, r, c
+):
+    result = 0.0
+    for index, order in enumerate(orders):
+        for factor in order:
+            if factor >= 0:
+                value = _write_product(
+                    T,
+                    IK,
+                    IV,
+                    IS,
+                    orders,
+                    total,
+                    rows,
+                    columns,
+                    index,
+                    flat,
+                    r,
+                    c,
+                    factor,
+                )
+                result = T.if_then_else(scalar_index == factor, value, result)
+    return result
+
+
+def _write_product(
+    T, IK, IV, IS, orders, total, rows, columns, injection, flat, r, c, skip=-3
+):
+    """Emit the authored FP32 product, or its zero-safe factor derivative."""
+    result = 0.0
+    for index, order in enumerate(orders):
+        product = None
+        for factor in order:
+            if factor == skip:
+                continue
+            if factor == -1:
+                value = T.if_then_else(
+                    r < rows,
+                    T.cast(IK[(index * total + flat) * rows + r], "float32"),
+                    0.0,
+                )
+            elif factor == -2:
+                value = T.if_then_else(
+                    c < columns,
+                    T.cast(IV[(index * total + flat) * columns + c], "float32"),
+                    0.0,
+                )
+            else:
+                value = T.cast(IS[factor * total + flat], "float32")
+            product = value if product is None else product * value
+        result = T.if_then_else(injection == index, product, result)
+    return result
+
+
 @lru_cache(maxsize=None)
 def _compile_copy(shape, strides, source_dtype, result_dtype, device_index):
     import tilelang
@@ -279,6 +334,7 @@ def _compile_summary(
     capacity,
     codes,
     injections,
+    injection_orders,
     readouts,
     length,
     packed,
@@ -303,9 +359,10 @@ def _compile_summary(
             IK: T.Tensor((sizes[3],), dtypes[3]),
             IV: T.Tensor((sizes[4],), dtypes[4]),
             Q: T.Tensor((sizes[5],), dtypes[5]),
-            DY: T.Tensor((sizes[6],), dtypes[6]),
+            IS: T.Tensor((sizes[6],), dtypes[6]),
+            DY: T.Tensor((sizes[7],), dtypes[7]),
             Metadata: T.Tensor((3 * capacity,), "int64"),
-            Offsets: T.Tensor((sizes[7],), dtypes[7]),
+            Offsets: T.Tensor((sizes[8],), dtypes[8]),
             Transform: T.Tensor((capacity * heads * rows * rows,), "float32"),
             Decay: T.Tensor((capacity * heads * columns,), "float32"),
             Bias: T.Tensor((capacity * heads * rows * columns,), "float32"),
@@ -409,31 +466,23 @@ def _compile_summary(
                             if not reverse:
                                 for injection in T.unroll(injections):
                                     for r, c in T.Parallel(br, bc):
-                                        key = T.if_then_else(
-                                            r < rows,
-                                            T.cast(
-                                                IK[
-                                                    (injection * total + flat) * rows
-                                                    + r
-                                                ],
-                                                "float32",
-                                            ),
-                                            0.0,
-                                        )
-                                        value = T.if_then_else(
-                                            (block >= linear_blocks)
-                                            & (value_base + c < columns),
-                                            T.cast(
-                                                IV[
-                                                    (injection * total + flat) * columns
-                                                    + value_base
-                                                    + c
-                                                ],
-                                                "float32",
-                                            ),
-                                            0.0,
-                                        )
-                                        matrix[r, c] = matrix[r, c] + key * value
+                                        if block >= linear_blocks:
+                                            matrix[r, c] = matrix[
+                                                r, c
+                                            ] + _write_product(
+                                                T,
+                                                IK,
+                                                IV,
+                                                IS,
+                                                injection_orders,
+                                                total,
+                                                rows,
+                                                columns,
+                                                injection,
+                                                flat,
+                                                r,
+                                                value_base + c,
+                                            )
                     slot = chunk * heads + head
                     for r, c in T.Parallel(br, bc):
                         if r < rows:
@@ -582,6 +631,7 @@ def _compile_replay(
     capacity,
     codes,
     injections,
+    injection_orders,
     readouts,
     length,
     packed,
@@ -606,8 +656,9 @@ def _compile_replay(
             IK: T.Tensor((sizes[3],), dtypes[3]),
             IV: T.Tensor((sizes[4],), dtypes[4]),
             Q: T.Tensor((sizes[5],), dtypes[5]),
+            IS: T.Tensor((sizes[6],), dtypes[6]),
             Metadata: T.Tensor((3 * capacity,), "int64"),
-            Offsets: T.Tensor((sizes[6],), dtypes[6]),
+            Offsets: T.Tensor((sizes[7],), dtypes[7]),
             Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
             Output: T.Tensor((readouts * total * columns,), output_dtype),
             Final: T.Tensor((sequences * heads * rows * columns,), final_dtype),
@@ -649,27 +700,20 @@ def _compile_replay(
                                 )
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(
-                                        r < rows,
-                                        T.cast(
-                                            IK[(injection * total + flat) * rows + r],
-                                            "float32",
-                                        ),
-                                        0.0,
+                                    state[r, c] = state[r, c] + _write_product(
+                                        T,
+                                        IK,
+                                        IV,
+                                        IS,
+                                        injection_orders,
+                                        total,
+                                        rows,
+                                        columns,
+                                        injection,
+                                        flat,
+                                        r,
+                                        block * bc + c,
                                     )
-                                    value = T.if_then_else(
-                                        block * bc + c < columns,
-                                        T.cast(
-                                            IV[
-                                                (injection * total + flat) * columns
-                                                + block * bc
-                                                + c
-                                            ],
-                                            "float32",
-                                        ),
-                                        0.0,
-                                    )
-                                    state[r, c] = state[r, c] + key * value
                             output_flat = (
                                 token * heads + head
                                 if packed
@@ -723,6 +767,7 @@ def _compile_local_vjp(
     capacity,
     codes,
     injections,
+    injection_orders,
     readouts,
     length,
     packed,
@@ -745,17 +790,19 @@ def _compile_local_vjp(
             IK: T.Tensor((sizes[3],), dtypes[3]),
             IV: T.Tensor((sizes[4],), dtypes[4]),
             Q: T.Tensor((sizes[5],), dtypes[5]),
+            IS: T.Tensor((sizes[6],), dtypes[6]),
             Metadata: T.Tensor((3 * capacity,), "int64"),
-            Offsets: T.Tensor((sizes[6],), dtypes[6]),
+            Offsets: T.Tensor((sizes[7],), dtypes[7]),
             Checkpoints: T.Tensor((capacity * heads * rows * columns,), "float32"),
             Carry: T.Tensor((capacity * heads * rows * columns,), "float32"),
-            DY: T.Tensor((readouts * total * columns,), dtypes[7]),
+            DY: T.Tensor((readouts * total * columns,), dtypes[8]),
             DL: T.Tensor((blocks * sizes[0],), "float32"),
             DR: T.Tensor((blocks * sizes[1],), "float32"),
             DC: T.Tensor((blocks * sizes[2],), "float32"),
             DIK: T.Tensor((blocks * sizes[3],), "float32"),
             DIV: T.Tensor((sizes[4],), "float32"),
             DQ: T.Tensor((blocks * sizes[5],), "float32"),
+            DIS: T.Tensor((blocks * sizes[6],), "float32"),
         ):
             with T.Kernel(capacity, heads, blocks, threads=128) as (chunk, head, block):
                 sequence = T.cast(Metadata[chunk], "int32")
@@ -800,27 +847,20 @@ def _compile_local_vjp(
                                 )
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(
-                                        r < rows,
-                                        T.cast(
-                                            IK[(injection * total + flat) * rows + r],
-                                            "float32",
-                                        ),
-                                        0.0,
+                                    state[r, c] = state[r, c] + _write_product(
+                                        T,
+                                        IK,
+                                        IV,
+                                        IS,
+                                        injection_orders,
+                                        total,
+                                        rows,
+                                        columns,
+                                        injection,
+                                        flat,
+                                        r,
+                                        block * bc + c,
                                     )
-                                    value = T.if_then_else(
-                                        block * bc + c < columns,
-                                        T.cast(
-                                            IV[
-                                                (injection * total + flat) * columns
-                                                + block * bc
-                                                + c
-                                            ],
-                                            "float32",
-                                        ),
-                                        0.0,
-                                    )
-                                    state[r, c] = state[r, c] + key * value
                     for r, c in T.Parallel(br, bc):
                         adjoint[r, c] = T.if_then_else(
                             (r < rows) & (block * bc + c < columns),
@@ -849,27 +889,20 @@ def _compile_local_vjp(
                                 )
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(
-                                        r < rows,
-                                        T.cast(
-                                            IK[(injection * total + flat) * rows + r],
-                                            "float32",
-                                        ),
-                                        0.0,
+                                    state[r, c] = state[r, c] + _write_product(
+                                        T,
+                                        IK,
+                                        IV,
+                                        IS,
+                                        injection_orders,
+                                        total,
+                                        rows,
+                                        columns,
+                                        injection,
+                                        flat,
+                                        r,
+                                        block * bc + c,
                                     )
-                                    value = T.if_then_else(
-                                        block * bc + c < columns,
-                                        T.cast(
-                                            IV[
-                                                (injection * total + flat) * columns
-                                                + block * bc
-                                                + c
-                                            ],
-                                            "float32",
-                                        ),
-                                        0.0,
-                                    )
-                                    state[r, c] = state[r, c] + key * value
                             output_flat = (
                                 token * heads + head
                                 if packed
@@ -929,19 +962,21 @@ def _compile_local_vjp(
                                     adjoint[r, c] = adjoint[r, c] + query * dy
                             for injection in T.unroll(injections):
                                 for r, c in T.Parallel(br, bc):
-                                    value = T.if_then_else(
-                                        block * bc + c < columns,
-                                        T.cast(
-                                            IV[
-                                                (injection * total + flat) * columns
-                                                + block * bc
-                                                + c
-                                            ],
-                                            "float32",
-                                        ),
-                                        0.0,
+                                    products[r, c] = adjoint[r, c] * _write_product(
+                                        T,
+                                        IK,
+                                        IV,
+                                        IS,
+                                        injection_orders,
+                                        total,
+                                        rows,
+                                        columns,
+                                        injection,
+                                        flat,
+                                        r,
+                                        block * bc + c,
+                                        -1,
                                     )
-                                    products[r, c] = adjoint[r, c] * value
                                 T.reduce_sum(products, row_sum, dim=1)
                                 for r in T.Parallel(br):
                                     if r < rows:
@@ -954,15 +989,21 @@ def _compile_local_vjp(
                                             + r
                                         ] = row_sum[r]
                                 for r, c in T.Parallel(br, bc):
-                                    key = T.if_then_else(
-                                        r < rows,
-                                        T.cast(
-                                            IK[(injection * total + flat) * rows + r],
-                                            "float32",
-                                        ),
-                                        0.0,
+                                    products[r, c] = adjoint[r, c] * _write_product(
+                                        T,
+                                        IK,
+                                        IV,
+                                        IS,
+                                        injection_orders,
+                                        total,
+                                        rows,
+                                        columns,
+                                        injection,
+                                        flat,
+                                        r,
+                                        block * bc + c,
+                                        -2,
                                     )
-                                    products[r, c] = adjoint[r, c] * key
                                 T.reduce_sum(products, column_sum, dim=0)
                                 for c in T.Parallel(bc):
                                     if block * bc + c < columns:
@@ -971,6 +1012,31 @@ def _compile_local_vjp(
                                             + block * bc
                                             + c
                                         ] = column_sum[c]
+                            for scalar_index in T.unroll(sizes[6] // max(1, total)):
+                                # Each scalar slot belongs to exactly one injection.
+                                for r, c in T.Parallel(br, bc):
+                                    products[r, c] = adjoint[r, c] * _scalar_derivative(
+                                        T,
+                                        IK,
+                                        IV,
+                                        IS,
+                                        injection_orders,
+                                        total,
+                                        rows,
+                                        columns,
+                                        scalar_index,
+                                        flat,
+                                        r,
+                                        block * bc + c,
+                                    )
+                                T.reduce_sum(products, column_sum, dim=0)
+                                for c in T.Parallel(bc):
+                                    scalar_products[0, c] = column_sum[c]
+                                T.reduce_sum(scalar_products, scalar, dim=1)
+                                DIS[
+                                    (block * (sizes[6] // total) + scalar_index) * total
+                                    + flat
+                                ] = scalar[0]
                             for reverse_op in T.unroll(operations):
                                 op = operations - 1 - reverse_op
                                 code = _operation_code(T, codes, op)
@@ -1202,6 +1268,7 @@ def _parameters(
     length,
     packed,
     device,
+    injection_orders=None,
 ):
     return dict(
         heads=heads,
@@ -1212,6 +1279,11 @@ def _parameters(
         capacity=capacity,
         codes=tuple(_CODES[code] for code in operation_codes),
         injections=injections,
+        injection_orders=(
+            tuple(injection_orders)
+            if injection_orders is not None
+            else ((-1, -2),) * injections
+        ),
         readouts=readouts,
         length=length,
         packed=packed,
@@ -1233,6 +1305,8 @@ def forward(
     record=True,
     sequence_offsets=None,
     chunk_metadata=None,
+    injection_scalars=None,
+    injection_orders=None,
 ):
     """Return outputs, final State and FP32 entries; segmentation stays on device."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
@@ -1261,6 +1335,8 @@ def forward(
         else chunk_metadata
     )
     capacity, device = chunks.shape[1], initial_state.device
+    if injection_scalars is None:
+        injection_scalars = torch.empty((0, tokens, heads, 1, 1), device=device)
     checkpoints = torch.empty(
         (capacity, heads, rows, columns), device=device, dtype=torch.float32
     )
@@ -1276,6 +1352,7 @@ def forward(
             injection_left,
             injection_right,
             readout,
+            injection_scalars,
         )
         flat_factors = tuple(_flat(value) for value in factors)
         offsets_flat, prefix_flat, metadata_flat = (
@@ -1296,6 +1373,7 @@ def forward(
             length=length,
             packed=packed,
             device=device,
+            injection_orders=injection_orders,
         )
         parameters["chunk_size"] = chunk_size
         transform = torch.empty(
@@ -1379,6 +1457,8 @@ def backward(
     grad_final,
     sequence_offsets=None,
     chunk_metadata=None,
+    injection_scalars=None,
+    injection_orders=None,
 ):
     """Reverse affine carry followed by parallel, inverse-free chunk-local VJPs."""
     sequences, heads, rows, columns, tokens, length, count, packed, shape = _layout(
@@ -1390,6 +1470,9 @@ def backward(
         else chunk_metadata
     )
     capacity, device = chunks.shape[1], initial_state.device
+    has_scalars = injection_scalars is not None
+    if injection_scalars is None:
+        injection_scalars = torch.empty((0, tokens, heads, 1, 1), device=device)
     if not packed:
         checkpoints = checkpoints.permute(0, 2, 1, 3, 4)
     factors = (
@@ -1399,6 +1482,7 @@ def backward(
         injection_left,
         injection_right,
         readout,
+        injection_scalars,
     )
     gradients = [
         torch.zeros(value.shape, device=device, dtype=torch.float32)
@@ -1412,7 +1496,9 @@ def backward(
     )
     if not capacity:
         _copy(df, di)
-        return (*gradients, di)
+        return (
+            (*gradients[:6], di, gradients[6]) if has_scalars else (*gradients[:6], di)
+        )
     dy = (
         torch.zeros(shape, device=device, dtype=torch.float32)
         if grad_output is None
@@ -1438,6 +1524,7 @@ def backward(
         length=length,
         packed=packed,
         device=device,
+        injection_orders=injection_orders,
     )
     blocks = _ceildiv(columns, 16)
     transform = torch.empty(
@@ -1482,7 +1569,7 @@ def backward(
         carry.view(-1),
         di.view(-1),
     )
-    partial_indices = (0, 1, 2, 3, 5)
+    partial_indices = (0, 1, 2, 3, 5, 6)
     partials = {
         index: torch.zeros(
             (blocks, factors[index].numel()), device=device, dtype=torch.float32
@@ -1507,6 +1594,7 @@ def backward(
         partials[3].view(-1),
         gradients[4].view(-1),
         partials[5].view(-1),
+        partials[6].view(-1),
     )
     for index in partial_indices:
         size = factors[index].numel()
@@ -1514,4 +1602,4 @@ def backward(
             _compile_reduce(size, blocks, device.index)(
                 partials[index].view(-1), gradients[index].view(-1)
             )
-    return (*gradients, di)
+    return (*gradients[:6], di, gradients[6]) if has_scalars else (*gradients[:6], di)

@@ -112,6 +112,12 @@ _FACTORED_CONTEXT: tuple[ContextEntry, ...] = (
         ("injection", "token", "head", "column"),
         "[injections,tokens,heads,1,columns]",
     ),
+    (
+        "factored.injection_scalars",
+        "float32",
+        ("factor", "token", "head"),
+        "[scalar_factors,tokens,heads,1,1]",
+    ),
     ("factored.readout", "runtime", ("token", "head", "row"), "[tokens,heads,rows,1]"),
     (
         "factored.recorded",
@@ -401,6 +407,8 @@ def _factored_vjp(
         coefficients=context["factored.coefficient"],
         injection_left=context["factored.injection_left"],
         injection_right=context["factored.injection_right"],
+        injection_scalars=context["factored.injection_scalars"],
+        injection_orders=context["factored.injection_orders"],
         readout=context["factored.readout"],
         recorded=context["factored.recorded"],
         initial_state=context["factored.initial_state"],

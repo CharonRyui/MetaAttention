@@ -67,6 +67,21 @@ class FactoredOperationIR:
 
 
 @dataclass(frozen=True)
+class WeightedOuterProductIR:
+    """Two vector factors and feature-free factors in authored product order.
+
+    ``factor_order`` uses -1/-2 for the first/second State Feature vectors and
+    nonnegative local indices for scalar factors. No coefficients are folded
+    into vectors, so FP32 product association and expression rounding survive.
+    """
+
+    left_factor: int
+    right_factor: int
+    scalar_factors: tuple[int, ...]
+    factor_order: tuple[int, ...]
+
+
+@dataclass(frozen=True)
 class RankOneFactoredIR:
     """Structural proof for one ordered matrix-State recurrence.
 
@@ -80,6 +95,11 @@ class RankOneFactoredIR:
     injection_count: int
     readout_roles: tuple[Any, ...]
     symmetric_rank_one: bool = False
+    injections: tuple[WeightedOuterProductIR, ...] = ()
+
+    @property
+    def injection_scalar_count(self) -> int:
+        return sum(len(term.scalar_factors) for term in self.injections)
 
 
 @dataclass(frozen=True)
@@ -995,19 +1015,38 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
     injections = algorithm.transitions[0].injections
     if not injections:
         return None
+    writes: list[WeightedOuterProductIR] = []
     for injection in injections:
-        if len(injection.factors) != 2:
+        left = right = None
+        scalars: list[int] = []
+        order: list[int] = []
+        for index, factor in enumerate(injection.factors):
+            roles = tuple(factor.roles)
+            if roles == (first_role,) and left is None:
+                left = index
+                order.append(-1)
+            elif roles == (second_role,) and right is None:
+                right = index
+                order.append(-2)
+            elif not roles:
+                order.append(len(scalars))
+                scalars.append(index)
+            else:
+                return None
+        if left is None or right is None:
             return None
-        roles = {tuple(factor.roles) for factor in injection.factors}
-        if roles != {(first_role,), (second_role,)}:
-            return None
+        writes.append(WeightedOuterProductIR(left, right, tuple(scalars), tuple(order)))
     symmetric_rank_one = all(
         node.left == node.right
         for node in algorithm.transitions[0].propagations
         if isinstance(node, RankOnePropagation)
     )
     return RankOneFactoredIR(
-        tuple(operations), len(injections), readout_roles, symmetric_rank_one
+        tuple(operations),
+        len(injections),
+        readout_roles,
+        symmetric_rank_one,
+        tuple(writes),
     )
 
 
