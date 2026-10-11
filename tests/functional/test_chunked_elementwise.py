@@ -72,16 +72,19 @@ def test_chunked_path_matches_the_token_recurrence(gpu_device):
             return_final_state=True,
         )
 
+    # Evaluate the authored BF16 key addition before promoting the injection.
+    shifted_key = (key + torch.tensor(0.1, device=gpu_device)).float()
+    scaled_query = (query * torch.tensor(DIM**-0.5, device=gpu_device)).float()
     state = initial[0].clone()
     outputs = []
     for token in range(LENGTH):
         state = state * gate[0, :, token].float().exp().unsqueeze(-1) + torch.einsum(
-            "hk,hv->hkv", key[0, :, token].float(), value[0, :, token].float()
+            "hk,hv->hkv", shifted_key[0, :, token], value[0, :, token].float()
         )
         outputs.append(
             torch.einsum(
                 "hk,hkv->hv",
-                query[0, :, token].float() * DIM**-0.5,
+                scaled_query[0, :, token],
                 state,
             )
         )
@@ -131,6 +134,8 @@ def test_chunked_path_handles_both_scaled_axes(gpu_device):
             query=query, key=key, value=value, key_gate=key_gate, value_gate=value_gate
         )
 
+    shifted_key = (key + torch.tensor(0.1, device=gpu_device)).float()
+    scaled_query = (query * torch.tensor(DIM**-0.5, device=gpu_device)).float()
     state = torch.zeros(HEADS, DIM, DIM, device=gpu_device)
     outputs = []
     for token in range(LENGTH):
@@ -138,11 +143,9 @@ def test_chunked_path_handles_both_scaled_axes(gpu_device):
             key_gate[0, :, token].float().exp().unsqueeze(-1)
             * value_gate[0, :, token].float().exp().unsqueeze(-2)
         ) + torch.einsum(
-            "hk,hv->hkv", key[0, :, token].float(), value[0, :, token].float()
+            "hk,hv->hkv", shifted_key[0, :, token], value[0, :, token].float()
         )
-        outputs.append(
-            torch.einsum("hk,hkv->hv", query[0, :, token].float() * DIM**-0.5, state)
-        )
+        outputs.append(torch.einsum("hk,hkv->hv", scaled_query[0, :, token], state))
     expected = torch.stack(outputs, dim=1)
     for token in (63, 64, 127):
         torch.testing.assert_close(
@@ -243,7 +246,7 @@ def test_diagonal_typed_readout_tail_and_continuation(gpu_device, kind):
         TensorInput,
     )
 
-    batch, heads, length, rows, columns = 2, 2, 67, 3, 5
+    batch, heads, length, rows, columns = 2, 2, 67, 64, 128
     row, col = FeatureRole("r"), FeatureRole("c")
     head = HeadRole("h")
     generator = torch.Generator(device=gpu_device).manual_seed(31)

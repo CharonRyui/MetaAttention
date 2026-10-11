@@ -429,6 +429,8 @@ class ChunkedRecipe:
     native_product_normalized: Any | None
     inputs: tuple[Any, ...]
     feature_order: tuple[Any, ...]
+    input_only: frozenset[int]
+    expression_slots: Mapping[int, int]
 
 
 def _product_terms(expression: Any) -> list[Any]:
@@ -684,6 +686,38 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         and any(len(item.injections) > 1 for item in algorithm.transitions)
     ):
         return None
+    # Dependency classification and semantic CSE happen once. Runtime caches
+    # use integer slots, avoiding recursive IR hashing on each invocation.
+    from ...stateful_operator import StateTerm
+
+    slots, canonical, input_only = {}, {}, set()
+
+    def visit(expression):
+        key = id(expression)
+        if key in slots:
+            return key in input_only
+        children = ()
+        if hasattr(expression, "left"):
+            children = (expression.left, expression.right)
+        elif hasattr(expression, "operand"):
+            children = (expression.operand,)
+        dependencies = tuple(visit(child) for child in children)
+        independent = not isinstance(expression, StateTerm) and all(dependencies)
+        slots[key] = canonical.setdefault(expression, len(canonical))
+        if independent:
+            input_only.add(key)
+        return independent
+
+    for transition in algorithm.transitions:
+        for propagation in transition.propagations:
+            if hasattr(propagation, "factor"):
+                visit(propagation.factor)
+        for injection in transition.injections:
+            for factor in injection.factors:
+                visit(factor.expression)
+    for _, expression in readouts:
+        visit(expression)
+
     return ChunkedRecipe(
         MappingProxyType({state.name: state for state in algorithm.states}),
         MappingProxyType(
@@ -704,6 +738,8 @@ def compile_chunked_recipe(algorithm: Any, role_sizes=None) -> ChunkedRecipe | N
         product,
         tuple(bindings),
         feature_order,
+        frozenset(input_only),
+        MappingProxyType(slots),
     )
 
 
@@ -870,8 +906,8 @@ def execute_chunked_states(
     identity_read = recipe.identity_read
     prepared: dict[str, Any] = {}
     final_states: dict[str, torch.Tensor] = {}
-    term_values: dict[Any, torch.Tensor] = {}
-    input_values: dict[Any, torch.Tensor] = {}
+    term_values: dict[int, torch.Tensor] = {}
+    input_values: dict[int, torch.Tensor] = {}
     broadcast_values: dict[int, torch.Tensor] = {}
     product_scores: dict[Any, torch.Tensor] = {}
 
@@ -881,16 +917,15 @@ def execute_chunked_states(
         return value.reshape(token_count, heads, -1).expand(token_count, heads, size)
 
     def input_expression(expression: Any) -> torch.Tensor:
-        if expression not in input_values:
+        slot = recipe.expression_slots[id(expression)]
+        if slot not in input_values:
             result = (
                 _evaluate(expression, values, segment=segment, squeeze_features=True)
                 .float()
                 .contiguous()
             )
-            input_values[expression] = (
-                result.unsqueeze(-1) if result.ndim == 2 else result
-            )
-        return input_values[expression]
+            input_values[slot] = result.unsqueeze(-1) if result.ndim == 2 else result
+        return input_values[slot]
 
     def row_expression(expression: Any, size: int, lazy: bool) -> Any:
         if lazy and isinstance(expression, Outer):
@@ -971,7 +1006,7 @@ def execute_chunked_states(
         prepared[name] = carry, factors, identity
         return prepared[name]
 
-    expression_values: dict[Any, torch.Tensor] = {}
+    expression_values: dict[int, torch.Tensor] = {}
     fused_outputs: dict[str, torch.Tensor] = {}
     if recipe.bonus_readout is not None:
         from .diagonal.diagonal_block import diagonal_block_bonus_readout
@@ -1031,15 +1066,17 @@ def execute_chunked_states(
             fused_outputs[readout.name] = fused
 
     def evaluate(expression: Any) -> torch.Tensor:
-        if expression not in expression_values:
-            expression_values[expression] = evaluate_uncached(expression)
-        return expression_values[expression]
+        slot = recipe.expression_slots[id(expression)]
+        if slot not in expression_values:
+            expression_values[slot] = evaluate_uncached(expression)
+        return expression_values[slot]
 
     def evaluate_uncached(expression: Any) -> torch.Tensor:
-        if _contracted_terms(expression) == []:
+        if id(expression) in recipe.input_only:
             return input_expression(expression)
         if isinstance(expression, StateTerm):
-            if expression not in term_values:
+            slot = recipe.expression_slots[id(expression)]
+            if slot not in term_values:
                 carry, factors, identity = prepare(expression.state)
                 size = carry.shape[2]
                 if expression.role is None:
@@ -1047,12 +1084,12 @@ def execute_chunked_states(
                 elif (
                     identity
                     and isinstance(expression.operand, Outer)
-                    and not _contracted_terms(expression.operand)
+                    and id(expression.operand) in recipe.input_only
                 ):
                     query = row_expression(expression.operand, size, True)
                 else:
                     query = vector(evaluate(expression.operand), size)
-                term_values[expression] = read_state(
+                term_values[slot] = read_state(
                     carry,
                     factors,
                     query,
@@ -1061,7 +1098,7 @@ def execute_chunked_states(
                     identity=identity,
                     product_scores=product_scores,
                 )
-            return term_values[expression]
+            return term_values[slot]
         if isinstance(expression, (Add, Multiply, Divide, Contract, Outer)):
             left, right = evaluate(expression.left), evaluate(expression.right)
             if isinstance(expression, Add):
