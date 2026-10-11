@@ -64,6 +64,15 @@ def test_extended_family_defaults_are_registered():
         "hgrn",
         "based",
         "rebased",
+        "delta-rule",
+        "kda",
+        "gdn2",
+        "comba",
+        "iplr",
+        "dplr",
+        "oja",
+        "delta-product",
+        "abc",
     }
 
 
@@ -120,6 +129,138 @@ def test_gdn_adapter_passes_gate_and_beta_by_name(monkeypatch):
 
     monkeypatch.setattr(fla_gdn, "fused_recurrent_gated_delta_rule", recurrent)
     adapter = _fla_call(case, inputs)
+    adapter.invoke(adapter.prepare(inputs), None, False)
+
+
+@pytest.mark.parametrize(
+    "family,module_name,function_name,mapping",
+    (
+        ("delta-rule", "delta_rule", "fused_recurrent_delta_rule", {"beta": "beta"}),
+        ("kda", "kda", "fused_recurrent_kda", {"g": "gate", "beta": "beta"}),
+        (
+            "gdn2",
+            "gdn2",
+            "fused_recurrent_gdn2",
+            {"g": "gate", "b": "erase", "w": "write"},
+        ),
+        (
+            "comba",
+            "comba",
+            "fused_recurrent_comba",
+            {"p": "prediction_key", "g": "gate", "beta": "beta"},
+        ),
+        (
+            "iplr",
+            "generalized_delta_rule.iplr",
+            "fused_recurrent_iplr_delta_rule",
+            {"a": "alpha", "b": "beta"},
+        ),
+        (
+            "dplr",
+            "generalized_delta_rule.dplr",
+            "fused_recurrent_dplr_delta_rule",
+            {"a": "alpha", "b": "beta", "gk": "gate"},
+        ),
+        (
+            "oja",
+            "gated_oja_rule",
+            "fused_recurrent_gated_oja_rule",
+            {"gv": "gate", "beta": "beta"},
+        ),
+    ),
+)
+def test_new_adapters_preserve_named_arguments_and_continuation(
+    monkeypatch, family, module_name, function_name, mapping
+):
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from testing.benchmark_fla_stateful import _fla_call
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = next(item for item in benchmark.CASES if item.name == family)
+    operator = case.factory(**case.kwargs(3))
+    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cpu"))
+    initial = torch.randn(case.batch, case.heads, case.dim, case.dim_value)
+
+    def recurrent(*args, **kwargs):
+        assert kwargs["initial_state"] is initial
+        assert kwargs["output_final_state"] is True
+        assert kwargs["scale"] == case.dim**-0.5
+        for argument, input_name in mapping.items():
+            expected = inputs[input_name].transpose(1, 2)
+            if family == "comba" and argument == "p":
+                expected = expected.float() * inputs["gate"].transpose(
+                    1, 2
+                ).exp().unsqueeze(-1)
+            torch.testing.assert_close(kwargs[argument], expected)
+        value = kwargs["v"] if family == "comba" else args[2]
+        return value, initial
+
+    monkeypatch.setitem(
+        sys.modules,
+        f"fla.ops.{module_name}",
+        SimpleNamespace(**{function_name: recurrent}),
+    )
+    adapter = _fla_call(case, inputs)
+    outputs, states = adapter.split(
+        adapter.invoke(adapter.prepare(inputs), initial, True)
+    )
+    torch.testing.assert_close(outputs["output"], inputs["value"])
+    assert states["memory"] is initial
+
+
+def test_delta_product_adapter_interleaves_writes_inside_each_token(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from testing.benchmark_fla_stateful import _fla_call
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = next(item for item in benchmark.CASES if item.name == "delta-product")
+    operator = case.factory(**case.kwargs(3))
+    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cpu"))
+
+    def chunk(q, k, v, **kwargs):
+        assert kwargs["num_householder"] == 2
+        for actual, name in ((k, "key"), (v, "value"), (kwargs["beta"], "beta")):
+            for step in range(2):
+                torch.testing.assert_close(
+                    actual[:, step::2], inputs[f"{name}_{step}"].transpose(1, 2)
+                )
+        torch.testing.assert_close(kwargs["g"], inputs["gate"].transpose(1, 2))
+        return v[:, ::2], None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "fla.ops.gated_delta_product",
+        SimpleNamespace(chunk_gated_delta_product=chunk),
+    )
+    adapter = _fla_call(case, inputs)
+    adapter.invoke(adapter.prepare(inputs), None, False)
+
+
+def test_abc_adapter_limits_comparison_to_output_only(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from testing.benchmark_fla_stateful import _fla_call
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = next(item for item in benchmark.CASES if item.name == "abc")
+    operator = case.factory(**case.kwargs(3))
+    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cpu"))
+
+    def chunk(q, k, v, s, **kwargs):
+        assert s.dtype == inputs["query"].dtype
+        torch.testing.assert_close(s.float(), inputs["slot_logits"].transpose(1, 2))
+        assert kwargs == {"initial_state": None, "output_final_state": False}
+        return v, None
+
+    monkeypatch.setitem(sys.modules, "fla.ops.abc", SimpleNamespace(chunk_abc=chunk))
+    adapter = _fla_call(case, inputs)
+    assert not adapter.state_contract
+    assert "three raw accumulators" in adapter.note
     adapter.invoke(adapter.prepare(inputs), None, False)
 
 

@@ -37,6 +37,15 @@ FLA_FAMILIES = (
     "hgrn",
     "based",
     "rebased",
+    "delta-rule",
+    "kda",
+    "gdn2",
+    "comba",
+    "iplr",
+    "dplr",
+    "oja",
+    "delta-product",
+    "abc",
 )
 P0_FAMILIES = FLA_FAMILIES
 P0_BATCHES = (1, 2)
@@ -331,9 +340,154 @@ def _baseline_call(torch, adapter, parts, contract):
     return run
 
 
+def _delta_family_baseline(case):
+    """Map new examples to FLA's public recurrent APIs (chunk for ABC/Product)."""
+    import importlib
+    import torch
+
+    functions = {
+        "delta-rule": ("delta_rule", "fused_recurrent_delta_rule"),
+        "kda": ("kda", "fused_recurrent_kda"),
+        "gdn2": ("gdn2", "fused_recurrent_gdn2"),
+        "comba": ("comba", "fused_recurrent_comba"),
+        "iplr": ("generalized_delta_rule.iplr", "fused_recurrent_iplr_delta_rule"),
+        "dplr": ("generalized_delta_rule.dplr", "fused_recurrent_dplr_delta_rule"),
+        "oja": ("gated_oja_rule", "fused_recurrent_gated_oja_rule"),
+        "delta-product": ("gated_delta_product", "chunk_gated_delta_product"),
+        "abc": ("abc", "chunk_abc"),
+    }
+    if case.name not in functions:
+        return None
+    module, function_name = functions[case.name]
+    function = getattr(
+        importlib.import_module(f"fla.ops.{module}"), function_name, None
+    )
+    if function is None:
+        raise ImportError(
+            f"FLA does not provide fla.ops.{module}.{function_name}; use --fla-source with a recent checkout"
+        )
+
+    def prepare(values):
+        native = {
+            key: value.transpose(1, 2).contiguous() for key, value in values.items()
+        }
+        if case.name == "abc":
+            native["slot_logits"] = native["slot_logits"].to(native["query"].dtype)
+        if case.name == "comba":
+            # This FLA fused kernel predicts from prior S, unlike its naive
+            # reference and our example, which predict from exp(g) S.
+            native["prediction_key"] = native["prediction_key"].float() * native[
+                "gate"
+            ].exp().unsqueeze(-1)
+        if case.name == "delta-product":
+            # Interleave inner writes per token, not entire sequences per write.
+            steps = sum(key.startswith("key_") for key in values)
+            for key in ("key", "value", "beta"):
+                native[key] = (
+                    torch.stack(
+                        [native[f"{key}_{step}"] for step in range(steps)], dim=2
+                    )
+                    .flatten(1, 2)
+                    .contiguous()
+                )
+            native["steps"] = steps
+        return native
+
+    def invoke(values, initial, final):
+        q, k, v = (values[key] for key in ("query", "key", "value"))
+        kwargs = dict(initial_state=initial, output_final_state=final)
+        if case.name == "abc":
+            output, state = function(q, k, v, values["slot_logits"], **kwargs)
+        else:
+            kwargs["scale"] = case.dim**-0.5
+            if case.name == "delta-rule":
+                output, state = function(q, k, v, beta=values["beta"], **kwargs)
+            elif case.name == "kda":
+                output, state = function(
+                    q, k, v, g=values["gate"], beta=values["beta"], **kwargs
+                )
+            elif case.name == "gdn2":
+                output, state = function(
+                    q,
+                    k,
+                    v,
+                    g=values["gate"],
+                    b=values["erase"],
+                    w=values["write"],
+                    **kwargs,
+                )
+            elif case.name == "comba":
+                output, state = function(
+                    q=q,
+                    k=k,
+                    p=values["prediction_key"],
+                    v=v,
+                    g=values["gate"],
+                    beta=values["beta"],
+                    **kwargs,
+                )
+            elif case.name in ("iplr", "dplr"):
+                kwargs.update(a=values["alpha"], b=values["beta"])
+                if case.name == "dplr":
+                    kwargs["gk"] = values["gate"]
+                output, state = function(q, k, v, **kwargs)
+            elif case.name == "oja":
+                output, state = function(
+                    q, k, v, gv=values["gate"], beta=values["beta"], **kwargs
+                )
+            else:
+                output, state = function(
+                    q,
+                    k,
+                    v,
+                    g=values["gate"],
+                    beta=values["beta"],
+                    num_householder=values["steps"],
+                    **kwargs,
+                )
+        return output.transpose(1, 2), state
+
+    return FLABaseline(
+        prepare,
+        invoke,
+        ("key_slot", "slot_value") if case.name == "abc" else ("memory",),
+        state_contract=case.name != "abc",
+        note=(
+            "ABC exposes normalized key/value caches; Meta carries three raw accumulators. "
+            "Only output-only from zero is comparable."
+            if case.name == "abc"
+            else ""
+        ),
+        preprocessing=(
+            f"{function_name}; transpose/contiguous"
+            + (
+                "; interleave fixed inner writes"
+                if case.name == "delta-product"
+                else "; cast BF16-representable FP32 logits to BF16"
+                if case.name == "abc"
+                else "; FP32 prediction key * exp(gate) for prior-State fused kernel"
+                if case.name == "comba"
+                else ""
+            )
+        ),
+    )
+
+
 def _fla_call(case, inputs):
-    """Return an FLA 0.5.2 adapter for a directly mapped example."""
+    """Return an optional FLA adapter; newer families need a recent checkout."""
     name = case.name
+    if name in {
+        "delta-rule",
+        "kda",
+        "gdn2",
+        "comba",
+        "iplr",
+        "dplr",
+        "oja",
+        "delta-product",
+        "abc",
+    }:
+        return _delta_family_baseline(case)
     if name == "hgrn":
         from fla.ops.hgrn import fused_recurrent_hgrn
 
@@ -663,6 +817,9 @@ def _measure_pair(
         "batch": case.batch,
         "heads": case.heads,
         "seqlen": seqlen,
+        "dim": case.dim,
+        "dim_value": case.dim_value,
+        "dim_slot": case.dim_slot if case.name in ("gsa", "abc") else None,
         "contract": contract,
         "device": torch.cuda.get_device_name(device),
         "status": "OK",
@@ -782,7 +939,9 @@ def _measure_pair(
             result["winner"] = (
                 "MetaAttention" if result["speedup_public_cuda_event_ms"] > 1 else "FLA"
             )
-    except (ImportError, RuntimeError, TypeError, ValueError) as error:
+    except Exception as error:
+        # Optional backends also raise compiler-specific exceptions (e.g. Triton
+        # CompilationError); preserve Meta measurements and classify the baseline.
         result.update(fla_status="FAILED", status="FLA_FAILED", fla_error=str(error))
     return result
 

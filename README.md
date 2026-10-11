@@ -116,6 +116,11 @@ CSV, and plots are artifacts; benchmark results require a fixed GPU, software
 environment, warmup/repetition count, and idle-device record.
 The standalone Stateful plan runner measures those contracts without external baseline adapters.
 
+The [new example benchmark guide](examples/README.md#benchmark-against-fla)
+covers Delta Rule, KDA, GDN2, ComBa, IPLR/DPLR, Oja, Delta Product and ABC.
+[Measured H20 results](docs/stateful-example-benchmarks.md) include the selected
+execution paths, public-call and CUDA Graph latency, memory use and raw records.
+
 
 
 ## Performance tests

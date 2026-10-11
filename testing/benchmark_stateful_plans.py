@@ -52,6 +52,14 @@ from examples.retnet_recurrent import retnet_recurrent  # noqa: E402
 from examples.retention_attention import retention_attention  # noqa: E402
 from examples.rwkv6_attention import rwkv6_attention  # noqa: E402
 from examples.rwkv7_state import rwkv7_state  # noqa: E402
+from examples.abc_attention import abc_attention  # noqa: E402
+from examples.comba import comba  # noqa: E402
+from examples.delta_rule import delta_rule_attention  # noqa: E402
+from examples.gated_delta_product import gated_delta_product  # noqa: E402
+from examples.gated_oja_rule import gated_oja_rule  # noqa: E402
+from examples.gdn2 import gdn2  # noqa: E402
+from examples.generalized_delta_rule import iplr_delta_rule, dplr_delta_rule  # noqa: E402
+from examples.kda import kda  # noqa: E402
 
 
 STANDARD = ("batch", "heads", "seqlen", "dim", "dim_value")
@@ -121,6 +129,19 @@ CASES = (
     ),
     Case("mamba2", mamba2, signature=("B", "HQ", "S", "D", "DV")),
     Case("retnet", retnet_recurrent, signature=("B", "H", "S", "D", "DV")),
+    Case("delta-rule", delta_rule_attention),
+    Case("kda", kda),
+    Case("gdn2", gdn2),
+    Case("comba", comba),
+    Case("iplr", iplr_delta_rule),
+    Case("dplr", dplr_delta_rule),
+    Case("oja", gated_oja_rule),
+    Case("delta-product", gated_delta_product),
+    Case(
+        "abc",
+        abc_attention,
+        signature=("batch", "heads", "seqlen", "dim", "dim_slot", "dim_value"),
+    ),
 )
 MATRIX_BATCHES = (1, 2)
 MATRIX_HEADS = (1, 8, 16)
@@ -226,8 +247,13 @@ def inputs_for(operator, case: Case, seqlen: int, device: torch.device) -> dict:
             tensor = (torch.nn.functional.logsigmoid(tensor.float()) / 4).to(spec.dtype)
             tensor[:, :, 16 : min(32, seqlen)] = 0
             tensor[:, :, 256 : min(272, seqlen)] = 0
-        elif spec.name == "beta":
+        elif spec.name == "beta" and case.name not in ("iplr", "dplr"):
             tensor = tensor.sigmoid()
+        elif spec.name.startswith("beta_") or spec.name in ("erase", "write"):
+            tensor = tensor.sigmoid()
+        elif case.name in ("iplr", "dplr") and spec.name == "beta":
+            # Independent, small low-rank vector; avoid unstable random maps.
+            tensor = tensor * (0.02 / case.dim**0.5)
         elif spec.name == "coefficient":
             tensor = -tensor.sigmoid() / 4
         elif spec.name == "dt":
@@ -245,6 +271,27 @@ def inputs_for(operator, case: Case, seqlen: int, device: torch.device) -> dict:
             tensor = torch.nn.functional.normalize(tensor.float(), dim=-1).to(
                 spec.dtype
             )
+        if case.name in (
+            "delta-rule",
+            "kda",
+            "gdn2",
+            "comba",
+            "iplr",
+            "dplr",
+            "oja",
+            "delta-product",
+        ) and (
+            spec.name in ("key", "prediction_key", "alpha")
+            or spec.name.startswith("key_")
+            or (case.name == "oja" and spec.name == "value")
+        ):
+            tensor = torch.nn.functional.normalize(tensor.float(), dim=-1).to(
+                spec.dtype
+            )
+        if case.name == "abc" and spec.name == "slot_logits":
+            # FLA ABC's dot products require logits to share the BF16 data dtype.
+            # Store those exact values in Meta's FP32 gate input for fair parity.
+            tensor = (tensor * 0.2).to(torch.bfloat16).float()
         if case.name == "normalized-linear" and spec.name in ("query", "key"):
             tensor = (torch.nn.functional.softplus(tensor.float()) + 0.1).to(spec.dtype)
         if case.name == "rwkv6" and spec.name == "bonus":

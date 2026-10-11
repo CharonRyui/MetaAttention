@@ -110,3 +110,51 @@ CUDA_VISIBLE_DEVICES=0 uv run --extra test pytest -q --run-gpu \
 The GPU cases use BF16 inputs and `[64, 128]` matrix states. These checks establish
 correctness at the tested shapes; they do not establish performance parity with
 FLA or coverage of complete model layers.
+
+## Benchmark against FLA
+
+Both `testing/benchmark_stateful_plans.py` (Meta only) and
+`testing/benchmark_fla_stateful.py` now register all nine factories above. For a
+recent FLA checkout and an otherwise idle NVIDIA GPU:
+
+```bash
+uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
+  --families delta-rule,kda,gdn2,comba,iplr,dplr,oja,delta-product,abc \
+  --batches 1 --heads 8 --seqlens 512 2048 \
+  --contract output-only --timing both --warmup 5 --repetitions 20 \
+  --workspace-gib 8 --fla-source ../flash-linear-attention \
+  --output-dir benchmark_results/new_examples_h20_8gib
+```
+
+Use `--contract all` to additionally check final states and two-call continuation.
+ABC is comparable only for output-only from zero: FLA's two normalized caches
+are different from Meta's three raw accumulators. The other eight families
+compare all three contracts. FLA uses its public fused recurrent API, except
+Delta Product and ABC, which use their public chunk APIs. This is a forward
+benchmark; it does not measure training backward or the fastest FLA chunk kernel
+for each recurrent family.
+
+The default workloads use BF16 query/key/value, FP32 gates/state, `K=V=64`,
+16 ABC slots, and two Delta Product writes. Inputs normalize correction vectors,
+use small independent low-rank vectors for IPLR/DPLR, and use exactly
+BF16-representable ABC logits so both sides receive the same values. Gate/logit
+preparation happens before timing; layout conversion, ABC's FLA logit cast,
+ComBa's prediction-key adjustment and Delta Product interleaving remain inside
+the public-call interval. This FLA checkout's ComBa fused kernel predicts from
+the prior state; multiplying its prediction key by `exp(gate)` matches the
+example's prediction from the decayed state. The adjustment uses FP32 to avoid
+introducing another BF16 rounding step.
+
+The 8 GiB workspace budget permits the full measured workload on H20. With the
+default 1 GiB budget, some `T=2048` workloads are rejected before execution;
+those rejections are recorded rather than assigned latency values.
+
+Each comparable result must pass the independent FP32 oracle and pairwise output
+checks before its ratio is reported. Records include the selected lowerer,
+public-call latency, synchronized wall time, CUDA Graph replay when available,
+peak allocator usage, and source/environment provenance. `reference-stateful`
+is a possible selected path; its measurements include that implementation.
+Graph-capture failures and missing FLA APIs are recorded explicitly. The runner
+writes `records.json`, `manifest.json`, `summary.csv`, and comparison plots.
+See [the measured H20 results](../docs/stateful-example-benchmarks.md) for the
+workload, selected lowerers and performance limits.
