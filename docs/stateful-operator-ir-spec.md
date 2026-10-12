@@ -2,12 +2,22 @@
 
 Status: `proposed`
 
+Scope: this document preserves the initial schema-v1 proposal and its production
+acceptance goals; it is not a current capability inventory. Implemented language
+extensions are recorded in [ADR 0002](adr/0002-multiple-states-and-readout-expressions.md),
+[ADR 0003](adr/0003-product-features-and-prior-state-readouts.md), and
+[the API guide](API.md). The [domain glossary](../GLOSSARY.md) and
+[FLA coverage assessment](fla-ir-coverage-assessment.md) distinguish current
+capability from proposed extensions.
+
 ## Problem Statement
 
-The current branch is not yet an implementation of this contract: its prior
-authoring path selected legacy whole algorithms underneath Algorithm IR.
-This specification explicitly forbids eager token loops, dedicated GDN
-execution, and backend-specific backward as the implementation target.
+The original authoring path selected legacy whole algorithms underneath
+Algorithm IR. This proposal specifies a compositional implementation target
+and explicitly forbids eager token loops, dedicated GDN execution, and
+backend-specific backward. Current implementation and validation evidence are
+recorded separately; the proposal's status is not a claim about every path in
+the current checkout.
 
 Model authors need one small mathematical interface for state evolution. A supported state transition must compile because its typed algebra is Scanable, not because the repository recognizes a model name or exact graph. The same mathematical program must drive forward, backward, dense execution, packed variable-length execution, initial/final state, capability diagnostics, and cache identity. Kernel schedules may optimize common algebraic structures, but they must not replace their semantics.
 

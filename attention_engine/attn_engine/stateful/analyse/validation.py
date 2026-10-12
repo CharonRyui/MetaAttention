@@ -1,4 +1,4 @@
-"""Structural validation for the Algorithm IR, schema v2.
+"""Structural validation for the Algorithm IR, including ordered affine steps.
 
 The module validates shapes of the authored program only: which nodes the
 language admits, which roles they carry, and whether every State is driven by
@@ -14,6 +14,9 @@ from ...stateful_operator import (
     AxisScale,
     Constant,
     Divide,
+    Contract,
+    Outer,
+    Softmax,
     Clamp,
     Exp,
     Identity,
@@ -30,6 +33,8 @@ from ...stateful_operator import (
     Sqrt,
     StateContraction,
     StateTerm,
+    StateInjection,
+    ProductInjection,
     StatefulCompilationError,
     _reject_duplicate_names,
 )
@@ -85,6 +90,32 @@ def validate_transition_structure(algorithm: AlgorithmIR) -> None:
     for index, transition in enumerate(algorithm.transitions):
         state = states[transition.state]
         features = set(state.feature_roles)
+        for step_index, step in enumerate(transition.ordered_steps):
+            if not isinstance(
+                step,
+                (
+                    Identity,
+                    AxisScale,
+                    RankOnePropagation,
+                    ProductInjection,
+                    StateInjection,
+                ),
+            ):
+                raise StatefulCompilationError(
+                    "IR_SCHEMA",
+                    f"transitions[{index}].steps[{step_index}]",
+                    {"node": type(step).__name__},
+                )
+            if isinstance(step, StateInjection):
+                path = f"transitions[{index}].steps[{step_index}]"
+                if step.role is not None and step.role not in features:
+                    raise StatefulCompilationError("IR_TYPE", f"{path}.role", {})
+                for name in ("coefficient", "left", "right"):
+                    expression = getattr(step, name)
+                    if expression is not None:
+                        _reject_state_terms(
+                            expression, f"{path}.{name}", "State Injection"
+                        )
         for node_index, propagation in enumerate(transition.propagations):
             path = f"transitions[{index}].propagations[{node_index}]"
             if isinstance(propagation, AxisScale):
@@ -109,6 +140,12 @@ def validate_transition_structure(algorithm: AlgorithmIR) -> None:
                 _reject_state_terms(expression, expression_path, "Transition")
         for injection_index, injection in enumerate(transition.injections):
             path = f"transitions[{index}].injections[{injection_index}]"
+            if not isinstance(injection, ProductInjection):
+                raise StatefulCompilationError(
+                    "IR_SCHEMA",
+                    path,
+                    {"expected": "ProductInjection; use steps for StateInjection"},
+                )
             covered = {role for factor in injection.factors for role in factor.roles}
             if not features <= covered:
                 raise StatefulCompilationError(
@@ -191,10 +228,12 @@ def _state_terms(expression: InputExpression, path: str):
     if isinstance(expression, Negate):
         yield from _state_terms(expression.operand, f"{path}.operand")
         return
-    if isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift)):
+    if isinstance(
+        expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)
+    ):
         yield from _state_terms(expression.operand, f"{path}.operand")
         return
-    if isinstance(expression, (Add, Multiply, Divide)):
+    if isinstance(expression, (Add, Multiply, Divide, Outer, Contract)):
         yield from _state_terms(expression.left, f"{path}.left")
         yield from _state_terms(expression.right, f"{path}.right")
         return

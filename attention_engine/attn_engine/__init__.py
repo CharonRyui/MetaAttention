@@ -32,6 +32,8 @@ from .stateful_operator import (
     Sqrt as Sqrt,
     StateContraction as StateContraction,
     StateSpec as StateSpec,
+    StateReference as StateReference,
+    StateInjection as StateInjection,
     StateTerm as StateTerm,
     StateTransition as StateTransition,
     StatefulCompilationError as StatefulCompilationError,

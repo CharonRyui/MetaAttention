@@ -15,7 +15,7 @@ from typing import (
 
 import torch
 
-SCHEMA_VERSION = "stateful-operator-ir/3"
+SCHEMA_VERSION = "stateful-operator-ir/4"
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
@@ -683,11 +683,86 @@ class HeadMapping:
         return dict(self.mappings).get(source)
 
 
+@dataclass(frozen=True)
+class StateReference:
+    """Prior token State, or the complete current-token value of another State.
+
+    Current references induce a Transition dependency, never an implicit read
+    of a partially updated State. Within a Transition, each step acts on that
+    Transition's running value.
+    """
+
+    state: str
+    prior: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, str) or not self.state.isidentifier():
+            raise ValueError("State Reference requires a State name")
+        if not isinstance(self.prior, bool):
+            raise TypeError("State Reference prior must be a boolean")
+
+
+@dataclass(frozen=True, init=False)
+class StateInjection:
+    """Add an input-driven linear action on a referenced State.
+
+    Without ``role``, add ``coefficient * source``. With ``role``, add
+    ``coefficient * left * contract(right, source)`` along that Feature axis.
+    Unlike RankOnePropagation, this action has no implicit identity term.
+    Source and destination have identical logical roles. Coefficients and
+    vectors are State-free, keeping the joint Transition affine.
+    """
+
+    source: StateReference
+    coefficient: InputExpression
+    role: FeatureRole | None
+    left: InputExpression | None
+    right: InputExpression | None
+
+    def __init__(
+        self,
+        source: StateReference,
+        coefficient: InputExpression | float | int = 1.0,
+        *,
+        role: FeatureRole | None = None,
+        left: InputExpression | float | int | None = None,
+        right: InputExpression | float | int | None = None,
+    ) -> None:
+        if not isinstance(source, StateReference):
+            raise TypeError("State Injection requires a StateReference")
+        if role is not None and not isinstance(role, FeatureRole):
+            raise TypeError("State Injection role must be a Feature role")
+        if (role is None and (left is not None or right is not None)) or (
+            role is not None and (left is None or right is None)
+        ):
+            raise ValueError(
+                "State Injection rank-one action requires role, left and right"
+            )
+        object.__setattr__(self, "source", source)
+        object.__setattr__(self, "coefficient", as_expression(coefficient))
+        object.__setattr__(self, "role", role)
+        object.__setattr__(self, "left", None if left is None else as_expression(left))
+        object.__setattr__(
+            self, "right", None if right is None else as_expression(right)
+        )
+
+
 @dataclass(frozen=True, init=False)
 class StateTransition:
     state: str
     propagations: tuple[Identity | AxisScale | RankOnePropagation, ...]
     injections: tuple[ProductInjection, ...]
+    steps: (
+        tuple[
+            Identity
+            | AxisScale
+            | RankOnePropagation
+            | ProductInjection
+            | StateInjection,
+            ...,
+        ]
+        | None
+    )
 
     def __init__(
         self,
@@ -695,14 +770,45 @@ class StateTransition:
         *,
         propagations: TypingSequence[Identity | AxisScale | RankOnePropagation] = (),
         injections: TypingSequence[ProductInjection] = (),
+        steps: TypingSequence[
+            Identity
+            | AxisScale
+            | RankOnePropagation
+            | ProductInjection
+            | StateInjection
+        ]
+        | None = None,
     ) -> None:
+        propagations, injections = tuple(propagations), tuple(injections)
+        if steps is not None:
+            if propagations or injections:
+                raise ValueError("use steps or propagations/injections, not both")
+            steps = tuple(node for node in steps if not isinstance(node, Identity))
+            propagations = tuple(
+                node
+                for node in steps
+                if isinstance(node, (AxisScale, RankOnePropagation))
+            )
+            injections = tuple(
+                node for node in steps if isinstance(node, ProductInjection)
+            )
         object.__setattr__(self, "state", state)
         object.__setattr__(
             self,
             "propagations",
             tuple(node for node in propagations if not isinstance(node, Identity)),
         )
-        object.__setattr__(self, "injections", tuple(injections))
+        object.__setattr__(self, "injections", injections)
+        object.__setattr__(self, "steps", steps)
+
+    @property
+    def ordered_steps(self):
+        """Semantic step order, including the legacy grouped spelling."""
+        return (
+            self.steps
+            if self.steps is not None
+            else (*self.propagations, *self.injections)
+        )
 
 
 @dataclass(frozen=True, init=False)
@@ -756,8 +862,8 @@ class AlgorithmIR:
         from .stateful.analyse.algorithm import analyze_algorithm
 
         validate_algorithm_structure(self)
-        object.__setattr__(self, "_analysis", analyze_algorithm(self))
         validate_transition_structure(self)
+        object.__setattr__(self, "_analysis", analyze_algorithm(self))
 
     @property
     def _structural_identity(self) -> str:
@@ -2308,6 +2414,40 @@ class StatefulOperator:
             injection_right.append(
                 _evaluate(factors[write.right_factor].expression, values).float()
             )
+            if recipe.injection_propagations:
+                # Convert an ordered write to its final additive contribution
+                # by applying subsequent actions to its vector factors. This
+                # is linear in suffix length, with no outer-product expansion.
+                row = injection_left[-1].reshape(
+                    runtime.token_count, runtime.state_heads, initial_state.shape[-2], 1
+                )
+                column = injection_right[-1].reshape(
+                    runtime.token_count, runtime.state_heads, 1, initial_state.shape[-1]
+                )
+                for action_index in recipe.injection_propagations[
+                    len(injection_left) - 1
+                ]:
+                    action = self._program.transition.propagations[action_index]
+                    if isinstance(action, AxisScale):
+                        factor = _evaluate(action.factor, values).float()
+                        if not action.roles:
+                            row = factor * row
+                        elif action.roles == (first_role,):
+                            row = factor.reshape_as(row) * row
+                        else:
+                            column = factor.reshape_as(column) * column
+                    else:
+                        action_left = (
+                            _evaluate(action.left, values).float().reshape_as(row)
+                        )
+                        action_right = (
+                            _evaluate(action.right, values).float().reshape_as(row)
+                        )
+                        scalar = _evaluate(action.coefficient, values).float()
+                        row = row + scalar * action_left * (action_right * row).sum(
+                            -2, keepdim=True
+                        )
+                injection_left[-1], injection_right[-1] = row, column
             scalar_base = len(injection_scalars)
             injection_scalars.extend(
                 _evaluate(factors[index].expression, values).float()
@@ -2510,8 +2650,8 @@ def _dense_summary_required(algorithm: AlgorithmIR) -> bool:
     factor each, which the prefix kernel composes per element.
     """
     for transition in algorithm.transitions:
-        for node in transition.propagations:
-            if isinstance(node, RankOnePropagation):
+        for node in transition.ordered_steps:
+            if isinstance(node, (RankOnePropagation, StateInjection)):
                 return True
     return False
 

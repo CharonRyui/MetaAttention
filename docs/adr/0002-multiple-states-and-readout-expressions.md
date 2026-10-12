@@ -40,16 +40,21 @@ plans unchanged, so schema v2 cannot regress a v1 workload.
 ## Considered Options
 A dedicated lowering per model family was rejected: it reintroduces the model catalog this compiler exists to avoid, and each new family would need its own analysis, backward, and cache identity. Extending the language and lowering each Program through the shared summary/scan machinery keeps one semantic source.
 
-State-dependent Transition operands (TTT, Titans) were rejected for this schema:
-letting a Transition read its own previous State makes the per-token map
-state-dependent, which breaks the affine summary that makes Scanable Programs
-parallel. Those operators need an inner-loop construct and a separate decision.
+State Terms in Transition operands were rejected for this schema, preserving
+independent input-driven affine summaries. This is a language restriction, not
+proof that every State reference destroys an affine summary: a linear action on
+Prior State, including cross-State coupling, can remain jointly affine. The
+TTT and Titans references use nonlinear State-derived normalization in their
+updates and need a separate execution decision. A nonlinear transformation
+between an auxiliary scan and a downstream scan is another distinct case; see
+[the coverage assessment](../fla-ir-coverage-assessment.md).
 
-Higher-order States with a product Feature (Based, Rebased: a `[K*K, V]`
-numerator) were rejected for this schema: they need more than two Feature roles
-and Product Injections with three or more factors. They remain expressible only
-after a later schema revision. (ADR 0003 makes that revision: Feature roles of
-any arity, `Outer`, `Contract`, `Softmax`, and prior-State readouts.)
+Product Features (Based, Rebased: a `[K*K, V]` numerator) were deferred in this
+schema because it lacked a typed product Feature expression. ADR 0003 adds
+Product Feature roles, `Outer`, `Contract`, `Softmax`, and prior-State readouts.
+A product occupies one State axis, so these examples keep a two-Feature-axis
+matrix State. They do not require a three-factor Injection: `Outer(k, k)` is
+one factor of the two-factor matrix Injection.
 
 ## Consequences
 

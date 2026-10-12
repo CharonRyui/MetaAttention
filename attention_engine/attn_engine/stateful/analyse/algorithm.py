@@ -102,6 +102,7 @@ class RankOneFactoredIR:
     injections: tuple[WeightedOuterProductIR, ...] = ()
     transpose_state: bool = False
     readout_axis: int = 0
+    injection_propagations: tuple[tuple[int, ...], ...] = ()
 
     @property
     def injection_scalar_count(self) -> int:
@@ -172,6 +173,8 @@ class Analysis:
     canonical_identity: str
     normalized: AlgorithmIR
     reference_required: bool
+    transition_order: tuple[str, ...]
+    joint_axis: int | None
 
 
 def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
@@ -191,6 +194,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         Outer,
         Multiply,
         Negate,
+        ProductInjection,
         RankOnePropagation,
         Reciprocal,
         Shift,
@@ -199,10 +203,13 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         Sqrt,
         StateContraction,
         StateTerm,
+        StateInjection,
         StatefulCompilationError,
         _canonical_identity,
     )
+    from .transitions import transition_schedule
 
+    transition_order, joint_axis = transition_schedule(algorithm)
     input_types = {item.name: (item.dtype, item.roles) for item in algorithm.inputs}
     states = {state.name: state for state in algorithm.states}
     transitions = {transition.state: transition for transition in algorithm.transitions}
@@ -384,10 +391,32 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         return typed
 
     reverse: list[VJPStep] = []
-    for state_index, (state_spec, transition) in enumerate(ordered):
-        base = "transition" if len(ordered) == 1 else f"transitions[{state_index}]"
-        for index, node in enumerate(transition.propagations):
-            path = f"{base}.propagations[{index}]"
+    transition_indices = {t.state: i for i, t in enumerate(algorithm.transitions)}
+    if joint_axis is not None:
+        ordered = tuple((states[name], transitions[name]) for name in transition_order)
+    for state_spec, transition in ordered:
+        base = (
+            "transition"
+            if len(ordered) == 1
+            else f"transitions[{transition_indices[state_spec.name]}]"
+        )
+        nodes = (
+            tuple(
+                (f"{base}.steps[{i}]", node) for i, node in enumerate(transition.steps)
+            )
+            if transition.steps is not None
+            else (
+                *(
+                    (f"{base}.propagations[{i}]", node)
+                    for i, node in enumerate(transition.propagations)
+                ),
+                *(
+                    (f"{base}.injections[{i}]", node)
+                    for i, node in enumerate(transition.injections)
+                ),
+            )
+        )
+        for path, node in nodes:
             if isinstance(node, Identity):
                 continue
             if isinstance(node, AxisScale):
@@ -420,7 +449,9 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                         )
                 if any(role in state_spec.feature_roles for role in coefficient.roles):
                     raise StatefulCompilationError(
-                        "IR_TYPE", f"{path}.coefficient", {"expected": "feature scalar"}
+                        "IR_TYPE",
+                        f"{path}.coefficient",
+                        {"expected": "feature scalar"},
                     )
                 reverse.append(
                     VJPStep(
@@ -429,43 +460,72 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                         _input_names(node.left, node.right, node.coefficient),
                     )
                 )
+            elif isinstance(node, ProductInjection):
+                for factor_index, factor in enumerate(node.factors):
+                    typed = type_expression(
+                        factor.expression, f"{path}.factors[{factor_index}].expression"
+                    )
+                    actual = tuple(
+                        role for role in typed.roles if role in state_spec.feature_roles
+                    )
+                    # An expression may broadcast along declared axes, but may
+                    # not carry a State Feature axis it does not declare.
+                    if not set(actual) <= set(factor.roles):
+                        raise StatefulCompilationError(
+                            "IR_TYPE",
+                            f"{path}.factors[{factor_index}].roles",
+                            {
+                                "expression_features": _role_names(actual),
+                                "declared": _role_names(factor.roles),
+                            },
+                        )
+                reverse.append(
+                    VJPStep(
+                        path,
+                        "product_injection",
+                        tuple(
+                            name
+                            for factor in node.factors
+                            for name in _input_names(factor.expression)
+                        ),
+                    )
+                )
+            elif isinstance(node, StateInjection):
+                coefficient = type_expression(node.coefficient, f"{path}.coefficient")
+                if any(isinstance(role, FeatureRole) for role in coefficient.roles):
+                    raise StatefulCompilationError(
+                        "IR_TYPE",
+                        f"{path}.coefficient",
+                        {"expected": "feature scalar"},
+                    )
+                if node.role is not None:
+                    for name in ("left", "right"):
+                        typed = type_expression(getattr(node, name), f"{path}.{name}")
+                        if tuple(
+                            role
+                            for role in typed.roles
+                            if isinstance(role, FeatureRole)
+                        ) != (node.role,):
+                            raise StatefulCompilationError(
+                                "IR_TYPE",
+                                f"{path}.{name}",
+                                {"expected_feature": str(node.role)},
+                            )
+                version = "prior" if node.source.prior else "current"
+                reverse.append(
+                    VJPStep(
+                        path,
+                        "state_injection",
+                        (
+                            f"{node.source.state}.{version}",
+                            *_input_names(node.coefficient, node.left, node.right),
+                        ),
+                    )
+                )
             else:
                 raise StatefulCompilationError(
                     "RECURRENT", path, {"node": type(node).__name__}
                 )
-
-        for index, injection in enumerate(transition.injections):
-            path = f"{base}.injections[{index}]"
-            for factor_index, factor in enumerate(injection.factors):
-                typed = type_expression(
-                    factor.expression, f"{path}.factors[{factor_index}].expression"
-                )
-                actual = tuple(
-                    role for role in typed.roles if role in state_spec.feature_roles
-                )
-                # A factor may declare a Feature role that its expression does not
-                # carry: the value broadcasts along that axis. It may not carry a
-                # Feature role it does not declare.
-                if not set(actual) <= set(factor.roles):
-                    raise StatefulCompilationError(
-                        "IR_TYPE",
-                        f"{path}.factors[{factor_index}].roles",
-                        {
-                            "expression_features": _role_names(actual),
-                            "declared": _role_names(factor.roles),
-                        },
-                    )
-            reverse.append(
-                VJPStep(
-                    path,
-                    "product_injection",
-                    tuple(
-                        name
-                        for factor in injection.factors
-                        for name in _input_names(factor.expression)
-                    ),
-                )
-            )
 
     for index, readout in enumerate(algorithm.readouts):
         path = f"readouts[{index}]"
@@ -516,7 +576,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         base = (
             "transition"
             if len(ordered) == 1
-            else f"transitions[{len(ordered) - 1 - state_index}]"
+            else f"transitions[{transition_indices[state_spec.name]}]"
         )
         reverse.append(
             VJPStep(
@@ -537,7 +597,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 f"d_{state_spec.name}_final",
                 f"d_{state_spec.name}_initial",
             )
-            for state_spec, _ in ordered
+            for state_spec in algorithm.states
         ),
     )
     scalar_factorized = None
@@ -546,6 +606,7 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     v1_shape = (
         len(algorithm.states) == 1
         and algorithm.states[0].rank == 2
+        and algorithm.transitions[0].steps is None
         and all(isinstance(readout, StateContraction) for readout in algorithm.readouts)
     )
     scalar_propagations = v1_shape and all(
@@ -676,7 +737,10 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     return Analysis(
         ExecutionClass.SCANABLE,
         AffineSummaryIR(
-            state.name, "dense", "state", tuple(s.name for s in algorithm.states)
+            state.name,
+            "joint-axis" if joint_axis is not None else "dense",
+            "state",
+            tuple(s.name for s in algorithm.states),
         ),
         backward,
         tuple(types),
@@ -687,6 +751,8 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
         canonical_identity,
         algorithm,
         _requires_reference(algorithm),
+        transition_order,
+        joint_axis,
     )
 
 
@@ -698,6 +764,8 @@ def _requires_reference(algorithm: AlgorithmIR) -> bool:
     """
     from ...stateful_operator import Shift, StateContraction, _expressions
 
+    if any(transition.steps is not None for transition in algorithm.transitions):
+        return True
     if len(algorithm.states) != 1 or algorithm.states[0].rank != 2:
         return True
     if any(not isinstance(readout, StateContraction) for readout in algorithm.readouts):
@@ -922,6 +990,9 @@ def _simplified_identity_payload(algorithm):
     )
 
     def simplify_transition(transition):
+        if transition.steps is not None:
+            # Keep the semantic order and StateReference versions in identity.
+            return transition
         propagations = tuple(
             replace(node, factor=simplify_expression(node.factor))
             if isinstance(node, AxisScale)
@@ -1071,6 +1142,14 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         _expressions,
     )
 
+    from ...stateful_operator import StateInjection, ProductInjection
+
+    if any(
+        isinstance(node, StateInjection)
+        for transition in algorithm.transitions
+        for node in transition.ordered_steps
+    ):
+        return None
     if any(isinstance(expression, Shift) for expression in _expressions(algorithm)):
         return None
     if len(algorithm.states) != 1 or algorithm.states[0].rank != 2:
@@ -1158,6 +1237,11 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         for node in algorithm.transitions[0].propagations
         if isinstance(node, RankOnePropagation)
     )
+    propagation_positions = [
+        index
+        for index, node in enumerate(algorithm.transitions[0].ordered_steps)
+        if isinstance(node, (AxisScale, RankOnePropagation))
+    ]
     return RankOneFactoredIR(
         tuple(operations),
         len(injections),
@@ -1166,6 +1250,17 @@ def rank_one_factored_eligible(algorithm: AlgorithmIR) -> RankOneFactoredIR | No
         tuple(writes),
         transpose_state,
         readout_axis,
+        tuple(
+            tuple(
+                propagation_index
+                for propagation_index, position in enumerate(propagation_positions)
+                if position > write_index
+            )
+            for write_index, node in enumerate(algorithm.transitions[0].ordered_steps)
+            if isinstance(node, ProductInjection)
+        )
+        if algorithm.transitions[0].steps is not None
+        else (),
     )
 
 

@@ -9,6 +9,9 @@ MetaAttention provides users with pythonic interface to define customized attent
 The [Stateful example guide](examples/README.md) documents Delta Rule, KDA,
 GDN2, ComBa, IPLR/DPLR, Gated Oja, fixed-step Delta Product, and ABC, including
 input conventions, state continuation, numerical limits, and validation.
+The [domain glossary](GLOSSARY.md) defines State, Transition, Readout and coverage
+terms. The [FLA coverage assessment](docs/fla-ir-coverage-assessment.md) records
+current IR capabilities, semantic limits and proposed extension priorities.
 
 # 1. Getting Started Guide
 

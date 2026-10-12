@@ -10,7 +10,15 @@ Dense inputs use head-first `[B, H, T, ...]` layout. Query, key and value inputs
 use the factory's `dtype` (BF16 by default); the gates and scalar learning rates
 in the examples below use FP32. Keys and values arrive as supplied: input
 projection, key normalization, gate activation and layer wrappers belong to the
-caller. All outputs read the state after the current token's update.
+caller. The factories in the table below read the state after the current
+token's update; other examples such as RWKV6 explicitly read prior state.
+
+Coverage distinguishes core recurrence, numerical range, State compatibility,
+complete layer behavior and measured performance. See
+[the FLA coverage assessment](../docs/fla-ir-coverage-assessment.md) for the
+current boundaries and proposed IR extensions. In particular,
+`examples.linear_attention.forgetting_attention` currently delegates to Simple
+GLA; it does not implement FLA's pairwise softmax Forgetting Attention.
 
 | File / factory | Recurrence on state `S` with shape `[K, V]` | Additional inputs |
 | --- | --- | --- |
@@ -23,6 +31,7 @@ caller. All outputs read the state after the current token's update.
 | [`gated_oja_rule.py`](gated_oja_rule.py) / `gated_oja_rule` | `S' = S diag(exp(gate))`; `S = S' + beta (k - S' v) v^T` | VALUE-channel `gate`, scalar `beta` |
 | [`gated_delta_product.py`](gated_delta_product.py) / `gated_delta_product` | Scalar decay, then ordered delta writes within each token | Scalar `gate`; named `key_j`, `value_j`, `beta_j` |
 | [`abc_attention.py`](abc_attention.py) / `abc_attention` | Weighted key/value slot sums plus a weight sum; normalized slot softmax readout | `slot_logits` with shape `[B, Hk, T, M]` |
+| [`momentum_delta_rule.py`](momentum_delta_rule.py) / `momentum_delta_rule` | `M = exp(log_mu) M_prior + eta k (p^T S_prior - v)^T`; `S = exp(log_alpha) S_prior - beta M` | `prediction_key`, scalar `log_alpha`, `log_mu`, `beta`, `eta`; two matrix States |
 
 Every gate is in natural-log space. Scalar inputs have shape `[B, Hs, T]`;
 channel gates add their indicated feature axis. Generalized Delta's `beta` is a
@@ -37,9 +46,19 @@ an already decayed state.
 
 Delta Product fixes `num_householder` when constructing the operator (default:
 2). Split FLA's interleaved `[B, T*num_householder, H, ...]` streams into
-head-first `key_0`, `value_0`, `beta_0`, etc. Each earlier injection includes the
-effect of later corrections. The explicit outer-product expansion grows exponentially with
-the step count and is intended to illustrate small fixed counts.
+head-first `key_0`, `value_0`, `beta_0`, etc. Schema-v4 `steps` interleaves
+propagation and injection directly, preserving earlier writes without
+exponential expression expansion. The factored lowerer prepares write factors
+through subsequent actions and retains the compiled inference/backward path.
+
+Momentum Delta Rule follows FLA's recurrent reference sign convention above.
+Initial and final State names are `("memory", "momentum")`, corresponding to
+FLA's stacked `(S, M)` cache. `use_p_times_alpha=True` scales `prediction_key`
+by `exp(log_alpha)` to predict from decayed memory. Current Momentum must
+complete before the Memory Transition; the compiler derives this dependency
+from `StateReference`, irrespective of authored Transition order. Both
+Transitions are combined into one joint affine scan. This reference-grade
+path has correctness coverage, but no performance benchmark yet.
 
 ABC maintains `key_slot [K, M]`, `slot_value [M, V]`, and `normalizer [M]`.
 It implements vanilla ABC using `exp(slot_logits)` weights, normalization and
@@ -114,7 +133,9 @@ FLA or coverage of complete model layers.
 ## Benchmark against FLA
 
 Both `testing/benchmark_stateful_plans.py` (Meta only) and
-`testing/benchmark_fla_stateful.py` now register all nine factories above. For a
+`testing/benchmark_fla_stateful.py` register the original nine factories above;
+Momentum is covered by correctness tests and is not yet registered in these
+benchmark runners. For a
 recent FLA checkout and an otherwise idle NVIDIA GPU:
 
 ```bash

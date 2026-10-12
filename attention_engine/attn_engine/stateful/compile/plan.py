@@ -146,9 +146,9 @@ PLAN_RULES = {
     PlanRepresentation.STATEFUL_REFERENCE: PlanRule(
         PlanRepresentation.STATEFUL_REFERENCE,
         (
-            "independent-affine-states",
-            "post-transition-readout-expressions",
-            "authored-propagation-order",
+            "input-driven-affine-state-transitions",
+            "prior-and-current-state-readouts",
+            "authored-step-order-and-acyclic-current-state-dependencies",
         ),
     ),
 }
@@ -206,6 +206,7 @@ class EstimationShape:
     factored_workspace: int = 0
     factored_chunk_bytes: int = 0
     native_resources: Any | None = None
+    joint_axis_size: int = 0
 
     @classmethod
     def of(
@@ -226,6 +227,7 @@ class EstimationShape:
         factored_workspace: int = 0,
         factored_chunk_bytes: int = 0,
         native_resources: Any | None = None,
+        joint_axis_size: int = 0,
     ) -> "EstimationShape":
         rows = feature_sizes[0]
         columns = feature_sizes[1] if len(feature_sizes) > 1 else 1
@@ -247,6 +249,7 @@ class EstimationShape:
             factored_workspace,
             factored_chunk_bytes,
             native_resources,
+            joint_axis_size,
         )
 
     @property
@@ -485,6 +488,18 @@ class CandidateLowerer:
                 heads * (2 * dense + 2 * state) * 4,
             )
         if representation is PlanRepresentation.STATEFUL_REFERENCE:
+            if shape.joint_axis_size:
+                # Joint block maps, additive trajectories, prefix temporaries
+                # and autograd context. No dense transform over vec(K*V).
+                width = shape.joint_axis_size
+                elements = width * width + shape.state_total_elements
+                return CandidateEstimate(
+                    True,
+                    heads * 8 * elements * 4,
+                    2 * heads * width * elements,
+                    4,
+                    heads * 8 * elements * 4,
+                )
             return CandidateEstimate(
                 True,
                 heads * (2 * dense + 4 * shape.state_total_elements) * 4,
@@ -1112,6 +1127,7 @@ def compile_plan(
                 and (
                     rank_one_factored.transpose_state
                     or rank_one_factored.injection_scalar_count
+                    or rank_one_factored.injection_propagations
                 )
             )
         )
@@ -1265,6 +1281,11 @@ def compile_plan(
                         columns,
                     ),
                 )
+        if rank_one_factored.injection_propagations:
+            # Preparing ordered writes retains differentiable vector actions,
+            # including their reverse intermediates, outside the kernel.
+            suffix_actions = sum(map(len, rank_one_factored.injection_propagations))
+            factored_token_bytes += 6 * 4 * heads * rows * suffix_actions
     state_total = 0
     for spec in operator._program.states:
         sizes = [fixed_sizes[role] for role in spec.feature_roles]
@@ -1275,6 +1296,12 @@ def compile_plan(
         dense_summary,
         state_count=len(operator._program.states),
         state_total_elements=state_total,
+        joint_axis_size=(
+            len(operator._program.states)
+            * fixed_sizes[state.feature_roles[operator._program._analysis.joint_axis]]
+            if operator._program._analysis.joint_axis is not None
+            else 0
+        ),
         dense_total_elements=sum(
             fixed_sizes[spec.feature_roles[0]] ** 2
             + (

@@ -8,7 +8,7 @@ status: accepted
 
 The Algorithm IR expression language gains the vocabulary needed by the supported product-Feature profiles, without changing the Scanable guarantee or the lowering pipeline:
 
-- **Feature roles of any arity, including products.** `ProductFeatureRole(left,
+- **Several distinct Feature roles, including products.** `ProductFeatureRole(left,
   right)` declares a Feature whose axis is the flattened product of two Features,
   and a State may use that product as one of its axes. `Outer(left, right, role)`
   builds the product axis of two expressions. This is how Based and Rebased keep a
@@ -62,7 +62,11 @@ implicit second transition; `prior=True` names the pre-transition State instead.
   silently allocating. Making that plan chunk its output pass is a performance
   decision, not a language one.
 - ADR 0002's rejection of product Features is superseded by this ADR: Feature
-  roles now have any arity. Its rejection of three-factor Injections is *not*
-  superseded, and this ADR keeps it: Based and Rebased are authored with
-  two-factor Injections whose second-order factor is a product-Feature operand,
-  and its rejection of state-dependent Transitions (TTT, Titans) still stands.
+  roles may include typed products, while each State still has one or two
+  Feature axes. Based and Rebased use two-factor Injections whose second-order
+  factor is a product-Feature operand; this does not impose a general two-factor
+  limit. Current Product Injections admit several typed factors, including
+  Feature-free weights. The restriction on State Terms in Transitions still
+  stands. Cross-State affine coupling, nonlinear transformations between scans,
+  and nonlinear State Feedback require different summary proofs; see
+  [the coverage assessment](../fla-ir-coverage-assessment.md).

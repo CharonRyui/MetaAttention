@@ -28,6 +28,7 @@ FAMILIES = (
     "dplr",
     "oja",
     "delta_product",
+    "momentum",
     "abc",
 )
 FACTORIES = {
@@ -39,6 +40,7 @@ FACTORIES = {
     "dplr": ("generalized_delta_rule", "dplr_delta_rule"),
     "oja": ("gated_oja_rule", "gated_oja_rule"),
     "delta_product": ("gated_delta_product", "gated_delta_product"),
+    "momentum": ("momentum_delta_rule", "momentum_delta_rule"),
     "abc": ("abc_attention", "abc_attention"),
 }
 
@@ -72,7 +74,7 @@ def _case(kind, *, device="cpu", dim=3, dim_value=5, dtype=torch.float32, steps=
             for role in spec.roles
         )
         value = 0.2 * torch.randn(shape, generator=generator)
-        if spec.name == "gate":
+        if spec.name in ("gate", "log_alpha", "log_mu"):
             value = -0.3 * torch.rand(shape, generator=generator)
         elif spec.name.startswith("beta") and kind not in ("iplr", "dplr"):
             value = 0.1 + 0.4 * torch.rand(shape, generator=generator)
@@ -118,7 +120,18 @@ def _reference(kind, inputs, initial, *, steps=2):
             output.append(torch.einsum("bhm,bhmv->bhv", probabilities, slot_values))
             continue
         state = states["memory"]
-        if kind in ("iplr", "dplr"):
+        if kind == "momentum":
+            prediction = torch.einsum("bhk,bhkv->bhv", x["prediction_key"], state)
+            momentum = x["log_mu"].exp()[..., None, None] * states["momentum"]
+            momentum = momentum + x["eta"][..., None, None] * x["key"].unsqueeze(-1) * (
+                prediction - x["value"]
+            ).unsqueeze(-2)
+            states["momentum"] = momentum
+            state = (
+                x["log_alpha"].exp()[..., None, None] * state
+                - x["beta"][..., None, None] * momentum
+            )
+        elif kind in ("iplr", "dplr"):
             correction = torch.einsum("bhk,bhkv->bhv", x["alpha"], state)
             if kind == "dplr":
                 state = state * x["gate"].exp().unsqueeze(-1)
@@ -250,7 +263,7 @@ def test_example_gradients_match_recurrence(kind):
         )
 
 
-@pytest.mark.parametrize("steps", (1, 3))
+@pytest.mark.parametrize("steps", (1, 3, 12))
 def test_delta_product_preserves_all_intermediate_writes(steps):
     operator, roles, inputs, initial = _case("delta_product", steps=steps)
     actual = _invoke(operator, roles, inputs, initial)
@@ -324,3 +337,171 @@ def test_example_gradients_execute_on_gpu(kind, gpu_device):
         torch.testing.assert_close(
             actual_gradient, expected_gradient, rtol=0.08, atol=0.02
         )
+
+
+def test_momentum_decayed_prediction_matches_recurrence():
+    from examples.momentum_delta_rule import momentum_delta_rule
+
+    _, roles, inputs, initial = _case("momentum")
+    operator = momentum_delta_rule(
+        1, 2, 5, 3, 5, dtype=torch.float32, use_p_times_alpha=True
+    )
+    actual = _invoke(operator, roles, inputs, initial)
+    reference_inputs = dict(inputs)
+    # The variant explicitly promotes p to FP32 before scaling.
+    reference_inputs["prediction_key"] = inputs["prediction_key"] * inputs[
+        "log_alpha"
+    ].exp().unsqueeze(-1)
+    expected, final = _reference("momentum", reference_inputs, initial)
+    torch.testing.assert_close(actual.outputs["output"], expected, rtol=2e-5, atol=2e-6)
+    for name, value in final.items():
+        torch.testing.assert_close(
+            actual.final_state[name], value, rtol=2e-5, atol=2e-6
+        )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("kind", ("momentum", "delta_product"))
+def test_ordered_examples_packed_empty_sequence_gradients(kind, gpu_device):
+    operator, roles, dense_inputs, initial = _case(
+        kind,
+        device=gpu_device,
+        dim=64,
+        dim_value=128,
+        dtype=torch.bfloat16,
+    )
+    inputs = {
+        name: value.squeeze(0).transpose(0, 1).contiguous().requires_grad_()
+        for name, value in dense_inputs.items()
+    }
+    states = {
+        name: value.repeat(3, 1, 1, 1).requires_grad_()
+        for name, value in initial.items()
+    }
+    offsets = torch.tensor([0, 2, 2, 5], dtype=torch.int32, device=gpu_device)
+    compiled = operator.compile(
+        role_sizes=roles, target=Target(), mode="packed", backward=True
+    )
+    actual = compiled(
+        **inputs,
+        sequence_offsets=offsets,
+        initial_state=StateTuple(tuple(states), tuple(states.values())),
+        return_final_state=True,
+    )
+    expected_output, final_parts = [], {name: [] for name in states}
+    for index, (start, end) in enumerate(((0, 2), (2, 2), (2, 5))):
+        if start == end:
+            for name in states:
+                final_parts[name].append(states[name][index : index + 1])
+            continue
+        output, final = _reference(
+            kind,
+            {
+                name: value[start:end].transpose(0, 1).unsqueeze(0)
+                for name, value in inputs.items()
+            },
+            {name: value[index : index + 1] for name, value in states.items()},
+        )
+        expected_output.append(output.squeeze(0).transpose(0, 1))
+        for name in states:
+            final_parts[name].append(final[name])
+    expected_output = torch.cat(expected_output)
+    expected_states = {name: torch.cat(parts) for name, parts in final_parts.items()}
+    torch.testing.assert_close(
+        actual.outputs["output"].float(), expected_output, rtol=0.06, atol=0.01
+    )
+    for name in states:
+        torch.testing.assert_close(
+            actual.final_state[name], expected_states[name], rtol=0.04, atol=0.005
+        )
+    leaves = (*inputs.values(), *states.values())
+    actual_loss = actual.outputs["output"].float().square().sum() + sum(
+        x.square().sum() for x in actual.final_state
+    )
+    expected_loss = expected_output.square().sum() + sum(
+        x.square().sum() for x in expected_states.values()
+    )
+    for observed, expected in zip(
+        torch.autograd.grad(actual_loss, leaves),
+        torch.autograd.grad(expected_loss, leaves),
+    ):
+        torch.testing.assert_close(observed, expected, rtol=0.08, atol=0.02)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("loss_kind", ("output", "final", "both"))
+def test_momentum_longer_dense_continuation_and_gradients(loss_kind, gpu_device):
+    operator, roles, inputs, initial = _case(
+        "momentum",
+        device=gpu_device,
+        dim=64,
+        dim_value=128,
+        dtype=torch.bfloat16,
+    )
+    inputs = {
+        name: value.repeat(2, 1, 4, *([1] * (value.ndim - 3)))[:, :, :17]
+        .contiguous()
+        .requires_grad_()
+        for name, value in inputs.items()
+    }
+    initial = {
+        name: value.repeat(2, 1, 1, 1).requires_grad_()
+        for name, value in initial.items()
+    }
+    compiled = operator.compile(
+        role_sizes=roles, target=Target(), mode="dense", backward=True
+    )
+    actual = compiled(
+        **inputs,
+        initial_state=StateTuple(tuple(initial), tuple(initial.values())),
+        return_final_state=True,
+    )
+    output, final = _reference("momentum", inputs, initial)
+    torch.testing.assert_close(
+        actual.outputs["output"].float(), output, rtol=0.06, atol=0.01
+    )
+    for name, value in final.items():
+        torch.testing.assert_close(
+            actual.final_state[name], value, rtol=0.02, atol=0.002
+        )
+    prefix = compiled(
+        **{name: value[:, :, :7].contiguous() for name, value in inputs.items()},
+        initial_state=StateTuple(tuple(initial), tuple(initial.values())),
+        return_final_state=True,
+    )
+    suffix = compiled(
+        **{name: value[:, :, 7:].contiguous() for name, value in inputs.items()},
+        initial_state=prefix.final_state,
+        return_final_state=True,
+    )
+    torch.testing.assert_close(
+        suffix.outputs["output"],
+        actual.outputs["output"][:, :, 7:],
+        rtol=0.06,
+        atol=0.01,
+    )
+    for name in final:
+        torch.testing.assert_close(
+            suffix.final_state[name], actual.final_state[name], rtol=0.02, atol=0.002
+        )
+    actual_loss = (
+        actual.outputs["output"].float().square().sum() if loss_kind != "final" else 0
+    )
+    expected_loss = output.square().sum() if loss_kind != "final" else 0
+    if loss_kind != "output":
+        actual_loss = actual_loss + sum(
+            value.square().sum() for value in actual.final_state
+        )
+        expected_loss = expected_loss + sum(
+            value.square().sum() for value in final.values()
+        )
+    leaves = (*inputs.values(), *initial.values())
+    actual_grad = torch.autograd.grad(actual_loss, leaves, allow_unused=True)
+    expected_grad = torch.autograd.grad(expected_loss, leaves, allow_unused=True)
+    for actual_value, expected_value in zip(actual_grad, expected_grad):
+        if expected_value is None:
+            assert actual_value is None
+        else:
+            torch.testing.assert_close(
+                actual_value, expected_value, rtol=0.08, atol=0.02
+            )

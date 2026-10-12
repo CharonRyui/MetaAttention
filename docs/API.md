@@ -183,7 +183,9 @@ expression readouts, token shifts, and typed arithmetic needed by the Stateful
 Operator examples.
 
 - **Several independent States** with one Transition each; States share one Head
-  role and use at most two distinct Feature roles.
+  role. The v2 vocabulary used at most two distinct Feature roles across the
+  Program; v3 removes that Program-wide limit, while each State still has one
+  or two Feature axes.
 - **Rank-1 States** (`Batch, Head, Feature`) for scalar accumulators such as a
   linear-attention denominator.
 - **Expression readouts**: `Readout(name, expression, output_dtype)` where the
@@ -230,12 +232,49 @@ the v1 language retain typed specialized TileLang plans.
 Stateful Operator examples keep each per-token recurrence in its own
 `examples/<family>.py` module so the examples exercise the compiler directly.
 
+Schema v4 adds ordered affine steps and coupled State updates:
+
+- `StateTransition("memory", steps=(...))` interleaves `AxisScale`,
+  `RankOnePropagation`, `ProductInjection` and `StateInjection`. Each step acts
+  on the running target State. Use `steps` or the existing grouped
+  `propagations/injections` spelling; mixing them is an error.
+- `StateReference("memory", prior=True)` selects the State before this token.
+  The default selects another State's completed Current State. Current
+  references induce a Transition DAG, sorted independently of author order;
+  cycles, including current self references, fail with `IR_DEPENDENCY`.
+- `StateInjection(source, coefficient)` adds a scaled source State.
+  `StateInjection(source, coefficient, role=KEY, left=k, right=p)` adds
+  `coefficient * k * (p^T source)` along KEY. It has no implicit identity term.
+  Its coefficient and vectors must be State-free, preserving joint affinity.
+
+The first coupled lowering requires all States to share ordered logical roles,
+with all non-scalar actions on one shared Feature axis. It stacks States along
+that axis, composes the token-local DAG's block-affine map, and scans the sequence
+in parallel. It supports dense/packed execution, initial/final States, prior
+Readouts and gradients through the reference scan. Workspace is charged for the
+joint axis. Momentum Delta Rule is an example of this path; no performance
+parity is claimed. Delta Product uses ordered steps and retains the compiled
+factored path by transforming write factors through later actions.
+
+State Terms remain reserved for Readouts; nonlinear State-derived coefficients
+and Scan Stage DAGs remain unsupported. Readout `prior=True` retains its existing
+meaning. Intermediate target values are implicit in step order; arbitrary
+named intermediate State references are not introduced. `Shift` zero-fills
+invocation sequence starts and does not carry input history across calls.
+Product Injections may contain several typed factors; some specialized
+lowerings require two vector factors.
+
+See [ADR 0004](adr/0004-ordered-affine-state-transitions.md),
+[the domain glossary](../GLOSSARY.md) and
+[the FLA coverage assessment and proposed priorities](fla-ir-coverage-assessment.md).
+
 The first production Target is CUDA H20. It accepts BF16/FP32 inputs and
 outputs, FP32 State, canonical contiguous layouts, and Feature pairs in
 `{64,128} × {64,128}`. Invalid IR, unsupported composition, Target mismatch,
 invalid packed offsets, unsupported specialization, resource failure, and
 codegen failure surface as structured `StatefulCompilationError` values. The
-complete contract is in `docs/stateful-operator-ir-spec.md`.
+initial schema-v1 contract is in `docs/stateful-operator-ir-spec.md`; ADRs 0002
+and 0003 record the implemented language extensions described above.
 
 ### Structural inference schedules
 

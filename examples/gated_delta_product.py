@@ -1,8 +1,8 @@
 """A fixed number of ordered Delta Rule writes per token, with scalar decay.
 
-FLA interleaves propagation and injection at each inner step. Here the inner
-steps are unrolled into one affine Transition: each earlier write is transformed
-by all subsequent rank-one propagations before joining the final injection.
+Each inner step propagates the running State, then writes its additive term.
+The authored IR grows linearly with the fixed number of writes; summary
+composition propagates earlier writes without expanding their expressions.
 """
 
 from __future__ import annotations
@@ -13,7 +13,6 @@ from attn_engine import (
     AlgorithmIR,
     AxisScale,
     Batch,
-    Contract,
     Exp,
     FeatureRole,
     HeadMapping,
@@ -68,8 +67,7 @@ def gated_delta_product(
         TensorInput("query", (Batch, QUERY_HEADS, Sequence, KEY), dtype),
         TensorInput("gate", (Batch, STATE_HEADS, Sequence), torch.float32),
     ]
-    propagations = [AxisScale(Exp(Input("gate")))]
-    injections = []
+    steps = [AxisScale(Exp(Input("gate")))]
     for step in range(num_householder):
         inputs.extend(
             (
@@ -84,47 +82,22 @@ def gated_delta_product(
         )
         key = Input(f"key_{step}")
         beta = Input(f"beta_{step}")
-        propagations.append(RankOnePropagation(KEY, key, key, -beta))
-        # If c_j = beta_j k_j v_j^T, its final contribution is
-        # P_last ... P_(j+1) c_j. Expand the transformed KEY factor as
-        # a sum of vectors with scalar coefficients. Each resulting outer
-        # product is a separate injection, preserving every intermediate write.
-        terms = [(key, ())]
-        for later in range(step + 1, num_householder):
-            later_key = Input(f"key_{later}")
-            corrections = []
-            for vector, coefficients in terms:
-                corrections.append(
-                    (
-                        later_key,
-                        (
-                            *coefficients,
-                            -Input(f"beta_{later}"),
-                            Contract(later_key, vector, KEY),
-                        ),
-                    )
-                )
-            terms.extend(corrections)
-        for vector, coefficients in terms:
-            injections.append(
+        steps.extend(
+            (
+                RankOnePropagation(KEY, key, key, -beta),
                 ProductInjection(
                     (
-                        ProductFactor(vector, (KEY,)),
+                        ProductFactor(key, (KEY,)),
                         ProductFactor(beta * Input(f"value_{step}"), (VALUE,)),
-                        *(
-                            ProductFactor(coefficient, ())
-                            for coefficient in coefficients
-                        ),
                     )
-                )
+                ),
             )
+        )
     return StatefulOperator(
         AlgorithmIR(
             inputs=inputs,
             states=(StateSpec("memory", (Batch, STATE_HEADS, KEY, VALUE)),),
-            transition=StateTransition(
-                "memory", propagations=propagations, injections=injections
-            ),
+            transition=StateTransition("memory", steps=steps),
             readouts=(
                 Readout(
                     "output",

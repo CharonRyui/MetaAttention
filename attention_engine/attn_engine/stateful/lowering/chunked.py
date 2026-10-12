@@ -293,7 +293,9 @@ def chunked_states_eligible(algorithm: Any, *, packed: bool = False) -> bool:
     """Static proof for dense diagonal recurrence with dependent readout passes."""
     from ...stateful_operator import AxisScale, Identity, ProductFeatureRole
 
-    if packed:
+    if packed or any(
+        transition.steps is not None for transition in algorithm.transitions
+    ):
         return False
     specs = {state.name: state for state in algorithm.states}
     modes: dict[str, set[bool]] = {name: set() for name in specs}

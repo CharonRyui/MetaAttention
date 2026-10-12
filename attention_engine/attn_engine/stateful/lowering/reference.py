@@ -1,4 +1,4 @@
-"""Reference lowering for schema-v2 Stateful Programs.
+"""Reference lowering for independent and coupled affine Stateful Programs.
 
 Schema v2 admits several independent States, rank-1 States, readouts expressed
 as arithmetic over State Terms, and expression nodes such as ``Divide`` or
@@ -11,7 +11,10 @@ specialized lowerings use:
 * the summaries are composed by the segmented scans shared with the rest of the
   compiler, so execution stays parallel over the Sequence instead of falling
   back to a token loop;
-* readouts evaluate the authored expression against post-transition States.
+* readouts evaluate the authored expression against prior/current States.
+
+Schema v4 also composes ordered writes and coupled block-axis summaries through
+``ordered.py``, preserving a parallel segmented scan for both forms.
 
 The lowering is deliberately reference-grade: it is the semantic baseline for
 v2 Programs and the oracle that specialized kernels must match. Kernels that
@@ -21,6 +24,7 @@ reuse the same summaries can replace it without changing Algorithm IR.
 from __future__ import annotations
 
 from typing import Any, Mapping
+import math
 
 import torch
 
@@ -200,19 +204,33 @@ def execute_reference(
     order, axes = feature_layout(algorithm)
     state_values: dict[str, torch.Tensor] = {}
     prior_values: dict[str, torch.Tensor] = {}
-    for state in algorithm.states:
-        state_values[state.name] = _scan_state(
+    if algorithm._analysis.joint_axis is not None:
+        from .ordered import scan_coupled_states
+
+        state_values = scan_coupled_states(
             algorithm,
-            state,
             values=values,
-            initial=initial_states[state.name],
+            initial_states=initial_states,
             segment=segment,
             role_sizes=role_sizes,
-            feature_axes=axes,
             heads=heads,
             token_count=token_count,
             device=device,
         )
+    for state in algorithm.states:
+        if state.name not in state_values:
+            state_values[state.name] = _scan_state(
+                algorithm,
+                state,
+                values=values,
+                initial=initial_states[state.name],
+                segment=segment,
+                role_sizes=role_sizes,
+                feature_axes=axes,
+                heads=heads,
+                token_count=token_count,
+                device=device,
+            )
         prior_values[state.name] = _prior_state(
             state_values[state.name], initial_states[state.name], segment
         )
@@ -261,6 +279,23 @@ def _scan_state(
     device: torch.device,
 ) -> torch.Tensor:
     """Compose one State's per-token affine summary and apply it in parallel."""
+    transition = next(
+        item for item in algorithm.transitions if item.state == state.name
+    )
+    if transition.steps is not None:
+        from .ordered import scan_ordered_state
+
+        return scan_ordered_state(
+            algorithm,
+            state,
+            values=values,
+            initial=initial,
+            segment=segment,
+            role_sizes=role_sizes,
+            heads=heads,
+            token_count=token_count,
+            device=device,
+        )
     view = _matrix_view(state)
     initial_matrix = initial.unsqueeze(-1) if state.rank == 1 else initial
     transition = next(
@@ -340,14 +375,16 @@ def _scan_state(
 
 def _role_vector(value: torch.Tensor, token_count: int, heads: int) -> torch.Tensor:
     """Reduce a value carrying exactly one Feature role to ``[tokens, heads, size]``."""
-    squeezed = _squeeze_singleton_features(value.float())
-    if squeezed.ndim != 3:
+    if value.ndim < 3 or sum(size != 1 for size in value.shape[2:]) > 1:
         raise StatefulCompilationError(
             "IR_TYPE",
             "expression",
             {"reason": "operand must carry exactly one Feature role"},
         )
-    return squeezed.reshape(token_count, heads, squeezed.shape[-1])
+    # A logical Feature of extent one is still a vector. Squeezing all
+    # singleton axes would erase it; an explicit extent also admits no tokens.
+    size = math.prod(value.shape[2:])
+    return value.float().reshape(token_count, heads, size)
 
 
 def _injection_terms(
@@ -375,7 +412,11 @@ def _injection_terms(
             value = evaluate(factor.expression, values).float()
             roles = tuple(factor.roles)
             if not roles:
-                shaped = value.reshape(token_count, heads, 1, 1)
+                shaped = (
+                    value.reshape(1, 1, 1, 1)
+                    if value.ndim == 0
+                    else value.reshape(token_count, heads, 1, 1)
+                )
             elif len(roles) == 1:
                 squeezed = _squeeze_singleton_features(value)
                 if squeezed.ndim == 0:
@@ -562,6 +603,8 @@ def _prior_state(
 def _final_state(
     states: torch.Tensor, segment: torch.Tensor, initial: torch.Tensor
 ) -> torch.Tensor:
+    if states.shape[0] == 0:
+        return initial.clone()
     sequence_count = initial.shape[0]
     lengths = torch.bincount(segment.long(), minlength=sequence_count)
     last = (torch.cumsum(lengths, dim=0) - 1).clamp_min(0)

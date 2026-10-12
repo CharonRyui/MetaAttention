@@ -1,10 +1,10 @@
-# Domain Glossary
+# Stateful Compiler Context
 
-## Stateful operator
-A computation that transforms an explicit mutable mathematical state for each sequence and may expose that state for continuation. The term describes behavior, not a model family.
+Domain terms are defined in [GLOSSARY.md](GLOSSARY.md). This document records
+compiler behavior and implementation constraints. The current capability
+assessment and proposed extensions are in
+[the FLA coverage assessment](docs/fla-ir-coverage-assessment.md).
 
-## Algorithm IR
-The typed mathematical description of a stateful operator: inputs, state transition, and readouts. It describes roles and semantics without naming a model, hardware target, layout, or schedule.
 ## Algorithm IR compatibility
 Compatibility means accepting previously unseen compositions expressible in the existing Algorithm IR and satisfying its validation and Scanable rules. It does not mean recognizing arbitrary frontend or backend IR directly.
 ## Canonical IR
@@ -27,32 +27,41 @@ A compiler-chosen representative set of sequence workloads used when the caller 
 Batch size, dense Sequence length, packed logical-sequence count, packed token count, and packed offsets are runtime dimensions. They do not select a new Mathematical Plan or compiled kernel. Head and Feature dimensions remain compile-time specialization dimensions.
 
 
+## Current Algorithm IR capability
+Schema v4 supports several named States, each with one or two ordered Feature
+roles and one Transition. States may be independent or coupled by typed affine
+State Injections on one shared Feature axis. A Product Feature occupies one axis;
+it does not increase State rank. The reference executor requires all States to
+share one Head role.
 
+The legacy Transition spelling applies ordered Propagations, then adds all
+Injections. `steps` instead preserves interleaved propagation and writes.
+`StateInjection(StateReference(...))` adds an input-driven linear action on
+Prior State or another State's completed Current State. Current references
+induce an acyclic Transition dependency checked before lowering. Coefficients
+and Product Injection expressions remain Input-driven; State Terms are
+reserved for Readouts. Product Injections may contain several factors, subject
+to typing and lowering constraints. Readouts may combine multiple States,
+nonlinear arithmetic and nested contractions; `prior=True` selects Prior State.
 
+`Shift` zero-fills sequence starts within an invocation. It does not retain
+input history across invocations; passing final State alone does not supply
+that history.
 
-## State
-The per-sequence value carried from one token transition to the next. In the first language schema it is one named matrix with two distinct ordered Feature roles.
+## Scanability and language acceptance
+A compact associative summary is a mathematical property, separate from schema
+acceptance, available lowering, and concrete resource feasibility. Current
+Transitions admit input-driven affine maps. Coupled States with matching roles
+and actions on one shared Feature axis lower to a joint block-affine summary,
+scanned in parallel. Mixed-axis coupling and heterogeneous State roles are
+rejected by this first coupled implementation. Nonlinear Readouts do not change
+the scanability of State evolution.
 
-## Feature role
-A named logical axis participating in state algebra. Role order is meaningful: it determines the direction of an axis action and is not inferred from physical tensor layout.
-
-## Propagation
-The ordered transformation applied to prior State before additive input-derived terms are added. Propagations execute in authored left-to-right order.
-
-## Injection
-An input-derived additive contribution to the next State. Its factors are typed by the Feature roles they carry; missing roles may broadcast, while shared roles must be combined explicitly.
-
-## Readout
-A named output derived from the post-transition State and current token inputs by one explicit State Contraction. Independent readouts may observe the same State.
-
-## Head Mapping
-The declared relationship between input Head roles and the State Head role. It defines both forward sharing and the inverse gradient reduction.
-
-## Scanable Program
-A mathematically valid Algorithm IR program whose per-token transition has an associative compact summary whose storage is independent of sequence length. Scanability is a semantic classification, separate from hardware feasibility.
-
-## Recurrent Program
-A mathematically valid program for which this compiler has no proven compact associative summary. It is rejected by the compiler rather than executed through a sequential fallback.
+A nonlinear transformation between an upstream auxiliary scan and a downstream
+memory scan may permit a Scan Stage DAG without a joint Affine Summary. That
+execution capability is proposed, not implemented. Programs without a proven
+compact summary are rejected by the current compiler; there is no sequential
+recurrence fallback.
 
 ## ExecutionResult
 The immutable public result of every Stateful Operator invocation. It contains named outputs and, only when requested, named final State; the result shape never changes with the number of outputs or states.
