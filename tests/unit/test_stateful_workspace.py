@@ -53,15 +53,20 @@ def _workspace(compiled):
     return plan.plan.candidate.lowerer, plan.plan.workspace
 
 
-def test_factored_inference_accepts_chunks_but_rejects_excessive_scratch():
-    """Chunk summaries avoid token-State storage but remain envelope-bounded."""
+def test_factored_inference_bounds_scratch_but_still_charges_full_output():
+    """Window scratch is bounded; retained output still scales with length."""
     lowerer, workspace = _workspace(
         _compile(gated_delta_rule, seqlen=2048, backward=False)
     )
     assert lowerer == "tilelang-factored-recurrence"
     assert 0 < workspace.required_bytes(2048) < ENVELOPE
+    assert workspace.inference_window_tokens > 0
+    short = workspace.required_bytes(2048)
+    long = workspace.required_bytes(32768)
+    assert long - short == (32768 - 2048) * workspace.output_bytes_per_token
+    assert long < ENVELOPE
     with pytest.raises(RuntimeError, match="resource envelope"):
-        workspace.required_bytes(32768)
+        workspace.required_bytes(1 << 22)
 
 
 def test_factored_short_replay_charges_every_checkpoint_before_rejecting():
@@ -72,7 +77,9 @@ def test_factored_short_replay_charges_every_checkpoint_before_rejecting():
 
     _, workspace = _workspace(_compile(rwkv7_state, seqlen=65, backward=False, size=64))
     length = 65
-    token_bytes = length * workspace.bytes_per_token
+    token_bytes = length * (
+        workspace.bytes_per_token + workspace.output_bytes_per_token
+    )
     # Five chunk entries plus the final-State allowance, not two 64-token chunks.
     required = token_bytes + 6 * workspace.bytes_per_chunk
     bounded = replace(workspace, maximum_bytes=required)
@@ -83,6 +90,33 @@ def test_factored_short_replay_charges_every_checkpoint_before_rejecting():
         )
 
 
+def test_factored_window_workspace_counts_batch_tail_and_retained_output():
+    from dataclasses import replace
+
+    from attn_engine.stateful.compile.plan import WorkspacePolicy
+
+    policy = WorkspacePolicy(
+        bytes_per_token=2,
+        maximum_bytes=1000,
+        bytes_per_chunk=10,
+        chunk_tokens=16,
+        inference_window_tokens=64,
+        output_bytes_per_token=4,
+    )
+    # Two full windows are live; output covers both entire 129-token sequences.
+    required = 2 * 64 * 2 + 2 * (4 + 1) * 10 + 2 * 129 * 4
+    boundary = replace(policy, maximum_bytes=required)
+    assert (
+        boundary.required_bytes(258, sequence_count=2, sequence_length=129) == required
+    )
+    with pytest.raises(RuntimeError, match="resource envelope"):
+        replace(boundary, maximum_bytes=required - 1).required_bytes(
+            258, sequence_count=2, sequence_length=129
+        )
+    assert policy.required_bytes(0, sequence_count=2, sequence_length=0) == 0
+    assert policy.required_bytes(17, sequence_length=17) == 17 * 6 + 3 * 10
+
+
 def test_factored_recurrence_charges_recorded_states_with_a_backward():
     """A compiled backward records the per-token State it replays from."""
     lowerer, workspace = _workspace(
@@ -91,6 +125,8 @@ def test_factored_recurrence_charges_recorded_states_with_a_backward():
     assert lowerer == "tilelang-factored-recurrence"
     # one State per token per head, recorded in bf16
     assert workspace.bytes_per_token == HEADS * ROWS * COLUMNS * 2
+    assert workspace.inference_window_tokens == 0
+    assert workspace.output_bytes_per_token == 0
     assert workspace.required_bytes(2048) < ENVELOPE
     with pytest.raises(RuntimeError):
         workspace.required_bytes(32768)

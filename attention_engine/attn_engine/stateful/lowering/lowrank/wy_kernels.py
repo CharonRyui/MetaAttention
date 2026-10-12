@@ -33,7 +33,7 @@ def scratch_bytes_per_chunk(
     be = max(32, 1 << (16 * events - 1).bit_length())
     br = max(32, 1 << (rows - 1).bit_length())
     return 4 * (
-        2 * be * br + 2 * be * columns + br * columns + readout_count * 16 * be + 16
+        2 * be * br + be * columns + br * columns + readout_count * 16 * be + 16
     )
 
 
@@ -382,7 +382,6 @@ def _compile_carry(
             P: T.Tensor((batch, heads, chunks, chunk), "float32"),
             Initial: T.StridedTensor(*initial_meta),
             Entry: T.Tensor((batch, heads, chunks, br, columns), "float32"),
-            Response: T.Tensor((batch, heads, chunks, be, columns), "float32"),
             Final: T.StridedTensor(*final_meta),
         ):
             with T.Kernel(
@@ -418,9 +417,7 @@ def _compile_carry(
                         )
                         responses[e, c] = response[e, c] + value
                         if cb * _BLOCK + c < columns:
-                            Response[sequence, head, ci, e, cb * _BLOCK + c] = (
-                                responses[e, c]
-                            )
+                            F[sequence, head, ci, e, cb * _BLOCK + c] = responses[e, c]
                     T.clear(next_state)
                     gemm(u, responses, next_state)
                     for r, c in T.Parallel(br, _BLOCK):
@@ -580,6 +577,7 @@ def execute(
     if length <= _SHORT:
         _compile_direct(metas, **parameters)(*tensors)
     else:
+        del tensors
         events = len(left) + len(injection_left)
         chunks = (length + 15) // 16
         be = max(32, 1 << (16 * events - 1).bit_length())
@@ -590,7 +588,9 @@ def execute(
             return torch.empty((*shape, *tail), device=device, dtype=torch.float32)
 
         d, u = empty(be, br), empty(br, be)
-        f, response = empty(be, columns), empty(be, columns)
+        # Carry reads each chunk's additive term before overwriting it with the
+        # response consumed by readout; their global storage can be shared.
+        f = empty(be, columns)
         entry, prefix = empty(br, columns), empty(16)
         weights = torch.empty(
             (len(query), *shape, 16, be), device=device, dtype=torch.float32
@@ -598,6 +598,7 @@ def execute(
         _compile_solve(metas, **parameters)(
             L, R, C, IL, IR, Q, d, f, u, weights, prefix
         )
+        del L, R, C, IL, IR
         carry = dict(
             batch=batch,
             heads=heads,
@@ -608,10 +609,11 @@ def execute(
             device_index=device.index,
         )
         _compile_carry(metas[6], metas[8], **carry)(
-            d, f, u, prefix, initial_state, entry, response, final
+            d, f, u, prefix, initial_state, entry, final
         )
+        del d, u
         _compile_readout(metas[5], metas[7], readouts=len(query), **carry)(
-            Q, weights, prefix, entry, response, output
+            Q, weights, prefix, entry, f, output
         )
     return tuple(
         output[i].reshape(batch, length, heads, columns).permute(0, 2, 1, 3).to(dtype)

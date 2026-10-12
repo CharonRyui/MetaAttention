@@ -309,3 +309,132 @@ def test_prior_trajectory_binding_keeps_single_feature_extent():
         torch.autograd.grad(result.outputs[0].sum(), x)[0],
         torch.autograd.grad(torch.stack(expected, 2).sum(), x)[0],
     )
+
+
+def test_dense_inference_windows_preserve_prior_exports_roles_and_continuation():
+    torch.manual_seed(42)
+    a = _stage("a", "x", "first", prior=True)
+    b = _stage("b", "derived", "second", (StageBinding("derived", "a", "trajectory"),))
+    permuted = AlgorithmIR(
+        (TensorInput("x", (Batch, Sequence, H, F), torch.float32),),
+        a.algorithm.states,
+        a.algorithm.transitions,
+        a.algorithm.readouts,
+        HeadMapping(),
+    )
+    operator = StagedStatefulOperator(
+        ScanStageIR(
+            (b, ScanStage("a", permuted)),
+            (
+                StageOutput("out", "b", "trajectory"),
+                StageOutput("aux", "a", "trajectory"),
+            ),
+        )
+    )
+    x = torch.randn(2, 1031, 2, 3)
+    initial = StateTuple(
+        ("second", "first"), (torch.randn(2, 2, 3), torch.randn(2, 2, 3))
+    )
+    saved = tuple(t.clone() for t in initial)
+    compiled = _compile(operator, backward=False, workspace=150000)
+    assert (
+        compiled.workspace_bytes(2062, sequence_count=2, sequence_length=1031) <= 150000
+    )
+    result = compiled(x=x, initial_state=initial, return_final_state=True)
+    b, a = initial
+    expected, auxiliary = [], []
+    for token in range(1031):
+        b = 0.7 * b + a
+        auxiliary.append(a)
+        a = 0.7 * a + x[:, token]
+        expected.append(b)
+    torch.testing.assert_close(
+        result.outputs["out"], torch.stack(expected, 2), atol=2e-6, rtol=1e-5
+    )
+    torch.testing.assert_close(
+        result.outputs["aux"], torch.stack(auxiliary, 2), atol=2e-6, rtol=1e-5
+    )
+    for actual, wanted in zip(result.final_state, (b, a), strict=True):
+        torch.testing.assert_close(actual, wanted)
+    first = compiled(
+        x=x[:, :513].contiguous(), initial_state=initial, return_final_state=True
+    )
+    last = compiled(
+        x=x[:, 513:].contiguous(),
+        initial_state=first.final_state,
+        return_final_state=True,
+    )
+    for name in ("out", "aux"):
+        torch.testing.assert_close(
+            torch.cat((first.outputs[name], last.outputs[name]), 2),
+            result.outputs[name],
+            atol=2e-6,
+            rtol=1e-5,
+        )
+    for actual, wanted in zip(last.final_state, result.final_state, strict=True):
+        torch.testing.assert_close(actual, wanted)
+    for actual, wanted in zip(initial, saved, strict=True):
+        torch.testing.assert_close(actual, wanted, atol=0, rtol=0)
+    # The full exported output alone exceeds this envelope; windowing cannot help.
+    with pytest.raises(StatefulCompilationError, match="RUNTIME_RESOURCE"):
+        _compile(operator, backward=False, workspace=90000)(x=x)
+
+
+@pytest.mark.parametrize(
+    "family", ["preconditioned-kda", "preconditioned-gdn", "lightnet"]
+)
+def test_long_staged_dense_inference_workspace(family):
+    from dataclasses import replace
+    from testing import benchmark_stateful_plans as benchmark
+
+    case = replace(
+        next(c for c in benchmark.CASES if c.name == family), batch=2, heads=16
+    )
+    operator = case.factory(**case.kwargs(8192))
+    compiled = operator.compile(
+        role_sizes=benchmark.role_sizes_for(operator, case, 8192),
+        target=Target(),
+        mode="dense",
+    )
+    assert (
+        compiled.workspace_bytes(16384, sequence_count=2, sequence_length=8192)
+        <= 1 << 30
+    )
+
+
+def test_staged_shift_keeps_sequence_history_at_window_boundary():
+    from attn_engine import Shift
+
+    stage = _stage("a", "x", "first")
+    algorithm = stage.algorithm
+    transition = StateTransition(
+        "first",
+        propagations=(AxisScale(0.7),),
+        injections=(ProductInjection((ProductFactor(Shift(Input("x"), 1), (F,)),)),),
+    )
+    stage = ScanStage(
+        "a",
+        AlgorithmIR(
+            algorithm.inputs,
+            algorithm.states,
+            transition,
+            algorithm.readouts,
+            algorithm.head_mapping,
+        ),
+    )
+    operator = StagedStatefulOperator(
+        ScanStageIR(
+            (stage,),
+            (StageOutput("out", "a", "trajectory"),),
+        )
+    )
+    compiled = _compile(operator, backward=False)
+    x = torch.ones(2, 2, 1025, 3)
+    x[:, :, 1023] = 8
+    result = compiled(x=x)
+    state = torch.zeros(2, 2, 3)
+    wanted = []
+    for token in range(1025):
+        state = 0.7 * state + (x[:, :, token - 1] if token else 0)
+        wanted.append(state)
+    torch.testing.assert_close(result.outputs["out"], torch.stack(wanted, 2))

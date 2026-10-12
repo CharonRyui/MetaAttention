@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import dataclass, fields, is_dataclass, replace
 import hashlib
 import json
 import math
@@ -1204,6 +1204,15 @@ class StatefulOperator:
                 if return_final_state
                 else None
             )
+        elif (
+            plan.plan.workspace.inference_window_tokens
+            and runtime.device.type == "cuda"
+            and not runtime.packed
+            and runtime.uniform_length > plan.plan.workspace.inference_window_tokens
+        ):
+            outputs, final_state = self._execute_factored_windows(
+                inputs, state, runtime, role_sizes, return_final_state, plan
+            )
         else:
             values = self._normalize_inputs(inputs, runtime, role_sizes)
             outputs, final_state = self._lower_parallel_scan(
@@ -1215,6 +1224,56 @@ class StatefulOperator:
             ),
             final_state,
         )
+
+    def _execute_factored_windows(
+        self, inputs, state, runtime, role_sizes, return_final_state, plan
+    ):
+        """Bound inference scratch by preparing and replaying one window at a time."""
+        length = runtime.uniform_length
+        window = plan.plan.workspace.inference_window_tokens
+        outputs = None
+        for begin in range(0, length, window):
+            count = min(window, length - begin)
+            part = {
+                spec.name: (
+                    inputs[spec.name].narrow(spec.roles.index(Sequence), begin, count)
+                    if Sequence in spec.roles
+                    else inputs[spec.name]
+                )
+                for spec in self._program.inputs
+            }
+            segment = replace(
+                runtime,
+                uniform_length=count,
+                token_count=runtime.sequence_count * count,
+            )
+            values = self._normalize_inputs(part, segment, role_sizes)
+            segment_outputs, final = self._lower_factored_recurrence(
+                values, state, segment, True, plan
+            )
+            if outputs is None:
+                outputs = tuple(
+                    torch.empty(
+                        runtime.sequence_count,
+                        runtime.state_heads,
+                        length,
+                        value.shape[-1],
+                        dtype=value.dtype,
+                        device=runtime.device,
+                    )
+                    for value in segment_outputs
+                )
+            for output, value in zip(outputs, segment_outputs, strict=True):
+                output[:, :, begin : begin + count].copy_(value)
+            state = final[self._program.states[0].name]
+            # Release this window's preparation and outputs before preparing the next.
+            del values, segment_outputs, final, value
+        final_state = (
+            StateTuple((self._program.states[0].name,), (state,))
+            if return_final_state
+            else None
+        )
+        return outputs, final_state
 
     def _validate_compilation(
         self,

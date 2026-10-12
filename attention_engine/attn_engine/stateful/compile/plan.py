@@ -174,6 +174,10 @@ class KernelConfig:
 _FLOPS_PER_BYTE = 1 / 16
 _BYTES_PER_LAUNCH = 4_096
 
+# Dense inference carries State between windows; factor preparation and replay
+# scratch need only cover this many tokens per sequence.
+FACTORED_INFERENCE_WINDOW = 1024
+
 # The representations whose runtime composes a per-token summary, runs one prefix
 # pass over it, and contracts the readout in a separate pass.
 _SUMMARY_REPRESENTATIONS = frozenset(
@@ -754,6 +758,8 @@ class WorkspacePolicy:
 
     Dense chunk scratch is charged per sequence and ceiling-divided chunk,
     including a final-State allowance; it does not require token alignment.
+    ``inference_window_tokens`` bounds scratch for dense factored inference,
+    while ``output_bytes_per_token`` still charges the complete retained output.
     """
 
     bytes_per_token: int
@@ -762,6 +768,8 @@ class WorkspacePolicy:
     alignment_tokens: int = 0
     bytes_per_chunk: int = 0
     chunk_tokens: int = 64
+    inference_window_tokens: int = 0
+    output_bytes_per_token: int = 0
 
     def required_bytes(
         self,
@@ -777,7 +785,12 @@ class WorkspacePolicy:
             and token_count % self.alignment_tokens == 0
         ):
             per_token = self.aligned_bytes_per_token
-        required = token_count * per_token
+        length = sequence_length if sequence_length is not None else token_count
+        live_tokens = token_count
+        if self.inference_window_tokens:
+            length = min(length, self.inference_window_tokens)
+            live_tokens = min(token_count, sequence_count * length)
+        required = live_tokens * per_token + token_count * self.output_bytes_per_token
         if (
             self.bytes_per_chunk
             and token_count
@@ -786,7 +799,6 @@ class WorkspacePolicy:
                 or per_token == self.aligned_bytes_per_token
             )
         ):
-            length = sequence_length if sequence_length is not None else token_count
             chunks = (length + self.chunk_tokens - 1) // self.chunk_tokens
             required += sequence_count * (chunks + 1) * self.bytes_per_chunk
         if required > self.maximum_bytes:
@@ -1558,6 +1570,20 @@ def compile_plan(
         chunk_tokens=16
         if selected_plan.representation == PlanRepresentation.FACTORED_RECURRENCE
         else 64,
+        inference_window_tokens=FACTORED_INFERENCE_WINDOW
+        if (
+            selected_plan.representation == PlanRepresentation.FACTORED_RECURRENCE
+            and mode == "dense"
+            and backward_ir is None
+        )
+        else 0,
+        output_bytes_per_token=4 * heads * readout_count * output_width
+        if (
+            selected_plan.representation == PlanRepresentation.FACTORED_RECURRENCE
+            and mode == "dense"
+            and backward_ir is None
+        )
+        else 0,
     )
     backward_candidate = None
     backward_kernel_config = None

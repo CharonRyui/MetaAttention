@@ -1148,16 +1148,21 @@ def execute_chunked_states(
             return operand.softmax(-1)
         raise AssertionError("eligibility admitted an unsupported readout")
 
-    outputs = {
-        readout.name: (
-            fused_outputs[readout.name]
-            if readout.name in fused_outputs
-            else evaluate(expression).to(readout.output_dtype)
-        )
-        for readout, expression in recipe.readouts
-    }
-    if return_final_state:
-        for state in algorithm.states:
-            prepare(state.name)
-        return outputs, final_states
-    return outputs, None
+    try:
+        outputs = {
+            readout.name: (
+                fused_outputs[readout.name]
+                if readout.name in fused_outputs
+                else evaluate(expression).to(readout.output_dtype)
+            )
+            for readout, expression in recipe.readouts
+        }
+        if return_final_state:
+            for state in algorithm.states:
+                prepare(state.name)
+            return outputs, final_states
+        return outputs, None
+    finally:
+        # These mutually recursive closures capture the per-call tensor caches.
+        # Break their cycle so scratch is released without waiting for cyclic GC.
+        evaluate = evaluate_uncached = None
