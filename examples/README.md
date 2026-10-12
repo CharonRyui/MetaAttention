@@ -142,7 +142,7 @@ recent FLA checkout and an otherwise idle NVIDIA GPU:
 uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
   --families delta-rule,kda,gdn2,comba,iplr,dplr,oja,delta-product,abc \
   --batches 1 --heads 8 --seqlens 512 2048 \
-  --contract output-only --timing both --warmup 5 --repetitions 20 \
+  --contract output-only --fla-baseline both --timing both --warmup 5 --repetitions 20 \
   --workspace-gib 8 --fla-source ../flash-linear-attention \
   --output-dir benchmark_results/new_examples_h20_8gib
 ```
@@ -150,21 +150,28 @@ uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
 Use `--contract all` to additionally check final states and two-call continuation.
 ABC is comparable only for output-only from zero: FLA's two normalized caches
 are different from Meta's three raw accumulators. The other eight families
-compare all three contracts. FLA uses its public fused recurrent API, except
-Delta Product and ABC, which use their public chunk APIs. This is a forward
-benchmark; it does not measure training backward or the fastest FLA chunk kernel
-for each recurrent family.
+compare all three contracts. The runner compares both FLA schedules by default:
+`--fla-baseline recurrent` selects fused recurrent APIs, `prefill` selects public
+chunk/parallel APIs, and `both` emits a separate record for each. Missing APIs
+are recorded as unavailable, without substituting another schedule. ABC and
+Delta Product have only a public prefill API in FLA 0.5.2. This forward benchmark
+does not measure training backward or search for the fastest FLA tuning variant.
 
 The default workloads use BF16 query/key/value, FP32 gates/state, `K=V=64`,
 16 ABC slots, and two Delta Product writes. Inputs normalize correction vectors,
 use small independent low-rank vectors for IPLR/DPLR, and use exactly
 BF16-representable ABC logits so both sides receive the same values. Gate/logit
 preparation happens before timing; layout conversion, ABC's FLA logit cast,
-ComBa's prediction-key adjustment and Delta Product interleaving remain inside
-the public-call interval. This FLA checkout's ComBa fused kernel predicts from
-the prior state; multiplying its prediction key by `exp(gate)` matches the
-example's prediction from the decayed state. The adjustment uses FP32 to avoid
-introducing another BF16 rounding step.
+baseline-specific ComBa prediction-key adjustment and Delta Product interleaving
+remain inside the public-call interval. The fused ComBa adapter multiplies its
+prediction key by `exp(gate)` in FP32 to match the example's decayed-state
+prediction; each schedule must independently pass the oracle before timing is
+reported. For linear, Simple GLA, GLA and RWKV7 prefill, the adapter promotes
+q/k/v to FP32 so chunk GEMMs accept matching dtypes while preserving authored
+FP32 transforms. GLA prefill inputs shorter than 64 tokens are padded with
+neutral trailing tokens to avoid FLA 0.5.2 short FP32 chunk failures; the output
+is trimmed and the final State is preserved. These conversions and padding are
+timed and recorded as preprocessing.
 
 The 8 GiB workspace budget permits the full measured workload on H20. With the
 default 1 GiB budget, some `T=2048` workloads are rejected before execution;
@@ -177,5 +184,10 @@ peak allocator usage, and source/environment provenance. `reference-stateful`
 is a possible selected path; its measurements include that implementation.
 Graph-capture failures and missing FLA APIs are recorded explicitly. The runner
 writes `records.json`, `manifest.json`, `summary.csv`, and comparison plots.
+Records and CSV include `fla_baseline` and the actual `fla_function`; heatmaps
+are separate for recurrent and prefill comparisons.
+The [ABC fast-path assessment](../docs/abc-fast-path-assessment.md) describes
+how the existing readout lowering can support its auxiliary vector State and
+pointwise normalization stages.
 See [the measured H20 results](../docs/stateful-example-benchmarks.md) for the
 workload, selected lowerers and performance limits.

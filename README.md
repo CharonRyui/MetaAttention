@@ -97,7 +97,7 @@ Run the conservative first-phase matrix on an otherwise idle NVIDIA GPU:
 ```bash
 uv run --group fla-benchmark python testing/benchmark_fla_stateful.py \
   --families linear,simple-gla,gla,normalized-linear,retention,rwkv6,gsa,hgrn \
-  --contract all --timing both --workspace-gib 8 \
+  --contract all --fla-baseline both --timing both --workspace-gib 8 \
   --output-dir benchmark_results/stateful_fla
 ```
 
@@ -105,6 +105,10 @@ The runner selects a physical GPU before importing CUDA and uses the installed
 FLA 0.5.2 release by default. To compare a local checkout explicitly, pass
 `--fla-source ../flash-linear-attention`. The manifest records the actual FLA
 import path, package versions and checkout revision when supplied.
+`--fla-baseline both` (the default) compares recurrent and chunk/parallel prefill
+APIs in separate records; select `recurrent` or `prefill` to run one schedule.
+Missing public APIs are recorded as unavailable, without schedule fallback.
+JSON/CSV record `fla_baseline` and `fla_function`, and heatmaps separate schedules.
 `--workspace-gib` sets the Meta compilation budget (default: 1 GiB); 8 GiB
 allows the larger matrix points on an otherwise idle H20 with sufficient free
 memory. This is a budget, not a reservation. The runner includes public-call

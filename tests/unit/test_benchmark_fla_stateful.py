@@ -370,3 +370,161 @@ def test_long_scalar_families_use_safe_schedule(gpu_device, family):
     assert torch.allclose(
         actual["output"].cpu().float(), expected["output"], rtol=0.02, atol=0.05
     )
+
+
+@pytest.mark.parametrize("baseline", ["recurrent", "prefill"])
+@pytest.mark.parametrize("family", P0_FAMILIES)
+def test_explicit_baseline_selects_public_api_without_fallback(
+    monkeypatch, family, baseline
+):
+    import sys
+    from types import SimpleNamespace
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    registry = (
+        runner.DELTA_BASELINE_APIS
+        if family in runner.DELTA_BASELINE_APIS
+        else runner.BASELINE_APIS
+    )
+    module, recurrent, prefill = registry[family]
+    function_name = recurrent if baseline == "recurrent" else prefill
+
+    def function(*args, **kwargs):
+        raise AssertionError("adapter construction must not execute FLA")
+
+    monkeypatch.setitem(
+        sys.modules,
+        f"fla.ops.{module}",
+        SimpleNamespace(**{name: function for name in (recurrent, prefill) if name}),
+    )
+    case = next(item for item in benchmark.CASES if item.name == family)
+    if function_name is None:
+        with pytest.raises(runner.BaselineUnavailableError, match=f"{baseline} API"):
+            runner._fla_call(case, {}, baseline)
+    else:
+        adapter = runner._fla_call(case, {}, baseline)
+        assert adapter.function_name == f"fla.ops.{module}.{function_name}"
+
+
+def test_missing_prefill_function_does_not_use_recurrent(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    monkeypatch.setitem(
+        sys.modules, "fla.ops.kda", SimpleNamespace(fused_recurrent_kda=lambda: None)
+    )
+    case = next(item for item in benchmark.CASES if item.name == "kda")
+    with pytest.raises(runner.BaselineUnavailableError, match="chunk_kda"):
+        runner._fla_call(case, {}, "prefill")
+
+
+@pytest.mark.parametrize("baseline", ["recurrent", "prefill"])
+def test_comba_prediction_conversion_depends_on_baseline(monkeypatch, baseline):
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    monkeypatch.setitem(
+        sys.modules,
+        "fla.ops.comba",
+        SimpleNamespace(fused_recurrent_comba=lambda: None, chunk_comba=lambda: None),
+    )
+    case = next(item for item in benchmark.CASES if item.name == "comba")
+    operator = case.factory(**case.kwargs(3))
+    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cpu"))
+    values = runner._fla_call(case, inputs, baseline).prepare(inputs)
+    prediction = inputs["prediction_key"].transpose(1, 2)
+    expected = (
+        prediction.float() * inputs["gate"].transpose(1, 2).exp().unsqueeze(-1)
+        if baseline == "recurrent"
+        else prediction
+    )
+    torch.testing.assert_close(values["prediction_key"], expected)
+
+
+@pytest.mark.parametrize("family", ["linear", "simple-gla", "gla", "rwkv7"])
+def test_prefill_preserves_fp32_authored_transforms(monkeypatch, family):
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    module, recurrent, prefill = runner.BASELINE_APIS[family]
+    monkeypatch.setitem(
+        sys.modules,
+        f"fla.ops.{module}",
+        SimpleNamespace(**{recurrent: lambda: None, prefill: lambda: None}),
+    )
+    case = next(item for item in benchmark.CASES if item.name == family)
+    operator = case.factory(**case.kwargs(3))
+    inputs = benchmark.inputs_for(operator, case, 3, torch.device("cpu"))
+    values = runner._fla_call(case, inputs, "prefill").prepare(inputs)
+    assert all(values[key].dtype == torch.float32 for key in ("query", "key", "value"))
+    torch.testing.assert_close(values["query"], inputs["query"].transpose(1, 2).float())
+    if family == "rwkv7":
+        beta = inputs["beta"].transpose(1, 2).unsqueeze(-1)
+        torch.testing.assert_close(
+            values["value"], inputs["value"].transpose(1, 2).float() * beta
+        )
+        torch.testing.assert_close(
+            values["a"],
+            -inputs["removal"].transpose(1, 2).float()
+            * inputs["decay"].transpose(1, 2).exp(),
+        )
+    else:
+        torch.testing.assert_close(
+            values["key"], inputs["key"].transpose(1, 2).float() + 0.1
+        )
+
+
+def test_gla_prefill_short_call_pads_neutral_tokens_and_trims(monkeypatch):
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    initial = torch.randn(1, 8, 64, 64)
+    final = torch.randn_like(initial)
+
+    def chunk(query, key, value, gate, **kwargs):
+        assert query.shape[1] == 64
+        for tensor in (query, key, value, gate):
+            assert torch.count_nonzero(tensor[:, 32:]) == 0
+        assert kwargs["initial_state"] is initial
+        assert kwargs["output_final_state"] is True
+        return value, final
+
+    monkeypatch.setitem(sys.modules, "fla.ops.gla", SimpleNamespace(chunk_gla=chunk))
+    case = next(item for item in benchmark.CASES if item.name == "gla")
+    operator = case.factory(**case.kwargs(32))
+    inputs = benchmark.inputs_for(operator, case, 32, torch.device("cpu"))
+    adapter = runner._fla_call(case, inputs, "prefill")
+    output, state = adapter.invoke(adapter.prepare(inputs), initial, True)
+    torch.testing.assert_close(output, inputs["value"].float())
+    assert state is final
+
+
+def test_csv_preserves_baseline_identity_for_unavailable_comparison():
+    from testing.benchmark_fla_stateful import _csv_rows
+
+    row = _csv_rows(
+        [
+            {
+                "family": "abc",
+                "fla_baseline": "recurrent",
+                "fla_function": None,
+                "status": "NOT_COMPARABLE",
+                "fla_status": "UNAVAILABLE",
+            }
+        ]
+    )[0]
+    assert row["fla_baseline"] == "recurrent"
+    assert row["fla_function"] is None
+    assert row["speedup"] is None

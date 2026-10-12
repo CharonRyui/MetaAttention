@@ -52,7 +52,84 @@ P0_BATCHES = (1, 2)
 P0_HEADS = (1, 8, 16)
 P0_SEQLENS = (63, 64, 65, 130, 2048, 8192)
 P0_CONTRACTS = ("output-only", "final-state", "continuation")
-RESULT_SCHEMA_VERSION = 5
+FLA_BASELINES = ("recurrent", "prefill")
+RESULT_SCHEMA_VERSION = 6
+
+# Missing public APIs remain unavailable; never substitute another schedule.
+DELTA_BASELINE_APIS = {
+    "delta-rule": ("delta_rule", "fused_recurrent_delta_rule", "chunk_delta_rule"),
+    "kda": ("kda", "fused_recurrent_kda", "chunk_kda"),
+    "gdn2": ("gdn2", "fused_recurrent_gdn2", "chunk_gdn2"),
+    "comba": ("comba", "fused_recurrent_comba", "chunk_comba"),
+    "iplr": (
+        "generalized_delta_rule.iplr",
+        "fused_recurrent_iplr_delta_rule",
+        "chunk_iplr_delta_rule",
+    ),
+    "dplr": (
+        "generalized_delta_rule.dplr",
+        "fused_recurrent_dplr_delta_rule",
+        "chunk_dplr_delta_rule",
+    ),
+    "oja": ("gated_oja_rule", "fused_recurrent_gated_oja_rule", "chunk_gated_oja_rule"),
+    "delta-product": ("gated_delta_product", None, "chunk_gated_delta_product"),
+    "abc": ("abc", None, "chunk_abc"),
+}
+BASELINE_APIS = {
+    "linear": ("linear_attn", "fused_recurrent_linear_attn", "chunk_linear_attn"),
+    "normalized-linear": (
+        "linear_attn",
+        "fused_recurrent_linear_attn",
+        "chunk_linear_attn",
+    ),
+    "retention": ("simple_gla", "fused_recurrent_simple_gla", "chunk_simple_gla"),
+    "simple-gla": ("simple_gla", "fused_recurrent_simple_gla", "chunk_simple_gla"),
+    "retnet": ("simple_gla", "fused_recurrent_simple_gla", "chunk_simple_gla"),
+    "gla": ("gla", "fused_recurrent_gla", "chunk_gla"),
+    "rwkv6": ("rwkv6", "fused_recurrent_rwkv6", "chunk_rwkv6"),
+    "gsa": ("gsa", "fused_recurrent_gsa", "chunk_gsa"),
+    "gdn": (
+        "gated_delta_rule",
+        "fused_recurrent_gated_delta_rule",
+        "chunk_gated_delta_rule",
+    ),
+    "rwkv7": (
+        "generalized_delta_rule.dplr",
+        "fused_recurrent_dplr_delta_rule",
+        "chunk_dplr_delta_rule",
+    ),
+    "hgrn": ("hgrn", "fused_recurrent_hgrn", "chunk_hgrn"),
+    "based": ("based", None, "fused_chunk_based"),
+    "rebased": ("rebased", None, "parallel_rebased"),
+}
+
+
+class BaselineUnavailableError(RuntimeError):
+    pass
+
+
+def _baseline_function(family, baseline, registry):
+    import importlib
+
+    module_name, recurrent, prefill = registry[family]
+    if baseline not in (*FLA_BASELINES, None):
+        raise ValueError(f"unknown FLA baseline: {baseline}")
+    if baseline is None:
+        function_name = recurrent or prefill
+    else:
+        function_name = recurrent if baseline == "recurrent" else prefill
+    if function_name is None:
+        raise BaselineUnavailableError(f"FLA has no public {baseline} API for {family}")
+    try:
+        module = importlib.import_module(f"fla.ops.{module_name}")
+    except ImportError as error:
+        raise BaselineUnavailableError(str(error)) from error
+    function = getattr(module, function_name, None)
+    if function is None:
+        raise BaselineUnavailableError(
+            f"FLA does not provide fla.ops.{module_name}.{function_name}"
+        )
+    return function, f"fla.ops.{module_name}.{function_name}"
 
 
 @dataclass(frozen=True)
@@ -305,6 +382,7 @@ class FLABaseline:
     comparable: bool = True
     note: str = ""
     preprocessing: str = "transpose/contiguous; timed in public call"
+    function_name: str = ""
 
     def split(self, result):
         output, state = (
@@ -340,32 +418,16 @@ def _baseline_call(torch, adapter, parts, contract):
     return run
 
 
-def _delta_family_baseline(case):
-    """Map new examples to FLA's public recurrent APIs (chunk for ABC/Product)."""
-    import importlib
+def _delta_family_baseline(case, baseline=None):
+    """Bind an explicitly selected public FLA schedule to the authored inputs."""
     import torch
 
-    functions = {
-        "delta-rule": ("delta_rule", "fused_recurrent_delta_rule"),
-        "kda": ("kda", "fused_recurrent_kda"),
-        "gdn2": ("gdn2", "fused_recurrent_gdn2"),
-        "comba": ("comba", "fused_recurrent_comba"),
-        "iplr": ("generalized_delta_rule.iplr", "fused_recurrent_iplr_delta_rule"),
-        "dplr": ("generalized_delta_rule.dplr", "fused_recurrent_dplr_delta_rule"),
-        "oja": ("gated_oja_rule", "fused_recurrent_gated_oja_rule"),
-        "delta-product": ("gated_delta_product", "chunk_gated_delta_product"),
-        "abc": ("abc", "chunk_abc"),
-    }
-    if case.name not in functions:
+    if case.name not in DELTA_BASELINE_APIS:
         return None
-    module, function_name = functions[case.name]
-    function = getattr(
-        importlib.import_module(f"fla.ops.{module}"), function_name, None
+    function, function_name = _baseline_function(
+        case.name, baseline, DELTA_BASELINE_APIS
     )
-    if function is None:
-        raise ImportError(
-            f"FLA does not provide fla.ops.{module}.{function_name}; use --fla-source with a recent checkout"
-        )
+    recurrent = "fused_recurrent_" in function_name
 
     def prepare(values):
         native = {
@@ -373,7 +435,7 @@ def _delta_family_baseline(case):
         }
         if case.name == "abc":
             native["slot_logits"] = native["slot_logits"].to(native["query"].dtype)
-        if case.name == "comba":
+        if case.name == "comba" and recurrent:
             # This FLA fused kernel predicts from prior S, unlike its naive
             # reference and our example, which predict from exp(g) S.
             native["prediction_key"] = native["prediction_key"].float() * native[
@@ -458,6 +520,7 @@ def _delta_family_baseline(case):
             if case.name == "abc"
             else ""
         ),
+        function_name=function_name,
         preprocessing=(
             f"{function_name}; transpose/contiguous"
             + (
@@ -466,14 +529,14 @@ def _delta_family_baseline(case):
                 else "; cast BF16-representable FP32 logits to BF16"
                 if case.name == "abc"
                 else "; FP32 prediction key * exp(gate) for prior-State fused kernel"
-                if case.name == "comba"
+                if case.name == "comba" and recurrent
                 else ""
             )
         ),
     )
 
 
-def _fla_call(case, inputs):
+def _fla_call(case, inputs, baseline=None):
     """Return an optional FLA adapter; newer families need a recent checkout."""
     name = case.name
     if name in {
@@ -487,9 +550,11 @@ def _fla_call(case, inputs):
         "delta-product",
         "abc",
     }:
-        return _delta_family_baseline(case)
+        return _delta_family_baseline(case, baseline)
+    if name not in BASELINE_APIS:
+        return None
+    function, function_name = _baseline_function(name, baseline, BASELINE_APIS)
     if name == "hgrn":
-        from fla.ops.hgrn import fused_recurrent_hgrn
 
         def prepare_hgrn(values):
             value, gate = values["value"], values["gate"]
@@ -508,7 +573,7 @@ def _fla_call(case, inputs):
             batch_heads, length, width = value.shape
             if initial is not None:
                 initial = initial.reshape(batch_heads, width)
-            output, state = fused_recurrent_hgrn(
+            output, state = function(
                 value, gate, initial_state=initial, output_final_state=final
             )
             batch = batch_heads // case.heads
@@ -521,7 +586,8 @@ def _fla_call(case, inputs):
             prepare_hgrn,
             invoke_hgrn,
             ("hidden",),
-            preprocessing="flatten B,H into FLA batch; timed in public call",
+            function_name=function_name,
+            preprocessing=f"{function_name}; flatten B,H into FLA batch; timed in public call",
         )
 
     state_contract = name not in {"based", "rebased"}
@@ -551,41 +617,12 @@ def _fla_call(case, inputs):
             native["a"] = -native["removal"].float() * native["decay"].exp()
             native["b"] = native["key"].float() * beta
             native["value"] = native["value"].float() * beta
+        if baseline == "prefill" and name in {"linear", "simple-gla", "gla", "rwkv7"}:
+            # Chunk GEMMs require matching operand dtypes. Preserve the FP32
+            # authored transforms above rather than rounding them back to BF16.
+            for key in ("query", "key", "value"):
+                native[key] = native[key].float()
         return native
-
-    if name == "linear":
-        from fla.ops.linear_attn import fused_recurrent_linear_attn as function
-    elif name == "normalized-linear":
-        from fla.ops.linear_attn import fused_recurrent_linear_attn as function
-    elif name == "retention":
-        # Use the simple-GLA kernel with the prepared decay tensor.  The
-        # retention wrapper rebuilds its decay with a host-side arange, which
-        # introduces a CPU->CUDA copy during Graph capture.
-        from fla.ops.simple_gla import fused_recurrent_simple_gla as function
-    elif name in ("simple-gla", "retnet"):
-        from fla.ops.simple_gla import fused_recurrent_simple_gla as function
-    elif name == "gla":
-        from fla.ops.gla import fused_recurrent_gla as function
-    elif name == "rwkv6":
-        from fla.ops.rwkv6 import fused_recurrent_rwkv6 as function
-    elif name == "gsa":
-        from fla.ops.gsa import fused_recurrent_gsa as function
-    elif name == "gdn":
-        from fla.ops.gated_delta_rule import (
-            fused_recurrent_gated_delta_rule as function,
-        )
-    elif name == "rwkv7":
-        from fla.ops.generalized_delta_rule.dplr import (
-            fused_recurrent_dplr_delta_rule as function,
-        )
-    elif name == "based":
-        from fla.ops.based import fused_chunk_based as function
-    elif name == "rebased":
-        from fla.ops.rebased import parallel_rebased as function
-    elif name == "hgrn":
-        return None
-    else:
-        return None
 
     def invoke(values, initial, final):
         query, key, value = (values[key] for key in ("query", "key", "value"))
@@ -622,7 +659,22 @@ def _fla_call(case, inputs):
                 query, key, value, values.get("gate", values.get("decay")), **kwargs
             )
         elif name == "gla":
-            result = function(query, key, value, values["gate"], **kwargs)
+            length = query.shape[1]
+            gate = values["gate"]
+            if baseline == "prefill" and length < 64:
+                import torch
+
+                # FLA 0.5.2's short FP32 chunk output autotuning can launch
+                # misaligned kernels. Neutral trailing tokens select BT=64:
+                # zero injection and zero log-gate preserve the final State.
+                padding = (0, 0, 0, 0, 0, 64 - length)
+                query, key, value, gate = (
+                    torch.nn.functional.pad(tensor, padding)
+                    for tensor in (query, key, value, gate)
+                )
+            result = function(query, key, value, gate, **kwargs)
+            if baseline == "prefill" and length < 64:
+                result = (result[0][:, :length], result[1])
         elif name in ("based", "rebased"):
             result = function(query, key, value, **kwargs)
         elif name == "rwkv6":
@@ -670,7 +722,7 @@ def _fla_call(case, inputs):
             state = (state, key_sum[:, -1]) if final else None
         return output.transpose(1, 2), state
 
-    preprocessing = "transpose/contiguous"
+    preprocessing = f"{function_name}; transpose/contiguous"
     if name in {"linear", "simple-gla", "gla"}:
         preprocessing += "; FP32 authored key + 0.1"
     elif name == "normalized-linear":
@@ -683,6 +735,10 @@ def _fla_call(case, inputs):
         preprocessing += "; FP32 bonus materialization"
     elif name == "retnet":
         preprocessing += "; gate log"
+    if baseline == "prefill" and name in {"linear", "simple-gla", "gla", "rwkv7"}:
+        preprocessing += "; FP32 q/k/v for matching chunk GEMM operand dtypes"
+    if baseline == "prefill" and name == "gla":
+        preprocessing += "; pad lengths <64 with neutral tokens and trim output"
     note = (
         "" if state_contract else "FLA does not expose all equivalent recurrent States"
     )
@@ -693,6 +749,7 @@ def _fla_call(case, inputs):
         state_contract=state_contract,
         note=note,
         preprocessing=preprocessing,
+        function_name=function_name,
     )
 
 
@@ -808,6 +865,7 @@ def _measure_pair(
     contract,
     timing,
     workspace_bytes=1 << 30,
+    baseline=None,
 ):
     operator = case.factory(**case.kwargs(seqlen))
     sizes = benchmark.role_sizes_for(operator, case, seqlen)
@@ -828,6 +886,8 @@ def _measure_pair(
         "compile_timed": False,
         "workspace_limit_bytes": workspace_bytes,
         "ratio_direction": "FLA / MetaAttention (>1 means MetaAttention faster)",
+        "fla_baseline": baseline or "legacy",
+        "fla_function": None,
         "measurement_contract": {
             "public_cuda_event": "median warmed invocation",
             "cpu_wall": "median synchronized invocation",
@@ -878,7 +938,7 @@ def _measure_pair(
         return result
 
     try:
-        adapter = _fla_call(case, inputs)
+        adapter = _fla_call(case, inputs, baseline)
         if adapter is None:
             result.update(
                 fla_status="UNAVAILABLE",
@@ -886,6 +946,7 @@ def _measure_pair(
                 fla_error="no FLA adapter",
             )
             return result
+        result["fla_function"] = adapter.function_name
         fla_contract = (
             contract
             if contract == "output-only" or adapter.state_contract
@@ -939,6 +1000,10 @@ def _measure_pair(
             result["winner"] = (
                 "MetaAttention" if result["speedup_public_cuda_event_ms"] > 1 else "FLA"
             )
+    except BaselineUnavailableError as error:
+        result.update(
+            fla_status="UNAVAILABLE", status="NOT_COMPARABLE", fla_error=str(error)
+        )
     except Exception as error:
         # Optional backends also raise compiler-specific exceptions (e.g. Triton
         # CompilationError); preserve Meta measurements and classify the baseline.
@@ -950,6 +1015,8 @@ def _csv_rows(records: list[dict]) -> list[dict]:
     fields = (
         "schema_version",
         "family",
+        "fla_baseline",
+        "fla_function",
         "batch",
         "heads",
         "seqlen",
@@ -981,6 +1048,8 @@ def _csv_rows(records: list[dict]) -> list[dict]:
         row = {
             "schema_version": record.get("schema_version"),
             "family": record.get("family"),
+            "fla_baseline": record.get("fla_baseline", "legacy"),
+            "fla_function": record.get("fla_function"),
             "batch": record.get("batch"),
             "heads": record.get("heads"),
             "seqlen": record.get("seqlen"),
@@ -1039,7 +1108,7 @@ def _plot(path: Path, rows: list[dict], title: str) -> None:
     if not usable:
         raise RuntimeError("no successful Meta/FLA pairs available for plotting")
     labels = [
-        f"{row['family']}\nB{row['batch']} H{row['heads']} T{row['seqlen']}"
+        f"{row['family']} ({row.get('fla_baseline', 'legacy')})\nB{row['batch']} H{row['heads']} T{row['seqlen']}"
         for row in usable
     ]
     positions = np.arange(len(usable))
@@ -1076,8 +1145,16 @@ def _plot_matrix(output_dir: Path, rows: list[dict], title: str) -> None:
     import numpy as np
 
     usable = [row for row in rows if row["speedup"] is not None]
-    for contract in sorted({row["contract"] for row in usable}):
-        selected = [row for row in usable if row["contract"] == contract]
+    groups = sorted(
+        {(row["contract"], row.get("fla_baseline", "legacy")) for row in usable}
+    )
+    for contract, baseline in groups:
+        selected = [
+            row
+            for row in usable
+            if row["contract"] == contract
+            and row.get("fla_baseline", "legacy") == baseline
+        ]
         for family in sorted({row["family"] for row in selected}):
             family_rows = [row for row in selected if row["family"] == family]
             labels = [
@@ -1102,7 +1179,9 @@ def _plot_matrix(output_dir: Path, rows: list[dict], title: str) -> None:
                 cmap="RdYlGn",
                 norm=colors.LogNorm(vmin=1.0 / vmax, vmax=vmax),
             )
-            axis.set_title(f"{title}: FLA / MetaAttn ({family}, {contract})")
+            axis.set_title(
+                f"{title}: FLA / MetaAttn ({family}, {contract}, {baseline})"
+            )
             axis.set_yticks([0], ["speedup"])
             axis.set_xticks(
                 range(len(labels)), labels, rotation=75, ha="right", fontsize=7
@@ -1110,7 +1189,9 @@ def _plot_matrix(output_dir: Path, rows: list[dict], title: str) -> None:
             figure.colorbar(
                 image, ax=axis, label=">1 means MetaAttn faster (1x center)"
             )
-            figure.savefig(output_dir / f"speedup_{contract}_{family}.png", dpi=160)
+            figure.savefig(
+                output_dir / f"speedup_{baseline}_{contract}_{family}.png", dpi=160
+            )
             plt.close(figure)
 
 
@@ -1126,6 +1207,12 @@ def _parse_args() -> argparse.Namespace:
         "--contract", choices=(*P0_CONTRACTS, "all"), default="output-only"
     )
     parser.add_argument("--timing", choices=("e2e", "graph", "both"), default="both")
+    parser.add_argument(
+        "--fla-baseline",
+        choices=(*FLA_BASELINES, "both"),
+        default="both",
+        help="FLA execution schedule; missing APIs are recorded as unavailable",
+    )
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repetitions", type=int, default=30)
     parser.add_argument("--output-dir", type=Path)
@@ -1171,6 +1258,7 @@ def main() -> None:
             "matrix axes must be positive; warmup nonnegative; repetitions positive"
         )
     contracts = P0_CONTRACTS if args.contract == "all" else (args.contract,)
+    baselines = FLA_BASELINES if args.fla_baseline == "both" else (args.fla_baseline,)
     families = [item.strip() for item in args.families.split(",") if item.strip()]
     try:
         selected = choose_idle_gpu(
@@ -1189,6 +1277,7 @@ def main() -> None:
         "heads": args.heads,
         "seqlens": args.seqlens,
         "contracts": contracts,
+        "fla_baselines": baselines,
     }
     print(
         json.dumps(
@@ -1221,7 +1310,10 @@ def main() -> None:
     if not workloads:
         raise SystemExit("no workloads selected")
     records = []
-    for case, seqlen, contract in workloads:
+    comparisons = tuple(
+        (*workload, baseline) for workload in workloads for baseline in baselines
+    )
+    for case, seqlen, contract, baseline in comparisons:
         torch.manual_seed(42)
         try:
             record = _measure_pair(
@@ -1235,6 +1327,7 @@ def main() -> None:
                 contract,
                 args.timing,
                 workspace_bytes=int(args.workspace_gib * (1 << 30)),
+                baseline=baseline,
             )
         except Exception as error:
             record = {
@@ -1244,6 +1337,7 @@ def main() -> None:
                 "heads": case.heads,
                 "seqlen": seqlen,
                 "contract": contract,
+                "fla_baseline": baseline,
                 "status": "HARNESS_ERROR",
                 "fla_correctness": "ignored",
                 "error": repr(error),
@@ -1253,6 +1347,8 @@ def main() -> None:
             json.dumps(
                 {
                     "family": case.name,
+                    "fla_baseline": baseline,
+                    "fla_function": record.get("fla_function"),
                     "B": case.batch,
                     "H": case.heads,
                     "T": seqlen,
@@ -1277,7 +1373,7 @@ def main() -> None:
         "schema_version": RESULT_SCHEMA_VERSION,
         "selected_gpu": asdict(selected),
         "matrix": matrix,
-        "expected_records": len(workloads),
+        "expected_records": len(comparisons),
         "actual_records": len(records),
         "timing": args.timing,
         "warmup": args.warmup,
