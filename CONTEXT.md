@@ -28,7 +28,7 @@ Batch size, dense Sequence length, packed logical-sequence count, packed token c
 
 
 ## Current Algorithm IR capability
-Schema v4 supports several named States, each with one or two ordered Feature
+Schema v5 retains schema-v4 support for several named States, each with one or two ordered Feature
 roles and one Transition. States may be independent or coupled by typed affine
 State Injections on one shared Feature axis. A Product Feature occupies one axis;
 it does not increase State rank. The reference executor requires all States to
@@ -57,11 +57,16 @@ scanned in parallel. Mixed-axis coupling and heterogeneous State roles are
 rejected by this first coupled implementation. Nonlinear Readouts do not change
 the scanability of State evolution.
 
-A nonlinear transformation between an upstream auxiliary scan and a downstream
-memory scan may permit a Scan Stage DAG without a joint Affine Summary. That
-execution capability is proposed, not implemented. Programs without a proven
-compact summary are rejected by the current compiler; there is no sequential
-recurrence fallback.
+A Scan Stage DAG may apply a nonlinear Readout transformation between an
+upstream auxiliary scan and downstream memory scan without a joint Affine
+Summary. Schema v5 implements explicit typed stage bindings: each stage proves
+its own algebra, and gradients flow through the bound trajectories. The finite
+LogAddExp algebra uses `-inf` identity and a safe identity VJP. Stages may have
+different State Head roles; downstream Head Mapping preserves auxiliary head
+sharing. Optional checkpoint recomputes child intermediates; the resource
+budget still charges the conservative saved-scan baseline. See
+[ADR 0005](docs/adr/0005-scan-stage-dag-and-logaddexp.md). General Nonlinear State
+Feedback still has no compact-summary proof or sequential recurrence fallback.
 
 ## ExecutionResult
 The immutable public result of every Stateful Operator invocation. It contains named outputs and, only when requested, named final State; the result shape never changes with the number of outputs or states.

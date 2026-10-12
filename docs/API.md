@@ -256,8 +256,9 @@ joint axis. Momentum Delta Rule is an example of this path; no performance
 parity is claimed. Delta Product uses ordered steps and retains the compiled
 factored path by transforming write factors through later actions.
 
-State Terms remain reserved for Readouts; nonlinear State-derived coefficients
-and Scan Stage DAGs remain unsupported. Readout `prior=True` retains its existing
+State Terms remain reserved for Readouts within an affine AlgorithmIR.
+Schema v5 permits nonlinear State-derived coefficients through an explicit
+Scan Stage DAG, described below. Readout `prior=True` retains its existing
 meaning. Intermediate target values are implicit in step order; arbitrary
 named intermediate State references are not introduced. `Shift` zero-fills
 invocation sequence starts and does not carry input history across calls.
@@ -275,6 +276,73 @@ invalid packed offsets, unsupported specialization, resource failure, and
 codegen failure surface as structured `StatefulCompilationError` values. The
 initial schema-v1 contract is in `docs/stateful-operator-ir-spec.md`; ADRs 0002
 and 0003 record the implemented language extensions described above.
+
+### Scan Stage DAG (schema v5)
+
+`StagedStatefulOperator(ScanStageIR(stages, outputs))` composes separately
+scanable programs. A `ScanStage(name, algorithm, bindings=())` contains an
+`AlgorithmIR` or `LogAddExpScanIR`. `StageBinding(input, stage, output)` binds a
+downstream declared TensorInput to an upstream named Readout; only unbound
+inputs appear in the public call. `StageOutput(name, stage, output)` selects a
+public output. The compiler checks matching logical roles/dtype, permits
+physical role permutations, sorts stage dependencies and rejects cycles with
+`IR_DEPENDENCY`. Bindings do not insert implicit dtype casts.
+
+State names are globally unique. Public `StateTuple` order follows stage
+**declaration** order and each child's State order, even when topology changes
+the execution order. All stages share one invocation's sequence/offsets and
+Batch count; each retains its own State Head role. A downstream HeadMapping
+can expand a key-head trajectory to value heads without duplicating the public
+auxiliary State. Stage bindings export scalar/vector readouts; affine matrix
+trajectories are not an additional public binding form.
+
+```python
+from attn_engine import Target
+from examples.preconditioned_delta import (
+    KEY, VALUE, KEY_HEADS, VALUE_HEADS, preconditioned_delta,
+)
+
+compiled = preconditioned_delta(kind="gdn").compile(
+    role_sizes={KEY_HEADS: 2, VALUE_HEADS: 4, KEY: 64, VALUE: 64},
+    target=Target(), mode="dense", backward=True, checkpoint=True,
+)
+# Invoke with named query/key/value, log_atk_decay, beta_atk, center,
+# scale, log_decay and beta. StateTuple names are ("atk", "memory").
+# compiled.workspace_bytes(B*T, sequence_count=B, sequence_length=T)
+# reports the conservative staged resource envelope.
+```
+
+`Abs(operand)` / `expr.abs()` computes in FP32 with zero subgradient at zero.
+`Cast(operand, dtype)` / `expr.to(dtype)` explicitly places an FP32 or BF16
+conversion in the expression DAG. It preserves roles, and its position matters
+for rounding (Cast before multiplication can differ from Cast after it).
+
+`LogAddExpScanIR(logits: TensorInput, state: StateSpec | None)` defines only
+`z_current = logaddexp(z_prior, logits)`, defaulting to State name `z` and
+identity `-inf`. Inputs and explicit initial State accept finite values and
+`-inf`; NaN/+inf fail the runtime algebra check. Its FP32 Readouts are
+`normalized_key = exp(logits-z_current)` and `log_gate`; gate is
+`z_prior-z_current` for finite prior and 0 for cold `-inf` prior. An all-masked
+identity element produces zero key/gate. The identity/identity VJP is zero.
+`LogAddExpOperator(ir).compile(...)` also supports standalone invocation.
+Use [stable LightNet](../examples/lightnet_stable.py) to combine this stage
+with an affine matrix memory; its public State order is `(z, memory)`.
+FLA uses `(memory, z)` with z shaped `[B,1,H,K]`; engine z is `[B,H,K]`.
+
+Stages execute existing child lowerers and materialize only retained outputs.
+Torch autograd chains downstream coefficient gradients back through upstream
+expressions, trajectories and initial States. `checkpoint=True` recomputes
+child intermediates using non-reentrant checkpoint. The resource estimate
+remains conservative and charges the non-checkpoint scan levels; checkpoint
+reduces retained tensors, not the admitted resource envelope. Packed includes
+empty and all-empty sequences. Dense affine stages require positive length,
+as before; standalone LogAddExp additionally supports dense length zero.
+
+Preconditioned KDA/GDN and stable LightNet have independent reference, State,
+continuation and gradient checks. Their current staged execution is a
+capability baseline; generic scan storage and public-call latency still need
+performance work. See [ADR 0005](adr/0005-scan-stage-dag-and-logaddexp.md) and
+[stage benchmarks](stateful-stage-benchmarks.md) for measured limits.
 
 ### Structural inference schedules
 

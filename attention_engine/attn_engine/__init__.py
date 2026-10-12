@@ -2,6 +2,8 @@ from .attn_engine import AttentionEngine as AttentionEngine, OnlineFunc as Onlin
 from .stateful_operator import (
     CompiledStatefulOperator as CompiledStatefulOperator,
     Add as Add,
+    Abs as Abs,
+    Cast as Cast,
     AlgorithmIR as AlgorithmIR,
     Batch as Batch,
     AxisScale as AxisScale,
@@ -45,6 +47,18 @@ from .stateful_operator import (
     StateTuple as StateTuple,
     Target as Target,
     TensorInput as TensorInput,
+)
+from .stateful.logaddexp import (
+    LogAddExpScanIR as LogAddExpScanIR,
+    LogAddExpOperator as LogAddExpOperator,
+)
+from .stateful.stages import (
+    ScanStage as ScanStage,
+    ScanStageIR as ScanStageIR,
+    StageBinding as StageBinding,
+    StageOutput as StageOutput,
+    StagedStatefulOperator as StagedStatefulOperator,
+    CompiledScanStages as CompiledScanStages,
 )
 from .stateful.compile.device import (
     DeviceProfile as DeviceProfile,

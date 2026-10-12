@@ -161,6 +161,8 @@ class RawLoaderContext:
         token: str = "token",
         head: str = "head",
         feature: str = "feature",
+        *,
+        local_values=None,
     ):
         return emit_dense_loader(
             self.loaders[id(expression)],
@@ -170,6 +172,7 @@ class RawLoaderContext:
             head=head,
             feature=feature,
             sequence_length=self.sequence_length,
+            local_values=local_values,
         )
 
     def specialization_key(self, expressions):
@@ -198,6 +201,7 @@ def emit_dense_loader(
     head: str = "head",
     feature: str = "feature",
     sequence_length: int,
+    local_values=None,
 ) -> str:
     """Return a TileLang expression evaluating one ``DenseLoader``.
 
@@ -208,7 +212,9 @@ def emit_dense_loader(
     values: list[str] = []
     for node in loader.nodes:
         op = node[0]
-        if op == "input":
+        if op == "local":
+            values.append(local_values[node[1]])
+        elif op == "input":
             slot = source_map[node[1]]
             source = sources[slot]
             s0, s1, s2, s3 = source.strides
@@ -220,6 +226,10 @@ def emit_dense_loader(
             values.append(f"T.cast(X{slot}[{offset}], 'float32')")
         elif op == "constant":
             values.append(_constant(node[1], node[2]))
+        elif op == "cast":
+            value = values[node[1]]
+            dtype = str(node[2]).removeprefix("torch.")
+            values.append(f"T.cast(T.cast({value}, {dtype!r}), 'float32')")
         elif op == "binary":
             left, right, dtype, symbol = node[1], node[2], node[3], node[4]
             lhs, rhs = values[left], values[right]
@@ -229,6 +239,8 @@ def emit_dense_loader(
             operand, kind = values[node[1]], node[2]
             if kind == "neg":
                 value = f"(-{operand})"
+            elif kind == "abs":
+                value = f"T.abs({operand})"
             elif kind in ("exp", "log", "sqrt"):
                 value = f"T.{kind}({operand})"
             elif kind == "sigmoid":

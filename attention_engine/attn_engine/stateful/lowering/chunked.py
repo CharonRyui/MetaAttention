@@ -120,6 +120,8 @@ def _contracted_terms(expression: Any) -> list[Any] | None:
     """Collect nested State Terms; reject unimplemented expression nodes."""
     from ...stateful_operator import (
         Add,
+        Abs,
+        Cast,
         Clamp,
         Constant,
         Contract,
@@ -147,7 +149,8 @@ def _contracted_terms(expression: Any) -> list[Any] | None:
         right = _contracted_terms(expression.right)
         return None if left is None or right is None else left + right
     if isinstance(
-        expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Softmax)
+        expression,
+        (Abs, Cast, Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Softmax),
     ):
         return _contracted_terms(expression.operand)
     return None
@@ -756,9 +759,17 @@ def select_chunked_schedule(recipe, lowerer):
         recipe,
         native_diagonal=replace(
             native,
-            shared_scores=lowerer == "tilelang-chunked-shared-scores",
+            shared_scores=lowerer
+            in (
+                "tilelang-chunked-shared-scores",
+                "tilelang-native-diagonal-shared-scores",
+            ),
             fused_softmax=native.fused_softmax
-            and lowerer != "tilelang-chunked-readout-cut",
+            and lowerer
+            not in (
+                "tilelang-chunked-readout-cut",
+                "tilelang-native-diagonal-readout-cut",
+            ),
         ),
     )
 
@@ -884,6 +895,8 @@ def execute_chunked_states(
         )
     from ...stateful_operator import (
         Add,
+        Abs,
+        Cast,
         Clamp,
         Contract,
         Divide,
@@ -1115,6 +1128,10 @@ def execute_chunked_states(
         operand = evaluate(expression.operand).float()
         if isinstance(expression, Negate):
             return -operand
+        if isinstance(expression, Cast):
+            return evaluate(expression.operand).to(expression.dtype)
+        if isinstance(expression, Abs):
+            return evaluate(expression.operand).float().abs()
         if isinstance(expression, Exp):
             return operand.exp()
         if isinstance(expression, Log):

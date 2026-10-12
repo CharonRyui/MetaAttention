@@ -410,12 +410,14 @@ class CandidateLowerer:
             resources = shape.native_resources
             token_bytes, chunk_bytes = resources.output_bytes, resources.chunk_bytes
             launches = resources.launches
+            if resources.fused_softmax and not self.name.endswith("readout-cut"):
+                token_bytes += resources.replay_serial_bytes
             if self.name == "tilelang-native-diagonal-shared-scores":
                 chunk_bytes += resources.score_bytes
                 launches += resources.score_launches
             elif self.name == "tilelang-native-diagonal-readout-cut":
                 token_bytes += resources.cut_bytes
-                launches += 2
+                launches += resources.cut_launches
             elif resources.cut_bytes and not resources.fused_softmax:
                 token_bytes += resources.cut_bytes
             return CandidateEstimate(
@@ -423,7 +425,12 @@ class CandidateLowerer:
                 token_bytes + chunk_bytes // 64,
                 resources.flops_per_token,
                 launches,
-                token_bytes,
+                resources.output_bytes
+                + (
+                    resources.cut_bytes
+                    if self.name.endswith("readout-cut") or not resources.fused_softmax
+                    else 0
+                ),
                 workspace_bytes_per_chunk=chunk_bytes,
             )
         if representation in _SUMMARY_REPRESENTATIONS:
@@ -453,12 +460,14 @@ class CandidateLowerer:
                 resources = shape.native_resources
                 token_bytes, chunk_bytes = resources.output_bytes, resources.chunk_bytes
                 launches = resources.launches
+                if resources.fused_softmax and not self.name.endswith("readout-cut"):
+                    token_bytes += resources.replay_serial_bytes
                 if self.name == "tilelang-chunked-shared-scores":
                     chunk_bytes += resources.score_bytes
                     launches += resources.score_launches
                 elif self.name == "tilelang-chunked-readout-cut":
                     token_bytes += resources.cut_bytes
-                    launches += 2
+                    launches += resources.cut_launches
                 elif resources.cut_bytes and not resources.fused_softmax:
                     token_bytes += resources.cut_bytes
                 return CandidateEstimate(
@@ -466,7 +475,13 @@ class CandidateLowerer:
                     token_bytes + chunk_bytes // 64,
                     resources.flops_per_token,
                     launches,
-                    token_bytes,
+                    resources.output_bytes
+                    + (
+                        resources.cut_bytes
+                        if self.name.endswith("readout-cut")
+                        or not resources.fused_softmax
+                        else 0
+                    ),
                     workspace_bytes_per_chunk=chunk_bytes,
                 )
             # The chunked schedule keeps boundary carries and contracted
@@ -1329,14 +1344,20 @@ def compile_plan(
             None if chunked_recipe is None else chunked_recipe.native_diagonal
         )
         for lowerer in LOWERERS:
-            if lowerer.name == "tilelang-chunked-shared-scores" and (
+            if lowerer.name in (
+                "tilelang-chunked-shared-scores",
+                "tilelang-native-diagonal-shared-scores",
+            ) and (
                 native_diagonal is None
                 or native_diagonal.softmax is not None
                 or any(len(state.injections) != 1 for state in native_diagonal.states)
                 or not any(state.identity_columns for state in native_diagonal.states)
             ):
                 continue
-            if lowerer.name == "tilelang-chunked-readout-cut" and (
+            if lowerer.name in (
+                "tilelang-chunked-readout-cut",
+                "tilelang-native-diagonal-readout-cut",
+            ) and (
                 native_diagonal is None
                 or native_diagonal.softmax is None
                 or not native_diagonal.fused_softmax

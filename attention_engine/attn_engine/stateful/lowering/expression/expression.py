@@ -23,6 +23,8 @@ import torch
 
 from ....stateful_operator import (
     Add,
+    Abs,
+    Cast,
     Clamp,
     Constant,
     Contract,
@@ -43,7 +45,7 @@ from ....stateful_operator import (
 )
 
 
-_UNARY = (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Softmax)
+_UNARY = (Abs, Cast, Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Softmax)
 _BINARY = (Add, Multiply, Divide)
 
 
@@ -376,6 +378,10 @@ def _first_device(
 
 def _apply_unary(expression: Any, value: torch.Tensor) -> torch.Tensor:
     # Transcendentals and reciprocal are authored as FP32 operations in the IR.
+    if isinstance(expression, Cast):
+        return value.to(expression.dtype)
+    if isinstance(expression, Abs):
+        return value.float().abs()
     if isinstance(expression, Negate):
         return -value
     operand = value.float()

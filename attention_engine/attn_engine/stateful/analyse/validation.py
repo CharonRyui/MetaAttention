@@ -17,6 +17,8 @@ from ...stateful_operator import (
     Contract,
     Outer,
     Softmax,
+    Abs,
+    Cast,
     Clamp,
     Exp,
     Identity,
@@ -229,7 +231,8 @@ def _state_terms(expression: InputExpression, path: str):
         yield from _state_terms(expression.operand, f"{path}.operand")
         return
     if isinstance(
-        expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)
+        expression,
+        (Abs, Cast, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax),
     ):
         yield from _state_terms(expression.operand, f"{path}.operand")
         return

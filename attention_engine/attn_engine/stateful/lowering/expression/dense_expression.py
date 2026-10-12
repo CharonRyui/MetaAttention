@@ -40,9 +40,13 @@ class DenseExpression:
         return self.loader, tuple(pointers), tuple(strides), tuple(groups)
 
 
-def compile_dense_expression(expression, specs, feature, *, factors=()):
+def compile_dense_expression(
+    expression, specs, feature, *, factors=(), local_values=None
+):
     from ....stateful_operator import (
         Add,
+        Abs,
+        Cast,
         Clamp,
         Constant,
         Divide,
@@ -65,7 +69,11 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
                 raise ValueError("cyclic expression")
             return value
         nodes[node] = None
-        if isinstance(node, Input):
+        if local_values is not None and node in local_values:
+            name, dtype = local_values[node]
+            records.append(("local", name))
+            result = (len(records) - 1, dtype, False)
+        elif isinstance(node, Input):
             spec = specs[node.name]
             from ....stateful_operator import FeatureRole
 
@@ -102,7 +110,13 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
             records.append(("binary", left, right, dtype, symbol))
             index = len(records) - 1
             result = (index, dtype, ls and rs)
-        elif isinstance(node, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
+        elif isinstance(node, Cast):
+            operand, _, scalar = visit(node.operand)
+            records.append(("cast", operand, node.dtype))
+            result = (len(records) - 1, node.dtype, scalar)
+        elif isinstance(
+            node, (Abs, Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)
+        ):
             operand, dtype, scalar = visit(node.operand)
             if isinstance(node, Negate):
                 records.append(("unary", operand, "neg"))
@@ -110,6 +124,7 @@ def compile_dense_expression(expression, specs, feature, *, factors=()):
                 result = (index, dtype, scalar)
             else:
                 kind = {
+                    Abs: "abs",
                     Exp: "exp",
                     Log: "log",
                     Sigmoid: "sigmoid",

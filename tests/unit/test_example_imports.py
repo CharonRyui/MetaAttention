@@ -20,6 +20,8 @@ EXAMPLE_FACTORIES = (
     ("examples.generalized_delta_rule", "dplr_delta_rule"),
     ("examples.kda", "kda"),
     ("examples.momentum_delta_rule", "momentum_delta_rule"),
+    ("examples.preconditioned_delta", "preconditioned_delta"),
+    ("examples.lightnet_stable", "lightnet_stable"),
     ("examples.gated_delta_rule", "gated_delta_rule"),
     ("examples.gated_retention", "gated_retention"),
     ("examples.gated_slot_attention", "gated_slot_attention"),

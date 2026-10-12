@@ -15,7 +15,7 @@ from typing import (
 
 import torch
 
-SCHEMA_VERSION = "stateful-operator-ir/4"
+SCHEMA_VERSION = "stateful-operator-ir/5"
 _SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
 
@@ -206,6 +206,12 @@ class InputExpression:
     def log(self) -> Log:
         return Log(self)
 
+    def abs(self) -> Abs:
+        return Abs(self)
+
+    def to(self, dtype: torch.dtype) -> Cast:
+        return Cast(self, dtype)
+
     def sigmoid(self) -> Sigmoid:
         return Sigmoid(self)
 
@@ -296,6 +302,21 @@ class Divide(InputExpression):
 
     left: InputExpression
     right: InputExpression
+
+
+@dataclass(frozen=True)
+class Cast(InputExpression):
+    operand: InputExpression
+    dtype: torch.dtype
+
+    def __post_init__(self):
+        if self.dtype not in _SUPPORTED_DTYPES:
+            raise ValueError("Cast supports FP32 and BF16")
+
+
+@dataclass(frozen=True)
+class Abs(InputExpression):
+    operand: InputExpression
 
 
 @dataclass(frozen=True)
@@ -2703,7 +2724,12 @@ def _evaluate(
     """
     if isinstance(expression, Input):
         bound = values[expression.name]
-        return _squeeze_singleton_features(bound) if squeeze_features else bound
+        if squeeze_features:
+            value = _squeeze_singleton_features(bound)
+            # Readouts retain one output Feature axis. Feature-free per-token
+            # scalars must broadcast over that axis, not over heads or tokens.
+            return value.unsqueeze(-1) if value.ndim == 2 else value
+        return bound
     if isinstance(expression, Constant):
         device = _expression_device(values, states)
         return torch.full((), expression.value, device=device, dtype=expression.dtype)
@@ -2778,7 +2804,18 @@ def _evaluate(
             squeeze_features=squeeze_features,
             prior_states=prior_states,
         )
-    if isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
+    if isinstance(expression, Cast):
+        return _evaluate(
+            expression.operand,
+            values,
+            states=states,
+            state_specs=state_specs,
+            feature_axes=feature_axes,
+            segment=segment,
+            squeeze_features=squeeze_features,
+            prior_states=prior_states,
+        ).to(expression.dtype)
+    if isinstance(expression, (Abs, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
         operand = _evaluate(
             expression.operand,
             values,
@@ -2789,6 +2826,8 @@ def _evaluate(
             squeeze_features=squeeze_features,
             prior_states=prior_states,
         ).float()
+        if isinstance(expression, Abs):
+            return operand.abs()
         if isinstance(expression, Exp):
             return operand.exp()
         if isinstance(expression, Log):

@@ -18,6 +18,10 @@ class NativeStateRecipe:
     identity_rows: bool
     identity_columns: bool
 
+    @property
+    def vector(self):
+        return self.columns is None
+
 
 @dataclass(frozen=True)
 class NativeDiagonalRecipe:
@@ -27,6 +31,7 @@ class NativeDiagonalRecipe:
     softmax: Any
     fused_softmax: bool
     shared_scores: bool = False
+    region: Any = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +45,8 @@ class NativeDiagonalResources:
     cut_bytes: int
     live_bytes: int
     fused_softmax: bool
+    cut_launches: int = 2
+    replay_serial_bytes: int = 0
 
 
 def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
@@ -48,7 +55,6 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
         Constant,
         Identity,
         ProductFeatureRole,
-        Softmax,
         StateTerm,
     )
 
@@ -57,11 +63,12 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
     states = []
     for state in algorithm.states:
         transition = transitions[state.name]
-        if state.rank != 2 or any(
+        if state.rank not in (1, 2) or any(
             isinstance(r, ProductFeatureRole) for r in state.feature_roles
         ):
             return None
-        rows, columns = state.feature_roles
+        rows = state.feature_roles[0]
+        columns = state.feature_roles[1] if state.rank == 2 else None
         rgs = []
         cgs = []
         for node in transition.propagations:
@@ -76,14 +83,17 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
         injections = []
         for injection in transition.injections:
             factors = {f.roles: f.expression for f in injection.factors}
-            if (rows,) not in factors or (columns,) not in factors:
+            column_roles = (columns,) if columns is not None else ()
+            if (rows,) not in factors or (
+                columns is not None and column_roles not in factors
+            ):
                 return None
             key = compile_dense_expression(factors[(rows,)], specs, rows)
             value = compile_dense_expression(
-                factors[(columns,)],
+                factors.get(column_roles, Constant(1.0)),
                 specs,
                 columns,
-                factors=(factors[()],) if () in factors else (),
+                factors=(factors[()],) if columns is not None and () in factors else (),
             )
             if key is None or value is None:
                 return None
@@ -103,31 +113,21 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
         )
     native = []
     softmax = None
+    region = None
     for readout, expression in readouts:
         if bonus is not None and readout.name == bonus[0].name:
             continue
-        if isinstance(expression, StateTerm) and isinstance(
-            expression.operand, Softmax
-        ):
-            first = expression.operand.operand
-            if not isinstance(first, StateTerm) or first.state == expression.state:
+        from ..readout.softmax_recipe import compile_softmax_region
+
+        proof = compile_softmax_region(expression, algorithm, specs)
+        if proof is not None:
+            if softmax is not None or len(readouts) != 1:
                 return None
-            fs = next(s for s in algorithm.states if s.name == first.state)
-            ss = next(s for s in algorithm.states if s.name == expression.state)
-            if (
-                first.role != fs.feature_roles[0]
-                or expression.role != ss.feature_roles[0]
-                or fs.feature_roles[1] != ss.feature_roles[0]
-                or expression.operand.role != fs.feature_roles[1]
-            ):
-                return None
-            query = compile_dense_expression(first.operand, specs, first.role)
-            if query is None or softmax is not None or len(readouts) != 1:
-                return None
+            first, query, region = proof
             softmax = (readout, first, expression, query)
         elif isinstance(expression, StateTerm):
             state = next(s for s in algorithm.states if s.name == expression.state)
-            if expression.role != state.feature_roles[0]:
+            if state.rank != 2 or expression.role != state.feature_roles[0]:
                 return None
             query = compile_dense_expression(expression.operand, specs, expression.role)
             if query is None:
@@ -150,6 +150,12 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
         if query is None or bonus_value is None:
             return None
         native_bonus = (readout, term, query, bonus_value)
+    if any(s.vector for s in states) and region is None:
+        return None
+    if region is not None and {s.name for s in states if s.vector} != {
+        term.state for term in region.vectors
+    }:
+        return None
     fused = False
     if softmax is not None:
         if role_sizes is None:
@@ -160,16 +166,21 @@ def compile_native_diagonal(algorithm, readouts, bonus, role_sizes):
         ss = next(s for s in algorithm.states if s.name == softmax[2].state)
         first_shape = (1, 1, *(role_sizes[r] for r in fs.feature_roles))
         second_shape = (1, 1, *(role_sizes[r] for r in ss.feature_roles))
-        fused = readout_region_resources(first_shape, second_shape)["eligible"]
+        resources = readout_region_resources(first_shape, second_shape)
+        extra = 4 * role_sizes[fs.feature_roles[1]] * len(region.vectors)
+        fused = (
+            resources["eligible"] and resources["live_fp32_elements"] + extra <= 16384
+        )
     # The chunked planner selects shared-score lowering explicitly; compilation
     # must retain the ordinary replay default for resource planning.
     return NativeDiagonalRecipe(
-        tuple(states), tuple(native), native_bonus, softmax, fused
+        tuple(states), tuple(native), native_bonus, softmax, fused, region=region
     )
 
 
 def native_diagonal_resources(recipe, sizes, heads):
     states = {s.name: s for s in recipe.states}
+    sizes = {**sizes, None: 1}
     reads = list(recipe.readouts)
     if recipe.bonus:
         reads.append(recipe.bonus)
@@ -212,16 +223,33 @@ def native_diagonal_resources(recipe, sizes, heads):
     if recipe.softmax is not None:
         first = states[recipe.softmax[1].state]
         second = states[recipe.softmax[2].state]
-        cut_bytes = 8 * heads * sizes[first.columns]
+        cut_bytes = (8 + 4 * len(recipe.region.vectors)) * heads * sizes[first.columns]
         from ..readout.readout_regions import readout_region_resources
 
         live_bytes = readout_region_resources(
             (1, 1, sizes[first.rows], sizes[first.columns]),
             (1, 1, sizes[second.rows], sizes[second.columns]),
         )["live_fp32_bytes"]
+        live_bytes += 16 * sizes[first.columns] * len(recipe.region.vectors)
     launches = 2 * len(recipe.states) + len(reads)
     if recipe.softmax is not None:
-        launches += 1 if recipe.fused_softmax else 3
+        launches += (
+            1
+            if recipe.fused_softmax
+            else 3 + len({term.state for term in recipe.region.vectors})
+        )
+    vector_count = (
+        len({term.state for term in recipe.region.vectors}) if recipe.region else 0
+    )
+    # A vector-dependent identity region has a tensor-core alternative. Charge
+    # its serial replay critical path rather than rewarding only fewer launches.
+    # This conservative latency proxy leaves gated two-State recipes unchanged.
+    serial_bytes = (
+        live_bytes * 64
+        if vector_count
+        and all(s.identity_rows and s.identity_columns for s in recipe.states)
+        else 0
+    )
     return NativeDiagonalResources(
         output_bytes,
         chunk_bytes,
@@ -232,6 +260,8 @@ def native_diagonal_resources(recipe, sizes, heads):
         cut_bytes,
         live_bytes,
         recipe.fused_softmax,
+        2 + vector_count,
+        serial_bytes,
     )
 
 
@@ -253,6 +283,18 @@ def execute_native_diagonal(
 
     # A single replay consumer owns every State element and can publish the
     # final fragment itself. Other schedules retain summary/carry unchanged.
+    region_direct_final = (
+        sequence_length <= 64
+        and return_final_state
+        and recipe.softmax is not None
+        and recipe.fused_softmax
+        and {item.name for item in recipe.states}
+        == {
+            recipe.softmax[1].state,
+            recipe.softmax[2].state,
+            *(term.state for term in recipe.region.vectors),
+        }
+    )
     direct_final = (
         sequence_length <= 64
         and return_final_state
@@ -264,16 +306,23 @@ def execute_native_diagonal(
     prepared = {}
     finals = {}
     for item in recipe.states:
-        initial = initial_states[item.name]
+        public_initial = initial_states[item.name]
+        initial = public_initial.unsqueeze(-1) if item.vector else public_initial
         batch_heads = sequence_count * heads
         rows, columns = initial.shape[-2:]
         chunks = (sequence_length + 63) // 64
-        if chunks == 1 and (not return_final_state or direct_final):
+        if chunks == 1 and (
+            not return_final_state or direct_final or region_direct_final
+        ):
             carry = initial.reshape(batch_heads, rows, columns).unsqueeze(1)
-            final = torch.empty_like(initial) if direct_final else initial
+            final = (
+                torch.empty_like(initial)
+                if direct_final or region_direct_final
+                else initial
+            )
             prepared[item.name] = (item, carry, final)
-            if direct_final:
-                finals[item.name] = final
+            if direct_final or region_direct_final:
+                finals[item.name] = final.squeeze(-1) if item.vector else final
             continue
         scale = torch.empty(
             (batch_heads, chunks, rows, columns),
@@ -304,7 +353,7 @@ def execute_native_diagonal(
         )
         prepared[item.name] = (item, carry, final)
         if return_final_state:
-            finals[item.name] = final
+            finals[item.name] = final.squeeze(-1) if item.vector else final
     outputs = {}
     if recipe.shared_scores and recipe.readouts:
         from .native_tile_softmax import shared_score_readouts
@@ -386,5 +435,12 @@ def execute_native_diagonal(
             prior_second=second.prior,
             output_dtype=readout.output_dtype,
             fused=recipe.fused_softmax,
+            region=recipe.region,
+            vectors={
+                term.state: prepared[term.state][:2] for term in recipe.region.vectors
+            },
+            finals={name: entry[2] for name, entry in prepared.items()}
+            if region_direct_final
+            else None,
         )
     return outputs, (finals if return_final_state else None)

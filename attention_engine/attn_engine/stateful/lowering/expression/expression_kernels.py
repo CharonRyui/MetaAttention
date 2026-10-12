@@ -142,6 +142,8 @@ def _node_types(compiled, leaves):
                 if scalars[right] and not scalars[left]
                 else torch.promote_types(types[left], types[right])
             )
+        elif node.kind == "cast":
+            dtype, scalar = node.expression.dtype, scalars[node.children[0]]
         elif node.kind == "negate":
             dtype, scalar = types[node.children[0]], scalars[node.children[0]]
         else:
@@ -206,7 +208,11 @@ def _make_kernel(compiled, sources, shape, node_types, output_dtypes, block):
             value = f"({left} {symbol} {right})"
         else:
             operand = f"v{node.children[0]}"
-            if kind == "negate":
+            if kind == "cast":
+                value = operand
+            elif kind == "abs":
+                value = f"T.abs({operand})"
+            elif kind == "negate":
                 value = f"(-{operand})"
             elif kind in ("exp", "log", "sqrt"):
                 value = f"T.{kind}({operand})"

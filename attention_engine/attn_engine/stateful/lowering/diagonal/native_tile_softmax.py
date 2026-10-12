@@ -46,7 +46,9 @@ def _compile(annotations, body, grid, threads=128, *, device):
     if key not in _KERNELS:
         filename = f"<native-diagonal-region-{digest}>"
         linecache.cache[filename] = (len(text), None, text.splitlines(True), filename)
-        namespace = {"tilelang": tilelang, "T": T}
+        from .identity import fp32_gemm_macro
+
+        namespace = {"tilelang": tilelang, "T": T, "gemm": fp32_gemm_macro(T)}
         exec(compile(text, filename, "exec", dont_inherit=True), namespace)
         _KERNELS[key] = namespace["build"]()
     return _KERNELS[key]
@@ -305,11 +307,249 @@ def bonus_readout(
     )
 
 
-def softmax_cut(scores):
+def _vector_prefix(state, carry, inputs, length, heads, priors):
+    """One vector recurrence per chunk; never expand it to a square GEMM."""
+    batch_heads, chunks, features, _ = carry.shape
+    padded = 1 << (features - 1).bit_length()
+    context = _context(_state_expressions(state), inputs, heads, length)
+    outputs = tuple(
+        torch.empty(
+            (batch_heads // heads * length, heads, features),
+            device=carry.device,
+            dtype=torch.float32,
+        )
+        for _ in priors
+    )
+    key = (
+        "vector-prefix",
+        context.specialization_key(_state_expressions(state)),
+        length,
+        heads,
+        priors,
+        _tensor_metadata(carry),
+        _tensor_metadata(outputs[0]),
+    )
+    arguments = (*context.pointers, carry, *outputs)
+    kernel = _REGION_KERNELS.get(key)
+    if kernel is not None:
+        kernel(*arguments)
+        return outputs
+    body = [
+        f"chunk = block % {chunks}",
+        f"sh = block // {chunks}",
+        f"sequence = sh // {heads}",
+        f"head = sh % {heads}",
+        f"memory = T.alloc_fragment(({padded},), 'float32')",
+        f"for r in T.Parallel({padded}):",
+        f"    memory[r] = T.if_then_else(r < {features}, Carry[sh, chunk, r, 0], 0.0)",
+        f"for step in T.serial({_CHUNK}):",
+        f"    target = chunk * {_CHUNK} + step",
+        f"    if target < {length}:",
+        f"        token = sequence * {length} + target",
+        f"        for r in T.Parallel({padded}):",
+        f"            if r < {features}:",
+    ]
+    for i, prior in enumerate(priors):
+        if prior:
+            body.append(f"                Output{i}[token, head, r] = memory[r]")
+    _advance(
+        body,
+        "                ",
+        context,
+        state,
+        "memory[r]",
+        "token",
+        "r",
+        "0",
+        "prefix",
+    )
+    for i, prior in enumerate(priors):
+        if not prior:
+            body.append(f"                Output{i}[token, head, r] = memory[r]")
+    kernel = _compile(
+        list(context.annotations)
+        + [
+            _annotation("Carry", carry),
+            *(_annotation(f"Output{i}", out) for i, out in enumerate(outputs)),
+        ],
+        body,
+        batch_heads * chunks,
+        device=carry.device,
+    )
+    _REGION_KERNELS[key] = kernel
+    kernel(*arguments)
+    return outputs
+
+
+def _contraction(
+    state, carry, query, inputs, *, sequence_length, heads, prior, output_dtype
+):
+    """Identity GEMM with raw typed loaders; other recurrences use replay."""
+    if not (
+        state.identity_rows and state.identity_columns and len(state.injections) == 1
+    ):
+        return _replay(
+            state,
+            carry,
+            query,
+            inputs,
+            sequence_length=sequence_length,
+            heads=heads,
+            prior=prior,
+            output_dtype=output_dtype,
+        )
+    batch_heads, chunks, rows, columns = carry.shape
+    length = sequence_length
+    dense_query = isinstance(query, torch.Tensor)
+    expressions = state.injections[0] + (() if dense_query else (query,))
+    context = _context(expressions, inputs, heads, length)
+    key, value = state.injections[0]
+    kload = context.emit_value(key, "token", "head", "row")
+    vload = context.emit_value(value, "token", "head", "column")
+    qload = (
+        "T.cast(Query[token, head, row], 'float32')"
+        if dense_query
+        else context.emit_value(query, "token", "head", "row")
+    )
+    output = torch.empty(
+        (batch_heads // heads * length, heads, columns),
+        device=carry.device,
+        dtype=output_dtype,
+    )
+    key = (
+        "identity-contraction",
+        context.specialization_key(expressions),
+        length,
+        heads,
+        prior,
+        _tensor_metadata(carry),
+        _tensor_metadata(output),
+        _tensor_metadata(query) if dense_query else None,
+    )
+    arguments = [*context.pointers, carry, output]
+    if dense_query:
+        arguments.append(query)
+    kernel = _REGION_KERNELS.get(key)
+    if kernel is not None:
+        kernel(*arguments)
+        return output
+    tiles = (columns + 31) // 32
+    body = [
+        f"cb = block % {tiles}",
+        f"chunk = (block // {tiles}) % {chunks}",
+        f"sh = block // {tiles * chunks}",
+        f"sequence = sh // {heads}",
+        f"head = sh % {heads}",
+        "q = T.alloc_shared((64, 32), 'float32')",
+        "k = T.alloc_shared((32, 64), 'float32')",
+        "memory = T.alloc_shared((32, 32), 'float32')",
+        "v = T.alloc_shared((64, 32), 'float32')",
+        "score_shared = T.alloc_shared((64, 64), 'float32')",
+        "scores = T.alloc_fragment((64, 64), 'float32')",
+        "result = T.alloc_fragment((64, 32), 'float32')",
+        "T.clear(scores)",
+        "T.clear(result)",
+        f"for rb in T.serial({(rows + 31) // 32}):",
+        "    for t, r in T.Parallel(64, 32):",
+        "        row = rb * 32 + r",
+        "        target = chunk * 64 + t",
+        f"        token = sequence * {length} + target",
+        f"        if (target < {length}) & (row < {rows}):",
+        f"            q[t, r] = {qload}",
+        "        else:",
+        "            q[t, r] = 0.0",
+        "    for r, t in T.Parallel(32, 64):",
+        "        row = rb * 32 + r",
+        "        target = chunk * 64 + t",
+        f"        token = sequence * {length} + target",
+        f"        if (target < {length}) & (row < {rows}):",
+        f"            k[r, t] = {kload}",
+        "        else:",
+        "            k[r, t] = 0.0",
+        "    for r, c in T.Parallel(32, 32):",
+        f"        memory[r, c] = T.if_then_else((rb * 32 + r < {rows}) & (cb * 32 + c < {columns}), Carry[sh, chunk, rb * 32 + r, cb * 32 + c], 0.0)",
+        "    gemm(q, k, scores)",
+        "    gemm(q, memory, result)",
+        "for t, j in T.Parallel(64, 64):",
+        f"    score_shared[t, j] = T.if_then_else({'j < t' if prior else 'j <= t'}, scores[t, j], 0.0)",
+        "for j, c in T.Parallel(64, 32):",
+        "    column = cb * 32 + c",
+        "    target = chunk * 64 + j",
+        f"    token = sequence * {length} + target",
+        f"    if (target < {length}) & (column < {columns}):",
+        f"        v[j, c] = {vload}",
+        "    else:",
+        "        v[j, c] = 0.0",
+        "gemm(score_shared, v, result)",
+        "for t, c in T.Parallel(64, 32):",
+        f"    if (chunk * 64 + t < {length}) & (cb * 32 + c < {columns}):",
+        f"        Output[sequence * {length} + chunk * 64 + t, head, cb * 32 + c] = result[t, c]",
+    ]
+    annotations = list(context.annotations) + [
+        _annotation("Carry", carry),
+        _annotation("Output", output),
+    ]
+    arguments = [*context.pointers, carry, output]
+    if dense_query:
+        annotations.append(_annotation("Query", query))
+        arguments.append(query)
+    kernel = _compile(
+        annotations, body, batch_heads * chunks * tiles, device=carry.device
+    )
+    _REGION_KERNELS[key] = kernel
+    kernel(*arguments)
+    return output
+
+
+def softmax_cut(scores, *, region=None, vectors=None, inputs=None, length=None):
     """Produce a stable FP32 softmax without host-side CUDA arithmetic."""
     tokens, heads, features = scores.shape
     padded = 1 << (features - 1).bit_length()
     output = torch.empty(scores.shape, device=scores.device, dtype=torch.float32)
+    expressions = () if region is None else (region.scores, region.weights)
+    context = None if region is None else _context(expressions, inputs, heads, length)
+    vector_items = tuple((vectors or {}).items())
+    annotations = [_annotation("Scores", scores), _annotation("Output", output)]
+    arguments = [scores, output]
+    if context is not None:
+        annotations += list(context.annotations)
+        arguments += list(context.pointers)
+    for name, value in vector_items:
+        annotations.append(_annotation(name, value))
+        arguments.append(value)
+    key = (
+        "softmax-cut",
+        _tensor_metadata(scores),
+        context.specialization_key(expressions) if context else None,
+        tuple((name, _tensor_metadata(value)) for name, value in vector_items),
+        length,
+    )
+    kernel = _REGION_KERNELS.get(key)
+    if kernel is not None:
+        kernel(*arguments)
+        return output
+    bindings = {name: f"{name}[token, head, r]" for name, _ in vector_items}
+    score = "T.cast(Scores[token, head, r], 'float32')"
+    if region is not None:
+        score = context.emit_value(
+            region.scores,
+            "token",
+            "head",
+            "r",
+            local_values={**bindings, "scores": score},
+        )
+    probability = "values[r] / denominator[0]"
+    weight = (
+        probability
+        if region is None
+        else context.emit_value(
+            region.weights,
+            "token",
+            "head",
+            "r",
+            local_values={**bindings, "probability": probability},
+        )
+    )
     body = [
         f"token = block // {heads}",
         f"head = block % {heads}",
@@ -317,21 +557,25 @@ def softmax_cut(scores):
         "maximum = T.alloc_fragment((1,), 'float32')",
         "denominator = T.alloc_fragment((1,), 'float32')",
         f"for r in T.Parallel({padded}):",
-        f"    values[r] = T.if_then_else(r < {features}, T.cast(Scores[token, head, r], 'float32'), -T.infinity('float32'))",
+        "    values[r] = -T.infinity('float32')",
+        f"    if r < {features}:",
+        f"        values[r] = {score}",
         "T.reduce_max(values, maximum, dim=0)",
         f"for r in T.Parallel({padded}):",
         "    values[r] = T.exp(values[r] - maximum[0])",
         "T.reduce_sum(values, denominator, dim=0)",
         f"for r in T.Parallel({padded}):",
         f"    if r < {features}:",
-        "        Output[token, head, r] = values[r] / denominator[0]",
+        f"        Output[token, head, r] = {weight}",
     ]
-    _compile(
-        [_annotation("Scores", scores), _annotation("Output", output)],
+    kernel = _compile(
+        annotations,
         body,
         tokens * heads,
         device=scores.device,
-    )(scores, output)
+    )
+    _REGION_KERNELS[key] = kernel
+    kernel(*arguments)
     return output
 
 
@@ -349,6 +593,9 @@ def softmax_readout(
     prior_second=False,
     output_dtype=torch.float32,
     fused=False,
+    region=None,
+    vectors=None,
+    finals=None,
 ):
     """Execute q·state1 → softmax → state2, respecting both prior flags."""
     if first_carry.shape[-1] != second_carry.shape[-2]:
@@ -366,8 +613,29 @@ def softmax_readout(
             prior_first,
             prior_second,
             output_dtype,
+            region,
+            vectors,
+            finals,
         )
-    scores = _replay(
+    vector_cuts = {}
+    if region is not None:
+        grouped = {}
+        for i, term in enumerate(region.vectors):
+            grouped.setdefault(term.state, []).append((i, term.prior))
+        for name, views in grouped.items():
+            state, carry = vectors[name]
+            cuts = _vector_prefix(
+                state,
+                carry,
+                inputs,
+                sequence_length,
+                heads,
+                tuple(prior for _, prior in views),
+            )
+            vector_cuts.update(
+                {f"vector{i}": cut for (i, _), cut in zip(views, cuts, strict=True)}
+            )
+    scores = _contraction(
         first_state,
         first_carry,
         query,
@@ -377,8 +645,14 @@ def softmax_readout(
         prior=prior_first,
         output_dtype=torch.float32,
     )
-    weights = softmax_cut(scores)
-    return _replay(
+    weights = softmax_cut(
+        scores,
+        region=region,
+        vectors=vector_cuts,
+        inputs=inputs,
+        length=sequence_length,
+    )
+    return _contraction(
         second_state,
         second_carry,
         weights,
@@ -402,6 +676,9 @@ def _fused_softmax(
     prior1,
     prior2,
     output_dtype,
+    region=None,
+    vectors=None,
+    finals=None,
 ):
     # Retain both State matrices for one independent chunk. Parallel feature
     # reductions replace the migrated target x row x replay nesting.
@@ -409,6 +686,15 @@ def _fused_softmax(
     columns = carry2.shape[-1]
     pr, pm, pc = (1 << (size - 1).bit_length() for size in (rows, features, columns))
     expressions = _state_expressions(first) + _state_expressions(second) + (query,)
+    vector_states = (
+        tuple(dict.fromkeys(term.state for term in region.vectors)) if region else ()
+    )
+    vector_items = tuple(vectors[name] for name in vector_states)
+    if region is not None:
+        expressions += (region.scores, region.weights)
+        expressions += tuple(
+            expr for state, _ in vector_items for expr in _state_expressions(state)
+        )
     context = _context(expressions, inputs, heads, length)
     output = torch.empty(
         (batch_heads // heads * length, heads, columns),
@@ -426,13 +712,25 @@ def _fused_softmax(
         _CHUNK,
         bool(prior1),
         bool(prior2),
+        tuple(term.prior for term in region.vectors) if region else (),
+        tuple(_tensor_metadata(carry) for _, carry in vector_items),
         _tensor_metadata(carry1),
         _tensor_metadata(carry2),
         _tensor_metadata(output),
     )
+    final_items = tuple((finals or {}).items())
+    key += (tuple((name, _tensor_metadata(value)) for name, value in final_items),)
+    arguments = (
+        *context.pointers,
+        carry1,
+        carry2,
+        output,
+        *(carry for _, carry in vector_items),
+        *(value for _, value in final_items),
+    )
     kernel = _REGION_KERNELS.get(key)
     if kernel is not None:
-        kernel(*context.pointers, carry1, carry2, output)
+        kernel(*arguments)
         return output
     body = [
         f"chunk = block % {chunks}",
@@ -457,6 +755,77 @@ def _fused_softmax(
         f"    if target < {length}:",
         f"        token = sequence * {length} + target",
     ]
+
+    # Shared temporal snapshots let different contraction layouts read the same
+    # vector without repeating its State update or relying on fragment layouts.
+    init = []
+    for i, (_, carry) in enumerate(vector_items):
+        init += [
+            f"vector_state{i} = T.alloc_shared(({pm},), 'float32')",
+            f"for r in T.Parallel({pm}):",
+            f"    vector_state{i}[r] = T.if_then_else(r < {features}, VectorCarry{i}[sh, chunk, r, 0], 0.0)",
+        ]
+    for i, _ in enumerate(region.vectors if region else ()):
+        init.append(f"vector_view{i} = T.alloc_shared(({pm},), 'float32')")
+    # Insert allocations/initialization before the token loop.
+    loop = body.index(f"for step in T.serial({_CHUNK}):")
+    body[loop:loop] = init + ["T.sync_threads()"]
+    for i, name in enumerate(vector_states):
+        for j, term in enumerate(region.vectors):
+            if term.state == name and term.prior:
+                body += [
+                    f"        for r in T.Parallel({pm}):",
+                    f"            vector_view{j}[r] = vector_state{i}[r]",
+                ]
+        body += [
+            f"        for r in T.Parallel({pm}):",
+            f"            if r < {features}:",
+        ]
+        _advance(
+            body,
+            "                ",
+            context,
+            vector_items[i][0],
+            f"vector_state{i}[r]",
+            "token",
+            "r",
+            "0",
+            f"vector{i}",
+        )
+        for j, term in enumerate(region.vectors):
+            if term.state == name and not term.prior:
+                body += [
+                    f"        for r in T.Parallel({pm}):",
+                    f"            vector_view{j}[r] = vector_state{i}[r]",
+                ]
+    if vector_states:
+        body.append("        T.sync_threads()")
+    local_scores = {
+        f"vector{i}": f"vector_view{i}[c]"
+        for i, _ in enumerate(region.vectors if region else ())
+    }
+    score = (
+        "scores[c]"
+        if region is None
+        else context.emit_value(
+            region.scores,
+            "token",
+            "head",
+            "c",
+            local_values={**local_scores, "scores": "scores[c]"},
+        )
+    )
+    weight = (
+        "scores[c] / denominator[0]"
+        if region is None
+        else context.emit_value(
+            region.weights,
+            "token",
+            "head",
+            "c",
+            local_values={**local_scores, "probability": "scores[c] / denominator[0]"},
+        )
+    )
 
     def advance(state, variable, nrows, ncolumns, padded_r, padded_c, prefix):
         body.extend(
@@ -490,13 +859,20 @@ def _fused_softmax(
         f"                products1[r, c] = {q} * memory1[r, c]",
         "        T.reduce_sum(products1, scores, dim=0)",
         f"        for c in T.Parallel({pm}):",
-        f"            scores[c] = T.if_then_else(c < {features}, scores[c], -T.infinity('float32'))",
+        f"            if c < {features}:",
+        f"                scores[c] = {score}",
+        "            else:",
+        "                scores[c] = -T.infinity('float32')",
         "        T.reduce_max(scores, maximum, dim=0)",
         f"        for c in T.Parallel({pm}):",
         "            scores[c] = T.exp(scores[c] - maximum[0])",
         "        T.reduce_sum(scores, denominator, dim=0)",
         f"        for c in T.Parallel({pm}):",
-        "            weights[c] = scores[c] / denominator[0]",
+        f"            if c < {features}:",
+        f"                scores[c] = {weight}",
+        "            else:",
+        "                scores[c] = 0.0",
+        "        T.copy(scores, weights)",
         "        T.sync_threads()",
     ]
     if not prior2:
@@ -514,16 +890,41 @@ def _fused_softmax(
     if prior2:
         advance(second, "memory2", features, columns, pm, pc, "second")
     body.append("        T.sync_threads()")
+    if final_items:
+        body += [
+            f"for r, c in T.Parallel({pr}, {pm}):",
+            f"    if (r < {rows}) & (c < {features}):",
+            "        FinalFirst[sequence, head, r, c] = memory1[r, c]",
+            f"for r, c in T.Parallel({pm}, {pc}):",
+            f"    if (r < {features}) & (c < {columns}):",
+            "        FinalSecond[sequence, head, r, c] = memory2[r, c]",
+        ]
+        for i, _ in enumerate(vector_states):
+            body += [
+                f"for r in T.Parallel({pm}):",
+                f"    if r < {features}:",
+                f"        FinalVector{i}[sequence, head, r, 0] = vector_state{i}[r]",
+            ]
+    final_names = {
+        first.name: "FinalFirst",
+        second.name: "FinalSecond",
+        **{name: f"FinalVector{i}" for i, name in enumerate(vector_states)},
+    }
     annotations = list(context.annotations) + [
         _annotation("Carry1", carry1),
         _annotation("Carry2", carry2),
         _annotation("Output", output),
+        *(
+            _annotation(f"VectorCarry{i}", carry)
+            for i, (_, carry) in enumerate(vector_items)
+        ),
+        *(_annotation(final_names[name], value) for name, value in final_items),
     ]
     kernel = _compile(
         annotations, body, batch_heads * chunks, threads=256, device=carry1.device
     )
     _REGION_KERNELS[key] = kernel
-    kernel(*context.pointers, carry1, carry2, output)
+    kernel(*arguments)
     return output
 
 

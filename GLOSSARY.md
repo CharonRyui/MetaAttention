@@ -80,6 +80,14 @@ _Avoid_: Kernel chunk, token-local update stage
 An acyclic dependency graph of Scan Stages and transformations between their results; a downstream Stage may use an upstream State trajectory to determine its coefficients.
 _Avoid_: Joint Affine Summary when the inter-stage transformation is nonlinear
 
+**Stage Binding**:
+A typed connection from an upstream Scan Stage's token Readout to a downstream Stage's Input, preserving sequence identity and the selected State timing.
+_Avoid_: Final-State substitution for a trajectory
+
+**Scan Identity**:
+The State value representing an empty sequence for a particular scan algebra.
+_Avoid_: Zero State as a universal identity
+
 **Nonlinear State Feedback**:
 A dependency in which a nonlinear function of the State being updated determines its own subsequent evolution.
 _Avoid_: Nonlinear Readout

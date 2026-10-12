@@ -1,7 +1,7 @@
 # Stateful examples
 
 These factories describe recurrences with the existing Stateful Operator IR.
-They return a `StatefulOperator`; compilation binds the head and feature roles,
+They return a `StatefulOperator` or `StagedStatefulOperator`; compilation binds the head and feature roles,
 then invocation binds tensors by name. The factory's batch, head and sequence
 arguments follow the existing example convention; runtime tensors and
 `role_sizes` determine those extents. `dim` sets the query scale `1/sqrt(K)`.
@@ -67,6 +67,43 @@ they are different from FLA's normalized two-state cache. Supply logits whose
 exponentials and cumulative sums remain finite and positive in FP32. This
 example does not include the logcumsumexp stabilization used by FLA's recurrent
 ABC implementation.
+
+## Staged preconditioners and stable LightNet
+
+[`preconditioned_delta.py`](preconditioned_delta.py) exposes
+`preconditioned_delta(kind="kda" | "gdn", dtype=...)`. It scans ATK at key heads,
+then exports a FP32 preconditioned key to the memory scan. ATK keeps shape
+`[B,Hk,K]`, while memory keeps `[B,Hv,K,V]`; `Hv` must be divisible by `Hk`.
+Initial/final State names are `("atk", "memory")`.
+
+External inputs are `query`, `key`, `value`, FP32 scalar `log_atk_decay`,
+`beta_atk`, `center`, `scale`, `beta`, and `log_decay`. Auxiliary scalars use
+`[B,Hk,T]`; `beta` uses `[B,Hv,T]`. KDA's `log_decay` is KEY-channel
+`[B,Hv,T,K]`; GDN's is scalar `[B,Hv,T]`. Use `center=-0.2` and
+`scale=K**-0.5` to match FLA defaults. KDA follows its naive reference's raw q/k;
+GDN explicitly normalizes q/k in FP32. `x`/`eps` are factory parameters.
+
+[`lightnet_stable.py`](lightnet_stable.py) scans `logits` in log space, then binds
+FP32 normalized key and log gate to the matrix scan. It uses public States
+`("z", "memory")` with shapes `[B,H,K]` and `[B,H,K,V]`. FLA uses `(memory,z)`
+with z shaped `[B,1,H,K]`; convert explicitly when exchanging caches. Omitted
+State starts z at `-inf` and memory at zero. A cold z with supplied nonzero
+memory uses a zero first log gate, matching FLA. Query activation and layer
+projections remain outside this example.
+
+Compile staged programs with the union of each stage's Head/Feature roles.
+`backward=True` enables cross-stage gradients; optional `checkpoint=True`
+recomputes child intermediates. Packed accepts empty segments and all-empty
+inputs. [API](../docs/API.md#scan-stage-dag-schema-v5) documents binding, State
+ordering and resource limits. [Stage benchmarks](../docs/stateful-stage-benchmarks.md)
+record current measurements separately from correctness.
+
+```bash
+uv run --extra test pytest -q tests/unit/test_scan_stages.py \
+  tests/unit/test_preconditioned_delta.py tests/unit/test_logaddexp_scan.py
+uv run --extra test pytest -q --run-gpu tests/unit/test_preconditioned_delta.py
+uv run --group fla-benchmark python testing/benchmark_fla_stages.py --help
+```
 
 ## Compile and run KDA
 

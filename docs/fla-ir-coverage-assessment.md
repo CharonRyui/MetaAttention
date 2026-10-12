@@ -1,6 +1,6 @@
 # FLA 覆盖评估与 Algorithm IR 扩展建议
 
-状态：基线评估结论与扩展建议；第一阶段的实现进展另列于下节。基线能力矩阵对应下述 commit，不应当作新增 schema v4 的能力清单。
+状态：保留基线评估结论与扩展建议；第一、二阶段实现进展另列于下节。基线能力矩阵对应下述 commit，不应当作新增 schema v4/v5 的能力清单。
 
 ## 范围与证据
 
@@ -34,7 +34,7 @@ prior/current 引用与 current-state Transition DAG。接口与决定见
 - Delta Product 已改为有序写入，IR 规模为 O(n)。factored lowering 将早期写入的因子经过后续动作变换，保留原有编译路径；因子准备可为 O(n²)，不再进行指数展开。
 - Momentum Delta Rule 已有 example，按照 FLA 的符号约定更新两个 matrix State。相同 roles、沿一个共享 Feature 轴的耦合更新组合为联合 block-affine summary，再做 segmented parallel scan。
 - 本阶段允许引用 Prior State 或另一 State 的完整 Current State；中间 target 值由 steps 顺序表达，未增加任意命名中间版本。
-- 混合轴耦合、不同 State roles、state-derived 非线性系数及 Scan Stage DAG 仍不支持。Momentum 使用 reference-grade differentiable scan，尚无性能对比。
+- 单 token 联合 affine 更新仍不支持混合轴耦合或不同 State roles。Momentum 使用 reference-grade differentiable scan，尚无性能对比；跨 scan 的非线性系数变换已由下述第二阶段补齐。
 
 新增验证覆盖输出、两组 initial/final State、continuation、packed 空序列、依赖环拒绝与辅助 State 梯度。H20 检查覆盖 Momentum 输出/梯度和 Delta Product 的编译路径跨 chunk 行为。直接调用相邻 FLA Momentum reference，在 FP32、B=H=2、T=17、K=3、V=5 下，两种 `use_p_times_alpha` 设置最大输出误差为 `1.49e-8` 和 `1.30e-8`，final states 也通过误差检查。最终 CPU 单元回归为 **405 passed，76 deselected**；两组相关 H20 检查共 **18 passed**，覆盖新增 examples 和既有 factored 路径。这些检查不是新增性能测量。
 
@@ -66,7 +66,7 @@ Algorithm IR 是数学描述，Stateful Operator 是其编译与调用入口。�
 2. **Scan Stage DAG**：先完成辅助 scan，再将它的轨迹非线性变换为下游 scan 的系数；不必具有单一联合仿射 summary。
 3. **Nonlinear State Feedback**：被更新的 State 的非线性函数参与自身后续更新，现有 summary 证明不适用。
 
-以上是数学分类；后两类名称不对应当前已经实现的新 IR 节点。Token 内的有序赋值依赖与整段序列的 Scan Stage DAG 也不能混为同一个调度规则。
+以上是数学分类；基线时后两类名称不对应新增 IR 节点。Schema v5 已实现有限的 Scan Stage DAG；Nonlinear State Feedback 仍未支持。Token 内的有序赋值依赖与整段序列的 Scan Stage DAG 不能混为同一个调度规则。
 
 ## FLA 类型覆盖归约
 
@@ -176,9 +176,19 @@ k_write = k * m
 需要 phase scan、Sin/Cos、配对/分块 rotary、MIMO rank 的变换与归约、历史 K/V 的读取和更新，以及跨调用 continuation。
 [CyFA reference](../../flash-linear-attention/fla/ops/cyfa/naive.py) 同样使用累积 phase、slot rotation 与多 state readout，可作为可复用性验收 example。
 
+## 第二阶段实现进展（schema v5）
+
+- `ScanStageIR` 组合单独证明的 affine `AlgorithmIR` 和有限 `LogAddExpScanIR`。Typed `StageBinding` 导出 Readout 轨迹、保留 prior/current、roles、dtype 与 sequence 身份；依赖无环且自动排序，内部输入不由调用者提供。
+- `Abs` 与显式 `Cast` 支持 FP32 preconditioning 与 authored rounding。阶段 VJP 经 Torch autograd 汇合 output/final loss、传回 upstream initial State；可选 stage checkpoint 重算 child intermediates。
+- [Preconditioned KDA/GDN](../examples/preconditioned_delta.py) 用 ATK scan 生成非对称写入 key，再扫描主 memory。ATK 按 key heads 保存，memory 按 value heads 保存；HeadMapping 共享轨迹并在反向汇总梯度。KDA 遵循 naive raw q/k，GDN 使用 FP32 q/k L2 normalization。
+- [稳定 LightNet](../examples/lightnet_stable.py) 使用 log-space accumulator，identity 为 `-inf`，安全 identity VJP，cold 首 token gate=0；支持 finite initial z、非零 memory、continuation 和 FLA `(S,z)` 缓存显式转换。
+- CPU 独立 reference 和 H20 输出、initial/final、packed empty 与梯度检查通过；直接 FLA naive KDA/GDN 和 LightNet gate/full operator 互验已完成。性能与入口合同差异见 [stage benchmarks](stateful-stage-benchmarks.md)。这仍是 stage 能力基线，reference scan 的训练存储和长序列调度需要后续优化。
+
+接口与取舍见 [ADR 0005](adr/0005-scan-stage-dag-and-logaddexp.md)。General Nonlinear State Feedback、history、rotary 与 MIMO 仍未新增；阶段组合不构成对这些语言能力的隐式支持。
+
 ## 建议优先级
 
-以下为基线评估提出的优先级。用户随后授权开始实现，P1 的首个能力范围已落地，见上节；P2–P5 仍是后续建议。下一轮的交付顺序、最小 stage 语义和验收矩阵见 [能力增强实施计划](stateful-capability-roadmap.md)。
+以下为基线评估提出的优先级。P1、P2 的能力范围已落地，见上节；P3–P5 仍是后续建议。已实现合同、验收矩阵与后续性能任务见 [能力增强实施计划](stateful-capability-roadmap.md)。
 
 | 优先级 | 能力 | 首要验收收益 |
 | --- | --- | --- |
@@ -207,4 +217,4 @@ CPU 检查和已有 forward benchmark 不足以确认新能力的 GPU 性能。r
 [stateful example benchmarks](stateful-example-benchmarks.md)，结构优化方向见
 [stateful specialized paths](stateful-specialized-paths.md)。
 
-实现前还需确认：新增状态版本与 steps 的具体 interface、Scan Stage DAG 是公开 authoring 形式还是由分析推导、稳定 scan 支持的有限 algebra、history/state 转换契约，以及各阶段 GPU 验收矩阵。其中 P1 的首个接口范围已由 ADR 0004 记录；其余选择会改变公开语义，仍需后续设计。
+P1 的首个接口范围由 ADR 0004 记录，P2 的显式 stage authoring、有限 LogAddExp algebra、State 转换和验收范围由 ADR 0005 与阶段基准记录。P3 的 history、rotary/MIMO 与其他新 State 合同仍需设计和独立验收。

@@ -182,6 +182,8 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
     from ...stateful_operator import (
         Add,
         AxisScale,
+        Abs,
+        Cast,
         Clamp,
         Constant,
         Divide,
@@ -377,10 +379,13 @@ def analyze_algorithm(algorithm: AlgorithmIR) -> Analysis:
                 dtype,
                 _broadcast_roles(left.roles, right.roles, algorithm),
             )
+        elif isinstance(expression, Cast):
+            operand = type_expression(expression.operand, f"{path}.operand")
+            typed = TypedExpression(expression, expression.dtype, operand.roles)
         elif isinstance(expression, (Negate, Shift)):
             operand = type_expression(expression.operand, f"{path}.operand")
             typed = TypedExpression(expression, operand.dtype, operand.roles)
-        elif isinstance(expression, (Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
+        elif isinstance(expression, (Abs, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp)):
             operand = type_expression(expression.operand, f"{path}.operand")
             typed = TypedExpression(expression, torch.float32, operand.roles)
         else:
@@ -827,6 +832,8 @@ def simplify_expression(expression):
     """Apply representation-safe identities without reassociating arithmetic."""
     from ...stateful_operator import (
         Add,
+        Abs,
+        Cast,
         Clamp,
         Constant,
         Contract,
@@ -854,6 +861,11 @@ def simplify_expression(expression):
                 prior=expression.prior,
             )
         return expression
+    if isinstance(expression, Cast):
+        # Retain even constant casts: rounding precedes subsequent arithmetic.
+        return Cast(simplify_expression(expression.operand), expression.dtype)
+    if isinstance(expression, Abs):
+        return Abs(simplify_expression(expression.operand))
     if isinstance(expression, Negate):
         operand = simplify_expression(expression.operand)
         if isinstance(operand, Constant):
@@ -943,6 +955,8 @@ def _all_state_terms(expression):
     """Yield ``(path, StateTerm)`` for every State reference in an expression."""
     from ...stateful_operator import (
         Add,
+        Abs,
+        Cast,
         Clamp,
         Constant,
         Contract,
@@ -968,7 +982,8 @@ def _all_state_terms(expression):
     if isinstance(expression, (Input, Constant)):
         return
     if isinstance(
-        expression, (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax)
+        expression,
+        (Negate, Abs, Cast, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax),
     ):
         yield from _all_state_terms(expression.operand)
         return
@@ -1094,6 +1109,8 @@ def _role_names(roles: tuple[Any, ...]) -> list[str]:
 def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
     from ...stateful_operator import (
         Add,
+        Abs,
+        Cast,
         Clamp,
         Contract,
         Divide,
@@ -1119,7 +1136,19 @@ def _input_names(*expressions: InputExpression) -> tuple[str, ...]:
             result.extend(_input_names(expression.left, expression.right))
         elif isinstance(
             expression,
-            (Negate, Exp, Log, Sigmoid, Sqrt, Reciprocal, Clamp, Shift, Softmax),
+            (
+                Negate,
+                Abs,
+                Cast,
+                Exp,
+                Log,
+                Sigmoid,
+                Sqrt,
+                Reciprocal,
+                Clamp,
+                Shift,
+                Softmax,
+            ),
         ):
             result.extend(_input_names(expression.operand))
         elif isinstance(expression, StateTerm):

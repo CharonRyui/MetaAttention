@@ -1,6 +1,6 @@
 # Stateful IR 下一阶段能力增强计划
 
-状态：实施计划建议。Schema v4 的第一阶段已实现；以下新增公开接口仍需在实现中通过类型、summary 和梯度验证，不是已接受的新 schema 决定。
+状态：P2 能力交付已实现，schema v5。Scan Stage DAG、typed binding、Abs/Cast、跨阶段梯度、GDN head sharing 与稳定 LogAddExp 已通过公开调用验证；checkpoint、资源估计和独立 benchmark 已接入。长序列性能仍需后续优化，实测记录见 [阶段基准](stateful-stage-benchmarks.md)。
 
 ## 当前起点
 
@@ -14,7 +14,7 @@ block-axis summary 做可微 segmented scan。
 - current-token Transition DAG 描述一个联合仿射更新；它不能表达非线性辅助状态变换后生成下游 scan 系数。
 - 耦合要求相同 State roles、单一共享动作轴；通用 PyTorch scan 是数学与梯度基线，不能据此宣布高效 GPU 覆盖。训练时 autograd 会保留 scan 各级中间值，workspace 估计还需覆盖这些实际存活张量。
 
-基线覆盖分类见 [FLA 评估](fla-ir-coverage-assessment.md)。下一步主线保持 P2 → P3；现有 lowering 性能增强按独立范围推进。
+基线覆盖分类见 [FLA 评估](fla-ir-coverage-assessment.md)。P2 的接口与数值合同见 [ADR 0005](adr/0005-scan-stage-dag-and-logaddexp.md)。下一步能力主线为 P3；现有 stage 与 readout lowering 性能增强按独立范围推进。
 
 ## 实施顺序与交付边界
 
@@ -41,7 +41,7 @@ block-axis summary 做可微 segmented scan。
 5. **公开 State**：按声明的顺序汇总各 stage 的 initial/final State；保留现有单 stage operator 的调用合同与缓存身份。
 6. **资源**：先采用明确物化的轨迹基线。编译估计和 runtime envelope 包括每个 stage summary、轨迹、表达式中间值和反向保存值，记录 overlapping lifetime；随后才加入 checkpoint/recompute 选择。
 
-待接口设计解决的具体问题是 stage 输出命名、binding 角色映射和 dtype cast 的语法。先用 Preconditioned KDA 的独立 reference 约束这些选择，不增加任意非线性 recurrence interpreter。
+已采用 `ScanStage`、`StageBinding`、`StageOutput` 和 `StagedStatefulOperator`，输入 binding 保留 logical roles/dtype，并转换物理 axis 顺序；`Cast` 明确转换位置。每个 stage 导出 Readout，从而复用 prior/current 选择和类型检查。接口、限制与用法见 [API](API.md#scan-stage-dag-schema-v5)。不增加任意非线性 recurrence interpreter。
 
 Preconditioned KDA 的首个完整链路：
 

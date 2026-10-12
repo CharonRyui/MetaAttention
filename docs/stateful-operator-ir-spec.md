@@ -5,7 +5,9 @@ Status: `proposed`
 Scope: this document preserves the initial schema-v1 proposal and its production
 acceptance goals; it is not a current capability inventory. Implemented language
 extensions are recorded in [ADR 0002](adr/0002-multiple-states-and-readout-expressions.md),
-[ADR 0003](adr/0003-product-features-and-prior-state-readouts.md), and
+[ADR 0003](adr/0003-product-features-and-prior-state-readouts.md),
+[ADR 0004](adr/0004-ordered-affine-state-transitions.md),
+[ADR 0005](adr/0005-scan-stage-dag-and-logaddexp.md), and
 [the API guide](API.md). The [domain glossary](../GLOSSARY.md) and
 [FLA coverage assessment](fla-ir-coverage-assessment.md) distinguish current
 capability from proposed extensions.
