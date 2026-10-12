@@ -120,3 +120,32 @@ CPU recipe tests 4 passed，覆盖 State 重命名、辅助 vector cut 计费、
 这是固定小 batch/head workload 的测量，不代表全部形状。多 chunk 的 public 调用仍主要受 dispatch/summary/carry 多 kernel 开销影响，部分点慢于 FLA；Graph 与 public 结果分别报告。CUPTI 对 foreign launches 的计数不稳定，`total_launches` 只能作为单次 profile 证据，不能凭上述表宣称所有 kernel 均融合。此次未完成 register/shared/spill 全矩阵 profile，也未合并多个 State 的 summary/carry；这两项是后续优化。训练与 packed 继续走既有合法路径，本次 native softmax region 仅用于 dense inference。
 
 同步完成通用 `Abs`/`Cast` 表达式编译支持：分析/type、State 依赖遍历、VJP input 依赖、CPU/autograd、TileLang pointwise 与 raw loader 均接受节点；Cast 保留每个 BF16/FP32 转换边界，Abs 在 FP32 计算且零点梯度为 0。公共 IR 定义/export/reference evaluation 由主会话范围提供。
+
+## 三十次重复的复测（2026-10-12）
+
+同一实现提交 `741c32f`，H20 GPU0，启动时无外部 compute PID。
+B=H=1、K=V=64、SLOT=16，BF16 q/k/v、FP32 logits，zero initial、
+output-only，workspace=8 GiB，warmup=5、repetitions=30。
+Meta/oracle、FLA/oracle 和 pair 输出校验在全部五个长度均通过；
+全部选择 `tilelang-native-diagonal-readout-cut`。ABC 公开区间包含
+布局与预处理，沿用本文件的约定；stage benchmark 的外部布局预绑定约定不同。
+
+| T | Meta public ms | FLA public ms | Meta Graph ms | FLA Graph ms | Meta peak incremental bytes | FLA peak incremental bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 0.442 | 0.328 | 0.0255 | 0.0278 | 2,048 | 8,704 |
+| 64 | 0.283 | 0.324 | 0.0320 | 0.0362 | 20,480 | 45,056 |
+| 65 | 0.497 | 0.331 | 0.0500 | 0.0420 | 40,448 | 53,760 |
+| 2048 | 0.503 | 0.334 | 0.0607 | 0.1633 | 923,648 | 1,441,792 |
+| 8192 | 0.625 | 0.628 | 0.1073 | 0.5426 | 3,694,592 | 5,767,168 |
+
+T8192 的公开调用约为 0.625/0.628 ms，接近持平；Graph 下约为
+0.107/0.543 ms。T2048 的 Graph 路径更快，而公开调用仍慢于 FLA。
+这说明移除 CPU dispatch/launch 间隙后执行路径有优势，但公开调用开销仍需优化。
+T65 跨 chunk 后公开调用约 0.497 ms，FLA 为 0.331 ms，Graph 也略慢；
+不能将长序列 Graph 的优势外推到所有形状。
+
+[仓库内结果与 manifest](benchmarks/abc-741c32f.json) 包含版本、源文件哈希、
+五条记录、正确性误差、公开/Graph/CPU-wall 计时及内存。该 runner 保存
+中位数而非每次原始计时样本。原始 JSON/CSV/manifest/图保留在远端
+`/tmp/abc_perf_741c32f/`，日志为 `/tmp/abc_perf_741c32f.log`。
+本轮没有修改生产实现，也没有测试 ABC 训练性能。

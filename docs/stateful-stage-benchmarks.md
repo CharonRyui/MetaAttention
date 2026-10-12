@@ -208,3 +208,75 @@ Evidence on the SSH host (outside the tracked source files):
 All benchmark/waiting processes launched for this task have finished. The
 GPU0 retry satisfied the requested four lengths for all three families;
 original contention/fatal-exit evidence was retained rather than overwritten.
+
+## Thirty-repetition H20 measurement (2026-10-12)
+
+Source commit: `741c32fa53b93a8337dc747f9105eb8fa670f013`; FLA commit:
+`f3bec720f7847d4f176872b34f002cc580e2cc6e`. GPU0, B1/H1/K=V64, BF16,
+nonzero initial states, 8 GiB workspace cap, **warmup=5/reps=30**.
+The same numerical and timing contracts above apply. All twelve workloads
+completed; GPU snapshots before and after every isolated workload observed
+no external compute PID. This is one measured run of these fixed shapes.
+
+[Tracked JSON](benchmarks/stages-741c32f.json) retains all CUDA-event and
+synchronized wall samples, per-tensor oracle errors, lowerers, allocator peaks,
+workspace estimates, GPU snapshots and source hashes. The raw remote log is
+`/tmp/fla_stages_perf_741c32f.log`.
+
+Public CUDA-event medians in milliseconds:
+
+| Family | T | Meta fwd | FLA chunk fwd | FLA recurrent fwd | Meta VJP | FLA chunk VJP |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| KDA | 1 | 1.234 | mismatch | 0.091 | 1.376 | mismatch |
+| KDA | 64 | 1.277 | mismatch | 0.141 | 3.147 | mismatch |
+| KDA | 2048 | 1.411 | mismatch | 2.238 | 4.526* | mismatch |
+| KDA | 8192 | 1.867 | mismatch | 8.683 | 8.525* | mismatch |
+| GDN | 1 | 1.429 | 0.777 | 0.091 | 2.271 | 1.358 |
+| GDN | 64 | 1.532 | 0.766 | 0.168 | 5.964 | 2.088 |
+| GDN | 2048 | 2.279 | 0.801 | 1.752 | 5.535* | 1.440* |
+| GDN | 8192 | 4.774 | 0.827 | 6.738 | 9.144* | 1.630* |
+| LightNet | 1 | 1.215 | 0.435 | 0.179 | 1.269 | 0.765 |
+| LightNet | 64 | 1.403 | 0.413 | 0.220 | 2.656 | 0.739 |
+| LightNet | 2048 | 1.626 | 0.452 | 2.918 | 3.642* | 0.847* |
+| LightNet | 8192 | 1.773 | 1.309 | 11.428 | 10.041* | 1.234* |
+
+`*`: long-sequence full VJP oracle remains unchecked. All twelve Meta forward
+output/final-state checks passed. Meta T1/64 VJPs passed. GDN/LightNet FLA
+forward and short VJP checks passed. KDA chunk remains a semantic mismatch
+because its public API normalizes q/k; its timing samples remain in the JSON
+but are excluded from this table. KDA recurrent forward passed at all lengths.
+
+At T8192, synchronized CPU-wall medians for Meta/FLA chunk were
+**4.797/0.848 ms** for GDN and **1.803/1.327 ms** for LightNet. Meta KDA
+was **1.888 ms**, compared with **8.705 ms** for the matching FLA recurrent
+baseline. The latter is a recurrent schedule comparison, not a matched chunk
+prefill comparison. LightNet T1 varied appreciably within this run: the sorted
+sample interval from index 2 to index 26 was **0.845–1.531 ms**. Raw samples
+should be consulted before extrapolating short-call results.
+
+T8192 allocator peaks and conservative public workspace bounds (MiB):
+
+| Family | Meta forward peak | FLA chunk forward peak | Meta VJP peak | FLA chunk VJP peak | Meta forward bound | Meta backward bound |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| KDA | 87.6 | 18.3 | 201.2 | 46.6 | 268.9 | 5058.6 |
+| GDN | 99.7 | 12.3 | 225.6 | 25.8 | 316.3 | 5105.1 |
+| LightNet | 20.2 | 11.0 | 1452.8 | 97.1 | 54.4 | 6112.3 |
+
+KDA chunk memory figures describe the mismatched public API and are diagnostic
+only. Allocator peaks include resident tensors; bounds are conservative
+resource estimates and must not be interpreted as measured peak memory.
+
+The selected child runtimes agree with the earlier smoke: chunked preconditioner
+plus factored memory for KDA/GDN inference, segmented LogAddExp plus vector
+propagation for LightNet inference. KDA/GDN backward uses the reference
+preconditioner; LightNet backward uses axis-scale memory. The current public
+stage calls cost about 1–1.5 ms even at T1/64. GDN T8192 is about 5.8 times
+the matched FLA chunk latency, and LightNet about 1.35 times. Stage execution
+overhead, auxiliary scan execution, and the differentiable child runtimes are
+priorities for subsequent optimization. These measurements identify the
+overall cost; they do not isolate each child or establish a causal breakdown.
+
+The same source commit also received a 30-repetition ABC readout measurement;
+see [ABC results](abc-fast-path-assessment.md#三十次重复的复测2026-10-12).
+Abs/Cast are included in the preconditioned expressions and their full public
+timing; this run does not attribute a separate latency to each expression node.
