@@ -367,8 +367,8 @@ CONTRACTS = ("output-only", "final-state", "continuation")
 def _token_oracle(operator, inputs, sizes, *, initial_state=None):
     """CPU FP32 recurrence, independent of lowering/scan/rewrite implementation.
 
-    Expressions carry named Feature axes; every propagation is applied in authored
-    order, followed by injections. This also preserves prior-State readouts.
+    Expressions carry named Feature axes; transitions apply ordered affine steps,
+    including interleaved injections. This also preserves prior-State readouts.
     """
     from attn_engine import stateful_operator as ir
 
@@ -519,15 +519,15 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
         for transition in algorithm.transitions:
             spec = specs[transition.state]
             state = states[spec.name]
-            for propagation in transition.propagations:
-                if isinstance(propagation, ir.AxisScale):
-                    factor, roles = evaluate(propagation.factor, token, prior)
+            for step in transition.ordered_steps:
+                if isinstance(step, ir.AxisScale):
+                    factor, roles = evaluate(step.factor, token, prior)
                     state = state * align(factor, roles, spec.feature_roles)
-                elif isinstance(propagation, ir.RankOnePropagation):
-                    left, lr = evaluate(propagation.left, token, prior)
-                    right, rr = evaluate(propagation.right, token, prior)
-                    coefficient, cr = evaluate(propagation.coefficient, token, prior)
-                    axis = 2 + spec.feature_roles.index(propagation.role)
+                elif isinstance(step, ir.RankOnePropagation):
+                    left, lr = evaluate(step.left, token, prior)
+                    right, rr = evaluate(step.right, token, prior)
+                    coefficient, cr = evaluate(step.coefficient, token, prior)
+                    axis = 2 + spec.feature_roles.index(step.role)
                     contraction = (state * align(right, rr, spec.feature_roles)).sum(
                         axis, keepdim=True
                     )
@@ -537,16 +537,14 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
                         * align(left, lr, spec.feature_roles)
                         * contraction
                     )
+                elif isinstance(step, ir.ProductInjection):
+                    product = torch.ones(1, 1, *([1] * spec.rank))
+                    for factor in step.factors:
+                        value, roles = evaluate(factor.expression, token, prior)
+                        product = product * align(value, roles, spec.feature_roles)
+                    state = state + product
                 else:
-                    raise TypeError(
-                        f"unsupported oracle propagation {type(propagation).__name__}"
-                    )
-            for injection in transition.injections:
-                product = torch.ones(1, 1, *([1] * spec.rank))
-                for factor in injection.factors:
-                    value, roles = evaluate(factor.expression, token, prior)
-                    product = product * align(value, roles, spec.feature_roles)
-                state = state + product
+                    raise TypeError(f"unsupported oracle step {type(step).__name__}")
             states[spec.name] = state
         for readout in algorithm.readouts:
             expression = (

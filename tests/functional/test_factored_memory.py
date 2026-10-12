@@ -27,6 +27,7 @@ def test_long_factored_inference_fits_default_budget_and_bounded_peak(
         mode="dense",
         optimized=True,
     )
+    torch.manual_seed(42)
     inputs = benchmark.inputs_for(operator, case, length, gpu_device)
     with torch.inference_mode():
         compiled(**inputs)
@@ -42,6 +43,27 @@ def test_long_factored_inference_fits_default_budget_and_bounded_peak(
     assert result.final_state["memory"].shape == (2, 16, 64, 64)
     assert torch.isfinite(result.outputs["output"]).all()
     assert torch.isfinite(result.final_state["memory"]).all()
+    if family == "delta-product":
+        from tests.unit.test_delta_family_examples import _reference
+
+        previous_threads = torch.get_num_threads()
+        try:
+            torch.set_num_threads(1)
+            expected_output, expected_states = _reference(
+                "delta_product",
+                {name: value.cpu() for name, value in inputs.items()},
+                {"memory": torch.zeros(2, 16, 64, 64)},
+            )
+        finally:
+            torch.set_num_threads(previous_threads)
+        verdict = benchmark._correctness(
+            result.outputs.as_dict(),
+            result.final_state.as_dict(),
+            {"output": expected_output},
+            expected_states,
+            "final-state",
+        )
+        assert verdict["status"] == "VALID", verdict
 
 
 @pytest.mark.parametrize("family", ["delta-rule", "kda", "oja", "delta-product"])

@@ -62,6 +62,7 @@ def test_missing_final_state_is_invalid_only_for_state_contracts():
         "rwkv6",
         "rwkv7",
         "hgrn",
+        "delta-product",
     ],
 )
 def test_token_recurrence_continuation_preserves_all_states(name):
@@ -120,3 +121,92 @@ def test_based_oracle_matches_polynomial_attention():
         weights.sum(-1, keepdim=True) + 1e-6
     )
     torch.testing.assert_close(actual["output"], expected, rtol=1e-6, atol=1e-6)
+
+
+def test_delta_product_oracle_preserves_interleaved_writes_and_readout_timing():
+    from examples.gated_delta_product import (
+        gated_delta_product,
+        STATE_HEADS,
+        KEY,
+        VALUE,
+    )
+    from attn_engine import AlgorithmIR, Readout, StatefulOperator
+
+    operator = gated_delta_product(1, 1, 1, 2, 2, dtype=torch.float32)
+    inputs = {
+        "query": torch.tensor([[[[1.0, 0.0]]]]),
+        "gate": torch.zeros(1, 1, 1),
+        "key_0": torch.tensor([[[[1.0, 0.0]]]]),
+        "key_1": torch.tensor([[[[0.5, 0.5]]]]),
+        "value_0": torch.tensor([[[[1.0, 2.0]]]]),
+        "value_1": torch.zeros(1, 1, 1, 2),
+        "beta_0": torch.ones(1, 1, 1),
+        "beta_1": torch.ones(1, 1, 1),
+    }
+    algorithm = operator.algorithm
+    readout = algorithm.readouts[0]
+    operator = StatefulOperator(
+        AlgorithmIR(
+            inputs=algorithm.inputs,
+            states=algorithm.states,
+            transition=algorithm.transitions,
+            readouts=(
+                readout,
+                Readout("prior", replace(readout.expression, prior=True)),
+            ),
+            head_mapping=algorithm.head_mapping,
+        )
+    )
+    outputs, states = _token_oracle(
+        operator, inputs, {STATE_HEADS: 1, KEY: 2, VALUE: 2}
+    )
+    expected_state = torch.tensor([[[[0.75, 1.5], [-0.25, -0.5]]]])
+    torch.testing.assert_close(states["memory"], expected_state, rtol=0, atol=0)
+    torch.testing.assert_close(outputs["output"], expected_state[:, :, :1, :] * 2**-0.5)
+    torch.testing.assert_close(outputs["prior"], torch.zeros(1, 1, 1, 2))
+
+    # A legacy grouped transition intentionally yields a different result.
+    from attn_engine import StateTransition
+
+    grouped = StatefulOperator(
+        AlgorithmIR(
+            inputs=algorithm.inputs,
+            states=algorithm.states,
+            transition=StateTransition(
+                "memory",
+                propagations=algorithm.transition.propagations,
+                injections=algorithm.transition.injections,
+            ),
+            readouts=algorithm.readouts,
+            head_mapping=algorithm.head_mapping,
+        )
+    )
+    _, grouped_states = _token_oracle(
+        grouped, inputs, {STATE_HEADS: 1, KEY: 2, VALUE: 2}
+    )
+    torch.testing.assert_close(
+        grouped_states["memory"], torch.tensor([[[[1.0, 2.0], [0.0, 0.0]]]])
+    )
+
+
+@pytest.mark.parametrize("steps", [1, 2, 3])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("nonzero_initial", [False, True])
+def test_delta_product_oracle_matches_independent_residual_recurrence(
+    steps, dtype, nonzero_initial
+):
+    from tests.unit.test_delta_family_examples import _case, _reference
+
+    operator, sizes, inputs, initial = _case("delta_product", dtype=dtype, steps=steps)
+    if not nonzero_initial:
+        initial = {name: torch.zeros_like(state) for name, state in initial.items()}
+    expected, expected_states = _reference(
+        "delta_product", inputs, initial, steps=steps
+    )
+    outputs, states = _token_oracle(
+        operator, inputs, sizes, initial_state=initial if nonzero_initial else None
+    )
+    torch.testing.assert_close(outputs["output"], expected, rtol=1e-6, atol=1e-6)
+    torch.testing.assert_close(
+        states["memory"], expected_states["memory"], rtol=1e-6, atol=1e-6
+    )

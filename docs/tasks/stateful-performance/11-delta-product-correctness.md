@@ -1,6 +1,8 @@
 # Delta-product benchmark 正确性修复计划
 
-状态：已定位 oracle 顺序错误，待实施修复。显存改动已提交为 `3d032cb`；本任务单独修复 benchmark 正确性判断，不改变已验证的显存优化。
+状态：已完成 oracle 顺序修复及回归验证。显存改动已提交为 `3d032cb`；本任务修复 benchmark 正确性判断，不改变已验证的显存优化。
+
+实施结果：共享 oracle 按 `ordered_steps` 执行；CPU 全量 551 通过、96 跳过；GPU inference 23 通过，新增长度边界独立对照 16 通过。原 50 条矩阵 Meta 全部 VALID，META_INVALID 与 META_RUNTIME_REJECTED 均为 0；delta-product 三种合同及 FLA prefill 全部通过。详细证据见 [H20 修复报告](../../measurements/delta-product-oracle-fix-h20/README.md)。以下保留原诊断依据与实施计划。
 
 ## 已确认的问题
 
@@ -68,4 +70,4 @@ PYTHONPATH=attention_engine .venv/bin/python testing/benchmark_fla_stateful.py \
   --gpu <idle_gpu> --output-dir benchmark_results/delta_product_oracle_fix
 ```
 
-本文件是可实施的修复计划；此提交尚未修改 oracle 或 kernel。
+计划已实施：修改 oracle、必要回归测试和观测证据；GPU kernel 无需修改。benchmark oracle 的耦合 StateInjection 等其他 IR 支持扩展不属于本次 delta-product 修复范围，遇到 unsupported step 会显式报错。
