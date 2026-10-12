@@ -73,6 +73,9 @@ def test_extended_family_defaults_are_registered():
         "oja",
         "delta-product",
         "abc",
+        "preconditioned-kda",
+        "preconditioned-gdn",
+        "lightnet",
     }
 
 
@@ -528,3 +531,188 @@ def test_csv_preserves_baseline_identity_for_unavailable_comparison():
     assert row["fla_baseline"] == "recurrent"
     assert row["fla_function"] is None
     assert row["speedup"] is None
+
+
+@pytest.mark.parametrize(
+    "family", ["preconditioned-kda", "preconditioned-gdn", "lightnet"]
+)
+@pytest.mark.parametrize("contract", ["output-only", "final-state", "continuation"])
+@pytest.mark.parametrize("baseline", ["recurrent", "prefill"])
+def test_staged_families_share_public_measurement_contract(
+    monkeypatch, family, contract, baseline
+):
+    """Exercise compiled stages and cache conversion through the main runner."""
+    import sys
+    from dataclasses import replace
+    from types import SimpleNamespace
+    import torch
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+    from testing.benchmark_fla_stages import oracle
+
+    monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "1")
+    case = replace(
+        next(c for c in benchmark.CASES if c.name == family),
+        batch=2,
+        heads=2,
+        dim=3,
+        dim_value=4,
+    )
+    calls = []
+
+    def function(**kwargs):
+        assert not torch.is_grad_enabled()
+        assert kwargs["q"].shape[:3] == (2, kwargs["v"].shape[1], 2)
+        assert kwargs["scale"] == 3**-0.5
+        native = {
+            "query": kwargs["q"].transpose(1, 2),
+            "value": kwargs["v"].transpose(1, 2),
+        }
+        memory = torch.zeros(2, 2, 3, 4)
+        if family == "lightnet":
+            native["logits"] = kwargs["k"].transpose(1, 2)
+            initial = kwargs["initial_state"]
+            auxiliary = torch.full((2, 2, 3), -torch.inf)
+            if initial is not None:
+                memory, z = initial
+                assert z.shape == (2, 1, 2, 3)
+                auxiliary = z.squeeze(1)
+        else:
+            native.update(
+                {
+                    n: kwargs[k].transpose(1, 2)
+                    for n, k in (
+                        ("key", "k"),
+                        ("log_decay", "g"),
+                        ("log_atk_decay", "g_atk"),
+                        ("beta_atk", "beta_atk"),
+                        ("beta", "beta"),
+                    )
+                }
+            )
+            shape = native["query"].shape[:-1]
+            native["center"] = torch.full(shape, -0.2)
+            native["scale"] = torch.full(shape, 3**-0.5)
+            auxiliary = kwargs["initial_A_state"]
+            memory = kwargs["initial_state"]
+            if auxiliary is None:
+                assert memory is None
+                auxiliary, memory = torch.zeros(2, 2, 3), torch.zeros(2, 2, 3, 4)
+            else:
+                assert auxiliary.shape == (2, 2, 3) and memory.shape == (2, 2, 3, 4)
+            if family == "preconditioned-gdn":
+                assert kwargs["use_qk_l2norm_in_kernel"] is True
+            elif baseline == "recurrent":
+                assert kwargs["use_qk_l2norm_in_kernel"] is False
+        calls.append(
+            (kwargs["output_final_state"], kwargs["initial_state"] is not None)
+        )
+        result = oracle(torch, family, native, (auxiliary, memory))
+        output = result["output"].transpose(1, 2)
+        final = kwargs["output_final_state"]
+        auxiliary = result["z" if family == "lightnet" else "atk"]
+        if family == "lightnet":
+            return output, (result["memory"] if final else None, auxiliary.unsqueeze(1))
+        return output, result["memory"] if final else None, auxiliary if final else None
+
+    module, recurrent, prefill = runner.BASELINE_APIS[family]
+    monkeypatch.setitem(
+        sys.modules,
+        f"fla.ops.{module}",
+        SimpleNamespace(**{recurrent: function, prefill: function}),
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "test")
+
+    def measure(call, warmup, repetitions, timing):
+        assert torch.is_inference_mode_enabled()
+        output, states = call()
+        assert output["output"].shape == (2, 2, 5, 4)
+        assert (states is None) == (contract == "output-only")
+        return {"public_cuda_event_ms": 1.0, "cpu_wall_ms": 2.0, "graph_ms": 0.5}
+
+    monkeypatch.setattr(benchmark, "_measure_call", measure)
+    result = runner._measure_pair(
+        benchmark,
+        torch,
+        case,
+        5,
+        torch.device("cpu"),
+        1,
+        2,
+        contract,
+        "both",
+        workspace_bytes=8 << 30,
+        baseline=baseline,
+    )
+    assert result["meta_correctness"]["status"] == "VALID"
+    assert result["meta_lowerer"] == "scan-stage-dag"
+    assert len(result["selected_child_lowerers"]) == 2
+    assert result["staged_workspace_estimate_bytes"] > 0
+    assert result["fla_preprocessing_timed"] is True
+    if family == "preconditioned-kda" and baseline == "prefill":
+        assert result["status"] == "NOT_COMPARABLE"
+        assert result["fla_contract_comparable"] is False
+        assert "normalization" in result["fla_note"]
+        assert "winner" not in result
+        assert runner._csv_rows([result])[0]["speedup"] is None
+    else:
+        assert result["status"] == result["fla_status"] == "OK"
+        assert runner._valid_pair(result)
+        assert runner._csv_rows([result])[0]["meta_ms"] == 1.0
+    if contract == "continuation":
+        assert (True, True) in calls  # Actual prefix caches reached the suffix.
+    elif contract == "output-only":
+        assert all(not final for final, _ in calls)
+
+
+@pytest.mark.parametrize(
+    "family", ["preconditioned-kda", "preconditioned-gdn", "lightnet"]
+)
+def test_staged_workloads_preserve_full_batch_head_contract_matrix(family):
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    workloads = runner._workloads(
+        benchmark, [family], [1, 2], [1, 8], [63, 65], runner.P0_CONTRACTS
+    )
+    assert len(workloads) == 24
+    assert {
+        (case.name, case.batch, case.heads, length, contract)
+        for case, length, contract in workloads
+    } == set(
+        runner.benchmark_matrix([family], [1, 2], [1, 8], [63, 65], runner.P0_CONTRACTS)
+    )
+
+
+def test_staged_workspace_rejection_uses_existing_result_status(monkeypatch):
+    from dataclasses import replace
+    import torch
+    from testing import benchmark_fla_stateful as runner
+    from testing import benchmark_stateful_plans as benchmark
+
+    monkeypatch.setenv("STATEFUL_OPERATOR_TEST_CPU", "1")
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda device: "test")
+    case = replace(
+        next(c for c in benchmark.CASES if c.name == "lightnet"),
+        heads=1,
+        dim=3,
+        dim_value=4,
+    )
+    result = runner._measure_pair(
+        benchmark,
+        torch,
+        case,
+        2048,
+        torch.device("cpu"),
+        0,
+        1,
+        "final-state",
+        "e2e",
+        workspace_bytes=1024,
+        baseline="prefill",
+    )
+    assert result["status"] == "META_RUNTIME_REJECTED"
+    assert result["fla_status"] == "NOT_RUN"
+    assert "RUNTIME_RESOURCE" in result["error"]
+    row = runner._csv_rows([result])[0]
+    assert row["status"] == "META_RUNTIME_REJECTED" and row["speedup"] is None

@@ -60,6 +60,8 @@ from examples.gated_oja_rule import gated_oja_rule  # noqa: E402
 from examples.gdn2 import gdn2  # noqa: E402
 from examples.generalized_delta_rule import iplr_delta_rule, dplr_delta_rule  # noqa: E402
 from examples.kda import kda  # noqa: E402
+from examples.lightnet_stable import lightnet_stable  # noqa: E402
+from examples.preconditioned_delta import preconditioned_delta  # noqa: E402
 
 
 STANDARD = ("batch", "heads", "seqlen", "dim", "dim_value")
@@ -87,6 +89,7 @@ class Case:
             "dim": self.dim,
             "dim_value": self.dim_value,
             "dim_slot": self.dim_slot,
+            "kind": "gdn" if self.name == "preconditioned-gdn" else "kda",
         }
         aliases = {
             "B": "batch",
@@ -142,6 +145,9 @@ CASES = (
         abc_attention,
         signature=("batch", "heads", "seqlen", "dim", "dim_slot", "dim_value"),
     ),
+    Case("preconditioned-kda", preconditioned_delta, signature=("kind",)),
+    Case("preconditioned-gdn", preconditioned_delta, signature=("kind",)),
+    Case("lightnet", lightnet_stable),
 )
 MATRIX_BATCHES = (1, 2)
 MATRIX_HEADS = (1, 8, 16)
@@ -230,6 +236,40 @@ def role_sizes_for(operator, case: Case, seqlen: int) -> dict:
     return sizes
 
 
+def plan_metadata(compiled, case, seqlen):
+    """Describe the selected plan, or each child of a staged public callable."""
+    if hasattr(compiled, "children"):
+        children = {}
+        for name, child in compiled.children.items():
+            plan = getattr(child.operator, "_plans", {}).get(child.specialization)
+            children[name] = {
+                "runtime_family": plan.runtime_family if plan else child.runtime_family,
+                "selected_lowerer": plan.plan.candidate.lowerer if plan else None,
+            }
+        return {
+            "meta_lowerer": compiled.runtime_family,
+            "mathematical_representation": compiled.runtime_family,
+            "rewrites": [],
+            "selected_child_lowerers": children,
+            "staged_workspace_estimate_bytes": compiled.workspace_bytes(
+                case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen
+            ),
+            "staged_workspace_sequence_length": seqlen,
+        }
+    plan = compiled.operator._plans[compiled.specialization]
+    estimate = next(
+        item
+        for identity, item in plan.plan.candidate_estimates
+        if identity == plan.plan.candidate.identity
+    )
+    return {
+        "meta_lowerer": plan.plan.candidate.lowerer,
+        "mathematical_representation": plan.plan.mathematical_plan.representation.value,
+        "rewrites": list(plan.plan.mathematical_plan.rewrites),
+        "static_estimate": asdict(estimate),
+    }
+
+
 def inputs_for(operator, case: Case, seqlen: int, device: torch.device) -> dict:
     sizes = role_sizes_for(operator, case, seqlen)
     values = {}
@@ -247,6 +287,14 @@ def inputs_for(operator, case: Case, seqlen: int, device: torch.device) -> dict:
             tensor = (torch.nn.functional.logsigmoid(tensor.float()) / 4).to(spec.dtype)
             tensor[:, :, 16 : min(32, seqlen)] = 0
             tensor[:, :, 256 : min(272, seqlen)] = 0
+        elif spec.name in ("log_atk_decay", "log_decay"):
+            tensor = -tensor.float().sigmoid() * 0.1
+        elif spec.name == "beta_atk":
+            tensor = tensor.sigmoid() * 0.4
+        elif spec.name == "center":
+            tensor = torch.full_like(tensor, -0.2)
+        elif spec.name == "scale":
+            tensor = torch.full_like(tensor, case.dim**-0.5)
         elif spec.name == "beta" and case.name not in ("iplr", "dplr"):
             tensor = tensor.sigmoid()
         elif spec.name.startswith("beta_") or spec.name in ("erase", "write"):
@@ -303,6 +351,12 @@ def inputs_for(operator, case: Case, seqlen: int, device: torch.device) -> dict:
             if case.name == "retnet":
                 tensor = tensor.exp()
             tensor = tensor.expand(shape).contiguous()
+        if case.name in (
+            "preconditioned-kda",
+            "preconditioned-gdn",
+            "lightnet",
+        ) and spec.name in ("query", "key", "value", "logits"):
+            tensor = tensor * 0.3
         values[spec.name] = tensor.to(spec.dtype).contiguous()
     return values
 
@@ -326,6 +380,36 @@ def _token_oracle(operator, inputs, sizes, *, initial_state=None):
         if Sequence in spec.roles
     )
     heads = sizes[algorithm.states[0].head_role]
+    from attn_engine import ScanStageIR
+
+    if isinstance(algorithm, ScanStageIR):
+        # Independent token recurrence shared with the focused stage benchmark;
+        # no compiled child or engine evaluator participates in this oracle.
+        from testing.benchmark_fla_stages import oracle
+
+        family = (
+            "lightnet"
+            if "logits" in inputs
+            else "preconditioned-kda"
+            if inputs["log_decay"].ndim == 4
+            else "preconditioned-gdn"
+        )
+        initial = tuple(
+            initial_state[spec.name].detach().cpu().float().clone()
+            if initial_state is not None
+            else torch.full(
+                (batch, sizes[spec.head_role], *(sizes[r] for r in spec.feature_roles)),
+                -torch.inf if spec.name == "z" else 0.0,
+            )
+            for spec in algorithm.states
+        )
+        result = oracle(
+            torch,
+            family,
+            {n: v.detach().cpu().float() for n, v in inputs.items()},
+            initial,
+        )
+        return {"output": result.pop("output").float()}, result
     states = {
         spec.name: (
             torch.zeros(batch, heads, *(sizes[r] for r in spec.feature_roles))
@@ -597,8 +681,16 @@ def _meta_call(compiled, parts, contract):
         prefix = compiled(**parts[0], return_final_state=contract != "output-only")
         result = prefix
         if contract == "continuation":
+            from attn_engine import StateTuple
+
+            # Final views may contain batch gaps; the public initial-State
+            # contract requires contiguous storage. Preparation is timed.
+            initial = StateTuple(
+                prefix.final_state.names,
+                tuple(value.contiguous() for value in prefix.final_state),
+            )
             result = compiled(
-                **parts[1], initial_state=prefix.final_state, return_final_state=True
+                **parts[1], initial_state=initial, return_final_state=True
             )
         outputs = {name: result.outputs[name] for name in result.outputs.names}
         if contract == "continuation":
@@ -663,6 +755,7 @@ def _measure_call(call, warmup, repetitions, timing="both"):
     return record
 
 
+@torch.inference_mode()
 def measure(
     case: Case,
     seqlen: int,
@@ -700,7 +793,7 @@ def measure(
         "torch_version": torch.__version__,
         "timing_units": "milliseconds",
         "input_layout": "B,H,T,features; preparation inside public-call intervals",
-        "initial_state": "zero; continuation suffix receives actual prefix final-State",
+        "initial_state": "authored identity (zero, except LightNet z=-inf); continuation suffix receives actual prefix final-State",
     }
     record["contract_scope"] = (
         "one public call; output only"
@@ -718,25 +811,23 @@ def measure(
             status="COMPILE_REJECTED", error=f"{error.category} at {error.path}"
         )
         return record
-    plan = compiled.operator._plans[compiled.specialization]
-    selected_estimate = next(
-        estimate
-        for identity, estimate in plan.plan.candidate_estimates
-        if identity == plan.plan.candidate.identity
-    )
+    metadata = plan_metadata(compiled, case, seqlen)
+    record.update(metadata)
     record.update(
-        lowerer=plan.plan.candidate.lowerer,
-        representation=plan.plan.mathematical_plan.representation.value,
-        mathematical_representation=plan.plan.mathematical_plan.representation.value,
-        rewrites=list(plan.plan.mathematical_plan.rewrites),
-        static_estimate=asdict(selected_estimate),
+        lowerer=metadata["meta_lowerer"],
+        representation=metadata["mathematical_representation"],
     )
-    workspace = plan.plan.workspace
-    record.update(
-        workspace_bytes_per_token=workspace.bytes_per_token,
-        workspace_bytes_per_chunk=workspace.bytes_per_chunk,
-        workspace_limit_bytes=workspace.maximum_bytes,
+    workspace = (
+        None
+        if hasattr(compiled, "children")
+        else compiled.operator._plans[compiled.specialization].plan.workspace
     )
+    if workspace is not None:
+        record.update(
+            workspace_bytes_per_token=workspace.bytes_per_token,
+            workspace_bytes_per_chunk=workspace.bytes_per_chunk,
+            workspace_limit_bytes=workspace.maximum_bytes,
+        )
     inputs = inputs_for(operator, case, seqlen, device)
     parts = (
         _split_inputs(operator, inputs, seqlen // 2)
@@ -745,8 +836,14 @@ def measure(
     )
     call = _meta_call(compiled, parts, contract)
     try:
-        record["workspace_bytes"] = workspace.required_bytes(
-            case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen
+        record["workspace_bytes"] = (
+            compiled.workspace_bytes(
+                case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen
+            )
+            if workspace is None
+            else workspace.required_bytes(
+                case.batch * seqlen, sequence_count=case.batch, sequence_length=seqlen
+            )
         )
         actual, states = call()
     except (StatefulCompilationError, RuntimeError) as error:

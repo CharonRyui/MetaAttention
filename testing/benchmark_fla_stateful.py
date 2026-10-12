@@ -46,6 +46,9 @@ FLA_FAMILIES = (
     "oja",
     "delta-product",
     "abc",
+    "preconditioned-kda",
+    "preconditioned-gdn",
+    "lightnet",
 )
 P0_FAMILIES = FLA_FAMILIES
 P0_BATCHES = (1, 2)
@@ -76,6 +79,17 @@ DELTA_BASELINE_APIS = {
     "abc": ("abc", None, "chunk_abc"),
 }
 BASELINE_APIS = {
+    "preconditioned-kda": (
+        "precond_kda",
+        "fused_recurrent_precond_kda",
+        "chunk_precond_kda",
+    ),
+    "preconditioned-gdn": (
+        "precond_gated_delta_rule",
+        "fused_recurrent_precond_gated_delta_rule",
+        "chunk_precond_gated_delta_rule",
+    ),
+    "lightnet": ("lightnet", "fused_recurrent_lightnet", "chunk_lightnet"),
     "linear": ("linear_attn", "fused_recurrent_linear_attn", "chunk_linear_attn"),
     "normalized-linear": (
         "linear_attn",
@@ -536,9 +550,68 @@ def _delta_family_baseline(case, baseline=None):
     )
 
 
+def _staged_family_baseline(case, baseline):
+    """Normalize public FLA caches to Meta's canonical multi-State order."""
+    function, function_name = _baseline_function(case.name, baseline, BASELINE_APIS)
+    preconditioned = case.name != "lightnet"
+    gdn = case.name == "preconditioned-gdn"
+    recurrent = "fused_recurrent_" in function_name
+
+    def prepare(values):
+        return {
+            name: value.transpose(1, 2).contiguous() for name, value in values.items()
+        }
+
+    def invoke(values, initial, final):
+        kwargs = dict(
+            q=values["query"],
+            v=values["value"],
+            scale=case.dim**-0.5,
+            output_final_state=final,
+        )
+        if preconditioned:
+            auxiliary, memory = (None, None) if initial is None else initial
+            kwargs.update(
+                k=values["key"],
+                g=values["log_decay"],
+                g_atk=values["log_atk_decay"],
+                beta_atk=values["beta_atk"],
+                beta=values["beta"],
+                initial_state=memory,
+                initial_A_state=auxiliary,
+            )
+            if gdn or recurrent:
+                kwargs["use_qk_l2norm_in_kernel"] = gdn
+            output, memory, auxiliary = function(**kwargs)
+        else:
+            native_initial = (
+                None if initial is None else (initial[1], initial[0].unsqueeze(1))
+            )
+            output, (memory, auxiliary) = function(
+                k=values["logits"], initial_state=native_initial, **kwargs
+            )
+            auxiliary = auxiliary.squeeze(1)
+        return output.transpose(1, 2), (auxiliary, memory) if final else None
+
+    comparable = not (case.name == "preconditioned-kda" and not recurrent)
+    return FLABaseline(
+        prepare,
+        invoke,
+        ("atk" if preconditioned else "z", "memory"),
+        comparable=comparable,
+        note="FLA public chunk KDA hardcodes q/k L2 normalization; Meta and recurrent KDA use raw q/k."
+        if not comparable
+        else "",
+        preprocessing=f"{function_name}; transpose/contiguous; gate construction and normalization timed",
+        function_name=function_name,
+    )
+
+
 def _fla_call(case, inputs, baseline=None):
     """Return an optional FLA adapter; newer families need a recent checkout."""
     name = case.name
+    if name in {"preconditioned-kda", "preconditioned-gdn", "lightnet"}:
+        return _staged_family_baseline(case, baseline)
     if name in {
         "delta-rule",
         "kda",
@@ -854,7 +927,14 @@ def _meta_failure_status(error: Exception) -> str:
     return "META_FAILED"
 
 
-def _measure_pair(
+def _measure_pair(benchmark, torch, *args, **kwargs):
+    # Staged inference must select its compiled native children, including during
+    # graph capture/profiling. Layout preparation remains inside each public call.
+    with torch.inference_mode():
+        return _measure_pair_inference(benchmark, torch, *args, **kwargs)
+
+
+def _measure_pair_inference(
     benchmark,
     torch,
     case,
@@ -903,18 +983,7 @@ def _measure_pair(
             mode="dense",
             optimized=True,
         )
-        plan = compiled.operator._plans[compiled.specialization]
-        estimate = next(
-            item
-            for identity, item in plan.plan.candidate_estimates
-            if identity == plan.plan.candidate.identity
-        )
-        result.update(
-            meta_lowerer=plan.plan.candidate.lowerer,
-            mathematical_representation=plan.plan.mathematical_plan.representation.value,
-            rewrites=list(plan.plan.mathematical_plan.rewrites),
-            static_estimate=asdict(estimate),
-        )
+        result.update(benchmark.plan_metadata(compiled, case, seqlen))
         inputs = benchmark.inputs_for(operator, case, seqlen, device)
         parts = (
             benchmark._split_inputs(operator, inputs, seqlen // 2)

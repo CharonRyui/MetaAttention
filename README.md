@@ -126,6 +126,14 @@ CSV, and plots are artifacts; benchmark results require a fixed GPU, software
 environment, warmup/repetition count, and idle-device record.
 The standalone Stateful plan runner measures those contracts without external baseline adapters.
 
+The main FLA runner now defaults to all 25 registered families, including
+`preconditioned-kda`, `preconditioned-gdn` and `lightnet`. These staged operators
+use the same batch/head matrix, state contracts, timing and result files as the
+other families. See the [unified stage benchmark guide](docs/stateful-stage-benchmarks.md#unified-benchmark-interface)
+for examples, selected child runtimes and FLA semantic limits. The focused
+`testing/benchmark_fla_stages.py` additionally measures VJPs and supplied
+nonzero caches under its separately documented timing contract.
+
 The [new example benchmark guide](examples/README.md#benchmark-against-fla)
 covers Delta Rule, KDA, GDN2, ComBa, IPLR/DPLR, Oja, Delta Product and ABC.
 [Measured H20 results](docs/stateful-example-benchmarks.md) include the selected

@@ -1,7 +1,10 @@
 # Public scan-stage benchmarks against FLA
 
-`testing/benchmark_fla_stages.py` registers three **attention operators**, not
-model layers:
+`testing/benchmark_fla_stateful.py` now includes these three **attention
+operators** in its default family registry, alongside the existing 22 families.
+`testing/benchmark_fla_stages.py` remains a focused diagnostic for nonzero
+supplied caches, explicit input dtype/dimensions and separately measured VJPs.
+These entries describe attention operators, not model layers:
 
 | CLI family | Public Meta factory | FLA prefill | FLA recurrent |
 | --- | --- | --- | --- |
@@ -16,7 +19,82 @@ ordinary candidate lowerer; its `selected_lowerer` is null, not a missing
 benchmark. A selected lowerer describes compilation, not proof that the
 same native executor runs during autograd.
 
-## Run
+## Unified benchmark interface
+
+Use the main runner for the same matrix, timing and result conventions as the
+other families:
+
+```sh
+.venv/bin/python testing/benchmark_fla_stateful.py \
+  --families preconditioned-kda,preconditioned-gdn,lightnet \
+  --batches 1 2 --heads 1 8 --seqlens 65 2048 8192 \
+  --contract all --fla-baseline both --timing both \
+  --workspace-gib 8 --warmup 5 --repetitions 30 \
+  --fla-source ../flash-linear-attention --gpu 0 \
+  --output-dir benchmark_results/staged-unified
+```
+
+Omitting `--families` selects all 25 registered families. The unified runner
+uses BF16 inputs and the default initial State of each authored operator:
+zero ATK/memory for preconditioned attention, and `z=-inf` with zero memory
+for LightNet. `output-only` requests no finals; `final-state` validates every
+State; `continuation` times prefix and suffix public calls, passes both actual
+prefix caches to the suffix, and includes output concatenation. Noncontiguous
+Meta final views are made contiguous at this boundary, inside the timed call.
+Continuation requires T>=2; use a separate output-only/final-state run for T1.
+
+All invocations, profiling and Graph capture run in `torch.inference_mode()`.
+External FLA layout conversion, gate construction, normalization and state
+layout conversion are included in the public interval, matching the other
+families in this runner. Compilation and independent CPU oracle execution are
+excluded. Public CUDA-event, synchronized CPU-wall, Graph replay, CUPTI and
+allocator measurements use the existing shared helpers. The output directory
+contains `manifest.json`, `records.json`, `summary.csv` and comparison plots.
+Schema 6 remains unchanged; staged records additionally include
+`selected_child_lowerers` and `staged_workspace_estimate_bytes`, rather than
+inventing a single child plan or treating a workspace bound as measured memory.
+
+FLA schedule selection is explicit and missing APIs remain `UNAVAILABLE`.
+Public chunk KDA's q/k normalization differs from the authored operator, so
+its prefill records are `NOT_COMPARABLE`, with correctness errors and the
+semantic reason retained. They produce no speedup or plotted winner. GDN and
+LightNet expose matching two-State final/continuation contracts. The existing
+CSV/plot eligibility checks apply to every family.
+
+The unified interface is a forward benchmark. The focused runner below retains
+separate VJP measurements and nonzero supplied initial caches; its timings use
+prebound external layouts and therefore must not be mixed with unified public
+measurements.
+
+### Unified-interface validation (2026-10-12)
+
+CPU unit regression: **531 passed**, four skipped, 92 GPU tests deselected.
+Focused benchmark checks: **132 passed**, including compiled stage output/final/
+continuation checks at B2/H2 with non-square K3/V4, both FLA schedule adapters,
+actual prefix cache forwarding, inference-mode timing, result/CSV eligibility,
+and workspace rejection classification. Ruff check/format and diff checks pass.
+
+H20 GPU0, BF16 K=V64, 8 GiB workspace, warmup=1/repetitions=3:
+
+- T65, B=1/2, H=1/2, all three families, all three state contracts, both
+  schedules: **72 records**, 60 valid pairs and 12 KDA prefill semantic
+  rejections. All Meta output/final-state oracle checks and Graph timings passed.
+- T1/2048, B=H=1, all three families, final-state, both schedules: **12
+  records**, ten valid pairs and two KDA prefill semantic rejections. All Meta
+  output/final-state oracle checks and Graph timings passed.
+- Legacy Linear/GDN/ABC, B=H=2, T65, all three contracts, both schedules:
+  **18 records**, 13 valid pairs and five expected ABC unavailable/incompatible
+  state-contract records. All Meta oracle checks and Graph timings passed.
+
+Raw JSON, manifest, CSV and plots are retained on the SSH host under
+`/tmp/fla_unified_stages_smoke/`, `/tmp/fla_unified_stages_edges/` and
+`/tmp/fla_unified_legacy_regression/`. Logs are
+`/tmp/fla_unified_stages_smoke.log` and `/tmp/fla_unified_edges_legacy.log`.
+These low-repetition runs verify integration and failure reporting; they are
+not a new stable performance comparison. Timing/profiling and continuation
+preparation use the shared helpers. No production lowering was changed.
+
+## Focused stage diagnostic
 
 From the repository root, with the CUDA/TileLang environment installed:
 
