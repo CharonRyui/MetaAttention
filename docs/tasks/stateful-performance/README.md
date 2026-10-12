@@ -20,6 +20,7 @@ expression、diagonal、scalar、lowrank、scan、readout 保持功能 locality�
 - [P3 checkpointed backward](08-checkpoint-backward.md)；依赖 01,03,04,05。
 - [P3 packed chunk pipeline](09-packed-pipeline.md)；依赖 02,04,05,08。
 - [计划组合、真实成本与调度选择](10-plan-selection.md)；依赖 00,01,03,04,05,06,07,08,09。
+- [Delta-product benchmark 正确性修复计划](11-delta-product-correctness.md)；已定位 ordered-step oracle 错误，待实施。
 
 ## 执行与提交
 子代理实现互不重叠的文件集合，负责人拥有共享接口与集成、H20 smoke 和原子提交。每个提交必须包含可运行的行为及证据，不能只交 scaffold。性能数据需要区分真实观测和推断。短序列 public latency 和长序列 Graph 均需验收；不强制所有结构使用同一 launch 数。
