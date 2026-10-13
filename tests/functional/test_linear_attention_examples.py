@@ -57,7 +57,9 @@ def _reference(query, key, value, gate=None, initial_state=None):
             else:
                 state = state * gate[:, :, index, :, None].float().exp()
         state = state + torch.einsum(
-            "bhk,bhv->bhkv", (key[:, :, index].float() + 0.1), value[:, :, index].float()
+            "bhk,bhv->bhkv",
+            (key[:, :, index].float() + 0.1),
+            value[:, :, index].float(),
         )
         outputs.append(
             torch.einsum(

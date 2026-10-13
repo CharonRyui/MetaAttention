@@ -785,6 +785,7 @@ def test_analysis_derives_raw_dense_recipe_from_structure():
     assert dense.right_factor[0].name == "value"
     assert dense.readout[0].name == "query"
 
+
 def test_analysis_accepts_constant_offset_in_scalar_factorized_injection():
     operator = StatefulOperator(_accumulator_ir(key_offset=0.1))
     dense = operator.algorithm._analysis.scalar_factorized.dense

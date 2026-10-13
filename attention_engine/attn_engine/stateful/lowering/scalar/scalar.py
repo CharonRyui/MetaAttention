@@ -71,7 +71,14 @@ def _compile_scalar_factorized_dense_raw(
         T, (left_operation, left_scale, left_is_log_scale, left_offset, scale_steps[1])
     )
     right_transform = _transform(
-        T, (right_operation, right_scale, right_is_log_scale, right_offset, scale_steps[2])
+        T,
+        (
+            right_operation,
+            right_scale,
+            right_is_log_scale,
+            right_offset,
+            scale_steps[2],
+        ),
     )
     readout_transform = _transform(
         T,
